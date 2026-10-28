@@ -1,0 +1,606 @@
+{
+ "snapshot": "2026-10-12",
+ "source": "Empira paper (preprint in preparation); figures and tables at the snapshot of 12 October 2026",
+ "starting_model_cutoff": "2025-01",
+ "findings": [
+  {
+   "title": "Self-improvement is credited on the problems that shaped it",
+   "body": "We read the evaluation sections of ten self-improving systems: STOP, Promptbreeder, ADAS, Gödel Agent, SICA, the Darwin Gödel Machine, the Huxley-Gödel Machine, AIDE², EvoTune and ThetaEvolve. All ten are evaluated by their own authors on fixed, pre-existing benchmarks, and none uses problems published after its model. Eight re-run the unmodified initial system as a reference, which is the right comparison, but none freezes its versions with a date. Without a date, nobody can say which problems a given version could not have seen."
+  },
+  {
+   "title": "Existing benchmarks do not hold problems out by date",
+   "body": "Across the 31 related resources we compared, 10 self-improving systems and 21 benchmarks and evaluation platforms, none fully dates system versions and none fully restricts evaluation to problems published after a version. Nine re-run a predecessor, and only two keep extending their task set. ALE-Bench and MLE-bench relate scores to problem dates, but only after the fact."
+  },
+  {
+   "title": "The literature supplies new problems at a usable rate",
+   "body": "Of the 1,102 tasks in the stream, 511 were first published after the January 2025 training cutoff of the common starting model. Tasks first published in the twelve months before the snapshot average about 25 per month. How quickly a problem reaches the stream depends on the field: the median latency from publication to admission is 178 days for computer systems and 367 days for operations research, but several years for physics, chemistry and finance, where the tasks come mostly from older literature."
+  },
+  {
+   "title": "Most higher scores are not scientific results",
+   "body": "For 574 tasks (52%), the source reports results only in its own setting, with different data, budget, model or hardware; the arena recreates the experiment on CPU, so a better score means a better result than the seed program, not than the paper. For 184 tasks nothing is published for the arena's instance, 98 have a proven optimum that can only be matched, and 64 have a published value not yet checked. That leaves 177 tasks on the SOTA track, and on 121 of them the task's own evaluator already reproduces the published human result. Only there can a higher score be checked as a new state of the art."
+  }
+ ],
+ "arrivals": {
+  "bins": [
+   "24-06",
+   "24-08",
+   "24-10",
+   "24-12",
+   "25-02",
+   "25-04",
+   "25-06",
+   "25-08",
+   "25-10",
+   "25-12",
+   "26-02",
+   "26-04",
+   "26-06",
+   "26-08"
+  ],
+  "cutoff_after_bin": 3,
+  "earlier_not_shown": 499,
+  "undated": 27,
+  "groups": {
+   "Mathematics": [
+    0,
+    5,
+    3,
+    3,
+    5,
+    6,
+    86,
+    2,
+    58,
+    0,
+    3,
+    8,
+    2,
+    4
+   ],
+   "Algorithms & OR": [
+    11,
+    0,
+    1,
+    2,
+    3,
+    24,
+    1,
+    12,
+    1,
+    1,
+    0,
+    6,
+    40,
+    6
+   ],
+   "Natural sciences": [
+    3,
+    1,
+    3,
+    6,
+    0,
+    1,
+    1,
+    0,
+    4,
+    4,
+    0,
+    4,
+    4,
+    4
+   ],
+   "AI on AI": [
+    7,
+    8,
+    8,
+    3,
+    0,
+    46,
+    14,
+    2,
+    14,
+    9,
+    81,
+    18,
+    16,
+    7
+   ],
+   "Other": [
+    1,
+    0,
+    0,
+    0,
+    2,
+    2,
+    3,
+    0,
+    0,
+    0,
+    1,
+    3,
+    3,
+    0
+   ]
+  }
+ },
+ "domains": {
+  "columns": [
+   "Domain",
+   "Tasks",
+   "Problems",
+   "Scientific",
+   "Ref. value",
+   "Post-cutoff",
+   "Latency (d)"
+  ],
+  "rows": [
+   [
+    "Mathematics",
+    393,
+    287,
+    267,
+    242,
+    174,
+    895
+   ],
+   [
+    "Language models & agents",
+    168,
+    95,
+    0,
+    0,
+    50,
+    1085
+   ],
+   [
+    "Machine learning",
+    117,
+    25,
+    1,
+    0,
+    94,
+    492
+   ],
+   [
+    "Continuous & black-box optimization",
+    83,
+    17,
+    0,
+    0,
+    58,
+    492
+   ],
+   [
+    "Computer systems & hardware",
+    70,
+    42,
+    3,
+    3,
+    63,
+    178
+   ],
+   [
+    "Operations research",
+    56,
+    51,
+    15,
+    3,
+    36,
+    367
+   ],
+   [
+    "Physics",
+    39,
+    33,
+    27,
+    5,
+    10,
+    1459
+   ],
+   [
+    "Chemistry & materials",
+    38,
+    29,
+    30,
+    13,
+    6,
+    1562
+   ],
+   [
+    "Earth & environment",
+    31,
+    31,
+    27,
+    0,
+    0,
+    4238
+   ],
+   [
+    "Software engineering",
+    28,
+    17,
+    20,
+    6,
+    4,
+    3639
+   ],
+   [
+    "Robotics & control",
+    27,
+    25,
+    0,
+    0,
+    6,
+    1095
+   ],
+   [
+    "Biology & health",
+    25,
+    24,
+    17,
+    3,
+    6,
+    1177
+   ],
+   [
+    "Finance & economics",
+    23,
+    19,
+    23,
+    5,
+    0,
+    7147
+   ],
+   [
+    "Mixed / unclassified",
+    4,
+    4,
+    0,
+    0,
+    4,
+    472
+   ]
+  ],
+  "total": [
+   "Total",
+   1102,
+   693,
+   430,
+   280,
+   511,
+   711
+  ]
+ },
+ "related": {
+  "columns": [
+   "Dated versions",
+   "Post-date",
+   "Replay",
+   "Independent",
+   "Growing"
+  ],
+  "legend": {
+   "y": "yes",
+   "p": "partly",
+   "n": "no",
+   "u": "unclear"
+  },
+  "groups": [
+   [
+    "Self-improving AI (self-reported)",
+    [
+     [
+      "STOP",
+      "pnynn"
+     ],
+     [
+      "Promptbreeder",
+      "nnpnn"
+     ],
+     [
+      "ADAS",
+      "pnynn"
+     ],
+     [
+      "Gödel Agent",
+      "pnpnn"
+     ],
+     [
+      "SICA",
+      "nnynn"
+     ],
+     [
+      "Darwin Gödel Machine",
+      "nnynn"
+     ],
+     [
+      "Huxley-Gödel Machine",
+      "nnynn"
+     ],
+     [
+      "AIDE²",
+      "nnynn"
+     ],
+     [
+      "EvoTune",
+      "nnynn"
+     ],
+     [
+      "ThetaEvolve",
+      "pnynn"
+     ]
+    ]
+   ],
+   [
+    "Discovery and optimization benchmarks",
+    [
+     [
+      "AlphaEvolve problems",
+      "unnnp"
+     ],
+     [
+      "CO-Bench",
+      "nnnyn"
+     ],
+     [
+      "FrontierCO",
+      "nnnyp"
+     ],
+     [
+      "HeuriGym",
+      "pnnyp"
+     ],
+     [
+      "ALE-Bench",
+      "ppnyp"
+     ],
+     [
+      "AlgoTune",
+      "pnnyn"
+     ],
+     [
+      "FrontierCS",
+      "nnnyy"
+     ],
+     [
+      "Frontier-Eng",
+      "nnnyp"
+     ],
+     [
+      "LLM4AD",
+      "nnnpp"
+     ]
+    ]
+   ],
+   [
+    "AI R&D and research-agent benchmarks",
+    [
+     [
+      "MLE-bench",
+      "ppnyn"
+     ],
+     [
+      "RE-Bench",
+      "pnpyp"
+     ],
+     [
+      "MLGym",
+      "pnnyp"
+     ],
+     [
+      "MLRC-Bench",
+      "pnnyp"
+     ],
+     [
+      "PaperBench",
+      "pnnyn"
+     ],
+     [
+      "AI4AI-Bench",
+      "nnnyn"
+     ],
+     [
+      "RSIBench-Data",
+      "nnnyn"
+     ],
+     [
+      "AstaBench",
+      "pnnyp"
+     ]
+    ]
+   ],
+   [
+    "Evaluation infrastructure and live evaluation",
+    [
+     [
+      "HAL",
+      "pnnyp"
+     ],
+     [
+      "LiveBench",
+      "ppnyy"
+     ],
+     [
+      "EvoTrace",
+      "nnnyn"
+     ],
+     [
+      "PAST-Bench",
+      "nnyyp"
+     ]
+    ]
+   ]
+  ],
+  "ours": [
+   "Empira (recorded so far)",
+   "ppnyy"
+  ]
+ },
+ "boards": [
+  {
+   "id": "progressive",
+   "name": "Progressive",
+   "ranks_by": "mean Δu on later problems",
+   "columns": [
+    [
+     "Δu (later)",
+     "Mean gain of each revision over its replayed predecessor on later problems, net of cost. The ranking key."
+    ],
+    [
+     "95% CI · P(Δu>0)",
+     "Bootstrap interval over problems, and the probability that the gain is positive."
+    ],
+    [
+     "Win rate",
+     "Share of later problems on which the successor beats the predecessor."
+    ],
+    [
+     "Seen · Later · Acc. gap",
+     "Gain on problems available during the revision, gain on later problems, and their difference."
+    ],
+    [
+     ">Human",
+     "Share of later problems on which the system exceeds the published human result."
+    ],
+    [
+     "Runs · Valid · Tok./rev.",
+     "Completed runs, share of valid outputs, tokens per revision."
+    ]
+   ]
+  },
+  {
+   "id": "recursive",
+   "name": "Recursive",
+   "ranks_by": "Δ²u",
+   "columns": [
+    [
+     "Δ²u · 95% CI",
+     "How much more progressive the revisions after a method revision are than those after its replayed predecessor."
+    ],
+    [
+     "Transplant · Ablation",
+     "Δu when a system's accumulated self-revisions are moved into a fresh run, or removed from the current one."
+    ],
+    [
+     "Revision types",
+     "Share of revisions that gain on later problems, show no later gain, fail confirmation, or only fix failures on seen problems."
+    ]
+   ]
+  },
+  {
+   "id": "domains",
+   "name": "By domain",
+   "ranks_by": "Δu within each domain",
+   "columns": [
+    [
+     "Δu per domain",
+     "The progressive score for each of the 13 domains, so that a gain in one area is not averaged away by another."
+    ],
+    [
+     "Macro average",
+     "Unweighted mean over the domains in which a system has later problems."
+    ]
+   ]
+  },
+  {
+   "id": "resources",
+   "name": "Resources",
+   "ranks_by": "reported next to the ranks",
+   "columns": [
+    [
+     "Tokens · LLM calls",
+     "Prompt and completion tokens and model calls over the study."
+    ],
+    [
+     "Wall · CPU · GPU hours",
+     "Time and compute, including time to the best result."
+    ],
+    [
+     "USD",
+     "Billed cost where a provider billed the run; unpriced runs are left empty, not zero."
+    ]
+   ]
+  }
+ ],
+ "cohort": [
+  [
+   "Baselines",
+   [
+    "Start model, one attempt",
+    "Start model, best-of-N",
+    "Start model, refinement",
+    "Frozen predecessor",
+    "Seed program"
+   ]
+  ],
+  [
+   "AlphaEvolve / OpenEvolve lineage",
+   [
+    "OpenEvolve",
+    "ShinkaEvolve",
+    "CodeEvolve",
+    "LoongFlow",
+    "AdaEvolve"
+   ]
+  ],
+  [
+   "FunSearch / EoH lineage",
+   [
+    "FunSearch re-implementation",
+    "EoH",
+    "ReEvo",
+    "HSEvo",
+    "MCTS-AHD"
+   ]
+  ],
+  [
+   "Self-referential agents",
+   [
+    "Darwin Gödel Machine",
+    "Gödel Agent",
+    "ADAS",
+    "AFlow",
+    "SICA",
+    "Meta-Harness"
+   ]
+  ],
+  [
+   "Prompt and program self-revision",
+   [
+    "Promptbreeder",
+    "EvoPrompt",
+    "GEPA",
+    "MIPRO"
+   ]
+  ],
+  [
+   "Reward design",
+   [
+    "Eureka",
+    "DrEureka"
+   ]
+  ],
+  [
+   "Equation discovery",
+   [
+    "LaSR",
+    "DrSR"
+   ]
+  ],
+  [
+   "Other self-improving systems",
+   [
+    "LLaMEA-BO",
+    "Mind Evolution",
+    "QDAIF",
+    "OMNI-EPIC"
+   ]
+  ],
+  [
+   "Arena reference system",
+   [
+    "SCiEL"
+   ]
+  ]
+ ]
+}
