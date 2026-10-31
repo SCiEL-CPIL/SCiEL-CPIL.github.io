@@ -1,0 +1,1 @@
+BET: {mechanism: "Adding 2-for-1 moves to local search allows removing two blocks and adding one, which can escape local minima where no single 1-for-1 swap improves the solution. This expands the search neighborhood and may find smaller coverings that the 1-for-1 local search cannot reach.", q: 0.35, delta: [0.0, 0.05]}
