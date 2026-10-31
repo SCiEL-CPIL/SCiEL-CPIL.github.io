@@ -1,186 +1,324 @@
 import itertools
-import time
 import random
-import numpy as np
+import time
+import math
+import sys
 
 def construct(v, k, t):
     start_time = time.time()
-    deadline = start_time + 140.0
+    time_limit = 115  # Leave margin
+    
+    all_points = list(range(v))
+    all_tsubsets = list(itertools.combinations(all_points, t))
+    tsubset_index = {ts: i for i, ts in enumerate(all_tsubsets)}
+    n_tsubsets = len(all_tsubsets)
+    
+    # Precompute all k-blocks and their covered t-subsets
+    all_blocks = list(itertools.combinations(all_points, k))
+    block_to_tsubs = {}
+    tsub_to_blocks = {i: [] for i in range(n_tsubsets)}
+    
+    for b in all_blocks:
+        covered_tsubs = []
+        for ts in itertools.combinations(b, t):
+            idx = tsubset_index[ts]
+            covered_tsubs.append(idx)
+            tsub_to_blocks[idx].append(b)
+        block_to_tsubs[b] = covered_tsubs
 
-    # 1. Precompute all k-blocks and t-subsets
-    points = list(range(v))
-    all_kblocks = list(itertools.combinations(points, k))
-    all_tsubs = list(itertools.combinations(points, t))
-    
-    n_blocks = len(all_kblocks)
-    n_tsubs = len(all_tsubs)
-    
-    # Map t-subsets to indices
-    tsub_to_idx = {ts: i for i, ts in enumerate(all_tsubs)}
-    
-    # 2. Build coverage matrix
-    # Cover[i, j] is True if t-subset j is contained in block i
-    # Using uint8 for faster arithmetic if needed, but bool is fine for logical ops.
-    # We will use int for dot product.
-    Cover = np.zeros((n_blocks, n_tsubs), dtype=np.uint8)
-    
-    for i, B in enumerate(all_kblocks):
-        B_set = set(B)
-        # Iterate t-subsets of B
-        # Optimization: Instead of iterating all tsubs and checking membership,
-        # generate tsubs from B directly.
-        for ts in itertools.combinations(B, t):
-            j = tsub_to_idx[ts]
-            Cover[i, j] = 1
+    def greedy_init():
+        # Standard Greedy Set Cover
+        uncovered = [1] * n_tsubsets
+        n_uncovered = n_tsubsets
+        blocks = []
+        block_set = set()
+        
+        while n_uncovered > 0:
+            best_block = None
+            best_gain = -1
             
-    # 3. Greedy Construction
-    uncovered = np.ones(n_tsubs, dtype=np.uint8)
-    selected_blocks = []
-    remaining_time_limit = deadline - 5.0 # Leave 5s for post-processing
-    
-    # Convert Cover to int for dot product? 
-    # np.dot with uint8 might work, or we can just use boolean logic and sum.
-    # gains = np.sum(Cover & uncovered[None, :], axis=1)
-    # This creates a temp array of size n_blocks x n_tsubs. 
-    # Cover & uncovered[None, :] is broadcasted.
-    # This is memory intensive (195MB temp) and slow.
-    
-    # Better: Use matrix multiplication.
-    # gains = Cover @ uncovered
-    # Cover is uint8, uncovered is uint8. Result is uint8? No, might overflow.
-    # Max gain is C(k, t) = C(7, 4) = 35. So uint8 is safe.
-    
-    while np.sum(uncovered) > 0:
-        if time.time() > remaining_time_limit:
-            # If we run out of time, we have an invalid covering.
-            # We must try to finish quickly or return best effort?
-            # The task requires a VALID covering.
-            # If we can't finish greedy, we fail.
-            # But greedy is fast. Let's assume it finishes.
-            pass
+            for b in all_blocks:
+                if b in block_set:
+                    continue
+                gain = 0
+                for ts_idx in block_to_tsubs[b]:
+                    if uncovered[ts_idx]:
+                        gain += 1
+                if gain > best_gain:
+                    best_gain = gain
+                    best_block = b
             
-        # Compute gains for all blocks
-        # gains[i] = number of uncovered tsubs in block i
-        gains = Cover @ uncovered
-        
-        best_idx = np.argmax(gains)
-        best_gain = gains[best_idx]
-        
-        if best_gain == 0:
-            # Should not happen if covering is possible
-            break
+            if best_block is None or best_gain == 0:
+                break
+                
+            blocks.append(best_block)
+            block_set.add(best_block)
             
-        selected_blocks.append(all_kblocks[best_idx])
+            for ts_idx in block_to_tsubs[best_block]:
+                if uncovered[ts_idx]:
+                    uncovered[ts_idx] = 0
+                    n_uncovered -= 1
+                    
+        return blocks
+
+    def local_search(blocks):
+        # Returns improved blocks
+        current_blocks = list(blocks)
+        current_block_set = set(current_blocks)
         
-        # Update uncovered
-        # uncovered = uncovered & (~Cover[best_idx])
-        # Since Cover[best_idx] is 0/1, ~Cover is 1/0 (if uint8, ~1 is 254, ~0 is 255).
-        # So use: uncovered = uncovered * (1 - Cover[best_idx])
-        # Or: uncovered = uncovered & (Cover[best_idx] == 0)
-        uncovered = uncovered & (Cover[best_idx] == 0)
+        # Coverage counts
+        coverage = [0] * n_tsubsets
+        for b in current_blocks:
+            for ts_idx in block_to_tsubs[b]:
+                coverage[ts_idx] += 1
         
-    # 4. Post-processing: Remove Redundant Blocks
-    # We have a valid covering (assuming greedy finished).
-    # Now minimize.
-    if time.time() < deadline - 2.0:
-        # Count coverage for each t-subset
-        # cover_counts[j] = number of blocks containing t-subset j
-        # We can compute this from the selected blocks.
-        # But we have the full Cover matrix.
-        # Let's create a subset of Cover for selected blocks.
-        # Or just iterate.
-        
-        # Efficient removal:
-        # 1. Compute cover_count for each t-subset based on selected_blocks.
-        # 2. Iterate selected_blocks. If a block covers no t-subset with count 1, it's redundant.
-        # 3. Remove it, update counts, repeat.
-        
-        # Map t-subset to index again for speed in lookup
-        # We already have tsub_to_idx.
-        
-        # Initialize counts
-        cover_counts = np.zeros(n_tsubs, dtype=np.int32)
-        
-        # Add counts for all selected blocks
-        # We can use the Cover matrix rows for selected blocks
-        sel_indices = []
-        for B in selected_blocks:
-            # Find index of B in all_kblocks
-            # This is slow if we search. 
-            # Better: keep track of indices during greedy.
-            pass
-            
-        # Let's redo greedy keeping indices.
-        
-    # RESTART LOGIC:
-    # The above draft has a flaw: mapping block tuple to index is slow.
-    # Let's modify the greedy loop to store indices.
-    
-    # Revised Greedy
-    selected_indices = []
-    uncovered = np.ones(n_tsubs, dtype=np.uint8)
-    remaining_time_limit = deadline - 10.0
-    
-    while np.sum(uncovered) > 0:
-        if time.time() > remaining_time_limit:
-            break
-            
-        gains = Cover @ uncovered
-        best_idx = np.argmax(gains)
-        
-        if gains[best_idx] == 0:
-            break
-            
-        selected_indices.append(best_idx)
-        uncovered = uncovered & (Cover[best_idx] == 0)
-        
-    # Convert indices to blocks
-    blocks = [all_kblocks[i] for i in selected_indices]
-    
-    # Post-processing: Remove Redundant
-    if time.time() < deadline - 2.0:
-        # Compute initial cover counts
-        cover_counts = np.zeros(n_tsubs, dtype=np.int32)
-        for idx in selected_indices:
-            cover_counts += Cover[idx]
-            
-        # Iteratively remove redundant blocks
-        # A block is redundant if it doesn't cover any t-subset with count 1.
-        # We need to know which t-subsets are covered by which block.
-        # We have Cover matrix.
-        
+        def is_valid():
+            # Check if any coverage is 0
+            # This is O(n_tsubsets)
+            for c in coverage:
+                if c == 0:
+                    return False
+            return True
+
+        def is_redundant(b):
+            # A block is redundant if every t-subset it covers is covered by >1 block
+            for ts_idx in block_to_tsubs[b]:
+                if coverage[ts_idx] == 1:
+                    return False
+            return True
+
+        def remove_block(b):
+            current_block_set.remove(b)
+            current_blocks.remove(b)
+            for ts_idx in block_to_tsubs[b]:
+                coverage[ts_idx] -= 1
+
+        def add_block(b):
+            current_block_set.add(b)
+            current_blocks.append(b)
+            for ts_idx in block_to_tsubs[b]:
+                coverage[ts_idx] += 1
+
+        # Phase 1: Remove redundants
         changed = True
-        while changed and time.time() < deadline - 2.0:
+        while changed:
             changed = False
-            new_selected_indices = []
-            for idx in selected_indices:
-                # Check if any t-subset in this block has count 1
-                # Block idx covers t-subsets where Cover[idx, j] == 1
-                # We need to check if any of those have cover_counts[j] == 1
-                # mask = Cover[idx] == 1
-                # unique_covered = mask & (cover_counts == 1)
-                # if np.any(unique_covered): keep, else remove
-                
-                # Optimization: 
-                # If the block has any 1 in positions where count is 1, it's essential.
-                # positions = np.where(Cover[idx] == 1)[0]
-                # if len(positions) > 0 and np.any(cover_counts[positions] == 1):
-                #     keep
-                # else:
-                #     remove
-                
-                # Vectorized check:
-                # essential = np.any((Cover[idx] == 1) & (cover_counts == 1))
-                if np.any((Cover[idx] == 1) & (cover_counts == 1)):
-                    new_selected_indices.append(idx)
-                else:
-                    # Remove block
-                    cover_counts -= Cover[idx]
+            # Iterate in reverse to allow removal during iteration? 
+            # Or just make a list of candidates.
+            candidates = list(current_blocks)
+            for b in candidates:
+                if is_redundant(b):
+                    remove_block(b)
                     changed = True
-            
-            selected_indices = new_selected_indices
-            
-        # Update blocks
-        blocks = [all_kblocks[i] for i in selected_indices]
+                    if (time.time() - start_time) > time_limit:
+                        return current_blocks
+
+        # Phase 2: 1-Exchange (Swap)
+        # Try to swap each block with a better one
+        # "Better" means: after swap, we can remove more redundants?
+        # Or simply: after swap, the set is valid, and we run redundancy removal.
+        # If the size decreases, accept.
         
-    return blocks
+        # To speed up, we can limit swaps.
+        # For each block b in current_blocks:
+        #   Find a block b_new not in current_block_set
+        #   Swap b with b_new
+        #   If valid, run redundancy removal
+        #   If size < current_size, keep the change
+        #   Else revert
+        
+        # This is O(N * M * Cost(Redundancy))
+        # N ~ 150, M ~ 50000. Too slow if we try all M.
+        # We need a heuristic for b_new.
+        # Pick b_new that covers many t-subsets that are currently "critical" (covered only by b)?
+        # Or just random sampling?
+        
+        # Let's try a limited 1-exchange:
+        # For each block b:
+        #   Identify t-subsets covered ONLY by b (critical for b).
+        #   b_new must cover all these critical t-subsets? No, b_new replaces b, so b_new must cover all t-subsets that b covered AND are not covered by others?
+        #   Actually, if we remove b, the critical t-subsets become uncovered.
+        #   So b_new MUST cover all critical t-subsets of b.
+        #   If no such b_new exists, we can't swap b directly to a valid state without adding another block?
+        #   Wait, the set must remain valid.
+        #   So b_new must cover all ts in (S_b \ S_others).
+        
+        # Let's implement this constraint.
+        for _ in range(10): # Repeat passes
+            if (time.time() - start_time) > time_limit:
+                break
+            improved = False
+            # Shuffle to avoid bias
+            blocks_to_try = current_blocks[:]
+            random.shuffle(blocks_to_try)
+            
+            for b in blocks_to_try:
+                if b not in current_block_set:
+                    continue
+                    
+                # Find critical t-subsets for b
+                critical_ts = []
+                for ts_idx in block_to_tsubs[b]:
+                    if coverage[ts_idx] == 1:
+                        critical_ts.append(ts_idx)
+                
+                # If no critical ts, b is redundant (should have been removed in Phase 1)
+                # But maybe it became critical after other swaps?
+                # Phase 1 ran before. So if we are here, b has at least one critical ts?
+                # Not necessarily. If we swapped other blocks, coverage counts changed.
+                # So we must check.
+                
+                if not critical_ts:
+                    # b is redundant now
+                    remove_block(b)
+                    improved = True
+                    # Re-run redundancy removal? Or just continue.
+                    # Let's break and restart Phase 1? 
+                    # For simplicity, just mark improved and continue loop.
+                    # But we should probably re-run Phase 1 to catch cascading redundancies.
+                    # Let's just break out and restart the whole local_search?
+                    # That might be slow.
+                    # Let's just remove it and continue.
+                    pass
+                else:
+                    # Find a candidate b_new that covers all critical_ts
+                    # To avoid O(M) scan, we can intersect tsub_to_blocks for each critical_ts
+                    # Candidates = intersection of tsub_to_blocks[ts] for ts in critical_ts
+                    # Exclude current_block_set
+                    
+                    candidates = None
+                    for ts_idx in critical_ts:
+                        blocks_covering = tsub_to_blocks[ts_idx]
+                        if candidates is None:
+                            candidates = set(blocks_covering)
+                        else:
+                            candidates.intersection_update(blocks_covering)
+                    
+                    if candidates:
+                        candidates -= current_block_set
+                        if candidates:
+                            # Pick a random candidate
+                            b_new = random.choice(list(candidates))
+                            
+                            # Try swap
+                            # Save state? 
+                            # Just do it, check validity (it should be valid by construction 
+                            # if b_new covers all critical ts of b, and other ts of b are covered by others?
+                            # Wait. If ts is in b but NOT critical, coverage[ts] >= 2.
+                            # If we remove b, coverage[ts] becomes >= 1. So still covered.
+                            # So yes, swapping b with b_new (which covers critical_ts) results in a valid set.
+                            
+                            # Perform swap
+                            remove_block(b)
+                            add_block(b_new)
+                            
+                            # Try to remove redundants
+                            # Quick check: run Phase 1 logic
+                            changed = True
+                            while changed:
+                                changed = False
+                                for bb in list(current_blocks):
+                                    if is_redundant(bb):
+                                        remove_block(bb)
+                                        changed = True
+                                        
+                            improved = True
+                            # If size didn't decrease, we might want to revert?
+                            # The swap itself doesn't change size.
+                            # But redundancy removal might.
+                            # If no redundancy was removed, size is same.
+                            # We might be stuck in a local minimum of size.
+                            # But we accepted the swap.
+                            # This is a valid move.
+                            
+            if not improved:
+                break
+                
+        return current_blocks
+
+    # Run ILS
+    best_blocks = greedy_init()
+    best_size = len(best_blocks)
+    
+    # Local search on initial
+    current_blocks = local_search(best_blocks)
+    if len(current_blocks) < best_size:
+        best_blocks = current_blocks
+        best_size = len(current_blocks)
+        
+    # ILS Loop
+    while (time.time() - start_time) < time_limit:
+        # Perturbation
+        # Pick a random block b
+        # Find critical ts of b
+        # Find b_new covering critical ts
+        # Swap
+        # If valid, local search
+        
+        b = random.choice(current_blocks)
+        
+        # Find critical ts
+        coverage = [0] * n_tsubsets
+        for bb in current_blocks:
+            for ts_idx in block_to_tsubs[bb]:
+                coverage[ts_idx] += 1
+        
+        critical_ts = []
+        for ts_idx in block_to_tsubs[b]:
+            if coverage[ts_idx] == 1:
+                critical_ts.append(ts_idx)
+        
+        if not critical_ts:
+            # b is redundant, remove it
+            current_blocks.remove(b)
+            # Local search
+            new_blocks = local_search(current_blocks)
+            if len(new_blocks) < best_size:
+                best_blocks = new_blocks
+                best_size = len(new_blocks)
+                current_blocks = new_blocks
+            continue
+            
+        # Find candidates for b_new
+        candidates = None
+        for ts_idx in critical_ts:
+            blocks_covering = tsub_to_blocks[ts_idx]
+            if candidates is None:
+                candidates = set(blocks_covering)
+            else:
+                candidates.intersection_update(blocks_covering)
+        
+        if not candidates:
+            # Cannot swap b directly
+            # Try removing b and adding 2 blocks? 
+            # Or just skip perturbation for this b
+            continue
+            
+        candidates -= set(current_blocks)
+        if not candidates:
+            continue
+            
+        b_new = random.choice(list(candidates))
+        
+        # Perform swap on a copy
+        temp_blocks = list(current_blocks)
+        temp_blocks.remove(b)
+        temp_blocks.append(b_new)
+        
+        # Local search
+        new_blocks = local_search(temp_blocks)
+        
+        if len(new_blocks) < best_size:
+            best_blocks = new_blocks
+            best_size = len(new_blocks)
+            current_blocks = new_blocks
+        else:
+            # Even if not best, we can accept if it's the same size?
+            # To explore, maybe accept same size with some probability?
+            # Or just keep current?
+            # Let's keep current to maintain momentum, or accept same size to diversify.
+            # Let's accept same size to allow further perturbations to find a dip.
+            if len(new_blocks) <= best_size:
+                 current_blocks = new_blocks
+
+    return [list(b) for b in best_blocks]
