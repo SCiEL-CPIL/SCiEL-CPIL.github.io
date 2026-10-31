@@ -4,8 +4,7 @@ N = 400
 # EVOLVE-BLOCK-START
 import numpy as np
 import time
-import scipy.optimize as opt
-import scipy.signal as sig
+from scipy.optimize import minimize
 
 def _autoconv_max_abs(h):
     """Compute max absolute value of linear autoconvolution using FFT for speed."""
@@ -21,138 +20,204 @@ def _autoconv_max_abs(h):
 def _score(h):
     """Compute the objective value: max|autoconv| / (sum h)^2."""
     s = np.sum(h)
-    if abs(s) < 1e-6:
+    if abs(s) < 1e-9:
         return 1e10
     return _autoconv_max_abs(h) / (s * s)
 
-def construct():
-    start_time = time.time()
-    deadline = start_time + 115.0
-    
-    # The problem is scale invariant.
-    # We can fix the sum to 1 to simplify optimization.
-    # Minimize max|autoconv| subject to sum(h) = 1.
-    # Then the score is just max|autoconv|.
-    
-    # Initial guess: All ones scaled to sum 1.
-    # h_i = 1/N.
-    # max|autoconv| = 1/N.
-    # Score = (1/N) / 1^2 = 1/N.
-    
-    # Let's try to find a shape that minimizes max|autoconv| given sum=1.
-    
-    def objective(x):
-        # x is the vector h
-        # Calculate autoconv
-        n = len(x)
-        size = 2 * n - 1
-        fsize = 1
-        while fsize < size:
-            fsize *= 2
-        H = np.fft.rfft(x, fsize)
-        ac = np.fft.irfft(H * H, fsize)
-        # Soft max to make it differentiable
-        # Use a small epsilon
-        eps = 0.01
-        # We want max |ac|
-        # log-sum-exp of |ac|/eps * eps
-        # But we need to handle the constraint sum(x)=1.
-        # We will use penalty method or constrained optimization.
-        
-        # Actually, let's just use the raw score with a constraint penalty.
-        s = np.sum(x)
-        if abs(s) < 1e-6:
-            return 1e10
-        val = _autoconv_max_abs(x) / (s * s)
-        return val
+def _soft_max_abs(ac, beta=50.0):
+    """
+    Smooth approximation of max(|ac|) using log-sum-exp.
+    This is differentiable and allows gradient-based optimization.
+    """
+    abs_ac = np.abs(ac)
+    # Shift for numerical stability
+    m = np.max(abs_ac)
+    if m < 1e-15:
+        return 0.0
+    # log-sum-exp trick: log(sum(exp(x_i))) = max(x_i) + log(sum(exp(x_i - max(x_i))))
+    # We want (1/beta) * log(sum(exp(beta * |ac_i|)))
+    # = (1/beta) * (beta * m + log(sum(exp(beta * (|ac_i| - m)))))
+    # = m + (1/beta) * log(sum(exp(beta * (|ac_i| - m))))
+    scaled = beta * (abs_ac - m)
+    # Clip to avoid overflow/underflow issues in exp
+    scaled = np.clip(scaled, -50, 50)
+    log_sum = np.log(np.sum(np.exp(scaled)))
+    return m + log_sum / beta
 
-    # We can use scipy.optimize.minimize with bounds?
-    # Signs can be negative.
-    # Let's try a few initializations and polish with local search on values.
-    
-    best_h = np.ones(N) / N
-    best_val = _score(best_h)
-    
+def _autoconv_fft(h):
+    """Compute full linear autoconvolution using FFT."""
+    n = len(h)
+    size = 2 * n - 1
+    fsize = 1
+    while fsize < size:
+        fsize *= 2
+    H = np.fft.rfft(h, fsize)
+    ac = np.fft.irfft(H * H, fsize)
+    return ac[:size]
+
+def _objective_smooth(h, beta=50.0):
+    """
+    Smooth objective: soft_max_abs(autoconv(h)) / (sum(h))^2
+    We optimize this to find good candidates, then evaluate the true objective.
+    """
+    s = np.sum(h)
+    if abs(s) < 1e-9:
+        return 1e10
+    ac = _autoconv_fft(h)
+    sm = _soft_max_abs(ac, beta)
+    return sm / (s * s)
+
+def _gen_chirp(n):
+    """Generate a chirp sequence: h[i] = exp(i * pi * i^2 / n)"""
+    i = np.arange(n)
+    phase = np.pi * i**2 / n
+    # Real part for signed step function
+    return np.cos(phase)
+
+def _gen_barker_like(n):
+    """
+    Generate a sequence with good autocorrelation properties.
+    Uses a simple construction: alternating signs with some structure.
+    """
+    h = np.zeros(n)
+    for i in range(n):
+        # Use a simple pattern that tends to have lower sidelobes
+        # This is a heuristic; not guaranteed to be optimal
+        if i % 4 == 0:
+            h[i] = 1.0
+        elif i % 4 == 1:
+            h[i] = -1.0
+        elif i % 4 == 2:
+            h[i] = 1.0
+        else:
+            h[i] = -1.0
+    return h
+
+def _local_search_flip(h, max_passes=5, deadline=None):
+    """
+    Local optimization: try flipping each element's sign, keep if improves score.
+    """
+    h = h.copy()
+    best_val = _score(h)
+    for _ in range(max_passes):
+        if deadline is not None and time.time() > deadline:
+            break
+        improved = False
+        for i in range(N):
+            if deadline is not None and time.time() > deadline:
+                break
+            h[i] = -h[i]
+            new_val = _score(h)
+            if new_val < best_val:
+                best_val = new_val
+                improved = True
+            else:
+                h[i] = -h[i]  # revert
+        if not improved:
+            break
+    return h, best_val
+
+def construct():
+    t_start = time.time()
+    deadline = t_start + 140.0  # Safety margin before 150s limit
+
+    best_score = np.inf
+    best_h = np.ones(N) / N  # Baseline: constant sequence
+
+    base_score = _score(best_h)
+    if base_score < best_score:
+        best_score = base_score
+        best_h = best_h.copy()
+
     # Initialization strategies
     inits = []
     
     # 1. All ones
     inits.append(np.ones(N))
     
-    # 2. Cosine window
+    # 2. Cosine windows
     x = np.arange(N)
     inits.append(np.cos(np.pi * x / N))
     inits.append(np.cos(np.pi * x / (2*N))**2)
     
-    # 3. Gaussian
+    # 3. Gaussian window
     mu = N/2
     sigma = N/4
     inits.append(np.exp(-(x - mu)**2 / (2*sigma**2)))
     
-    # 4. Triangle
+    # 4. Triangle window
     inits.append(np.maximum(0, 1 - np.abs(x - mu)/mu))
     
-    # 5. Random smooth
+    # 5. Chirp sequence
+    inits.append(_gen_chirp(N))
+    
+    # 6. Barker-like sequence
+    inits.append(_gen_barker_like(N))
+    
+    # 7. Random smoothed sequences
+    rng = np.random.default_rng(42)
     for i in range(5):
-        np.random.seed(i)
-        # Low pass filter random noise
-        noise = np.random.randn(N)
-        # Simple moving average
+        noise = rng.standard_normal(N)
         kernel = np.ones(10)/10
         smooth = np.convolve(noise, kernel, mode='same')
         inits.append(smooth)
         
+    # Optimization loop using smooth surrogate
     for h_init in inits:
-        if time.time() > deadline - 10:
+        if time.time() > deadline - 20:
             break
             
-        # Normalize to sum 1 for optimization stability?
-        # Or just optimize the ratio directly.
-        # The ratio is homogeneous of degree 0.
-        # Gradient descent on the ratio might be unstable due to scale.
-        # Let's fix sum(h) = 1.
-        
         s0 = np.sum(h_init)
         if abs(s0) < 1e-6:
             continue
+        
+        # Normalize to sum 1 to simplify optimization landscape
         h_norm = h_init / s0
         
-        # Define objective for constrained problem: sum(h)=1
-        # We use a penalty for sum(h) != 1
-        def obj_constrained(x):
-            s = np.sum(x)
-            penalty = 100.0 * (s - 1.0)**2
-            return _autoconv_max_abs(x) + penalty
-        
-        # Use BFGS
+        # Use smooth objective for gradient-based optimization
         try:
-            res = opt.minimize(obj_constrained, h_norm, method='BFGS', 
-                               options={'maxiter': 100, 'disp': False, 'gtol': 1e-6})
-            h_opt = res.x
-            # Check if sum is close to 1
-            if abs(np.sum(h_opt) - 1.0) < 0.1:
-                val = _autoconv_max_abs(h_opt)
-                # The score for this h_opt (with sum 1) is just val.
-                # But we need to compare with best_val which is calculated on raw h.
-                # Since score is scale invariant, score(h_opt) = score(h_opt * c).
-                # If sum(h_opt) = 1, score = max|A| / 1^2 = max|A|.
-                if val < best_val:
-                    best_val = val
-                    best_h = h_opt
+            # Start with moderate beta, increase for refinement
+            for beta in [20, 50, 100]:
+                if time.time() > deadline - 10:
+                    break
+                
+                def obj(x):
+                    return _objective_smooth(x, beta=beta)
+                
+                res = minimize(obj, h_norm, method='L-BFGS-B', 
+                               options={'maxiter': 100, 'disp': False, 'gtol': 1e-5})
+                h_opt = res.x
+                
+                # Check validity
+                if abs(np.sum(h_opt) - 1.0) < 0.5:
+                    val = _score(h_opt)
+                    if val < best_score:
+                        best_score = val
+                        best_h = h_opt.copy()
+                else:
+                    # Try to renormalize
+                    s_opt = np.sum(h_opt)
+                    if abs(s_opt) > 1e-6:
+                        h_opt = h_opt / s_opt
+                        val = _score(h_opt)
+                        if val < best_score:
+                            best_score = val
+                            best_h = h_opt.copy()
         except Exception:
             pass
 
-    # Final polish: Local sign/magnitude flips?
-    # Since we allowed real values, we can do coordinate descent.
-    # But BFGS should have done a decent job.
-    
-    # One more check: All ones is a strong baseline.
-    # Ensure we don't return something worse.
-    base_val = _score(np.ones(N))
-    if best_val > base_val:
-        best_val = base_val
-        best_h = np.ones(N)
-        
+    # Final local search refinement
+    if time.time() < deadline - 5:
+        h_refined, val_refined = _local_search_flip(best_h, max_passes=3, deadline=deadline-2)
+        if val_refined < best_score:
+            best_score = val_refined
+            best_h = h_refined.copy()
+
+    # Final check against baseline
+    if best_score > base_score:
+        best_score = base_score
+        best_h = np.ones(N) / N
+
     return best_h
 
 # EVOLVE-BLOCK-END

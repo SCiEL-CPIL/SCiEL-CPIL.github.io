@@ -11,30 +11,26 @@ SAFETY_MARGIN = 5.0
 EPS = 1e-9
 
 def construct():
-    # Check if we are already close to the time limit
     if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
         return [[0.0, 0.0, 0.0]], [0.0, 0.0], 1.0, 0.0
 
     # Define candidate point sets (axial coordinates)
     candidates = []
-    
-    # Candidate 1: Original "Lopsided" 1-6-4
+
     axial_1 = [
         (0, 0),
         (1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1),
         (1, 1), (-1, 2), (-2, 1), (2, -1)
     ]
     candidates.append(axial_1)
-    
-    # Candidate 2: "Cross" 1-6-4 (Opposite pairs in ring 2)
+
     axial_2 = [
         (0, 0),
         (1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1),
         (2, 0), (-2, 0), (0, 2), (0, -2)
     ]
     candidates.append(axial_2)
-    
-    # Candidate 3: Compact block 3x3 + 2
+
     axial_3 = [
         (0, 0), (1, 0), (2, 0),
         (0, 1), (1, 1), (2, 1),
@@ -42,16 +38,14 @@ def construct():
         (-1, 1), (3, 1)
     ]
     candidates.append(axial_3)
-    
-    # Candidate 4: 4-4-3
+
     axial_4 = [
         (0, 0), (1, 0), (2, 0), (3, 0),
         (0, 1), (1, 1), (2, 1), (3, 1),
         (0, 2), (1, 2), (2, 2)
     ]
     candidates.append(axial_4)
-    
-    # Candidate 5: 2-3-3-3
+
     axial_5 = [
         (0, 0), (1, 0),
         (0, 1), (1, 1), (2, 1),
@@ -59,8 +53,7 @@ def construct():
         (0, 3), (1, 3), (2, 3)
     ]
     candidates.append(axial_5)
-    
-    # Candidate 6: 3-3-3-2
+
     axial_6 = [
         (0, 0), (1, 0), (2, 0),
         (0, 1), (1, 1), (2, 1),
@@ -68,31 +61,27 @@ def construct():
         (0, 3), (1, 3)
     ]
     candidates.append(axial_6)
-    
-    # Candidate 7: Diamond-like
+
     axial_7 = [
         (0, 0),
         (1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, 1),
         (2, 0), (-2, 0), (0, 2), (0, -2)
     ]
     candidates.append(axial_7)
-    
-    # Candidate 8: 5-6 (two rows of 5 and 6)
+
     axial_8 = [
         (0, 0), (1, 0), (2, 0), (3, 0), (4, 0),
         (0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1)
     ]
     candidates.append(axial_8)
-    
-    # Candidate 9: Hexagonal 1-6-4 with offset ring
+
     axial_9 = [
         (0, 0),
         (1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1),
         (2, 1), (-2, 2), (-1, 3), (1, -2)
     ]
     candidates.append(axial_9)
-    
-    # Candidate 10: Compact 3-3-3-2 with different arrangement
+
     axial_10 = [
         (0, 0), (1, 0), (2, 0),
         (0, 1), (1, 1), (2, 1),
@@ -100,8 +89,7 @@ def construct():
         (1, 3), (2, 3)
     ]
     candidates.append(axial_10)
-    
-    # Candidate 11: 2-4-4-1 (compact)
+
     axial_11 = [
         (0, 0), (1, 0),
         (0, 1), (1, 1), (2, 1), (3, 1),
@@ -109,8 +97,7 @@ def construct():
         (1, 3)
     ]
     candidates.append(axial_11)
-    
-    # Candidate 12: L-shaped
+
     axial_12 = [
         (0, 0), (1, 0), (2, 0), (3, 0),
         (0, 1), (1, 1),
@@ -119,6 +106,66 @@ def construct():
         (0, 4)
     ]
     candidates.append(axial_12)
+
+    # New candidates
+    axial_13 = [
+        (0, 0),
+        (1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1),
+        (2, 0), (-2, 0), (0, 2), (1, 2)
+    ]
+    candidates.append(axial_13)
+
+    axial_14 = [
+        (0, 0),
+        (1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1),
+        (2, 0), (-2, 0), (1, 1), (-1, -1)
+    ]
+    candidates.append(axial_14)
+
+    axial_15 = [
+        (0, 0), (1, 0), (2, 0),
+        (1, 1), (2, 1),
+        (0, 2), (1, 2), (2, 2),
+        (-1, 1), (3, 1), (0, -1)
+    ]
+    candidates.append(axial_15)
+
+    axial_16 = [
+        (0, 0), (1, 0),
+        (0, 1), (1, 1), (2, 1),
+        (1, 2), (2, 2),
+        (0, 3), (1, 3), (2, 3), (3, 2)
+    ]
+    candidates.append(axial_16)
+
+    axial_17 = [
+        (0, 0),
+        (1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1),
+        (2, 1), (1, 2), (-1, 2), (0, 3)
+    ]
+    candidates.append(axial_17)
+
+    axial_18 = [
+        (0, 0), (1, 0), (2, 0), (3, 0),
+        (0, 1), (1, 1), (2, 1),
+        (1, 2), (2, 2), (3, 2)
+    ]
+    candidates.append(axial_18)
+
+    axial_19 = [
+        (0, 0), (1, 0),
+        (0, 1), (1, 1), (2, 1),
+        (1, 2), (2, 2),
+        (0, 3), (1, 3), (2, 3), (3, 3)
+    ]
+    candidates.append(axial_19)
+
+    axial_20 = [
+        (0, 0),
+        (1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1),
+        (2, 0), (-2, 0), (1, 1), (-1, 1)
+    ]
+    candidates.append(axial_20)
 
     def axial_to_cartesian(axial_list):
         pts = []
@@ -129,7 +176,6 @@ def construct():
         return np.array(pts)
 
     def calc_S_for_beta(pts, beta):
-        # Check time limit
         if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
             return float('inf'), None, None
         
@@ -138,27 +184,19 @@ def construct():
             ang = beta + math.pi / 6.0 + k * math.pi / 3.0
             normals.append((math.cos(ang), math.sin(ang)))
         
-        # Variables: cx, cy, D
-        # Minimize D
         c_obj = np.array([0.0, 0.0, 1.0])
-        
         A_ub = []
         b_ub = []
         
         for nx, ny in normals:
             for px, py in pts:
-                # Constraint 1: (px - cx)nx + (py - cy)ny <= D
                 A_ub.append([-nx, -ny, -1.0])
                 b_ub.append(-(px * nx + py * ny))
-                
-                # Constraint 2: -((px - cx)nx + (py - cy)ny) <= D
                 A_ub.append([nx, ny, -1.0])
                 b_ub.append(px * nx + py * ny)
         
         A_ub = np.array(A_ub)
         b_ub = np.array(b_ub)
-        
-        # Bounds
         bounds = [(None, None), (None, None), (0, None)]
         
         try:
@@ -175,13 +213,11 @@ def construct():
             return float('inf'), None, None
 
     def smooth_calc_S(pts, beta, cx, cy, temperature=0.1):
-        """Smooth surrogate for the min/max objective using log-sum-exp with center offset"""
         normals = []
         for k in range(6):
             ang = beta + math.pi / 6.0 + k * math.pi / 3.0
             normals.append((math.cos(ang), math.sin(ang)))
         
-        # Compute all projections relative to center
         projs = []
         for nx, ny in normals:
             for px, py in pts:
@@ -190,16 +226,12 @@ def construct():
                 projs.append(-proj)
         
         projs = np.array(projs)
-        
-        # Smooth max using log-sum-exp
         max_val = np.max(projs)
         if max_val > 100:
             return float('inf'), (cx, cy), float('inf')
         
-        # Soft max
         log_sum = np.log(np.sum(np.exp((projs - max_val) / temperature))) + max_val / temperature
         D = temperature * log_sum
-        
         S = (D + APOTHEM) / APOTHEM
         return S, (cx, cy), D
 
@@ -208,11 +240,9 @@ def construct():
         best_beta = 0.0
         best_center = None
         
-        # Check time
         if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
             return float('inf'), 0.0, None
         
-        # Coarse sampling of beta
         for i in range(37):
             beta = i * (math.pi / 6) / 36
             S, center, D = calc_S_for_beta(pts, beta)
@@ -221,7 +251,6 @@ def construct():
                 best_beta = beta
                 best_center = center
         
-        # Refine with bounded optimization
         try:
             if time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN:
                 res = minimize_scalar(lambda b: calc_S_for_beta(pts, b)[0], bounds=(0, math.pi / 6), method='bounded',
@@ -233,12 +262,10 @@ def construct():
         except Exception:
             pass
         
-        # Smooth multi-start phase: use log-sum-exp surrogate to escape local minima
         try:
             if time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN:
-                # Try multiple temperature values and starting points
-                temperatures = [0.5, 0.2, 0.1, 0.05]
-                start_betas = [0.0, math.pi/12, math.pi/6, best_beta]
+                temperatures = [0.5, 0.2, 0.1, 0.05, 0.02]
+                start_betas = [0.0, math.pi/18, math.pi/12, math.pi/9, best_beta]
                 
                 for temp in temperatures:
                     if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
@@ -249,17 +276,15 @@ def construct():
                         
                         def smooth_obj(params, t=temp):
                             cx, cy, beta = params
-                            # Wrap beta to [0, pi/6]
                             beta = ((beta % (math.pi/6)) + math.pi/6) % (math.pi/6)
                             S, _, _ = smooth_calc_S(pts, beta, cx, cy, temperature=t)
                             return S
                         
                         init = [best_center[0], best_center[1], sb]
                         res = minimize(smooth_obj, init, method='Nelder-Mead',
-                                     options={'maxiter': 300, 'xatol': 1e-8, 'fatol': 1e-8})
+                                     options={'maxiter': 500, 'xatol': 1e-10, 'fatol': 1e-10})
                         
                         if res.fun < 1e10:
-                            # Convert smooth result to exact evaluation
                             cx_r, cy_r, beta_r = res.x
                             beta_r = ((beta_r % (math.pi/6)) + math.pi/6) % (math.pi/6)
                             S_exact, c_exact, _ = calc_S_for_beta(pts, beta_r)
@@ -270,7 +295,6 @@ def construct():
         except Exception:
             pass
         
-        # Final high-precision polish: jointly optimize center and rotation
         try:
             if time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN:
                 def objective(params):
@@ -293,7 +317,7 @@ def construct():
                 
                 initial = [best_center[0], best_center[1], best_beta]
                 res = minimize(objective, initial, method='Nelder-Mead',
-                             options={'maxiter': 1000, 'xatol': 1e-14, 'fatol': 1e-14})
+                             options={'maxiter': 2000, 'xatol': 1e-15, 'fatol': 1e-15})
                 if res.fun < best_S:
                     best_S = res.fun
                     best_center = (res.x[0], res.x[1])
@@ -320,7 +344,6 @@ def construct():
             best_global_center = center
 
     if best_global_center is None or best_global_S == float('inf'):
-        # Fallback
         best_global_pts = axial_to_cartesian(candidates[0])
         best_global_center = (float(np.mean(best_global_pts[:, 0])), float(np.mean(best_global_pts[:, 1])))
         best_global_beta = 0.0
@@ -332,11 +355,9 @@ def construct():
             max_proj = max(max_proj, np.max(projs), -np.min(projs))
         best_global_S = (max_proj + APOTHEM) / APOTHEM
 
-    # Prepare output
     cx, cy = best_global_center
     angle_deg = math.degrees(best_global_beta)
     
-    # Scale to ensure disjointness (use a tiny expansion to avoid boundary contact)
     SCALE = 1.0 + 1e-10
     pts_scaled = []
     for x, y in best_global_pts:
@@ -346,7 +367,6 @@ def construct():
     
     pts_scaled = np.array(pts_scaled)
     
-    # Recalculate S for scaled points
     max_proj = 0
     for k in range(6):
         ang = best_global_beta + math.pi / 6.0 + k * math.pi / 3.0
