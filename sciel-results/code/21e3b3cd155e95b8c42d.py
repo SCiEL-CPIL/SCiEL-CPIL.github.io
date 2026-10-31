@@ -1,0 +1,630 @@
+"""Circle packing in perimeter-4 rectangle: SLSQP + Constraint Polish + LSE Refine + Sequential Impulse."""
+import numpy as np
+import time
+from scipy.optimize import minimize
+
+N = 21
+
+def _is_valid(cx, cy, r, W, H, tol=1e-8):
+    """Check if packing is valid."""
+    if W <= 0.05 or H <= 0.05:
+        return False
+    if np.any(cx - r < -tol) or np.any(cy - r < -tol):
+        return False
+    if np.any(cx + r > W + tol) or np.any(cy + r > H + tol):
+        return False
+    for i in range(N):
+        for j in range(i + 1, N):
+            dx = cx[i] - cx[j]
+            dy = cy[i] - cy[j]
+            if dx * dx + dy * dy < (r[i] + r[j]) ** 2 - tol:
+                return False
+    return True
+
+def _max_radius_for_circle(x, y, r, w, h, i):
+    """Calculate maximum possible radius for circle i given other positions."""
+    r_wall = min(x[i], w - x[i], y[i], h - y[i])
+    r_max = r_wall
+    for j in range(N):
+        if i == i: 
+            continue
+        dx = x[i] - x[j]
+        dy = y[i] - y[j]
+        d = np.sqrt(dx*dx + dy*dy)
+        r_allowed = d - r[j]
+        if r_allowed < r_max:
+            r_max = r_allowed
+    return max(0.0, r_max)
+
+def _tighten_positions(x, y, r, w, h, time_budget):
+    """
+    Use local search to minimize overlaps or maximize minimum distance.
+    Here we use a simple force-directed relaxation with adaptive step size.
+    """
+    x = x.copy()
+    y = y.copy()
+    n = N
+    dt = 0.005
+    min_dt = 0.0001
+    max_iter = int(min(2000, time_budget * 100))
+    
+    for it in range(max_iter):
+        if time.time() > time_budget:
+            break
+            
+        fx = np.zeros(n)
+        fy = np.zeros(n)
+        
+        # Wall repulsion
+        left_viol = np.maximum(r - x, 0.0)
+        right_viol = np.maximum(x + r - w, 0.0)
+        bottom_viol = np.maximum(r - y, 0.0)
+        top_viol = np.maximum(y + r - h, 0.0)
+        fx -= left_viol * 50
+        fx += right_viol * 50
+        fy -= bottom_viol * 50
+        fy += top_viol * 50
+        
+        # Pairwise repulsion
+        dx = x[:, None] - x[None, :]
+        dy = y[:, None] - y[None, :]
+        d_sq = dx * dx + dy * dy
+        r_sum = r[:, None] + r[None, :]
+        
+        iu = np.triu_indices(n, k=1)
+        d_sq_pairs = d_sq[iu]
+        r_sum_pairs = r_sum[iu]
+        
+        d_pairs = np.sqrt(np.maximum(d_sq_pairs, 1e-12))
+        overlap = np.maximum(r_sum_pairs - d_pairs, 0.0)
+        
+        if np.max(overlap) < 1e-9:
+            break
+            
+        f_pairs = overlap * 20.0
+        dx_pairs = dx[iu]
+        dy_pairs = dy[iu]
+        ux = dx_pairs / d_pairs
+        uy = dy_pairs / d_pairs
+        
+        for idx in range(len(iu[0])):
+            i_idx = iu[0][idx]
+            j_idx = iu[1][idx]
+            fx[i_idx] += ux[idx] * f_pairs[idx]
+            fy[i_idx] += uy[idx] * f_pairs[idx]
+            fx[j_idx] -= ux[idx] * f_pairs[idx]
+            fy[j_idx] -= uy[idx] * f_pairs[idx]
+            
+        # Adaptive step
+        force_mag = float(np.max(np.sqrt(fx * fx + fy * fy)))
+        if force_mag > 0.5:
+            dt = max(min_dt, dt * 0.5)
+        elif force_mag < 0.05:
+            dt = min(0.01, dt * 1.2)
+            
+        x += dt * fx
+        y += dt * fy
+        
+        # Clamp
+        x = np.clip(x, r, w - r)
+        y = np.clip(y, r, h - r)
+        
+    return x, y
+
+def _expand_and_relax(x, y, r, w, h, time_budget):
+    """
+    Iteratively expand each circle to its max possible radius, then tighten positions.
+    """
+    x = x.copy()
+    y = y.copy()
+    r = r.copy()
+    n = N
+    max_rounds = 50
+    
+    for rnd in range(max_rounds):
+        if time.time() > time_budget:
+            break
+        
+        improved = False
+        
+        # Step 1: Expand each circle
+        for i in range(n):
+            r_max = _max_radius_for_circle(x, y, r, w, h, i)
+            if r_max > r[i] + 1e-7:
+                r[i] = r_max
+                improved = True
+        
+        # Step 2: Tighten positions to resolve overlaps
+        x, y = _tighten_positions(x, y, r, w, h, time_budget - 0.5)
+        
+        if not improved:
+            # Try one more pass of expansion after tightening
+            for i in range(n):
+                r_max = _max_radius_for_circle(x, y, r, w, h, i)
+                if r_max > r[i] + 1e-7:
+                    r[i] = r_max
+                    improved = True
+            if not improved:
+                break
+                
+    return x, y, r
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140.0
+    
+    best_value = 0.0
+    best_result = None
+    
+    def check_validity(z, tol=1e-9):
+        x = z[0::3][:N]
+        y = z[1::3][:N]
+        r = z[2::3][:N]
+        w = z[-1]
+        h = 2.0 - w
+        
+        if w <= 0.05 or h <= 0.05:
+            return False, 0.0
+        
+        for i in range(N):
+            if r[i] <= 0:
+                return False, 0.0
+            if x[i] < r[i] - tol or x[i] > w - r[i] + tol:
+                return False, 0.0
+            if y[i] < r[i] - tol or y[i] > h - r[i] + tol:
+                return False, 0.0
+        
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = x[i] - x[j]
+                dy = y[i] - y[j]
+                d2 = dx * dx + dy * dy
+                r_sum = r[i] + r[j]
+                if d2 < r_sum ** 2 - tol:
+                    return False, 0.0
+        
+        val = float(np.sum(r))
+        return True, val
+
+    def get_initial_guesses():
+        guesses = []
+        side = int(np.ceil(np.sqrt(N)))
+        
+        # Grid-based
+        aspect_ratios = [1.0, 0.85, 1.18, 0.75, 1.33, 0.67, 1.5, 0.6, 1.75, 0.55, 2.0, 0.5, 1.2, 0.8]
+        for w0 in aspect_ratios:
+            h0 = 2.0 - w0
+            if h0 < 0.3:
+                continue
+            z = np.zeros(3 * N + 1)
+            for i in range(N):
+                row, col = divmod(i, side)
+                cx = (col + 0.5) / side * w0
+                cy = (row + 0.5) / side * h0
+                r0 = min(w0 / side, h0 / side) * 0.45
+                z[3 * i] = cx
+                z[3 * i + 1] = cy
+                z[3 * i + 2] = r0
+            z[-1] = w0
+            guesses.append(z)
+            
+        # Random starts
+        rng = np.random.default_rng(42)
+        for _ in range(15):
+            w0 = rng.uniform(0.6, 1.4)
+            h0 = 2.0 - w0
+            z = np.zeros(3 * N + 1)
+            for i in range(N):
+                r0 = rng.uniform(0.05, 0.12)
+                cx = rng.uniform(r0, w0 - r0)
+                cy = rng.uniform(r0, h0 - r0)
+                z[3 * i] = cx
+                z[3 * i + 1] = cy
+                z[3 * i + 2] = r0
+            z[-1] = w0
+            guesses.append(z)
+            
+        return guesses
+
+    guesses = get_initial_guesses()
+    
+    # Phase 1: SLSQP Optimization
+    for i, z0 in enumerate(guesses):
+        if time.time() > deadline - 30:
+            break
+            
+        # Quick relaxation
+        x0 = z0[0::3][:N].copy()
+        y0 = z0[1::3][:N].copy()
+        r0 = z0[2::3][:N].copy()
+        w0 = z0[-1]
+        h0 = 2.0 - w0
+        
+        # Force relax to resolve initial overlaps
+        x_rel, y_rel = _tighten_positions(x0, y0, r0, w0, h0, time.time() + 0.5)
+        
+        z_relaxed = np.zeros(3 * N + 1)
+        z_relaxed[0::3][:N] = x_rel
+        z_relaxed[1::3][:N] = y_rel
+        z_relaxed[2::3][:N] = r0
+        z_relaxed[-1] = w0
+        
+        # SLSQP with penalty
+        penalty_weight = 1000.0
+        
+        def objective(z):
+            x = z[0::3][:N]
+            y = z[1::3][:N]
+            r = z[2::3][:N]
+            w = z[-1]
+            h = 2.0 - w
+            
+            if w < 0.2 or h < 0.2 or np.any(r < 0):
+                return 1e6
+                
+            obj = -np.sum(r)
+            
+            dx = x[:, None] - x[None, :]
+            dy = y[:, None] - y[None, :]
+            d_sq = dx * dx + dy * dy
+            r_sum = r[:, None] + r[None, :]
+            
+            iu = np.triu_indices(N, k=1)
+            d_sq_pairs = d_sq[iu]
+            r_sum_pairs = r_sum[iu]
+            
+            d_pairs = np.sqrt(np.maximum(d_sq_pairs, 1e-12))
+            overlap = np.maximum(r_sum_pairs - d_pairs, 0.0)
+            overlap_penalty = penalty_weight * np.sum(overlap * overlap)
+            
+            left_viol = np.maximum(r - x, 0.0)
+            right_viol = np.maximum(x + r - w, 0.0)
+            bottom_viol = np.maximum(r - y, 0.0)
+            top_viol = np.maximum(y + r - h, 0.0)
+            
+            boundary_penalty = penalty_weight * (
+                np.sum(left_viol * left_viol) +
+                np.sum(right_viol * right_viol) +
+                np.sum(bottom_viol * bottom_viol) +
+                np.sum(top_viol * top_viol)
+            )
+            
+            obj += overlap_penalty + boundary_penalty
+            
+            if w < 0.5:
+                obj += penalty_weight * (0.5 - w) ** 2
+            elif w > 1.5:
+                obj += penalty_weight * (w - 1.5) ** 2
+                
+            return obj
+
+        remaining = deadline - (time.time() - start_time)
+        maxiter = int(min(500, max(100, remaining * 20)))
+        
+        try:
+            res = minimize(objective, z_relaxed, method='SLSQP',
+                           bounds=[(0, 2)] * (3 * N) + [(0.3, 1.7)],
+                           options={'maxiter': maxiter, 'ftol': 1e-12, 'maxls': 50})
+            
+            z_opt = res.x
+            valid, val = check_validity(z_opt)
+            
+            if valid and val > best_value:
+                best_value = val
+                best_result = z_opt.copy()
+            elif not valid:
+                # Try repair
+                z_repair = z_opt.copy()
+                r_idx = np.arange(2, len(z_repair) - 1, 3)
+                z_repair[r_idx] *= 0.95
+                valid, val = check_validity(z_repair)
+                if valid and val > best_value:
+                    best_value = val
+                    best_result = z_repair.copy()
+                    
+        except Exception:
+            continue
+            
+    # Phase 2: Polish
+    if best_result is not None and time.time() < deadline - 10:
+        x = best_result[0::3][:N].copy()
+        y = best_result[1::3][:N].copy()
+        r = best_result[2::3][:N].copy()
+        w = best_result[-1]
+        h = 2.0 - w
+        
+        # Run expand and relax
+        time_budget = deadline - 20
+        x, y, r = _expand_and_relax(x, y, r, w, h, time_budget)
+        
+        # Check validity and update
+        if _is_valid(x, y, r, w, h):
+            val = float(np.sum(r))
+            if val > best_value:
+                best_value = val
+                z_new = np.zeros(3 * N + 1)
+                z_new[0::3][:N] = x
+                z_new[1::3][:N] = y
+                z_new[2::3][:N] = r
+                z_new[-1] = w
+                best_result = z_new
+        
+        # Phase 2b: Smooth log-sum-exp epigraph polish
+        if time.time() < deadline - 15:
+            try:
+                z_ls = best_result.copy()
+                
+                def lsqepigraph_objective(z, beta=50.0):
+                    x = z[0::3][:N]
+                    y = z[1::3][:N]
+                    r = z[2::3][:N]
+                    w = z[-1]
+                    h = 2.0 - w
+                    
+                    if w < 0.3 or h < 0.3:
+                        return 1e6
+                    
+                    # Soft penalty for boundary violations using log-sum-exp
+                    left_viol = np.maximum(r - x, 0.0)
+                    right_viol = np.maximum(x + r - w, 0.0)
+                    bottom_viol = np.maximum(r - y, 0.0)
+                    top_viol = np.maximum(y + r - h, 0.0)
+                    
+                    # Smooth max via log-sum-exp for each boundary
+                    def soft_max(v, b):
+                        if np.max(v) < 1e-10:
+                            return 0.0
+                        v_shifted = v - np.max(v)
+                        return np.max(v) + np.log(np.sum(np.exp(b * v_shifted))) / b
+                    
+                    boundary_soft = (soft_max(left_viol, beta) + soft_max(right_viol, beta) +
+                                     soft_max(bottom_viol, beta) + soft_max(top_viol, beta))
+                    
+                    # Pairwise overlap with soft max
+                    dx = x[:, None] - x[None, :]
+                    dy = y[:, None] - y[None, :]
+                    d_sq = dx * dx + dy * dy
+                    r_sum = r[:, None] + r[None, :]
+                    iu = np.triu_indices(N, k=1)
+                    d_pairs = np.sqrt(np.maximum(d_sq[iu], 1e-12))
+                    overlap = np.maximum(r_sum[iu] - d_pairs, 0.0)
+                    
+                    overlap_soft = soft_max(overlap, beta)
+                    
+                    obj = -np.sum(r) + 50.0 * (boundary_soft + overlap_soft)
+                    
+                    if w < 0.4:
+                        obj += 100.0 * (0.4 - w) ** 2
+                    elif w > 1.6:
+                        obj += 100.0 * (w - 1.6) ** 2
+                    
+                    return obj
+                
+                # Run SLSQP with the smooth epigraph objective
+                res_ls = minimize(lsqepigraph_objective, z_ls, method='SLSQP',
+                                  bounds=[(0, 2)] * (3 * N) + [(0.3, 1.7)],
+                                  options={'maxiter': 300, 'ftol': 1e-14, 'maxls': 100})
+                
+                z_ls_opt = res_ls.x
+                valid, val = check_validity(z_ls_opt)
+                if valid and val > best_value:
+                    best_value = val
+                    best_result = z_ls_opt.copy()
+                    
+                    # Re-run expand and relax from the improved solution
+                    x = best_result[0::3][:N].copy()
+                    y = best_result[1::3][:N].copy()
+                    r = best_result[2::3][:N].copy()
+                    w = best_result[-1]
+                    h = 2.0 - w
+                    x, y, r = _expand_and_relax(x, y, r, w, h, deadline - 10)
+                    if _is_valid(x, y, r, w, h):
+                        val2 = float(np.sum(r))
+                        if val2 > best_value:
+                            best_value = val2
+                            z_new = np.zeros(3 * N + 1)
+                            z_new[0::3][:N] = x
+                            z_new[1::3][:N] = y
+                            z_new[2::3][:N] = r
+                            z_new[-1] = w
+                            best_result = z_new
+                            
+            except Exception:
+                pass
+
+    if best_result is None:
+        # Fallback
+        side = int(np.ceil(np.sqrt(N)))
+        cells = [((i + 0.5) / side, (j + 0.5) / side, 0.5 / side - 1e-3)
+                 for i in range(side) for j in range(side)]
+        return np.array(cells[:N])
+    
+    # Phase 3: High-precision final polish with explicit constraints
+    if time.time() < deadline - 5:
+        x = best_result[0::3][:N].copy()
+        y = best_result[1::3][:N].copy()
+        r = best_result[2::3][:N].copy()
+        w = best_result[-1]
+        h = 2.0 - w
+        
+        # Final high-precision SLSQP with explicit inequality constraints
+        # to squeeze out last bits of radius
+        
+        def final_objective(z):
+            x = z[0::3][:N]
+            y = z[1::3][:N]
+            r = z[2::3][:N]
+            w = z[-1]
+            h = 2.0 - w
+            return -np.sum(r)
+        
+        # Inequality constraints: g(z) >= 0
+        constraints = []
+        
+        # Wall constraints
+        for i in range(N):
+            # x[i] - r[i] >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda z, i=i: z[3*i] - z[3*i+2]})
+            # w - x[i] - r[i] >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda z, i=i: z[-1] - z[3*i] - z[3*i+2]})
+            # y[i] - r[i] >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda z, i=i: z[3*i+1] - z[3*i+2]})
+            # h - y[i] - r[i] >= 0
+            constraints.append({'type': 'ineq', 'fun': lambda z, i=i: (2.0 - z[-1]) - z[3*i+1] - z[3*i+2]})
+        
+        # Pairwise distance constraints
+        for i in range(N):
+            for j in range(i + 1, N):
+                constraints.append({
+                    'type': 'ineq',
+                    'fun': lambda z, i=i, j=j: (z[3*i] - z[3*j])**2 + (z[3*i+1] - z[3*j+1])**2 - (z[3*i+2] + z[3*j+2])**2
+                })
+        
+        # r[i] > 0
+        for i in range(N):
+            constraints.append({'type': 'ineq', 'fun': lambda z, i=i: z[3*i+2]})
+        
+        # w bounds
+        constraints.append({'type': 'ineq', 'fun': lambda z: z[-1] - 0.3})
+        constraints.append({'type': 'ineq', 'fun': lambda z: 1.7 - z[-1]})
+        
+        try:
+            res_final = minimize(final_objective, best_result.copy(), method='SLSQP',
+                                 bounds=[(0, 2)] * (3 * N) + [(0.3, 1.7)],
+                                 constraints=constraints,
+                                 options={'maxiter': 200, 'ftol': 1e-15, 'maxls': 200})
+            
+            z_final = res_final.x
+            valid, val = check_validity(z_final, tol=1e-10)
+            if valid and val > best_value:
+                best_value = val
+                best_result = z_final.copy()
+                
+        except Exception:
+            pass
+    
+    # Phase 4: Sequential Impulse Solver (SIS) polish
+    # This is a physics-based refinement that treats circles as particles
+    # and uses iterative impulse exchanges to enforce non-penetration strictly.
+    if time.time() < deadline - 2:
+        try:
+            x = best_result[0::3][:N].copy()
+            y = best_result[1::3][:N].copy()
+            r = best_result[2::3][:N].copy()
+            w = best_result[-1]
+            h = 2.0 - w
+            
+            # SIS: Iterate velocity-level impulses to resolve overlaps
+            # We simulate a short burst of time with strong damping
+            dt_sis = 0.001
+            n_steps = 500
+            damping = 0.95
+            mass = np.ones(N)
+            
+            vx = np.zeros(N)
+            vy = np.zeros(N)
+            
+            for step in range(n_steps):
+                if time.time() > deadline - 1:
+                    break
+                    
+                fx = np.zeros(N)
+                fy = np.zeros(N)
+                
+                # Wall forces (strong repulsion)
+                left_viol = np.maximum(r - x, 0.0)
+                right_viol = np.maximum(x + r - w, 0.0)
+                bottom_viol = np.maximum(r - y, 0.0)
+                top_viol = np.maximum(y + r - h, 0.0)
+                fx -= left_viol * 1000
+                fx += right_viol * 1000
+                fy -= bottom_viol * 1000
+                fy += top_viol * 1000
+                
+                # Pairwise impulses
+                dx = x[:, None] - x[None, :]
+                dy = y[:, None] - y[None, :]
+                d_sq = dx * dx + dy * dy
+                r_sum = r[:, None] + r[None, :]
+                
+                iu = np.triu_indices(N, k=1)
+                d_sq_pairs = d_sq[iu]
+                r_sum_pairs = r_sum[iu]
+                
+                d_pairs = np.sqrt(np.maximum(d_sq_pairs, 1e-12))
+                overlap = np.maximum(r_sum_pairs - d_pairs, 0.0)
+                
+                if np.max(overlap) > 1e-10:
+                    # Impulse magnitude proportional to overlap
+                    # Using relative mass
+                    inv_mass_i = 1.0 / mass[iu[0]]
+                    inv_mass_j = 1.0 / mass[iu[1]]
+                    total_inv_mass = inv_mass_i + inv_mass_j
+                    
+                    dx_pairs = dx[iu]
+                    dy_pairs = dy[iu]
+                    ux = dx_pairs / d_pairs
+                    uy = dy_pairs / d_pairs
+                    
+                    # Impulse J = overlap * stiffness
+                    J = overlap * 50.0
+                    
+                    for idx in range(len(iu[0])):
+                        i_idx = iu[0][idx]
+                        j_idx = iu[1][idx]
+                        
+                        # Apply impulse
+                        vx[i_idx] += ux[idx] * J[idx] * inv_mass_i[idx]
+                        vy[i_idx] += uy[idx] * J[idx] * inv_mass_i[idx]
+                        vx[j_idx] -= ux[idx] * J[idx] * inv_mass_j[idx]
+                        vy[j_idx] -= uy[idx] * J[idx] * inv_mass_j[idx]
+                        
+                # Integrate
+                x += vx * dt_sis
+                y += vy * dt_sis
+                
+                # Damping
+                vx *= damping
+                vy *= damping
+                
+                # Clamp to walls
+                x = np.clip(x, r, w - r)
+                y = np.clip(y, r, h - r)
+                
+                # Zero velocity at walls
+                vx[(x <= r) | (x >= w - r)] = 0
+                vy[(y <= r) | (y >= h - r)] = 0
+            
+            # After SIS, try to expand radii again
+            x, y, r = _expand_and_relax(x, y, r, w, h, deadline - 0.5)
+            
+            if _is_valid(x, y, r, w, h):
+                val = float(np.sum(r))
+                if val > best_value:
+                    best_value = val
+                    z_new = np.zeros(3 * N + 1)
+                    z_new[0::3][:N] = x
+                    z_new[1::3][:N] = y
+                    z_new[2::3][:N] = r
+                    z_new[-1] = w
+                    best_result = z_new
+                    
+        except Exception:
+            pass
+
+    # Final output
+    x = best_result[0::3][:N]
+    y = best_result[1::3][:N]
+    r = best_result[2::3][:N]
+    w = best_result[-1]
+    h = 2.0 - w
+    
+    # Safety shrink
+    for _ in range(10):
+        r_trial = r * (1 - 1e-9)
+        if _is_valid(x, y, r_trial, w, h):
+            r = r_trial
+        else:
+            break
+            
+    return np.column_stack((x, y, r))
