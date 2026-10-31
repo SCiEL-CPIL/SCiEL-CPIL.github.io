@@ -83,6 +83,42 @@ def construct():
         (0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1)
     ]
     candidates.append(axial_8)
+    
+    # Candidate 9: Hexagonal 1-6-4 with offset ring
+    axial_9 = [
+        (0, 0),
+        (1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1),
+        (2, 1), (-2, 2), (-1, 3), (1, -2)
+    ]
+    candidates.append(axial_9)
+    
+    # Candidate 10: Compact 3-3-3-2 with different arrangement
+    axial_10 = [
+        (0, 0), (1, 0), (2, 0),
+        (0, 1), (1, 1), (2, 1),
+        (0, 2), (1, 2), (2, 2),
+        (1, 3), (2, 3)
+    ]
+    candidates.append(axial_10)
+    
+    # Candidate 11: 2-4-4-1 (compact)
+    axial_11 = [
+        (0, 0), (1, 0),
+        (0, 1), (1, 1), (2, 1), (3, 1),
+        (0, 2), (1, 2), (2, 2), (3, 2),
+        (1, 3)
+    ]
+    candidates.append(axial_11)
+    
+    # Candidate 12: L-shaped
+    axial_12 = [
+        (0, 0), (1, 0), (2, 0), (3, 0),
+        (0, 1), (1, 1),
+        (0, 2), (1, 2),
+        (0, 3), (1, 3),
+        (0, 4)
+    ]
+    candidates.append(axial_12)
 
     def axial_to_cartesian(axial_list):
         pts = []
@@ -138,34 +174,31 @@ def construct():
         except Exception:
             return float('inf'), None, None
 
-    def smooth_calc_S(pts, beta, temperature=0.1):
-        """Smooth surrogate for the min/max objective using log-sum-exp"""
+    def smooth_calc_S(pts, beta, cx, cy, temperature=0.1):
+        """Smooth surrogate for the min/max objective using log-sum-exp with center offset"""
         normals = []
         for k in range(6):
             ang = beta + math.pi / 6.0 + k * math.pi / 3.0
             normals.append((math.cos(ang), math.sin(ang)))
         
-        # Compute all projections
+        # Compute all projections relative to center
         projs = []
         for nx, ny in normals:
             for px, py in pts:
-                projs.append(px * nx + py * ny)
-                projs.append(-(px * nx + py * ny))
+                proj = (px - cx) * nx + (py - cy) * ny
+                projs.append(proj)
+                projs.append(-proj)
         
         projs = np.array(projs)
         
         # Smooth max using log-sum-exp
         max_val = np.max(projs)
         if max_val > 100:
-            return float('inf')
+            return float('inf'), (cx, cy), float('inf')
         
         # Soft max
         log_sum = np.log(np.sum(np.exp((projs - max_val) / temperature))) + max_val / temperature
         D = temperature * log_sum
-        
-        # Find center that minimizes D (approximate by centroid)
-        cx = float(np.mean(pts[:, 0]))
-        cy = float(np.mean(pts[:, 1]))
         
         S = (D + APOTHEM) / APOTHEM
         return S, (cx, cy), D
@@ -200,6 +233,43 @@ def construct():
         except Exception:
             pass
         
+        # Smooth multi-start phase: use log-sum-exp surrogate to escape local minima
+        try:
+            if time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN:
+                # Try multiple temperature values and starting points
+                temperatures = [0.5, 0.2, 0.1, 0.05]
+                start_betas = [0.0, math.pi/12, math.pi/6, best_beta]
+                
+                for temp in temperatures:
+                    if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
+                        break
+                    for sb in start_betas:
+                        if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
+                            break
+                        
+                        def smooth_obj(params, t=temp):
+                            cx, cy, beta = params
+                            # Wrap beta to [0, pi/6]
+                            beta = ((beta % (math.pi/6)) + math.pi/6) % (math.pi/6)
+                            S, _, _ = smooth_calc_S(pts, beta, cx, cy, temperature=t)
+                            return S
+                        
+                        init = [best_center[0], best_center[1], sb]
+                        res = minimize(smooth_obj, init, method='Nelder-Mead',
+                                     options={'maxiter': 300, 'xatol': 1e-8, 'fatol': 1e-8})
+                        
+                        if res.fun < 1e10:
+                            # Convert smooth result to exact evaluation
+                            cx_r, cy_r, beta_r = res.x
+                            beta_r = ((beta_r % (math.pi/6)) + math.pi/6) % (math.pi/6)
+                            S_exact, c_exact, _ = calc_S_for_beta(pts, beta_r)
+                            if S_exact < best_S:
+                                best_S = S_exact
+                                best_beta = beta_r
+                                best_center = c_exact
+        except Exception:
+            pass
+        
         # Final high-precision polish: jointly optimize center and rotation
         try:
             if time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN:
@@ -223,7 +293,7 @@ def construct():
                 
                 initial = [best_center[0], best_center[1], best_beta]
                 res = minimize(objective, initial, method='Nelder-Mead',
-                             options={'maxiter': 500, 'xatol': 1e-12, 'fatol': 1e-12})
+                             options={'maxiter': 1000, 'xatol': 1e-14, 'fatol': 1e-14})
                 if res.fun < best_S:
                     best_S = res.fun
                     best_center = (res.x[0], res.x[1])
@@ -266,8 +336,8 @@ def construct():
     cx, cy = best_global_center
     angle_deg = math.degrees(best_global_beta)
     
-    # Scale to ensure disjointness
-    SCALE = 1.0 + 1e-8
+    # Scale to ensure disjointness (use a tiny expansion to avoid boundary contact)
+    SCALE = 1.0 + 1e-10
     pts_scaled = []
     for x, y in best_global_pts:
         sx = cx + (x - cx) * SCALE
