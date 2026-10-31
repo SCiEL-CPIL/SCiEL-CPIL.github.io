@@ -1,0 +1,422 @@
+"""Analytic uncertainty bound with spherical reparameterization + L-BFGS-B + Remez-style refinement."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from scipy.optimize import minimize
+
+_DEADLINE = time.time() + 195
+_START_TIME = time.time()
+
+# Precompute I_n = integral x^{2n} e^{-x^2} dx = (2n)! / (4^n n!) * sqrt(pi)
+def _precompute_I():
+    """Precompute I_n for n=0..13"""
+    I = np.zeros(14)
+    sp = np.sqrt(np.pi)
+    I[0] = sp
+    for n in range(1, 14):
+        I[n] = (2*n - 1) * I[n-1] / (4.0 * n)
+    return I
+
+_I = _precompute_I()
+
+# Precompute the S_p and S_q matrices for gradient computation
+# S_p[k, i] = sum_j p_j I[k+i+j] (but p varies, so we precompute the I structure)
+# Actually S_p depends on p, so we compute it on the fly.
+# But we can precompute the I index structure.
+
+def _compute_moments(p, q):
+    """Compute m and n moments from polynomial coefficients."""
+    I = _I
+    pp = np.outer(p, p)
+    m = np.zeros(3)
+    for k in range(3):
+        idx_mat = k + np.add.outer(np.arange(7), np.arange(7))
+        m[k] = np.sum(pp * I[idx_mat])
+    
+    qq = np.outer(q, q)
+    n = np.zeros(3)
+    for k in range(3):
+        n[k] = 2.0 * np.pi * np.sum(qq * I[k + np.add.outer(np.arange(7), np.arange(7))])
+    
+    return m, n
+
+def _compute_S(p, q):
+    """Compute S_p and S_q for gradient."""
+    I = _I
+    S_p = np.zeros((3, 7))
+    S_q = np.zeros((3, 7))
+    for k in range(3):
+        for i in range(7):
+            s_p = 0.0
+            s_q = 0.0
+            for j in range(7):
+                idx = k + i + j
+                if idx < 14:
+                    s_p += p[j] * I[idx]
+                    s_q += q[j] * I[idx]
+            S_p[k, i] = s_p
+            S_q[k, i] = s_q
+    return S_p, S_q
+
+def _coeffs_to_poly(a0, a4, a8):
+    """Convert Hermite coefficients to polynomial coefficients p[0..6] and q[0..6]."""
+    a12 = -(a0 + 3.0*a4 + 105.0*a8) / 945.0
+    
+    p = np.empty(7)
+    p[0] = 0.0  # Since g(0)=0, p[0] = a0+3a4+105a8+945a12 = 0
+    p[1] = -6.0*a4 - 420.0*a8 - 7560.0*a12
+    p[2] = a4 + 210.0*a8 + 13860.0*a12
+    p[3] = -28.0*a8 - 6930.0*a12
+    p[4] = a8 + 1155.0*a12
+    p[5] = -66.0*a12
+    p[6] = a12
+    
+    signs = np.array([1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0])
+    q = p * signs
+    return p, q
+
+def _bound_and_grad(params):
+    """
+    Compute uncertainty product and its analytic gradient.
+    params = [a0, a4, a8]
+    """
+    a0, a4, a8 = params[0], params[1], params[2]
+    
+    p, q = _coeffs_to_poly(a0, a4, a8)
+    m, n = _compute_moments(p, q)
+    
+    m0, m2 = m[0], m[1]
+    n0, n2 = n[0], n[1]
+    
+    if m0 <= 0 or n0 <= 0 or not np.isfinite(m0) or not np.isfinite(n0):
+        return 1e18, np.array([1e18, 1e18, 1e18])
+    
+    vf = m2 / m0
+    vF = n2 / n0
+    
+    if vf <= 0 or vF <= 0:
+        return 1e18, np.array([1e18, 1e18, 1e18])
+    
+    bound = np.sqrt(vf * vF)
+    
+    S_p, S_q = _compute_S(p, q)
+    
+    signs = np.array([1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0])
+    
+    # dp/da matrix: 3x7
+    # p[0] = 0 (constrained), but for gradient we need dp_k/da_c
+    # p[1] = -6a4 - 420a8 - 7560a12, a12 = -(a0+3a4+105a8)/945
+    # dp[1]/da0 = -7560 * (-1/945) = 8
+    # dp[1]/da4 = -6 - 7560*(-3/945) = -6 + 24 = 18... wait let me recompute
+    # a12 = -(a0 + 3a4 + 105a8)/945
+    # da12/da0 = -1/945, da12/da4 = -3/945, da12/da8 = -105/945
+    
+    da12 = np.array([-1.0/945.0, -3.0/945.0, -105.0/945.0])
+    
+    # p[k] as function of (a0, a4, a8):
+    # p[0] = 0 (always, by constraint)
+    # p[1] = -6a4 - 420a8 - 7560a12
+    # p[2] = a4 + 210a8 + 13860a12
+    # p[3] = -28a8 - 6930a12
+    # p[4] = a8 + 1155a12
+    # p[5] = -66a12
+    # p[6] = a12
+    
+    dpda = np.zeros((3, 7))
+    # dp[0]/da_c = 0 for all c (p[0] is identically 0)
+    
+    # dp[1]/da0 = -7560 * da12[0] = -7560 * (-1/945) = 8
+    # dp[1]/da4 = -6 - 7560 * da12[1] = -6 - 7560*(-3/945) = -6 + 24 = 18
+    # dp[1]/da8 = -420 - 7560 * da12[2] = -420 - 7560*(-105/945) = -420 + 840 = 420
+    dpda[0, 1] = -7560.0 * da12[0]
+    dpda[1, 1] = -6.0 - 7560.0 * da12[1]
+    dpda[2, 1] = -420.0 - 7560.0 * da12[2]
+    
+    # dp[2]/da0 = 13860 * da12[0]
+    # dp[2]/da4 = 1 + 13860 * da12[1]
+    # dp[2]/da8 = 210 + 13860 * da12[2]
+    dpda[0, 2] = 13860.0 * da12[0]
+    dpda[1, 2] = 1.0 + 13860.0 * da12[1]
+    dpda[2, 2] = 210.0 + 13860.0 * da12[2]
+    
+    # dp[3]/da0 = -6930 * da12[0]
+    # dp[3]/da4 = -6930 * da12[1]
+    # dp[3]/da8 = -28 - 6930 * da12[2]
+    dpda[0, 3] = -6930.0 * da12[0]
+    dpda[1, 3] = -6930.0 * da12[1]
+    dpda[2, 3] = -28.0 - 6930.0 * da12[2]
+    
+    # dp[4]/da0 = 1155 * da12[0]
+    # dp[4]/da4 = 1155 * da12[1]
+    # dp[4]/da8 = 1 + 1155 * da12[2]
+    dpda[0, 4] = 1155.0 * da12[0]
+    dpda[1, 4] = 1155.0 * da12[1]
+    dpda[2, 4] = 1.0 + 1155.0 * da12[2]
+    
+    # dp[5]/da0 = -66 * da12[0]
+    # dp[5]/da4 = -66 * da12[1]
+    # dp[5]/da8 = -66 * da12[2]
+    dpda[0, 5] = -66.0 * da12[0]
+    dpda[1, 5] = -66.0 * da12[1]
+    dpda[2, 5] = -66.0 * da12[2]
+    
+    # dp[6]/da0 = da12[0]
+    # dp[6]/da4 = da12[1]
+    # dp[6]/da8 = da12[2]
+    dpda[0, 6] = da12[0]
+    dpda[1, 6] = da12[1]
+    dpda[2, 6] = da12[2]
+    
+    grad = np.zeros(3)
+    for c in range(3):
+        dp = dpda[c]
+        dm = 2.0 * (dp @ S_p)
+        dq = dp * signs
+        dn = 4.0 * np.pi * (dq @ S_q)
+        dvm2 = (dm[1]*m0 - m2*dm[0]) / (m0*m0)
+        dvn2 = (dn[1]*n0 - n2*dn[0]) / (n0*n0)
+        grad[c] = (vF * dvm2 + vf * dvn2) / (2.0 * bound)
+    
+    return bound, grad
+
+def _objective(params):
+    val, _ = _bound_and_grad(params)
+    return val
+
+def _objective_grad(params):
+    val, grad = _bound_and_grad(params)
+    return val, grad
+
+# Spherical reparameterization
+def _spherical_to_coefficients(theta, phi):
+    """Convert spherical coordinates to (a0, a4, a8) on unit sphere."""
+    a0 = np.cos(theta)
+    a4 = np.sin(theta) * np.cos(phi)
+    a8 = np.sin(theta) * np.sin(phi)
+    return np.array([a0, a4, a8])
+
+def _coefficients_to_spherical(a0, a4, a8):
+    """Convert (a0, a4, a8) to (theta, phi) on unit sphere."""
+    r = np.sqrt(a0**2 + a4**2 + a8**2)
+    if r < 1e-15:
+        return (np.pi/2, 0.0)
+    a0n, a4n, a8n = a0/r, a4/r, a8/r
+    theta = np.arccos(np.clip(a0n, -1.0, 1.0))
+    phi = np.arctan2(a8n, a4n)
+    return (theta, phi)
+
+def _bound_and_grad_spherical(params):
+    """
+    Compute bound and gradient in spherical coordinates (theta, phi).
+    """
+    theta, phi = params[0], params[1]
+    coeffs = _spherical_to_coefficients(theta, phi)
+    bound, grad_coeff = _bound_and_grad(coeffs)
+    
+    st = np.sin(theta)
+    ct = np.cos(theta)
+    sp = np.sin(phi)
+    cp = np.cos(phi)
+    
+    jac = np.array([
+        [-st, 0.0],
+        [ct*cp, -st*sp],
+        [ct*sp, st*cp]
+    ])
+    
+    grad_spherical = jac.T @ grad_coeff
+    return bound, grad_spherical
+
+def _objective_spherical(params):
+    val, _ = _bound_and_grad_spherical(params)
+    return val
+
+def _objective_grad_spherical(params):
+    val, grad = _bound_and_grad_spherical(params)
+    return val, grad
+
+def _remez_polish(params, max_iter=50, tol=1e-12):
+    """
+    Remez-style exchange: iteratively adjust the three coefficients to 
+    equiosculate the bound across a set of nearby parameter points.
+    This is a heuristic: we evaluate the bound at several perturbed points
+    and adjust the center to minimize the maximum deviation.
+    """
+    current = params.copy()
+    current_val, _ = _bound_and_grad(current)
+    
+    if not np.isfinite(current_val):
+        return current
+    
+    # Define a set of perturbation directions
+    directions = []
+    for i in range(3):
+        for sign in [-1, 1]:
+            d = np.zeros(3)
+            d[i] = sign * 0.01
+            directions.append(d)
+    
+    # Also add some diagonal directions
+    directions.append(np.array([0.01, 0.01, 0.01]))
+    directions.append(np.array([0.01, 0.01, -0.01]))
+    directions.append(np.array([0.01, -0.01, 0.01]))
+    directions.append(np.array([-0.01, 0.01, 0.01]))
+    
+    best_params = current.copy()
+    best_max_dev = np.inf
+    
+    for it in range(max_iter):
+        if time.time() > _DEADLINE - 10:
+            break
+        
+        # Evaluate bound at perturbed points
+        vals = []
+        for d in directions:
+            try:
+                v, _ = _bound_and_grad(current + d)
+                vals.append(v)
+            except:
+                vals.append(current_val + 0.01)
+        
+        vals = np.array(vals)
+        max_dev = np.max(np.abs(vals - current_val))
+        
+        if max_dev < best_max_dev:
+            best_max_dev = max_dev
+            best_params = current.copy()
+        
+        if max_dev < tol:
+            break
+        
+        # Adjust current to reduce the maximum deviation
+        # Find the direction that has the largest positive deviation
+        idx_max = np.argmax(vals)
+        d_max = directions[idx_max]
+        
+        # Move slightly in the opposite direction
+        step = 0.005 * max_dev / (current_val + 1e-15)
+        current = current - step * d_max
+        
+        # Also try moving toward the point with minimum deviation
+        idx_min = np.argmin(vals)
+        d_min = directions[idx_min]
+        current = current + 0.002 * step * d_min
+    
+    return best_params
+
+def construct():
+    # Convert seed to spherical coordinates
+    seed_coeffs = np.array([-1.13, 0.04, 0.000308642])
+    seed_theta, seed_phi = _coefficients_to_spherical(*seed_coeffs)
+    
+    # Generate diverse starting points in spherical coordinates
+    rng = np.random.default_rng(42)
+    starts = []
+    
+    # Seed point
+    starts.append(np.array([seed_theta, seed_phi]))
+    
+    # Grid of starting points on the sphere
+    for theta in np.linspace(0.1, np.pi - 0.1, 15):
+        for phi in np.linspace(0.1, 2*np.pi - 0.1, 15):
+            starts.append(np.array([theta, phi]))
+    
+    # Random points
+    for _ in range(40):
+        theta = rng.uniform(0.05, np.pi - 0.05)
+        phi = rng.uniform(0.05, 2*np.pi - 0.05)
+        starts.append(np.array([theta, phi]))
+    
+    best_val = np.inf
+    best_params_sph = None
+    best_params_linear = None
+    
+    # Phase 1: Multi-start L-BFGS-B in spherical coordinates
+    for start in starts:
+        if time.time() > _DEADLINE - 80:
+            break
+        try:
+            res = minimize(_objective_grad_spherical, start, method='L-BFGS-B',
+                          jac=True, bounds=[(0.01, np.pi - 0.01), (0.01, 2*np.pi - 0.01)],
+                          options={'maxiter': 3000, 'ftol': 1e-14, 'gtol': 1e-13, 'maxls': 30})
+            if res.fun < best_val and np.isfinite(res.fun):
+                best_val = res.fun
+                best_params_sph = res.x.copy()
+                best_params_linear = _spherical_to_coefficients(res.x[0], res.x[1])
+        except Exception:
+            pass
+    
+    # Phase 2: Refine in linear coordinates from best spherical result
+    if best_params_linear is not None and time.time() < _DEADLINE - 50:
+        try:
+            res = minimize(_objective_grad, best_params_linear, method='L-BFGS-B',
+                          jac=True, options={'maxiter': 8000, 'ftol': 1e-15, 'gtol': 1e-14, 'maxls': 50})
+            if res.fun < best_val and np.isfinite(res.fun):
+                best_val = res.fun
+                best_params_linear = res.x.copy()
+        except Exception:
+            pass
+    
+    # Phase 3: Nelder-Mead polish in linear coordinates
+    if best_params_linear is not None and time.time() < _DEADLINE - 30:
+        try:
+            res = minimize(_objective, best_params_linear, method='Nelder-Mead',
+                          options={'maxiter': 30000, 'xatol': 1e-16, 'fatol': 1e-18, 'adaptive': True})
+            if res.fun < best_val and np.isfinite(res.fun):
+                best_val = res.fun
+                best_params_linear = res.x.copy()
+        except Exception:
+            pass
+    
+    # Phase 4: Remez-style exchange polish
+    if best_params_linear is not None and time.time() < _DEADLINE - 15:
+        try:
+            remez_params = _remez_polish(best_params_linear, max_iter=100, tol=1e-13)
+            v, _ = _bound_and_grad(remez_params)
+            if v < best_val and np.isfinite(v):
+                best_val = v
+                best_params_linear = remez_params
+        except Exception:
+            pass
+    
+    # Phase 5: Convert back to spherical and do high-precision polish there
+    if best_params_linear is not None and time.time() < _DEADLINE - 8:
+        theta, phi = _coefficients_to_spherical(*best_params_linear)
+        try:
+            res = minimize(_objective_grad_spherical, np.array([theta, phi]), method='L-BFGS-B',
+                          jac=True, bounds=[(0.001, np.pi - 0.001), (0.001, 2*np.pi - 0.001)],
+                          options={'maxiter': 15000, 'ftol': 1e-17, 'gtol': 1e-16, 'maxls': 50})
+            if res.fun < best_val and np.isfinite(res.fun):
+                best_val = res.fun
+                best_params_sph = res.x.copy()
+                best_params_linear = _spherical_to_coefficients(res.x[0], res.x[1])
+        except Exception:
+            pass
+    
+    # Phase 6: Final ultra-precise Nelder-Mead in linear coords
+    if best_params_linear is not None and time.time() < _DEADLINE - 4:
+        try:
+            res = minimize(_objective, best_params_linear, method='Nelder-Mead',
+                          options={'maxiter': 50000, 'xatol': 1e-19, 'fatol': 1e-21, 'adaptive': True})
+            if res.fun < best_val and np.isfinite(res.fun):
+                best_val = res.fun
+                best_params_linear = res.x.copy()
+        except Exception:
+            pass
+    
+    # Phase 7: One more L-BFGS-B with tightest tolerances
+    if best_params_linear is not None and time.time() < _DEADLINE - 2:
+        try:
+            res = minimize(_objective_grad, best_params_linear, method='L-BFGS-B',
+                          jac=True, options={'maxiter': 20000, 'ftol': 1e-19, 'gtol': 1e-17, 'maxls': 50})
+            if res.fun < best_val and np.isfinite(res.fun):
+                best_val = res.fun
+                best_params_linear = res.x.copy()
+        except Exception:
+            pass
+    
+    if best_params_linear is None:
+        return np.array([-1.13, 0.04, 0.000308642])
+    
+    return np.array(best_params_linear)
+# EVOLVE-BLOCK-END
