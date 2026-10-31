@@ -1,0 +1,554 @@
+"""Packing unit hexagons inside a regular hexagon."""
+import math
+import time
+import numpy as np
+from scipy.optimize import minimize
+
+N = 11
+SQRT3 = math.sqrt(3)
+DEADLINE = 130.0  # safety margin before 150s kill
+
+# Precompute hexagon vertex offsets and normals
+_HEX_ANGLES = np.array([i * math.pi / 3.0 for i in range(6)])
+_HEX_COS = np.cos(_HEX_ANGLES)
+_HEX_SIN = np.sin(_HEX_ANGLES)
+_NORMALS = np.array([(math.cos(math.radians(30 + i * 60)), math.sin(math.radians(30 + i * 60))) for i in range(6)])
+
+
+def get_hex_vertices(cx, cy, side, angle_rad):
+    """Return 6 vertices of a regular hexagon."""
+    ca = math.cos(angle_rad)
+    sa = math.sin(angle_rad)
+    verts = []
+    for i in range(6):
+        c = _HEX_COS[i]
+        s = _HEX_SIN[i]
+        vx = cx + side * (ca * c - sa * s)
+        vy = cy + side * (sa * c + ca * s)
+        verts.append((vx, vy))
+    return verts
+
+
+def compute_required_side_fast(inner, outer_center, outer_angle_deg):
+    """Vectorized computation of minimum outer side length."""
+    ox, oy = outer_center
+    cos_a = math.cos(math.radians(outer_angle_deg))
+    sin_a = math.sin(math.radians(outer_angle_deg))
+    
+    max_proj = 0.0
+    for (ix, iy, iangle) in inner:
+        rad = math.radians(iangle)
+        ca = math.cos(rad)
+        sa = math.sin(rad)
+        for i in range(6):
+            c = _HEX_COS[i]
+            s = _HEX_SIN[i]
+            vx = ix + (ca * c - sa * s)
+            vy = iy + (sa * c + ca * s)
+            dx = vx - ox
+            dy = vy - oy
+            lx = dx * cos_a + dy * sin_a
+            ly = -dx * sin_a + dy * cos_a
+            for j in range(6):
+                proj = lx * _NORMALS[j][0] + ly * _NORMALS[j][1]
+                if proj > max_proj:
+                    max_proj = proj
+    return 2.0 * max_proj / SQRT3
+
+
+def compute_required_side(inner, outer_center, outer_angle_deg):
+    """
+    Compute the minimum outer side length to contain all inner hexagons.
+    inner: list of (x, y, angle_deg)
+    outer_center: (x, y)
+    outer_angle_deg: rotation of the outer hexagon
+    """
+    if not inner:
+        return 0.0
+
+    ox, oy = outer_center
+    # Normals for a hexagon with angle 0 (vertices at 0, 60, ...):
+    # Outward normals are at 30, 90, 150, 210, 270, 330 degrees.
+    normals = []
+    for i in range(6):
+        theta = math.radians(30 + i * 60)
+        normals.append((math.cos(theta), math.sin(theta)))
+
+    max_projection = 0.0
+
+    # Rotate outer frame to match outer_angle
+    cos_a = math.cos(math.radians(outer_angle_deg))
+    sin_a = math.sin(math.radians(outer_angle_deg))
+
+    for (ix, iy, iangle) in inner:
+        verts = get_hex_vertices(ix, iy, 1.0, math.radians(iangle))
+        for v in verts:
+            # Translate to outer center
+            dx = v[0] - ox
+            dy = v[1] - oy
+            # Rotate points by -outer_angle to align with standard hex axes
+            lx = dx * cos_a + dy * sin_a
+            ly = -dx * sin_a + dy * cos_a
+
+            for nx, ny in normals:
+                proj = lx * nx + ly * ny
+                if proj > max_projection:
+                    max_projection = proj
+
+    # S * sqrt(3) / 2 >= max_projection
+    # S >= 2 * max_projection / sqrt(3)
+    return 2.0 * max_projection / SQRT3
+
+
+def sat_overlap_check(v1, v2, eps=1e-9):
+    """
+    Check if two convex polygons (defined by their vertices) overlap using SAT.
+    v1, v2: lists of (x, y) tuples.
+    Returns True if they overlap (including touching).
+    """
+    axes = []
+
+    # Get axes from edges of v1
+    for i in range(len(v1)):
+        p1 = v1[i]
+        p2 = v1[(i + 1) % len(v1)]
+        edge = (p2[0] - p1[0], p2[1] - p1[1])
+        normal = (-edge[1], edge[0])
+        norm = math.sqrt(normal[0] ** 2 + normal[1] ** 2)
+        if norm > 1e-9:
+            axes.append((normal[0] / norm, normal[1] / norm))
+
+    # Get axes from edges of v2
+    for i in range(len(v2)):
+        p1 = v2[i]
+        p2 = v2[(i + 1) % len(v2)]
+        edge = (p2[0] - p1[0], p2[1] - p1[1])
+        normal = (-edge[1], edge[0])
+        norm = math.sqrt(normal[0] ** 2 + normal[1] ** 2)
+        if norm > 1e-9:
+            axes.append((normal[0] / norm, normal[1] / norm))
+
+    for axis in axes:
+        min1 = min(p[0] * axis[0] + p[1] * axis[1] for p in v1)
+        max1 = max(p[0] * axis[0] + p[1] * axis[1] for p in v1)
+        min2 = min(p[0] * axis[0] + p[1] * axis[1] for p in v2)
+        max2 = max(p[0] * axis[0] + p[1] * axis[1] for p in v2)
+
+        # Check for gap
+        if max1 < min2 + eps or max2 < min1 + eps:
+            return False
+
+    return True
+
+
+def check_all_disjoint(inner, eps=1e-6):
+    """Check if all inner hexagons are pairwise disjoint using SAT."""
+    n = len(inner)
+    for i in range(n):
+        for j in range(i + 1, n):
+            vi = get_hex_vertices(inner[i][0], inner[i][1], 1.0, math.radians(inner[i][2]))
+            vj = get_hex_vertices(inner[j][0], inner[j][1], 1.0, math.radians(inner[j][2]))
+            if sat_overlap_check(vi, vj, eps):
+                return False
+    return True
+
+
+def check_inside_outer(inner, outer_center, outer_side, outer_angle_deg, eps=1e-6):
+    """Check all inner hexagons are inside the outer hexagon."""
+    ox, oy = outer_center
+    cos_a = math.cos(math.radians(outer_angle_deg))
+    sin_a = math.sin(math.radians(outer_angle_deg))
+
+    apothem = outer_side * SQRT3 / 2.0
+
+    for (ix, iy, iangle) in inner:
+        verts = get_hex_vertices(ix, iy, 1.0, math.radians(iangle))
+        for v in verts:
+            dx = v[0] - ox
+            dy = v[1] - oy
+            lx = dx * cos_a + dy * sin_a
+            ly = -dx * sin_a + dy * cos_a
+
+            for i in range(6):
+                theta = math.radians(30 + i * 60)
+                nx = math.cos(theta)
+                ny = math.sin(theta)
+                if lx * nx + ly * ny > apothem + eps:
+                    return False
+    return True
+
+
+def compute_cluster_extent(inner):
+    """
+    Compute the extent of the inner hexagon cluster.
+    Returns the maximum distance from centroid to any vertex.
+    """
+    if not inner:
+        return 0.0
+    
+    # Compute centroid of all vertices
+    all_verts = []
+    for (ix, iy, iangle) in inner:
+        verts = get_hex_vertices(ix, iy, 1.0, math.radians(iangle))
+        all_verts.extend(verts)
+    
+    if not all_verts:
+        return 0.0
+    
+    cx = sum(v[0] for v in all_verts) / len(all_verts)
+    cy = sum(v[1] for v in all_verts) / len(all_verts)
+    
+    max_dist = 0.0
+    for v in all_verts:
+        d = math.sqrt((v[0] - cx) ** 2 + (v[1] - cy) ** 2)
+        if d > max_dist:
+            max_dist = d
+    
+    return max_dist
+
+
+def objective_compact(params):
+    """
+    Objective for compacting the inner hexagon cluster.
+    Minimizes the cluster extent with smooth overlap penalty.
+    """
+    inner_list = []
+    for i in range(N):
+        x = params[i * 3]
+        y = params[i * 3 + 1]
+        a = params[i * 3 + 2]
+        inner_list.append([x, y, a])
+    
+    extent = compute_cluster_extent(inner_list)
+    
+    # Penalty for overlaps: use center distance as proxy
+    penalty = 0.0
+    min_dist = SQRT3 - 0.005  # Safe margin
+    for i in range(N):
+        for j in range(i + 1, N):
+            xi, yi, _ = inner_list[i]
+            xj, yj, _ = inner_list[j]
+            dist = math.sqrt((xi - xj) ** 2 + (yi - yj) ** 2)
+            if dist < min_dist:
+                penalty += (min_dist - dist) ** 2 * 50.0
+    
+    return extent + penalty
+
+
+def construct():
+    start_time = time.time()
+
+    # 1. Define 11 hexagons on a hexagonal lattice - tighter configuration
+    # Use a more compact hexagonal arrangement
+    axial_coords = [
+        (0, 0),
+        (1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1),
+        (2, 0), (1, 1), (-1, 2), (-2, 1)
+    ]
+
+    if len(axial_coords) > N:
+        axial_coords = axial_coords[:N]
+
+    # 2. Convert axial to Cartesian with tight spacing
+    epsilon = 1e-4  # Slightly larger epsilon for numerical stability
+    scale = 1.0 + epsilon
+
+    centers = []
+    for q, r in axial_coords:
+        x = 1.5 * scale * q
+        y = SQRT3 * scale * (r + q / 2.0)
+        centers.append((x, y))
+
+    # Initial layout: All hexagons aligned (angle 0)
+    initial_inner = [[x, y, 0.0] for x, y in centers]
+
+    best_side = float('inf')
+    best_inner = [list(x) for x in initial_inner]
+    best_outer_center = (0.0, 0.0)
+    best_outer_angle = 0.0
+
+    # 3. NEW: Pre-optimization phase - compact the cluster
+    # Minimize cluster extent before optimizing the outer container
+    compact_params = []
+    for x, y, a in initial_inner:
+        compact_params.extend([x, y, a])
+
+    best_compact_extent = compute_cluster_extent(initial_inner)
+    best_compact_inner = [list(x) for x in initial_inner]
+
+    # Try multiple restarts for compaction
+    num_compact_restarts = 8
+    for restart in range(num_compact_restarts):
+        if time.time() - start_time > DEADLINE - 60:
+            break
+
+        current_params = list(compact_params)
+        if restart > 0:
+            np.random.seed(123 + restart * 11)
+            perturb_scale = 0.03 + restart * 0.015
+            for i in range(len(current_params)):
+                if i % 3 == 2:  # angle
+                    current_params[i] += np.random.uniform(-10, 10)
+                else:
+                    current_params[i] += np.random.uniform(-perturb_scale, perturb_scale)
+
+        try:
+            res = minimize(
+                objective_compact,
+                current_params,
+                method='Nelder-Mead',
+                options={'maxiter': 400, 'xatol': 1e-8, 'fatol': 1e-10, 'maxfev': 800}
+            )
+
+            inner_list = []
+            for i in range(N):
+                inner_list.append([res.x[i * 3], res.x[i * 3 + 1], res.x[i * 3 + 2]])
+
+            extent = compute_cluster_extent(inner_list)
+            
+            # Check validity
+            if check_all_disjoint(inner_list):
+                if extent < best_compact_extent:
+                    best_compact_extent = extent
+                    best_compact_inner = inner_list
+        except Exception:
+            pass
+
+    # Use compacted layout as starting point for outer optimization
+    compact_inner = best_compact_inner
+
+    # 4. Optimize Outer Hexagon using scipy with multiple starts
+    # Variables: [cx, cy, angle_deg]
+
+    def objective_outer(params, inner_list):
+        cx, cy, angle_deg = params
+        side = compute_required_side_fast(inner_list, (cx, cy), angle_deg)
+        return side
+
+    # Initial guess: centroid of compacted layout and 0
+    compact_centers = [(c[0], c[1]) for c in compact_inner]
+    cx_avg = sum(c[0] for c in compact_centers) / len(compact_centers)
+    cy_avg = sum(c[1] for c in compact_centers) / len(compact_centers)
+
+    # Try multiple diverse initial angles to avoid local minima
+    best_result = None
+    best_val = float('inf')
+
+    # More comprehensive angle sampling
+    init_angles = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 
+                   95, 100, 105, 110, 115, 120, 125, 130, 135, 140, 145, 150, 155, 160, 165, 170, 175, 180]
+
+    for init_angle in init_angles:
+        if time.time() - start_time > DEADLINE - 45:
+            break
+
+        init_params = [cx_avg, cy_avg, float(init_angle)]
+
+        try:
+            res = minimize(
+                lambda p: objective_outer(p, compact_inner),
+                init_params,
+                method='Nelder-Mead',
+                options={'maxiter': 300, 'xatol': 1e-8, 'fatol': 1e-10, 'maxfev': 500}
+            )
+            if res.fun < best_val:
+                best_val = res.fun
+                best_result = res.x
+        except Exception:
+            pass
+
+    if best_result is not None:
+        best_outer_center = (best_result[0], best_result[1])
+        best_outer_angle = best_result[2]
+        best_side = best_val
+    else:
+        # Fallback
+        best_outer_center = (cx_avg, cy_avg)
+        best_outer_angle = 0.0
+        best_side = compute_required_side(compact_inner, best_outer_center, best_outer_angle)
+
+    # 5. Joint optimization of inner positions and outer parameters
+    # Variables: [x1,y1,a1, x2,y2,a2, ..., xN,yN,aN, cx, cy, angle]
+    # Total: 3*N + 3 = 36 variables
+
+    def objective_joint(params):
+        inner_list = []
+        for i in range(N):
+            x = params[i * 3]
+            y = params[i * 3 + 1]
+            a = params[i * 3 + 2]
+            inner_list.append([x, y, a])
+
+        cx = params[N * 3]
+        cy = params[N * 3 + 1]
+        angle = params[N * 3 + 2]
+
+        side = compute_required_side_fast(inner_list, (cx, cy), angle)
+
+        # Penalty for overlaps: use center distance as proxy
+        penalty = 0.0
+        min_dist = SQRT3 - 0.01  # Safe margin
+        for i in range(N):
+            for j in range(i + 1, N):
+                xi, yi, _ = inner_list[i]
+                xj, yj, _ = inner_list[j]
+                dist = math.sqrt((xi - xj) ** 2 + (yi - yj) ** 2)
+                if dist < min_dist:
+                    penalty += (min_dist - dist) ** 2 * 100.0
+
+        # Penalty for going outside (soft constraint)
+        ox, oy = cx, cy
+        cos_a = math.cos(math.radians(angle))
+        sin_a = math.sin(math.radians(angle))
+        apothem = side * SQRT3 / 2.0
+        for (ix, iy, iangle) in inner_list:
+            rad = math.radians(iangle)
+            ca = math.cos(rad)
+            sa = math.sin(rad)
+            for i in range(6):
+                c = _HEX_COS[i]
+                s = _HEX_SIN[i]
+                vx = ix + (ca * c - sa * s)
+                vy = iy + (sa * c + ca * s)
+                dx = vx - ox
+                dy = vy - oy
+                lx = dx * cos_a + dy * sin_a
+                ly = -dx * sin_a + dy * cos_a
+                for k in range(6):
+                    proj = lx * _NORMALS[k][0] + ly * _NORMALS[k][1]
+                    if proj > apothem:
+                        penalty += (proj - apothem) ** 2 * 50.0
+
+        return side + penalty
+
+    # Initial joint params - use compacted layout
+    init_params = []
+    for x, y, a in compact_inner:
+        init_params.extend([x, y, a])
+    init_params.extend([best_outer_center[0], best_outer_center[1], best_outer_angle])
+
+    # Try joint optimization with more restarts
+    best_joint_side = best_side
+    best_joint_inner = [list(x) for x in compact_inner]
+    best_joint_center = best_outer_center
+    best_joint_angle = best_outer_angle
+
+    num_restarts = 6
+    for restart in range(num_restarts):
+        if time.time() - start_time > DEADLINE - 20:
+            break
+
+        current_params = list(init_params)
+        if restart > 0:
+            # Add random perturbation with increasing magnitude
+            np.random.seed(42 + restart * 7)
+            perturb_scale = 0.02 + restart * 0.01
+            for i in range(len(current_params)):
+                if i < N * 3:
+                    current_params[i] += np.random.uniform(-perturb_scale, perturb_scale)
+                elif i == N * 3 + 2:  # angle
+                    current_params[i] += np.random.uniform(-5, 5)
+
+        try:
+            res = minimize(
+                objective_joint,
+                current_params,
+                method='Nelder-Mead',
+                options={'maxiter': 250, 'xatol': 1e-7, 'fatol': 1e-9, 'maxfev': 700}
+            )
+
+            # Extract result
+            inner_list = []
+            for i in range(N):
+                inner_list.append([res.x[i * 3], res.x[i * 3 + 1], res.x[i * 3 + 2]])
+            oc = (res.x[N * 3], res.x[N * 3 + 1])
+            oa = res.x[N * 3 + 2]
+
+            side = compute_required_side(inner_list, oc, oa)
+
+            # Check validity
+            if check_all_disjoint(inner_list) and check_inside_outer(inner_list, oc, side, oa):
+                if side < best_joint_side:
+                    best_joint_side = side
+                    best_joint_inner = inner_list
+                    best_joint_center = oc
+                    best_joint_angle = oa
+        except Exception:
+            pass
+
+    # 6. Final high-precision polish pass with multiple restarts
+    if time.time() - start_time < DEADLINE - 10:
+        polish_params = []
+        for x, y, a in best_joint_inner:
+            polish_params.extend([x, y, a])
+        polish_params.extend([best_joint_center[0], best_joint_center[1], best_joint_angle])
+
+        # Multiple polish attempts with slight perturbations
+        for polish_restart in range(3):
+            if time.time() - start_time > DEADLINE - 5:
+                break
+
+            current_polish = list(polish_params)
+            if polish_restart > 0:
+                np.random.seed(99 + polish_restart * 13)
+                for i in range(len(current_polish)):
+                    if i < N * 3:
+                        current_polish[i] += np.random.uniform(-0.005, 0.005)
+                    elif i == N * 3 + 2:
+                        current_polish[i] += np.random.uniform(-2, 2)
+
+            try:
+                res = minimize(
+                    objective_joint,
+                    current_polish,
+                    method='Nelder-Mead',
+                    options={'maxiter': 800, 'xatol': 1e-11, 'fatol': 1e-13, 'maxfev': 2500}
+                )
+
+                inner_list = []
+                for i in range(N):
+                    inner_list.append([res.x[i * 3], res.x[i * 3 + 1], res.x[i * 3 + 2]])
+                oc = (res.x[N * 3], res.x[N * 3 + 1])
+                oa = res.x[N * 3 + 2]
+
+                side = compute_required_side_fast(inner_list, oc, oa)
+
+                if check_all_disjoint(inner_list) and check_inside_outer(inner_list, oc, side, oa):
+                    if side < best_joint_side:
+                        best_joint_side = side
+                        best_joint_inner = inner_list
+                        best_joint_center = oc
+                        best_joint_angle = oa
+            except Exception:
+                pass
+
+    # 7. If joint optimization didn't find valid, try local search on initial layout
+    if best_joint_side >= best_side:
+        # Use the outer-optimized result with original inner positions
+        best_joint_inner = [list(x) for x in compact_inner]
+        best_joint_side = best_side
+        best_joint_center = best_outer_center
+        best_joint_angle = best_outer_angle
+
+    # 8. Final verification and fallback
+    final_inner = best_joint_inner
+    final_center = best_joint_center
+    final_side = best_joint_side
+    final_angle = best_joint_angle
+
+    if not check_all_disjoint(final_inner) or not check_inside_outer(final_inner, final_center, final_side, final_angle):
+        # Fallback: use original layout with safe spacing
+        scale_fallback = 1.02
+        fallback_centers = []
+        for q, r in axial_coords:
+            x = 1.5 * scale_fallback * q
+            y = SQRT3 * scale_fallback * (r + q / 2.0)
+            fallback_centers.append((x, y))
+
+        fallback_inner = [[x, y, 0.0] for x, y in fallback_centers]
+        final_center = (0.0, 0.0)
+        final_angle = 0.0
+        final_side = compute_required_side_fast(fallback_inner, final_center, final_angle)
+        final_inner = fallback_inner
+
+    return final_inner, final_center, final_side, final_angle
