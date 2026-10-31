@@ -59,66 +59,60 @@ def compute_required_side(inner, outer_center, outer_angle_deg):
     # S >= 2 * max_projection / sqrt(3)
     return 2.0 * max_projection / SQRT3
 
-def compute_overlap_penalty(inner, threshold=1e-4):
+def sat_overlap_check(v1, v2, eps=1e-9):
     """
-    Compute a penalty for overlapping hexagons.
-    We check distance between centers. For two unit hexagons, if they are aligned,
-    the minimum center distance to be disjoint is sqrt(3).
-    For arbitrary rotations, the condition is more complex.
-    However, a robust simple check for *unit* hexagons:
-    The inradius (apothem) is sqrt(3)/2.
-    If the distance between centers is less than sqrt(3) (sum of apothems for aligned), they might overlap.
-    Actually, for any two convex polygons, if the distance between centers is less than the minimum width of the Minkowski sum, they might overlap.
-    A safer, albeit conservative, penalty:
-    If dist < sqrt(3) - epsilon, assume overlap risk.
-    But this is not accurate for rotated hexagons.
-    
-    Let's use a more accurate check:
-    Two regular hexagons of side 1 are disjoint if and only if their Minkowski difference does not contain the origin.
-    This is expensive.
-    
-    Alternative:
-    Since we start from a valid lattice, we can use a penalty that is 0 when valid.
-    We can check pairwise distance. If dist < sqrt(3) * 0.999, apply penalty.
-    This might be too conservative and prevent movement.
-    
-    Let's try a different approach for the inner optimization:
-    We only allow movement if we can verify validity.
-    We will define the objective as `side_length` and use constraints or just check validity post-hoc.
-    If we use `minimize` without constraints, it will likely find an invalid configuration.
-    
-    Revised Plan for Inner Optimization:
-    1. Start with valid lattice.
-    2. Objective: `side_length + Lambda * sum(max(0, overlap_amount)^2)`.
-    3. How to calculate overlap_amount?
-       For two hexagons, if they are far, overlap is 0.
-       We can approximate overlap by checking if the distance between centers is less than the sum of their "radii" in the direction of the center vector.
-       For a regular hexagon, the distance from center to boundary in direction theta is:
-       r(theta) = (sqrt(3)/2) / cos((theta mod 60) - 30)  ... wait, apothem is sqrt(3)/2.
-       The distance to edge in direction phi is:
-       d(phi) = (sqrt(3)/2) / cos(phi - 30) for phi in [0, 60] relative to normal.
-       Actually, the support function of a regular hexagon with apothem a is:
-       h(u) = a / cos(angle(u, normal_nearest))
-       
-       Two polygons A and B are disjoint if for all directions u, h_A(u) + h_B(-u) < dist(A, B) is not quite right.
-       They are disjoint if the origin is not in A-B.
-       
-       Let's stick to a simpler heuristic for the penalty:
-       If center distance < sqrt(3) - 1e-3, apply a large penalty.
-       This ensures we don't cross the "aligned" threshold, which is the tightest constraint for hexagons.
-       Rotations might allow closer packing, but starting from aligned lattice, moving to rotated might require larger distances or specific alignments.
-       
-       Actually, the best packing of hexagons is the lattice.
-       So, optimizing inner positions might not help much if we stay near the lattice.
-       The gain is likely in the OUTER container alignment.
-       
-       So, I will focus heavily on optimizing the OUTER container (center + angle) using scipy.
+    Check if two convex polygons (defined by their vertices) overlap using SAT.
+    v1, v2: lists of (x, y) tuples.
+    Returns True if they overlap (including touching).
     """
-    return 0.0
+    axes = []
+    
+    # Get axes from edges of v1
+    for i in range(len(v1)):
+        p1 = v1[i]
+        p2 = v1[(i + 1) % len(v1)]
+        edge = (p2[0] - p1[0], p2[1] - p1[1])
+        normal = (-edge[1], edge[0])
+        norm = math.sqrt(normal[0]**2 + normal[1]**2)
+        if norm > 1e-9:
+            axes.append((normal[0] / norm, normal[1] / norm))
+    
+    # Get axes from edges of v2
+    for i in range(len(v2)):
+        p1 = v2[i]
+        p2 = v2[(i + 1) % len(v2)]
+        edge = (p2[0] - p1[0], p2[1] - p1[1])
+        normal = (-edge[1], edge[0])
+        norm = math.sqrt(normal[0]**2 + normal[1]**2)
+        if norm > 1e-9:
+            axes.append((normal[0] / norm, normal[1] / norm))
+    
+    for axis in axes:
+        min1 = min(p[0] * axis[0] + p[1] * axis[1] for p in v1)
+        max1 = max(p[0] * axis[0] + p[1] * axis[1] for p in v1)
+        min2 = min(p[0] * axis[0] + p[1] * axis[1] for p in v2)
+        max2 = max(p[0] * axis[0] + p[1] * axis[1] for p in v2)
+        
+        # Check for gap
+        if max1 < min2 + eps or max2 < min1 + eps:
+            return False
+    
+    return True
+
+def check_all_disjoint(inner, eps=1e-6):
+    """Check if all inner hexagons are pairwise disjoint using SAT."""
+    n = len(inner)
+    for i in range(n):
+        for j in range(i + 1, n):
+            vi = get_hex_vertices(inner[i][0], inner[i][1], 1.0, math.radians(inner[i][2]))
+            vj = get_hex_vertices(inner[j][0], inner[j][1], 1.0, math.radians(inner[j][2]))
+            if sat_overlap_check(vi, vj, eps):
+                return False
+    return True
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 140.0  # Safety margin for 150s limit
+    deadline = start_time + 135.0  # Safety margin for 150s limit
     
     # 1. Define 11 hexagons on a hexagonal lattice
     axial_coords = [
@@ -129,9 +123,7 @@ def construct():
     
     if len(axial_coords) > N:
         axial_coords = axial_coords[:N]
-    elif len(axial_coords) < N:
-        pass
-
+    
     # 2. Convert axial to Cartesian
     epsilon = 1e-6
     scale = 1.0 + epsilon
@@ -150,7 +142,7 @@ def construct():
     best_outer_center = (0.0, 0.0)
     best_outer_angle = 0.0
 
-    # 3. Optimize Outer Hexagon using scipy
+    # 3. Optimize Outer Hexagon using scipy with multiple starts
     # Variables: [cx, cy, angle_deg]
     
     def objective_outer(params):
@@ -161,20 +153,22 @@ def construct():
     # Initial guess: centroid and 0
     cx_avg = sum(c[0] for c in centers) / len(centers)
     cy_avg = sum(c[1] for c in centers) / len(centers)
-    initial_params = [cx_avg, cy_avg, 0.0]
     
-    # Try a few different initial angles to avoid local minima
+    # Try multiple diverse initial angles to avoid local minima
     best_result = None
     best_val = float('inf')
     
-    for init_angle in [0, 15, 30, 45, 60]:
-        if time.time() > deadline - 10:
+    init_angles = [0, 10, 20, 30, 45, 60, 75, 90, 120, 150, 180, 210, 240, 270, 300, 330]
+    
+    for init_angle in init_angles:
+        if time.time() > deadline - 15:
             break
             
         init_params = [cx_avg, cy_avg, float(init_angle)]
         
         try:
-            res = minimize(objective_outer, init_params, method='Nelder-Mead', options={'maxiter': 500, 'xatol': 1e-6, 'fatol': 1e-8})
+            res = minimize(objective_outer, init_params, method='Nelder-Mead', 
+                          options={'maxiter': 800, 'xatol': 1e-7, 'fatol': 1e-9, 'maxfev': 1500})
             if res.fun < best_val:
                 best_val = res.fun
                 best_result = res.x
@@ -188,17 +182,17 @@ def construct():
     else:
         # Fallback to grid search if scipy fails or times out
         best_side = float('inf')
-        for outer_angle_deg in range(0, 360, 10):
+        for outer_angle_deg in range(0, 360, 5):
             current_cx = cx_avg
             current_cy = cy_avg
             step = 0.5
-            for _ in range(2):
+            for _ in range(3):
                 improved = False
-                for dx in np.linspace(-step, step, 3):
-                    for dy in np.linspace(-step, step, 3):
+                for dx in np.linspace(-step, step, 5):
+                    for dy in np.linspace(-step, step, 5):
                         oc = (current_cx + dx, current_cy + dy)
                         side = compute_required_side(initial_inner, oc, outer_angle_deg)
-                        if side < best_side - 1e-5:
+                        if side < best_side - 1e-6:
                             best_side = side
                             best_outer_center = oc
                             best_outer_angle = outer_angle_deg
@@ -211,9 +205,8 @@ def construct():
             if time.time() > deadline - 5:
                 break
 
-    # 4. Optional: Try to optimize inner positions slightly
-    # This is risky for validity. We will only do this if we have time.
-    # We define a penalty for overlaps based on center distance < sqrt(3) - 1e-3.
+    # 4. Optimize inner positions with SAT-based validity checking
+    # Use a penalty approach but verify with SAT at the end
     
     def objective_inner(params):
         # Unpack params to inner list
@@ -226,59 +219,127 @@ def construct():
         
         side = compute_required_side(inner_list, best_outer_center, best_outer_angle)
         
-        # Penalty for overlaps
+        # Conservative penalty: center distance < sqrt(3) - margin
         penalty = 0.0
-        min_dist = math.sqrt(3) - 1e-3 # Threshold for "safe" distance
+        min_dist = math.sqrt(3) - 0.01  # Safe margin
         for i in range(N):
             for j in range(i+1, N):
                 xi, yi, _ = inner_list[i]
                 xj, yj, _ = inner_list[j]
                 dist = math.sqrt((xi-xj)**2 + (yi-yj)**2)
                 if dist < min_dist:
-                    # Quadratic penalty
                     overlap = min_dist - dist
-                    penalty += (overlap * 100.0)**2
+                    penalty += (overlap * 50.0)**2
                     
         return side + penalty
 
-    if time.time() < deadline - 20:
+    if time.time() < deadline - 25:
         # Initialize params from initial_inner
         init_params_inner = []
         for x, y, a in initial_inner:
             init_params_inner.extend([x, y, a])
             
-        try:
-            res_inner = minimize(objective_inner, init_params_inner, method='Nelder-Mead', options={'maxiter': 200, 'xatol': 1e-5, 'fatol': 1e-7})
-            
-            # Check if the result is valid (low penalty)
-            final_side = res_inner.fun
-            # Re-calculate penalty to be sure
-            inner_list_final = []
-            for i in range(N):
-                x = res_inner.x[i*3]
-                y = res_inner.x[i*3+1]
-                a = res_inner.x[i*3+2]
-                inner_list_final.append([x, y, a])
+        # Try multiple random perturbations for inner optimization
+        best_inner_side = best_side
+        best_inner_candidate = best_inner
+        
+        for trial in range(3):
+            if time.time() > deadline - 10:
+                break
                 
-            # Check validity strictly
-            is_valid = True
+            if trial == 0:
+                trial_params = init_params_inner[:]
+            else:
+                # Small random perturbation
+                trial_params = init_params_inner[:]
+                for i in range(len(trial_params)):
+                    if i % 3 != 2:  # Don't perturb angles randomly
+                        trial_params[i] += np.random.uniform(-0.1, 0.1)
+            
+            try:
+                res_inner = minimize(objective_inner, trial_params, method='Nelder-Mead', 
+                                    options={'maxiter': 300, 'xatol': 1e-6, 'fatol': 1e-8, 'maxfev': 500})
+                
+                # Extract result
+                inner_list_final = []
+                for i in range(N):
+                    x = res_inner.x[i*3]
+                    y = res_inner.x[i*3+1]
+                    a = res_inner.x[i*3+2]
+                    inner_list_final.append([x, y, a])
+                    
+                # Verify with SAT that all hexagons are disjoint
+                if check_all_disjoint(inner_list_final):
+                    side_final = compute_required_side(inner_list_final, best_outer_center, best_outer_angle)
+                    if side_final < best_inner_side - 1e-8:
+                        best_inner_side = side_final
+                        best_inner_candidate = inner_list_final
+            except Exception:
+                pass
+        
+        if best_inner_candidate is not best_inner:
+            best_side = best_inner_side
+            best_inner = best_inner_candidate
+
+    # 5. Final refinement: joint optimization of inner and outer if time permits
+    if time.time() < deadline - 15:
+        def objective_joint(params):
+            # First N*3 params are inner, last 3 are outer
+            inner_list = []
+            for i in range(N):
+                x = params[i*3]
+                y = params[i*3+1]
+                a = params[i*3+2]
+                inner_list.append([x, y, a])
+            
+            ox = params[N*3]
+            oy = params[N*3+1]
+            oa = params[N*3+2]
+            
+            side = compute_required_side(inner_list, (ox, oy), oa)
+            
+            # Penalty for overlaps
+            penalty = 0.0
+            min_dist = math.sqrt(3) - 0.01
             for i in range(N):
                 for j in range(i+1, N):
-                    xi, yi, _ = inner_list_final[i]
-                    xj, yj, _ = inner_list_final[j]
+                    xi, yi, _ = inner_list[i]
+                    xj, yj, _ = inner_list[j]
                     dist = math.sqrt((xi-xj)**2 + (yi-yj)**2)
-                    if dist < math.sqrt(3) - 1e-4:
-                        is_valid = False
-                        break
-                if not is_valid:
-                    break
-                    
-            if is_valid:
-                # Verify side length
-                side_final = compute_required_side(inner_list_final, best_outer_center, best_outer_angle)
-                if side_final < best_side:
-                    best_side = side_final
-                    best_inner = inner_list_final
+                    if dist < min_dist:
+                        overlap = min_dist - dist
+                        penalty += (overlap * 50.0)**2
+                        
+            return side + penalty
+        
+        joint_params = []
+        for x, y, a in best_inner:
+            joint_params.extend([x, y, a])
+        joint_params.extend([best_outer_center[0], best_outer_center[1], best_outer_angle])
+        
+        try:
+            res_joint = minimize(objective_joint, joint_params, method='Nelder-Mead',
+                                options={'maxiter': 200, 'xatol': 1e-7, 'fatol': 1e-9, 'maxfev': 400})
+            
+            inner_list_joint = []
+            for i in range(N):
+                x = res_joint.x[i*3]
+                y = res_joint.x[i*3+1]
+                a = res_joint.x[i*3+2]
+                inner_list_joint.append([x, y, a])
+            
+            ox_joint = res_joint.x[N*3]
+            oy_joint = res_joint.x[N*3+1]
+            oa_joint = res_joint.x[N*3+2]
+            
+            # Verify with SAT
+            if check_all_disjoint(inner_list_joint):
+                side_joint = compute_required_side(inner_list_joint, (ox_joint, oy_joint), oa_joint)
+                if side_joint < best_side - 1e-8:
+                    best_side = side_joint
+                    best_inner = inner_list_joint
+                    best_outer_center = (ox_joint, oy_joint)
+                    best_outer_angle = oa_joint
         except Exception:
             pass
 
