@@ -4,139 +4,103 @@ N = 400
 # EVOLVE-BLOCK-START
 import numpy as np
 import time
-from scipy.signal import fftconvolve
 
+def _autoconv_max_abs(h):
+    """Compute max absolute value of linear autoconvolution."""
+    ac = np.convolve(h, h, mode='full')
+    return np.max(np.abs(ac))
+
+def _squared_integral(h):
+    return np.sum(h) ** 2
+
+def _score(h):
+    """Compute the objective value."""
+    s = np.sum(h)
+    if abs(s) < 1e-6:
+        return 1e10
+    return _autoconv_max_abs(h) / (s * s)
+
+def _local_sign_flip(h, max_passes=5, deadline=None):
+    """Local optimization: try flipping each element's sign, keep if improves."""
+    h = h.copy()
+    best_val = _score(h)
+    for _ in range(max_passes):
+        if deadline is not None and time.time() > deadline:
+            break
+        improved = False
+        for i in range(N):
+            if deadline is not None and time.time() > deadline:
+                break
+            # Try flipping sign
+            h[i] = -h[i]
+            new_val = _score(h)
+            if new_val < best_val:
+                best_val = new_val
+                improved = True
+            else:
+                h[i] = -h[i]  # revert
+        if not improved:
+            break
+    return h, best_val
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 110.0  # safety margin before 150s kill
-
-    def autoconv_peak(x):
-        """Compute max absolute autoconvolution value."""
-        if np.all(x == 0):
-            return 0.0
-        ac = fftconvolve(x, x, mode='full')
-        return np.max(np.abs(ac))
-
-    def score(x):
-        """max|autoconv| / (sum)^2 - lower is better."""
-        s = np.sum(x)
-        if abs(s) < 1e-12:
-            return float('inf')
-        return autoconv_peak(x) / (s * s)
-
-    # Strategy: sparse signed sequences with local optimization
-    # Use Bernoulli sampling to create sparse structures where
-    # autoconvolution peak decays faster than the squared integral
-
-    best_x = np.ones(N)
-    best_val = score(best_x)
-
-    rng = np.random.default_rng(42)
-
-    # Try various sparsity levels and random sign patterns
-    sparsity_levels = [0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    deadline = start_time + 115.0  # safety margin
     
-    for density in sparsity_levels:
+    best_h = np.ones(N)
+    best_val = _score(best_h)
+    
+    # Try multiple random initializations with local sign-flip optimization
+    np.random.seed(42)
+    n_restarts = 50
+    
+    for r in range(n_restarts):
         if time.time() > deadline:
             break
-
-        n_restarts = 20
-        for r in range(n_restarts):
-            if time.time() > deadline:
-                break
-
-            # Create sparse signed sequence
-            mask = rng.random(N) < density
-            x = np.zeros(N)
-            x[mask] = rng.choice([-1.0, 1.0], size=np.sum(mask))
-            
-            # Ensure non-zero sum
-            s = np.sum(x)
-            if abs(s) < 1e-12:
-                continue
-
-            val = score(x)
-            if val < best_val:
-                best_val = val
-                best_x = x.copy()
-
-            # Local search: try flipping signs of non-zero entries
-            improved = True
-            max_iters = 50
-            for it in range(max_iters):
-                if time.time() > deadline:
-                    break
-                if not improved:
-                    break
-                improved = False
-
-                # Try flipping a random non-zero entry
-                non_zero_idx = np.where(x != 0)[0]
-                if len(non_zero_idx) == 0:
-                    break
-                    
-                trial_idx = rng.choice(non_zero_idx)
-                orig = x[trial_idx]
-                x[trial_idx] = -orig
-                new_val = score(x)
-                if new_val < best_val - 1e-12:
-                    best_val = new_val
-                    best_x = x.copy()
-                    improved = True
-                else:
-                    x[trial_idx] = orig
-
-                # Also try adding a new non-zero entry
-                zero_idx = np.where(x == 0)[0]
-                if len(zero_idx) > 0:
-                    add_idx = rng.choice(zero_idx)
-                    x[add_idx] = rng.choice([-1.0, 1.0])
-                    new_val = score(x)
-                    if new_val < best_val - 1e-12:
-                        best_val = new_val
-                        best_x = x.copy()
-                        improved = True
-                    else:
-                        x[add_idx] = 0
-
-                # Try removing a non-zero entry
-                non_zero_idx = np.where(x != 0)[0]
-                if len(non_zero_idx) > 1:
-                    rem_idx = rng.choice(non_zero_idx)
-                    x[rem_idx] = 0
-                    new_val = score(x)
-                    if new_val < best_val - 1e-12:
-                        best_val = new_val
-                        best_x = x.copy()
-                        improved = True
-                    else:
-                        x[rem_idx] = orig if orig != 0 else 1.0
-
-    # Final polish: try small perturbations on the best solution
-    if time.time() < deadline - 5:
-        x = best_x.copy()
-        for trial in range(300):
-            if time.time() > deadline - 2:
-                break
-            idx = rng.choice(N)
-            if x[idx] != 0:
-                orig = x[idx]
-                x[idx] = -orig
-                new_val = score(x)
-                if new_val < best_val - 1e-12:
-                    best_val = new_val
-                    best_x = x.copy()
-                else:
-                    x[idx] = orig
-            else:
-                x[idx] = rng.choice([-1.0, 1.0])
-                new_val = score(x)
-                if new_val < best_val - 1e-12:
-                    best_val = new_val
-                    best_x = x.copy()
-                else:
-                    x[idx] = 0
-
-    return best_x
+        
+        # Different initialization strategies
+        if r % 5 == 0:
+            # Random ±1
+            h = np.random.choice([-1.0, 1.0], size=N)
+        elif r % 5 == 1:
+            # Mostly +1 with some random -1
+            h = np.ones(N)
+            n_neg = np.random.randint(N//4, N//2)
+            neg_idx = np.random.choice(N, n_neg, replace=False)
+            h[neg_idx] = -1.0
+        elif r % 5 == 2:
+            # Chirp-like pattern
+            x = np.arange(N)
+            h = np.sign(np.cos(2 * np.pi * x * (x+1) / (2*N)))
+        elif r % 5 == 3:
+            # Random with continuous values
+            h = np.random.uniform(-1, 1, size=N)
+        else:
+            # Block pattern with random block sizes
+            h = np.ones(N)
+            pos = 0
+            while pos < N:
+                block_len = np.random.randint(1, N//10 + 1)
+                sign = np.random.choice([-1.0, 1.0])
+                h[pos:pos+block_len] = sign
+                pos += block_len
+        
+        # Ensure sum is not too small
+        s = np.sum(h)
+        if abs(s) < N * 0.1:
+            # Flip to increase sum
+            if s < 0:
+                h = -h
+            # Add a bias
+            h = h + 0.5
+            h = np.sign(h)
+        
+        # Local sign-flip optimization
+        h_opt, val_opt = _local_sign_flip(h, max_passes=3, deadline=deadline)
+        
+        if val_opt < best_val:
+            best_val = val_opt
+            best_h = h_opt
+    
+    return best_h
 # EVOLVE-BLOCK-END
