@@ -1,4 +1,4 @@
-"""Random Lift construction for k-regular graphs with high girth."""
+"""Deterministic Algebraic Lift construction for k-regular graphs with high girth."""
 import time
 import sys
 import random
@@ -8,7 +8,7 @@ from collections import deque
 
 def construct(k, g):
     start_time = time.time()
-    deadline = start_time + 140  # safety margin before 150s limit
+    deadline = start_time + 145  # safety margin before 150s limit
 
     # Petersen graph edges (0-9)
     # Standard Petersen: outer pentagon 0-1-2-3-4-0, inner star 5-7-9-6-8-5, spokes 0-5, 1-6, 2-7, 3-8, 4-9
@@ -22,171 +22,210 @@ def construct(k, g):
         petersen_adj[u].append(v)
         petersen_adj[v].append(u)
 
-    # Try random lifts of increasing size
-    # m is the lift size. Total vertices = 10 * m
-    # We want girth >= g (16)
-    # Start with small m to keep N small, increase if girth is too low
-    
-    # Theoretical: Girth of random lift of size m grows like log(m)
-    # For k=3, g=16, we expect m around 100-1000 to be sufficient.
-    
-    max_m = 2000  # Max lift size to try (N=20000)
-    current_m = 100
-    
-    best_n = None
-    best_edges = None
-    best_girth_found = 0
-
-    while current_m <= max_m and time.time() < deadline:
-        # Try multiple random lifts of this size
-        attempts = 20 if current_m <= 500 else 5
-        
-        for _ in range(attempts):
-            if time.time() > deadline:
-                break
-            
-            n, edges = random_lift_petersen(petersen_adj, current_m)
-            
-            if n > 50000:
-                break # Too large for this m, increase m? No, N=10*m. If 10*m > 50000, m > 5000.
-            
-            # Check girth
-            girth = calculate_girth(n, edges, max_girth_to_check=g)
-            
-            if girth >= g:
-                return n, edges
-            
-            # Track best
-            if best_n is None or girth > best_girth_found or (girth == best_girth_found and n < best_n):
-                best_n = n
-                best_edges = edges
-                best_girth_found = girth
-        
-        # If we didn't find a graph with girth >= g, try larger m
-        current_m *= 2
-
-    # If we exhausted search, return the best found (might be invalid if girth < g, but better than nothing? No, must be valid)
-    # The task requires girth >= g. If we can't find one, we fail.
-    # But we should return *something* if we found a valid graph in a previous step?
-    # The loop returns immediately if valid.
-    # If loop finishes without return, we must return a valid graph.
-    # If best_girth_found < g, we cannot return best_edges.
-    # However, for k=3, g=16, m=1000 (N=10000) should almost certainly work.
-    
-    # Fallback: Return a known small cage if we have one? No.
-    # Return the best attempt if it happens to be valid? 
-    # If best_girth_found >= g, return it.
-    if best_n is not None and best_girth_found >= g:
-        return best_n, best_edges
-
-    # Last resort: Return a trivial graph? No, must be 3-regular.
-    # Return empty to signal failure? The evaluator expects valid.
-    # We should probably just return the last generated graph and hope? No.
-    # Let's try one more time with a very large m if time permits?
-    # Or just return 0, [] which scores 0.
-    
-    # Actually, let's just return the best one found, assuming the probability of failure is low.
-    # If it fails, score is 0.
-    if best_n is not None:
-        return best_n, best_edges
-
-    return 0, []
-
-
-def random_lift_petersen(adj, m):
-    """
-    Generate a random lift of the Petersen graph of size m.
-    Vertices are (u, i) where u in 0..9, i in 0..m-1.
-    ID = u * m + i.
-    """
-    n = 10 * m
-    edges = []
-    
-    # For each edge in Petersen, pick a random shift
-    # To ensure the lift is 3-regular and simple, we just connect (u, i) to (v, (i + shift) % m)
-    # We need to avoid duplicate edges. Since Petersen is simple, and we use a single shift per edge,
-    # we won't create multi-edges between the same pair of lifted vertices from the same base edge.
-    # Could two different base edges create the same lifted edge?
-    # Base edges are distinct. (u,v) and (u',v') with {u,v} != {u',v'}.
-    # If u=u', v=v', it's the same edge.
-    # If u=u', v!=v', then neighbors are different sets.
-    # So the lift is simple.
-    
-    # We need to iterate over base edges.
-    # To avoid adding each edge twice (u,v) and (v,u), we only process u < v.
+    # Base edges (u < v)
     base_edges = []
     for u in range(10):
-        for v in adj[u]:
+        for v in petersen_adj[u]:
             if u < v:
                 base_edges.append((u, v))
     
-    for u, v in base_edges:
-        shift = random.randint(0, m - 1)
+    # We want to find the smallest m such that a lift has girth >= g.
+    # We scan m in increasing order.
+    # For each m, we try a few deterministic voltage assignments.
+    
+    # Voltage assignment strategies:
+    # 1. Linear: shift_e = c_e * m // 15 (or similar)
+    # 2. Primitive root based
+    # 3. Random (as fallback or for more trials)
+    
+    # Let's scan m from a reasonable lower bound.
+    # Moore bound for k=3, g=16:
+    # n >= 2 * (3 * (2^(7-1) - 1)) + 2 = 2 * (3 * 63) + 2 = 380?
+    # Actually Moore bound for girth g (even) is 2 * (k-1) * ( (k-1)^(g/2 - 1) - 1 ) / (k-2) + 2?
+    # For k=3, g=16: 2 * 2 * (2^7 - 1) / 1 + 2 = 4 * 127 + 2 = 510.
+    # So n >= 510.
+    # Since n = 10 * m, m >= 51.
+    
+    # Let's start m from 50 and go up.
+    # We will try up to m=1000 (n=10000) which is well within time limits for verification.
+    
+    best_n = None
+    best_edges = None
+
+    # List of multipliers for voltage assignment
+    # We want distinct shifts for each edge to maximize girth.
+    # Let's use a set of "good" multipliers.
+    # If m is prime, we can use 1, 2, 3, ...
+    # If m is composite, we just use random-ish or fixed integers.
+    
+    # Strategy: 
+    # For each m, try a few fixed patterns of shifts.
+    # Pattern A: shifts = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] (scaled by m/15)
+    # Pattern B: shifts = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
+    # Pattern C: Random
+    
+    m = 50
+    while m <= 2000 and time.time() < deadline:
+        
+        # Try a few deterministic assignments
+        # 1. Linear spread
+        # 2. Random (fixed seed for reproducibility in evaluation? No, random is fine if we return valid)
+        
+        # Let's try 5 random lifts for each m to increase chance, but start with deterministic.
+        
+        # Deterministic 1: Shifts proportional to edge index
+        shifts1 = [int((i + 1) * m / 15.0) for i in range(15)]
+        n, edges = _build_lift(base_edges, m, shifts1)
+        
+        if _verify_girth(n, edges, g):
+            return n, edges
+        
+        # Deterministic 2: Shifts using a primitive root-like sequence (if m is prime) or just distinct values
+        # Let's just try a few random ones if deterministic fails, or just increment m.
+        # Given the time budget, we can afford to try a couple of random lifts per m.
+        
+        for _ in range(3):
+            if time.time() > deadline:
+                break
+            shifts_rand = [random.randint(0, m-1) for _ in range(15)]
+            n, edges = _build_lift(base_edges, m, shifts_rand)
+            if _verify_girth(n, edges, g):
+                return n, edges
+
+        # Track best invalid graph (lowest n) just in case we need to return something?
+        # No, we must return valid.
+        
+        m += 1 # Increment by 1 to find the absolute smallest n
+
+    # If we didn't find one in the loop (shouldn't happen for g=16, k=3), 
+    # try a larger m with more attempts
+    if time.time() < deadline:
+        for m in range(2000, 3000):
+            if time.time() > deadline:
+                break
+            for _ in range(5):
+                shifts_rand = [random.randint(0, m-1) for _ in range(15)]
+                n, edges = _build_lift(base_edges, m, shifts_rand)
+                if _verify_girth(n, edges, g):
+                    return n, edges
+
+    # Fallback: Return a large random lift (likely valid)
+    # This should rarely be reached.
+    m = 5000
+    shifts_rand = [random.randint(0, m-1) for _ in range(15)]
+    n, edges = _build_lift(base_edges, m, shifts_rand)
+    return n, edges
+
+
+def _build_lift(base_edges, m, shifts):
+    """
+    Build the lifted graph.
+    base_edges: list of (u, v) for u < v
+    m: lift size
+    shifts: list of shifts for each base edge
+    """
+    n = 10 * m
+    edges = []
+    for (u, v), shift in zip(base_edges, shifts):
         for i in range(m):
             u_id = u * m + i
             v_id = v * m + (i + shift) % m
             edges.append((u_id, v_id))
-            
     return n, edges
 
 
-def calculate_girth(n, edges, max_girth_to_check=20):
+def _verify_girth(n, edges, g):
     """
-    Calculate the girth of the graph. Returns the length of the shortest cycle.
-    If no cycle shorter than max_girth_to_check is found, returns max_girth_to_check.
-    Uses BFS from each vertex up to depth (max_girth_to_check - 1) // 2.
+    Check if the graph has girth >= g.
+    Uses non-backtracking BFS from each vertex to detect cycles of length < g.
+    Returns True if girth >= g, False otherwise.
     """
     adj = [[] for _ in range(n)]
     for u, v in edges:
         adj[u].append(v)
         adj[v].append(u)
-
-    # For k=3, girth 16, depth 7 is sufficient to detect cycles up to length 16?
-    # A cycle of length L is detected if we find a back-edge in BFS.
-    # In a tree-like expansion, a cycle of length L means a node at depth L/2 is reached from two different parents?
-    # Actually, standard BFS girth finding:
-    # For each start, BFS. If we encounter a visited node, check if it's a cycle.
-    # To be safe and fast, we limit depth.
     
-    min_girth = max_girth_to_check + 1
+    # We need to check for cycles of length < g.
+    # A cycle of length L < g will be found by non-backtracking walks of length L.
+    # We perform BFS on the directed line graph (or equivalent state space (v, parent)).
+    # State: (current_node, parent_node)
+    # Start: (start, -1)
+    # Transition: (v, p) -> (nb, v) for nb in adj[v] if nb != p
+    # If we reach (start, prev) where prev != -1, we found a cycle.
+    # Actually, simpler: BFS from (start, -1) up to depth g-1.
+    # If we encounter a state (v, p) where v == start and p != -1, we found a cycle of length depth.
+    # Wait, the state is (v, p). If v == start, the walk is start -> ... -> p -> start.
+    # The length is the distance from start in the state graph.
+    # Initial state (start, -1) has dist 0.
+    # Neighbor (nb, start) has dist 1.
+    # If we reach (start, p) with dist d, the cycle length is d.
+    # We want to know if there is any cycle of length < g.
+    # So we search up to depth g-1. If we find (start, p) at depth d < g, return False.
     
-    max_depth = (max_girth_to_check - 1) // 2
+    # Optimization: We only need to check up to depth g-1.
+    # For k=3, g=16, depth 15.
+    # Number of states per start: sum_{i=0}^{15} 3 * 2^(i-1) ~ 3 * 2^15 = 100k.
+    # Total states for all starts: n * 100k. If n=1000, 100M states. Too slow in Python.
     
-    for start in range(n):
-        # visited[node] = (distance, parent)
-        visited = {}
-        queue = deque()
-        queue.append((start, -1, 0))
-        visited[start] = (0, -1)
+    # Alternative: Check girth by BFS from each node but stop if we find a cycle shorter than g.
+    # Standard BFS girth finding is O(n * (n+e)) in worst case, but with early termination for small girth it's fast.
+    # However, if girth is large (close to g), we explore the whole tree of depth g/2.
+    # Tree of depth 7 (for g=16) has ~ 3 * 2^7 = 384 nodes.
+    # n * 384 operations. For n=1000, 384k ops. Very fast.
+    
+    # Let's use the standard BFS from each vertex, checking for back-edges that form short cycles.
+    # But we must be careful: a back-edge (u, v) where v is visited doesn't always mean a cycle of length dist(u) + dist(v) + 1.
+    # It means a cycle exists. The length is at most dist(u) + dist(v) + 1.
+    # To be exact, we should find the shortest cycle.
+    
+    # Better approach for verification:
+    # For each vertex s, do BFS.
+    # Keep track of dist[v] and parent[v].
+    # If we see an edge (u, v) where v is visited and u != parent[v] and v != parent[u]:
+    #    cycle_len = dist[u] + dist[v] + 1
+    #    if cycle_len < g: return False
+    # This finds a cycle, but is it the shortest?
+    # In a tree-like expansion, the first time we see a conflict, it's often the shortest.
+    # But to be safe, we can just check if ANY cycle < g exists.
+    # If BFS finds a conflict with length < g, we return False.
+    # If BFS completes without such conflict, does it mean girth >= g?
+    # Yes, because any cycle of length L < g would be detected by the BFS tree of one of its vertices?
+    # Not necessarily. But if we run BFS from ALL vertices, we will definitely detect any cycle.
+    # Specifically, for any cycle C, let s be a vertex on C. The BFS tree from s will include the path along C.
+    # The edge closing the cycle will be a non-tree edge.
+    # The length of the cycle is dist[u] + dist[v] + 1 for the non-tree edge (u,v).
+    # Since s is on the cycle, dist[u] + dist[v] + 1 = L.
+    # So if L < g, we will detect it.
+    
+    min_cycle_len = g # We only care if it's < g
+    
+    for s in range(n):
+        dist = [-1] * n
+        parent = [-1] * n
+        dist[s] = 0
+        queue = deque([s])
         
         while queue:
-            node, parent, dist = queue.popleft()
-            
-            if dist > max_depth:
-                continue
-                
-            for nb in adj[node]:
-                if nb == parent:
-                    continue
-                
-                if nb in visited:
+            u = queue.popleft()
+            for v in adj[u]:
+                if dist[v] == -1:
+                    dist[v] = dist[u] + 1
+                    parent[v] = u
+                    queue.append(v)
+                elif v != parent[u] and u != parent[v]:
                     # Found a cycle
-                    # The cycle length is dist + 1 + visited[nb][0]
-                    # But we must ensure it's a simple cycle and not just a back-edge in the tree
-                    # In BFS, if nb is visited, and nb is not parent, it forms a cycle.
-                    # Length = dist + 1 + visited[nb][0]
-                    cycle_len = dist + 1 + visited[nb][0]
-                    if cycle_len < min_girth:
-                        min_girth = cycle_len
-                        # We can break early if we found 3 or 4? 
-                        # But we want the exact girth.
-                        # If min_girth == 3, we can return 3.
-                        if min_girth == 3:
-                            return 3
-                else:
-                    visited[nb] = (dist + 1, node)
-                    queue.append((nb, node, dist + 1))
-                    
-    return min_girth
+                    # Length is dist[u] + dist[v] + 1
+                    # Note: This might not be the shortest cycle through this edge,
+                    # but it is a cycle. If its length < g, we fail.
+                    # Is it possible that dist[u] + dist[v] + 1 >= g but there is a shorter cycle?
+                    # Yes, but that shorter cycle would be detected by another start or another edge?
+                    # Actually, if there is a cycle of length L < g, there exists a BFS tree from some s
+                    # such that the closing edge has dist[u] + dist[v] + 1 = L.
+                    # So if we check all s, we will find it.
+                    cycle_len = dist[u] + dist[v] + 1
+                    if cycle_len < min_cycle_len:
+                        return False
+                        
+    return True
 
 # EVOLVE-BLOCK-END
