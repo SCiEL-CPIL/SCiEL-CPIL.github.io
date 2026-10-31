@@ -1,0 +1,81 @@
+import time
+
+_start_time = None
+_DEADLINE = 330 * 0.95  # 313.5s safety margin
+
+
+def priority(vector, n):
+    """
+    Priority function for greedy cap set construction in {0,1,2}^n.
+
+    Strategy (Refined Symmetry and Balance):
+    1. Primary: Smooth quadratic distinct-symbol score. Ensures vectors use all 3 symbols.
+    2. Secondary: Strong quadratic balance penalty. Heavily penalizes deviation from
+       the uniform (n/3, n/3, n/3) distribution. This encourages the greedy algorithm
+       to select "central" vectors that are symmetric, which tends to block more
+       affine lines than biased vectors.
+    3. Tertiary: Smooth variance-based danger proxy. Penalizes high coordinate variance
+       to avoid "extreme" vectors that are structurally more likely to complete lines.
+    4. Quaternary: Fast polynomial rolling hash for robust deterministic tie-breaking.
+       This ensures a consistent, pseudo-random ordering among vectors with similar
+       structural scores, preventing clustering in specific sub-cubes.
+
+    All components computed in O(n) time.
+    """
+    global _start_time
+    if _start_time is None:
+        _start_time = time.time()
+    elif time.time() - _start_time > _DEADLINE:
+        return 0.0
+
+    # Fast symbol counting
+    c0 = 0
+    c1 = 0
+    c2 = 0
+    s = 0
+    s2 = 0
+    for v in vector:
+        if v == 0:
+            c0 += 1
+        elif v == 1:
+            c1 += 1
+            s += 1
+            s2 += 1
+        else:  # v == 2
+            c2 += 1
+            s += 2
+            s2 += 4
+
+    # Factor 1: Distinct symbol score
+    num_distinct = (1 if c0 > 0 else 0) + (1 if c1 > 0 else 0) + (1 if c2 > 0 else 0)
+    distinct_score = 10000.0 * num_distinct * num_distinct
+
+    # Factor 2: Balance penalty (chi-squared style)
+    # We want vectors to be as close to (n/3, n/3, n/3) as possible.
+    # Chi-squared: sum (observed - expected)^2 / expected, normalized by n.
+    # This gives a smoother, scale-aware penalty that is more principled than raw squared deviation.
+    ideal = n / 3.0
+    if ideal > 0:
+        chi_sq = ((c0 - ideal) ** 2 + (c1 - ideal) ** 2 + (c2 - ideal) ** 2) / ideal
+    else:
+        chi_sq = 0.0
+    balance_score = -chi_sq * 300.0
+
+    # Factor 3: Variance penalty (reduced weight since chi-squared already captures spread)
+    # High variance means many 0s and 2s. The chi-squared balance penalty already
+    # captures most of this, so use a lighter weight to avoid over-penalizing.
+    mean = s / n
+    variance = s2 / n - mean * mean
+    danger_score = -variance * 200.0
+
+    # Factor 4: Hash for tie-breaking (improved mixing to reduce sub-cube clustering)
+    # Use a better polynomial hash with larger multiplier and XOR folding
+    h = 0x811C9DC5  # FNV-1a offset basis
+    for val in vector:
+        h = ((h ^ val) * 0x01000193) & 0xFFFFFFFF
+    # XOR-fold to 32 bits for better distribution
+    h = (h ^ (h >> 16)) & 0xFFFFFFFF
+    hash_score = h / 0xFFFFFFFF
+
+    total = distinct_score + balance_score + danger_score + hash_score
+    return float(total)

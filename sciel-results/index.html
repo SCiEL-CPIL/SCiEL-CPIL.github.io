@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>SCiEL Live Results</title>
+<meta name="description" content="Live results of SCiEL evolutionary search driven by a single local open-weight model on autoresearch-tasks.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Merriweather:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script defer src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/languages/python.min.js"></script>
+<style>
+:root {
+  color-scheme: light;
+  --paper: #f9f9f6;
+  --card: #ffffff;
+  --ink: #1a1a1a;
+  --muted: #55554f;
+  --faint: #8a8a84;
+  --rule: rgba(0,0,0,0.07);
+  --rule-strong: rgba(0,0,0,0.18);
+  --blue: #2a78d6;
+  --blue-wash: rgba(42,120,214,0.10);
+  --orange: #eb6834;
+  --orange-wash: rgba(235,104,52,0.10);
+  --good: #1f7a4d;
+  --good-wash: rgba(31,122,77,0.10);
+  --sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  --serif: "Charter", "Bitstream Charter", "Iowan Old Style", "Merriweather", Georgia, Cambria, serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 15px/1.55 var(--sans); }
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 2px; }
+button { font: inherit; }
+[hidden] { display: none !important; }
+.wrap { max-width: 1180px; margin: 0 auto; padding-inline: max(20px, env(safe-area-inset-left, 0px)); }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+.topbar { border-bottom: 1px solid var(--rule); position: sticky; top: env(safe-area-inset-top, 0px); z-index: 10;
+  background: rgba(249,249,246,0.88); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+.topbar .wrap { display: flex; align-items: center; justify-content: space-between; gap: 16px; height: 52px; }
+.brand { font-weight: 600; letter-spacing: -0.01em; color: var(--ink); }
+.brand span { color: var(--faint); font-weight: 500; }
+.live { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); white-space: nowrap; }
+.pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--good); position: relative; flex: none; }
+.pulse::after { content: ""; position: absolute; inset: -4px; border-radius: 50%; border: 2px solid var(--good); opacity: 0; animation: ping 2.4s cubic-bezier(0,0,.2,1) infinite; }
+.pulse.idle { background: var(--faint); } .pulse.idle::after { display: none; }
+@keyframes ping { 0% { transform: scale(.6); opacity: .7; } 100% { transform: scale(1.6); opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .pulse::after { animation: none; } }
+
+header.hero { padding-block: 52px 8px; }
+.eyebrow { font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); margin: 0 0 14px; }
+h1 { font-family: var(--serif); font-weight: 700; font-size: clamp(30px, 4.6vw, 46px); line-height: 1.12; letter-spacing: -0.015em; margin: 0 0 16px; max-width: 22ch; }
+.lede { font-family: var(--serif); font-size: 18px; line-height: 1.6; color: var(--muted); max-width: 68ch; margin: 0; }
+.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; margin-block: 28px 0; }
+.stat { background: var(--card); padding: 16px 20px; }
+.stat .k { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.stat .v { font-size: 28px; font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.stat .s { font-size: 12px; color: var(--faint); margin-top: 2px; }
+@media (max-width: 720px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+section { padding-block: 32px; }
+h2 { font-family: var(--serif); font-size: 24px; font-weight: 700; letter-spacing: -0.01em; margin: 0 0 6px; }
+.sub { color: var(--muted); margin: 0 0 18px; max-width: 74ch; }
+
+.filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.chip { font-size: 13px; border: 1px solid var(--rule-strong); background: var(--card); color: var(--ink); border-radius: 999px; padding: 5px 13px; cursor: pointer; }
+.chip[aria-pressed="true"] { background: var(--ink); color: #fff; border-color: var(--ink); }
+.chip .n { color: var(--faint); margin-left: 4px; font-variant-numeric: tabular-nums; }
+.chip[aria-pressed="true"] .n { color: rgba(255,255,255,.65); }
+
+/* task panels */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px; }
+@media (max-width: 400px) { .grid { grid-template-columns: 1fr; } }
+.panel { background: var(--card); border: 1px solid var(--rule); border-radius: 12px; padding: 16px 18px 14px; display: flex; flex-direction: column; gap: 12px;
+  color: inherit; text-decoration: none; transition: border-color .15s, box-shadow .15s, transform .15s; min-width: 0; }
+.panel:hover { text-decoration: none; border-color: var(--rule-strong); box-shadow: 0 6px 22px rgba(0,0,0,0.06); transform: translateY(-1px); }
+.panel:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.ptop { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+.pname { font-weight: 600; font-size: 15.5px; line-height: 1.3; }
+.pfam { font-size: 12px; color: var(--faint); margin-top: 2px; }
+.status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; padding: 3px 9px; border-radius: 999px; white-space: nowrap; flex: none; }
+.status.running { color: var(--blue); background: var(--blue-wash); }
+.status.finished { color: var(--muted); background: rgba(0,0,0,0.045); }
+.status .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.pprog { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+.bar { flex: 1; height: 6px; border-radius: 3px; background: rgba(0,0,0,0.06); overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--blue); border-radius: 3px; }
+.bar.done i { background: var(--ink); opacity: .5; }
+.pmeta { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+.pmeta b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.vals { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; background: var(--rule); border-radius: 8px; overflow: hidden; border: 1px solid var(--rule); }
+.vals div { background: #fcfcfa; padding: 7px 9px; min-width: 0; }
+.vals .k { font-size: 11px; color: var(--faint); white-space: nowrap; }
+.vals .v { font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vals .ours .v { font-weight: 700; }
+.pfoot { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.tag { font-size: 11px; font-weight: 600; color: var(--orange); background: var(--orange-wash); padding: 1px 7px; border-radius: 999px; margin-left: 6px; vertical-align: 1px; white-space: nowrap; }
+.badge { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.badge.beat { color: var(--good); background: var(--good-wash); }
+.badge.match { color: var(--blue); background: var(--blue-wash); }
+.badge.gap { color: var(--muted); background: rgba(0,0,0,0.045); font-weight: 500; }
+.badge.na { color: var(--faint); font-weight: 500; padding-inline: 0; }
+.open { font-size: 12px; color: var(--faint); white-space: nowrap; }
+.panel:hover .open { color: var(--blue); }
+svg.spark { display: block; width: 100%; height: 36px; overflow: visible; }
+
+/* detail view */
+.back { display: inline-flex; gap: 6px; align-items: center; font-size: 14px; font-weight: 500; margin-block: 26px 14px; }
+.dhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.dhead h1 { font-size: clamp(26px, 3.6vw, 38px); margin-bottom: 8px; max-width: none; }
+.dsub { color: var(--muted); display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 14px; }
+.kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; margin-block: 22px 14px; }
+.kpi { background: var(--card); padding: 12px 14px; min-width: 0; }
+.kpi .k { font-size: 11.5px; color: var(--muted); }
+.kpi .v { font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.kpi .v.mono { font-family: var(--mono); font-size: 16px; padding-top: 2px; }
+.kpi .s { font-size: 11.5px; color: var(--faint); }
+@media (max-width: 900px) { .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 520px) { .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.cols { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 14px; }
+@media (max-width: 860px) { .cols { grid-template-columns: 1fr; } }
+.box { background: var(--card); border: 1px solid var(--rule); border-radius: 12px; padding: 18px 20px; min-width: 0; }
+.box h3 { font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 0 10px; text-transform: uppercase; letter-spacing: .07em; }
+.prose { font-family: var(--serif); font-size: 15px; line-height: 1.65; }
+.prose p { margin: 0 0 10px; }
+.prose h4 { font-family: var(--sans); font-size: 14px; font-weight: 600; margin: 16px 0 6px; }
+.prose h4:first-child { margin-top: 0; }
+.prose ul, .prose ol { margin: 0 0 10px; padding-left: 22px; } .prose li { margin-bottom: 5px; }
+.prose code { font-family: var(--mono); font-size: 12.5px; background: rgba(0,0,0,0.05); padding: 1px 4px; border-radius: 4px; }
+.contract { font-family: var(--mono); font-size: 12.5px; background: #fafaf7; border: 1px solid var(--rule); border-radius: 8px; padding: 10px 12px; margin-top: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+dl.facts { display: grid; grid-template-columns: auto 1fr; column-gap: 16px; row-gap: 5px; font-size: 13.5px; margin: 0; }
+dl.facts dt { color: var(--muted); } dl.facts dd { margin: 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; min-width: 0; }
+.opmix { display: flex; height: 8px; border-radius: 4px; overflow: hidden; gap: 2px; margin: 14px 0 8px; }
+.opmix i { display: block; height: 100%; }
+.callout { font-size: 13px; color: var(--muted); background: #fbf8f2; border: 1px solid rgba(235,104,52,0.25); border-radius: 8px; padding: 9px 12px; margin-top: 12px; }
+.callout.ok { background: #f3f8f5; border-color: rgba(31,122,77,0.25); }
+
+/* chart */
+.charthead { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.legend .sw { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.legend .ln { width: 16px; height: 2px; background: var(--ink); display: inline-block; }
+.legend .dash { width: 16px; height: 0; border-top: 1.5px dashed var(--faint); display: inline-block; }
+.legend .x { color: #a3a39c; font-weight: 700; font-style: normal; }
+.seg { display: inline-flex; border: 1px solid var(--rule-strong); border-radius: 8px; overflow: hidden; }
+.seg button { border: 0; background: var(--card); padding: 4px 10px; font-size: 12px; color: var(--muted); cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--ink); color: #fff; }
+.chartwrap { position: relative; width: 100%; }
+svg.chart { display: block; width: 100%; height: auto; touch-action: pan-y; }
+svg.chart text { font-family: var(--sans); }
+.hint { font-size: 12px; color: var(--faint); margin-top: 6px; }
+.tip { position: fixed; pointer-events: none; z-index: 30; background: var(--ink); color: #fff; font-size: 12px; line-height: 1.45; padding: 7px 10px; border-radius: 7px;
+  white-space: nowrap; font-variant-numeric: tabular-nums; transform: translate(-50%, calc(-100% - 12px)); box-shadow: 0 6px 18px rgba(0,0,0,.18); }
+.tip b { font-family: var(--mono); font-weight: 600; }
+.tip .op { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
+
+/* inspector */
+.inspector { border-top: 1px solid var(--rule); margin-top: 16px; padding-top: 18px; scroll-margin-top: 70px; }
+.ihead { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.ihead .t { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
+.ihead .s { font-size: 13px; color: var(--muted); }
+.navbtns { display: flex; gap: 6px; }
+.navbtns button { border: 1px solid var(--rule-strong); background: var(--card); border-radius: 7px; padding: 4px 10px; font-size: 12.5px; cursor: pointer; color: var(--ink); }
+.navbtns button:disabled { opacity: .4; cursor: default; }
+.icols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; }
+@media (max-width: 860px) { .icols { grid-template-columns: 1fr; } }
+.icard { background: #fcfcfa; border: 1px solid var(--rule); border-radius: 10px; padding: 14px 16px; min-width: 0; }
+.icard h4 { font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 0 10px; text-transform: uppercase; letter-spacing: .07em; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.icard h4 .pill { text-transform: none; letter-spacing: 0; }
+.pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; padding: 2px 9px; border-radius: 999px; background: rgba(0,0,0,0.05); color: var(--ink); white-space: nowrap; }
+.pill i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.step { display: flex; flex-direction: column; gap: 8px; font-size: 13.5px; }
+.step .row { display: grid; grid-template-columns: 104px minmax(0, 1fr); gap: 10px; }
+.step .row .k { color: var(--muted); }
+.quote { font-family: var(--serif); font-size: 14.5px; line-height: 1.6; border-left: 3px solid var(--rule-strong); padding-left: 12px; margin: 0; }
+.notes { font-family: var(--serif); font-size: 14px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; }
+.err { font-family: var(--mono); font-size: 12px; color: #9a3412; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 8px; padding: 8px 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.codebox { margin-top: 14px; border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; background: #fff; }
+.codehead { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--rule); background: #fafaf7; font-size: 12.5px; color: var(--muted); flex-wrap: wrap; }
+.codehead button { border: 0; background: none; color: var(--blue); cursor: pointer; padding: 0; font-size: 12.5px; }
+pre.code { margin: 0; padding: 12px 14px; font-family: var(--mono); font-size: 12.5px; line-height: 1.55; overflow: auto; max-height: 560px; background: #fff; }
+pre.code code.hljs { padding: 0; background: transparent; }
+pre.code.collapsed { max-height: 300px; }
+
+.tablebox { overflow-x: auto; }
+table.list { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.list th { text-align: left; font-size: 12px; font-weight: 600; color: var(--muted); padding: 8px 10px; border-bottom: 1px solid var(--rule-strong); white-space: nowrap; }
+table.list td { padding: 8px 10px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+table.list tr.sel td { background: var(--blue-wash); }
+table.list tbody tr[data-v] { cursor: pointer; } table.list tbody tr[data-v]:hover td { background: #f6f6f2; }
+
+.setup { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+.setup .box p, .setup .box li { color: var(--muted); font-size: 14px; }
+.setup .box p { margin: 0 0 8px; } .setup .box ul { margin: 0; padding-left: 18px; } .setup .box li { margin-bottom: 6px; }
+.setup h3 { font-size: 15px; text-transform: none; letter-spacing: 0; color: var(--ink); }
+footer { border-top: 1px solid var(--rule); padding-block: 26px 40px; color: var(--faint); font-size: 13px; margin-top: 28px; }
+footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.empty { color: var(--faint); padding: 28px; text-align: center; }
+.loading { color: var(--faint); padding: 40px 0; }
+.mt { margin-top: 14px; }
+@media (max-width: 520px) { .brand span { display: none; } .step .row { grid-template-columns: 88px minmax(0, 1fr); } }
+</style>
+</head>
+<body>
+<div class="topbar"><div class="wrap">
+  <a class="brand" href="../">SCiEL-CPIL <span>/ Live results</span></a>
+  <span class="live"><span class="pulse" id="pulse"></span><span id="liveText">Loading…</span></span>
+</div></div>
+
+<main id="app"><div class="wrap loading">Loading…</div></main>
+
+<footer><div class="wrap">
+  <span>CPIL Lab, MBZUAI · <a href="../">SCiEL-CPIL</a></span>
+  <span id="gen"></span>
+</div></footer>
+<div class="tip" id="tip" hidden></div>
+
+<script>
+(function () {
+  "use strict";
+  const $ = (s, r) => (r || document).querySelector(s);
+  const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  // operator -> [key, label, colour]; fixed categorical order, validated against the white chart surface
+  const OPS = [
+    ["diff", "Diff edit", "#2a78d6"],
+    ["full_rewrite", "Full rewrite", "#eb6834"],
+    ["cross", "Crossover", "#1baf7a"],
+    ["idea", "Idea mutation", "#eda100"],
+    ["repair", "Repair / fix", "#e87ba4"],
+  ];
+  const OPDESC = {
+    diff: "patches the parent program with targeted search/replace edits",
+    full_rewrite: "rewrites the parent program from scratch, keeping its interface",
+    cross: "combines the parent with ideas from other programs in the population",
+    idea: "mutates the strategy in idea space, then regenerates code from it",
+    repair: "repairs a program that failed or was rejected",
+  };
+  const SELECTOR = { bandit: "operator bandit", programme: "research programme", fixed: "fixed operator", idea_island: "idea island" };
+  const opKey = op => OPS.some(o => o[0] === op) ? op : "repair";
+  const opDef = op => OPS.find(o => o[0] === opKey(op));
+  const opColor = op => opDef(op)[2];
+  const opName = op => !op ? "—" : op === "error_repair" ? "Error repair" : op === "fix" ? "Fix" : opDef(op)[1];
+
+  let DATA = null, FILTER = "all", ROUTE = { view: "grid" }, ZOOM = "focus", CH = null;
+  const RUNCACHE = {}, CODECACHE = {};
+
+  /* ---------- formatting ---------- */
+  function fmt(x, sig) {
+    if (x == null || !isFinite(x)) return "—";
+    if (Number.isInteger(x) && Math.abs(x) < 1e7) return String(x);
+    const a = Math.abs(x);
+    if (a !== 0 && (a < 1e-3 || a >= 1e7)) return x.toExponential(Math.max(1, (sig || 6) - 1));
+    return String(Number(x.toPrecision(sig || 6)));
+  }
+  function digitsFor(a, b) {
+    if (a == null || b == null || a === b) return 6;
+    for (let d = 4; d <= 12; d++) if (Number(a.toPrecision(d)) !== Number(b.toPrecision(d))) return Math.max(d, 6);
+    return 12;
+  }
+  const pct = g => { const p = g * 100; return p >= 1 ? p.toFixed(1) + "%" : p >= 0.01 ? p.toFixed(2) + "%" : p.toPrecision(2) + "%"; };
+  function badge(r) {
+    if (r.gap == null) return '<span class="badge na">no literature value</span>';
+    if (r.gap < -1e-9) return '<span class="badge beat">▲ beats literature by ' + pct(-r.gap) + '</span>';
+    if (r.gap <= 1e-6) return '<span class="badge match">● matches literature</span>';
+    return '<span class="badge gap">' + pct(r.gap) + ' behind literature</span>';
+  }
+  function hours(h) {
+    if (h == null) return "—";
+    if (h < 1) return Math.max(1, Math.round(h * 60)) + " min";
+    if (h < 48) return (h < 10 ? h.toFixed(1) : Math.round(h)) + " h";
+    return (h / 24).toFixed(1) + " days";
+  }
+  function ago(iso) {
+    const s = (Date.now() - Date.parse(iso)) / 1000;
+    if (s < 90) return "just now";
+    if (s < 3600) return Math.round(s / 60) + " min ago";
+    if (s < 172800) return Math.round(s / 3600) + " h ago";
+    return Math.round(s / 86400) + " days ago";
+  }
+  const when = iso => iso ? iso.slice(0, 16).replace("T", " ") + " UTC" : "—";
+  const n = x => x == null ? "—" : Number(x).toLocaleString("en-US");
+  const isLit = r => r.gap != null && r.gap <= 1e-6;
+
+  function md(src) {
+    const lines = esc(src).split("\n"); let out = "", list = null, para = [];
+    const inline = s => s.replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>").replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+    const endPara = () => { if (para.length) { out += "<p>" + inline(para.join(" ")) + "</p>"; para = []; } };
+    const endList = () => { if (list) { out += "</" + list + ">"; list = null; } };
+    for (const raw of lines) {
+      const l = raw.trim(); let m;
+      if (!l) { endPara(); endList(); continue; }
+      if ((m = l.match(/^#{1,6}\s+(.*)/))) { endPara(); endList(); out += "<h4>" + inline(m[1]) + "</h4>"; continue; }
+      if ((m = l.match(/^(?:[-*]|\d+[.)])\s+(.*)/))) {
+        const t = /^\d/.test(l) ? "ol" : "ul"; endPara();
+        if (list !== t) { endList(); out += "<" + t + ">"; list = t; }
+        out += "<li>" + inline(m[1]) + "</li>"; continue;
+      }
+      endList(); para.push(l);
+    }
+    endPara(); endList();
+    return out;
+  }
+  function math(root) {
+    if (window.renderMathInElement) renderMathInElement(root, { delimiters: [{left: "$$", right: "$$", display: true}, {left: "$", right: "$", display: false}], throwOnError: false });
+  }
+
+  /* ---------- data ---------- */
+  async function getJSON(url) {
+    const r = await fetch(url + (url.includes("?") ? "&" : "?") + "t=" + Date.now(), { cache: "no-store" });
+    if (!r.ok) throw new Error(url);
+    return r.json();
+  }
+  async function loadData() { DATA = await getJSON("data.json"); }
+  async function loadRun(id, force) {
+    const c = RUNCACHE[id], card = DATA.runs.find(r => r.run_id === id);
+    if (c && !force && (card.status === "finished" || Date.now() - c.loadedAt < 60000)) return c;
+    const base = "runs/" + encodeURIComponent(id) + "/";
+    const index = await getJSON(base + "index.json");
+    const old = (c && c.chunks) || {}, chunks = {}, rows = [];
+    // full chunks never change: reuse them and refetch only the last one
+    for (let i = 0; i < index.chunks.length; i++) {
+      const name = index.chunks[i];
+      chunks[name] = old[name] && i < index.chunks.length - 1 ? old[name] : await getJSON(base + name);
+      rows.push(...chunks[name]);
+    }
+    const byId = {};
+    rows.forEach(r => { if (r.id) byId[r.id] = r; });
+    return (RUNCACHE[id] = { index, rows, byId, chunks, loadedAt: Date.now() });
+  }
+  async function code(hash) {
+    if (!CODECACHE[hash]) { const r = await fetch("code/" + hash + ".py"); CODECACHE[hash] = r.ok ? await r.text() : "# program not available"; }
+    return CODECACHE[hash];
+  }
+
+  /* ---------- routing ---------- */
+  function parseRoute() {
+    const m = location.hash.match(/^#\/run\/([^/]+)(?:\/v\/(\d+))?/);
+    ROUTE = m ? { view: "run", id: decodeURIComponent(m[1]), v: m[2] ? +m[2] : null } : { view: "grid" };
+  }
+  window.addEventListener("hashchange", () => {
+    const prev = ROUTE; parseRoute();
+    if (prev.view === "run" && ROUTE.view === "run" && prev.id === ROUTE.id && CH) { if (ROUTE.v != null) select(ROUTE.v, true); return; }
+    window.scrollTo(0, 0); route();
+  });
+  function route() { renderTopbar(); return ROUTE.view === "run" ? renderRun() : renderGrid(); }
+  function renderTopbar() {
+    const running = DATA.runs.filter(r => r.status === "running").length;
+    $("#pulse").className = "pulse" + (running ? "" : " idle");
+    $("#liveText").textContent = (running ? running + " running" : "idle") + " · updated " + ago(DATA.generated_at);
+    $("#gen").textContent = "Data generated " + new Date(DATA.generated_at).toUTCString().replace(" GMT", " UTC");
+  }
+
+  /* ---------- task panels ---------- */
+  function spark(r) {
+    const pts = r.spark || [];
+    if (!pts.length) return "";
+    const w = 300, h = 36, sign = r.direction === "minimize" ? -1 : 1;
+    const xmax = Math.max(r.version || 1, pts[pts.length - 1][0], 1);
+    const vals = pts.slice(pts.length > 2 ? 1 : 0).map(p => p[1] * sign);
+    if (r.published != null) vals.push(r.published * sign);
+    let lo = Math.min(...vals), hi = Math.max(...vals); if (hi === lo) { hi += 1; lo -= 1; }
+    const X = x => 2 + x / xmax * (w - 8), Y = v => 3 + (1 - Math.max(0, Math.min(1, (v * sign - lo) / (hi - lo)))) * (h - 6);
+    let d = "";
+    pts.forEach((p, i) => { d += i ? " H" + X(p[0]).toFixed(1) + " V" + Y(p[1]).toFixed(1) : "M" + X(p[0]).toFixed(1) + " " + Y(p[1]).toFixed(1); });
+    d += " H" + X(xmax).toFixed(1);
+    const color = r.status === "running" ? "#2a78d6" : "#1a1a1a", last = pts[pts.length - 1];
+    let g = "";
+    if (r.published != null) g += '<line x1="0" x2="' + w + '" y1="' + Y(r.published) + '" y2="' + Y(r.published) + '" stroke="#8a8a84" stroke-width="1" stroke-dasharray="3 3" vector-effect="non-scaling-stroke"/>';
+    g += '<path d="' + d + '" fill="none" stroke="' + color + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>';
+    return '<svg class="spark" viewBox="0 0 ' + w + ' ' + h + '" preserveAspectRatio="none" aria-hidden="true">' + g + '</svg>';
+  }
+  function panel(r) {
+    const dg = digitsFor(r.best_value, r.published), pctDone = Math.min(100, 100 * r.B_evals / r.budget);
+    const timing = r.status === "running"
+      ? (r.eta_hours != null ? "about <b>" + hours(r.eta_hours) + "</b> left" : "estimating time left")
+      : "finished in <b>" + hours(r.wall_hours) + "</b>";
+    return '<a class="panel" href="#/run/' + encodeURIComponent(r.run_id) + '" aria-label="' + esc(r.name) + ', ' + r.status + '">' +
+      '<div class="ptop"><div><div class="pname">' + esc(r.name) + (r.warm ? '<span class="tag">warm start</span>' : '') + '</div>' +
+      '<div class="pfam">' + esc(r.family) + ' · ' + (r.direction === "minimize" ? "minimise" : "maximise") + '</div></div>' +
+      '<span class="status ' + r.status + '"><span class="dot"></span>' + (r.status === "running" ? "Running" : "Finished") + '</span></div>' +
+      spark(r) +
+      '<div class="pprog"><div class="bar' + (r.status === "running" ? "" : " done") + '"><i style="width:' + pctDone.toFixed(1) + '%"></i></div><span class="num">' + r.B_evals + '/' + r.budget + ' evals</span></div>' +
+      '<div class="pmeta"><span>version <b>' + n(r.version) + '</b></span><span>' + timing + '</span></div>' +
+      '<div class="vals"><div><div class="k">Seed</div><div class="v" title="' + esc(r.seed_value) + '">' + esc(fmt(r.seed_value, 6)) + '</div></div>' +
+      '<div class="ours"><div class="k">Our best</div><div class="v" title="' + esc(r.best_value) + '">' + esc(fmt(r.best_value, dg)) + '</div></div>' +
+      '<div><div class="k">Literature</div><div class="v" title="' + esc(r.published) + '">' + esc(fmt(r.published, dg)) + '</div></div></div>' +
+      '<div class="pfoot">' + badge(r) + '<span class="open">Details →</span></div></a>';
+  }
+  function renderGrid() {
+    document.title = "SCiEL Live Results";
+    CH = null;
+    const runs = DATA.runs, running = runs.filter(r => r.status === "running"), done = runs.filter(r => r.status === "finished");
+    const tasksAtLit = new Set(runs.filter(isLit).map(r => r.suite_id));
+    const versions = runs.reduce((s, r) => s + (r.iterations || 0), 0), evals = runs.reduce((s, r) => s + (r.B_evals || 0), 0);
+    const counts = { all: runs.length, running: running.length, finished: done.length, lit: runs.filter(isLit).length };
+    const names = { all: "All", running: "Running", finished: "Finished", lit: "At or beyond literature" };
+    const shown = runs.filter(r => FILTER === "all" || (FILTER === "lit" ? isLit(r) : r.status === FILTER))
+      .sort((a, b) => (a.status === b.status ? 0 : a.status === "running" ? -1 : 1) ||
+        (a.status === "running" ? (a.eta_hours ?? 1e9) - (b.eta_hours ?? 1e9) : (b.last_event || "").localeCompare(a.last_event || "")));
+    $("#app").innerHTML =
+      '<header class="hero wrap"><p class="eyebrow">SCiEL · ' + esc(DATA.engine.model) + ' · autoresearch-tasks</p>' +
+      '<h1>Evolutionary search with a single open model, live.</h1>' +
+      '<p class="lede">SCiEL evolves programs for open problems in mathematics, physics and combinatorics, with one locally served 27B open-weight model as its only LLM. Each task gets ' + DATA.engine.budget + ' evaluations. Every panel below is a run: open it to follow the search version by version, see which search step produced each program, and read the algorithm it found.</p>' +
+      '<div class="stats">' + [
+        ["Tasks finished", done.length, "of " + runs.length + " runs started"],
+        ["Running now", running.length, DATA.scheduler.queue_left != null ? DATA.scheduler.queue_left + " more tasks queued" : ""],
+        ["At or beyond literature", tasksAtLit.size, tasksAtLit.size === 1 ? "task" : "tasks"],
+        ["Program versions", n(versions), n(evals) + " evaluations"],
+      ].map(s => '<div class="stat"><div class="k">' + s[0] + '</div><div class="v">' + s[1] + '</div><div class="s">' + esc(s[2]) + '</div></div>').join("") + '</div></header>' +
+      '<section class="wrap"><h2>Tasks</h2><p class="sub">Running tasks first, soonest to finish at the top. Each line traces the best value so far; the dashed line is the best value reported in the literature.</p>' +
+      '<div class="filters" role="group" aria-label="Filter tasks">' + Object.keys(names).map(k => '<button class="chip" data-f="' + k + '" aria-pressed="' + (FILTER === k) + '">' + names[k] + '<span class="n">' + counts[k] + '</span></button>').join("") + '</div>' +
+      '<div class="grid">' + (shown.map(panel).join("") || '<div class="empty">No tasks in this view.</div>') + '</div></section>' +
+      '<section class="wrap"><h2>Setup</h2><div class="setup">' + DATA.setup.map(b => '<div class="box"><h3>' + esc(b.title) + '</h3>' + md(b.body) + '</div>').join("") + '</div></section>';
+  }
+
+  /* ---------- run detail ---------- */
+  async function renderRun() {
+    const card = DATA.runs.find(r => r.run_id === ROUTE.id);
+    const back = '<a class="back" href="#/">← All tasks</a>';
+    if (!card) { $("#app").innerHTML = '<div class="wrap">' + back + '<p class="empty">This run is not in the current data.</p></div>'; return; }
+    document.title = card.name + " · SCiEL Live Results";
+    if (!RUNCACHE[card.run_id]) $("#app").innerHTML = '<div class="wrap">' + back + '<div class="loading">Loading run…</div></div>';
+    let run;
+    try { run = await loadRun(card.run_id); } catch (e) { $("#app").innerHTML = '<div class="wrap">' + back + '<p class="empty">Could not load this run.</p></div>'; return; }
+    if (ROUTE.view !== "run" || ROUTE.id !== card.run_id) return;
+    const ix = run.index, t = ix.task, dg = digitsFor(card.best_value, card.published);
+    const ops = OPS.map(o => [o, Object.entries(ix.operators).filter(([k]) => k !== "none" && opKey(k) === o[0]).reduce((s, [, c]) => s + c, 0)]).filter(x => x[1] > 0);
+    const opTotal = ops.reduce((s, x) => s + x[1], 0) || 1;
+    const sel = ROUTE.v != null ? ROUTE.v : card.best_version;
+    $("#app").innerHTML = '<div class="wrap">' + back +
+      '<div class="dhead"><div><h1>' + esc(card.name) + '</h1><div class="dsub"><span class="status ' + card.status + '"><span class="dot"></span>' + (card.status === "running" ? "Running" : "Finished") + '</span>' +
+      (card.warm ? '<span class="tag" style="margin:0">warm start</span>' : '') + '<span>' + esc(t.family) + '</span><span>·</span><span>' + (card.direction === "minimize" ? "lower is better" : "higher is better") + '</span></div></div>' +
+      '<div>' + badge(card) + '</div></div>' +
+      '<div class="kpis" id="kpis">' + kpis(card, dg) + '</div>' +
+
+      '<div class="box"><div class="charthead"><div><h3 style="margin:0 0 6px">Objective by version</h3><div class="legend">' +
+      ops.map(([o]) => '<span><i class="sw" style="background:' + o[2] + '"></i>' + o[1] + '</span>').join("") +
+      '<span><i class="ln"></i>Best so far</span>' + (card.published != null ? '<span><i class="dash"></i>Literature</span>' : '') + '<span><i class="x">×</i>Failed</span></div></div>' +
+      '<div class="seg" role="group" aria-label="Vertical range"><button data-zoom="focus" aria-pressed="' + (ZOOM === "focus") + '">Best region</button><button data-zoom="full" aria-pressed="' + (ZOOM === "full") + '">Full range</button></div></div>' +
+      '<div class="chartwrap" id="chartwrap"></div><div class="hint">Each marker is one program version, coloured by the search operator that produced it. Hover to preview, click to inspect.' + (card.status === "running" ? " The chart updates while the run is going." : "") + '</div>' +
+      '<div class="inspector" id="inspector"></div></div>' +
+
+      '<div class="cols mt">' +
+      '<div class="box"><h3>The task</h3><div class="prose">' + md(t.description || "") + '</div>' +
+      (t.contract ? '<div class="contract">' + esc(t.contract) + '</div>' : '') +
+      (Object.keys(t.parameters || {}).length ? '<dl class="facts" style="margin-top:12px">' + Object.entries(t.parameters).map(([k, v]) => '<dt>' + esc(k) + '</dt><dd class="num">' + esc(typeof v === "object" ? JSON.stringify(v) : v) + '</dd>').join("") + '</dl>' : '') + '</div>' +
+      '<div class="box"><h3>Experiment</h3><dl class="facts">' +
+      '<dt>Model</dt><dd>' + esc(ix.model) + ' (local vLLM)</dd>' +
+      '<dt>Search</dt><dd>SCiEL, 4 workers, ' + card.budget + ' evaluations' + (card.warm ? ', warm-started from the previous best program' : '') + '</dd>' +
+      '<dt>Run</dt><dd class="num" style="font-size:12px">' + esc(card.run_id) + '</dd>' +
+      '<dt>Started</dt><dd>' + when(card.started) + '</dd>' +
+      '<dt>Last activity</dt><dd>' + when(card.last_event) + '</dd>' +
+      '<dt>Model calls</dt><dd>' + n(ix.llm_calls) + (ix.completion_tokens ? ' · ' + n(ix.completion_tokens) + ' tokens' : '') + '</dd>' +
+      '<dt>Failed versions</dt><dd>' + n(ix.failed) + ' of ' + n(card.iterations) + '</dd></dl>' +
+      '<div class="opmix" aria-hidden="true">' + ops.map(([o, c]) => '<i style="width:' + (100 * c / opTotal) + '%;background:' + o[2] + '"></i>').join("") + '</div>' +
+      '<div class="legend">' + ops.map(([o, c]) => '<span><i class="sw" style="background:' + o[2] + '"></i>' + o[1] + ' · ' + c + '</span>').join("") + '</div>' +
+      (card.verified ? '<div class="callout ok">✓ ' + esc(card.verified) + '</div>' : '') +
+      (card.note ? '<div class="callout">' + esc(card.note) + '</div>' : '') +
+      (card.program ? '<p style="margin:14px 0 0;font-size:13.5px;font-weight:500"><a href="' + esc(card.program) + '">Download the best program (.py)</a></p>' : '') + '</div></div>' +
+
+      '<div class="box mt"><h3>How the search went</h3>' +
+      (ix.summary ? '<div class="prose" id="summary"><p style="font-family:var(--sans);font-size:12px;color:var(--faint)">Written by ' + esc(ix.model) + ' from the trajectory and the code' + (ix.summary_lang === "en" ? "" : " (Chinese original)") + '. Check claims against the program.</p>' + md(ix.summary) + '</div>'
+        : '<p class="prose" style="color:var(--muted);margin:0">' + (card.status === "running" ? "A model-written account of the whole search appears here when the run finishes. Until then, inspect individual versions in the chart above." : "No summary available.") + '</p>') + '</div>' +
+
+      '<div class="box mt"><h3>Improvements</h3><div class="tablebox"><table class="list"><thead><tr><th>Version</th><th>Evaluation</th><th>Value</th><th>Operator</th><th>Mode</th><th>Time</th></tr></thead><tbody id="imps"></tbody></table></div></div>' +
+      '</div>';
+    if ($("#summary")) math($("#summary"));
+    drawChart(card, run);
+    renderImprovements(card, run, sel);
+    renderInspector(card, run, sel);
+  }
+  function kpis(card, dg) {
+    return [
+      ["Version", n(card.version), n(card.iterations) + " programs generated", false],
+      ["Evaluations", card.B_evals + " / " + card.budget, card.evals_per_hour ? card.evals_per_hour + " per hour" : "", false],
+      [card.status === "running" ? "Time left" : "Wall time", card.status === "running" ? (card.eta_hours != null ? "≈ " + hours(card.eta_hours) : "—") : hours(card.wall_hours), "started " + when(card.started), false],
+      ["Seed", fmt(card.seed_value, 7), "starting program", true],
+      ["Our best", fmt(card.best_value, dg), card.best_version != null ? "version " + card.best_version : "", true],
+      ["Literature best", fmt(card.published, dg), card.published == null ? "no reference value" : "reported value", true],
+    ].map(k => '<div class="kpi"><div class="k">' + k[0] + '</div><div class="v' + (k[3] ? " mono" : "") + '">' + esc(k[1]) + '</div><div class="s">' + esc(k[2]) + '</div></div>').join("");
+  }
+  function improvements(card, run) {
+    const sign = card.direction === "minimize" ? -1 : 1;
+    let best = card.seed_value; const out = [];
+    for (const r of run.rows) if (r.ok && sign * r.val > sign * best) { best = r.val; out.push(r); }
+    return out;
+  }
+  function renderImprovements(card, run, sel) {
+    const imps = improvements(card, run).reverse();
+    $("#imps").innerHTML = imps.map(r => '<tr data-v="' + r.v + '"' + (r.v === sel ? ' class="sel"' : '') + '><td class="num">' + r.v + '</td><td class="num">' + (r.e ?? "—") + '</td><td class="num">' + esc(fmt(r.val, 10)) + '</td><td><span class="pill"><i style="background:' + opColor(r.op) + '"></i>' + esc(opName(r.op)) + '</span></td><td>' + esc(r.mode || "—") + '</td><td>' + when(r.t) + '</td></tr>').join("") ||
+      '<tr><td colspan="6" class="empty">No improvement over the seed yet.</td></tr>';
+  }
+
+  /* chart: x = version, y = objective; markers coloured by operator, best-so-far step line */
+  function drawChart(card, run) {
+    const wrap = $("#chartwrap");
+    const W = Math.max(320, Math.round(wrap.clientWidth || 900)), H = W < 560 ? 280 : 360;
+    const pad = { l: W < 560 ? 54 : 74, r: 14, t: 16, b: 56 };
+    const rows = run.rows, ok = rows.filter(r => r.ok);
+    const xmax = Math.max(rows.length ? rows[rows.length - 1].v : 1, 1);
+    const sign = card.direction === "minimize" ? -1 : 1;
+    let lo, hi;
+    const vals = ok.map(r => r.val);
+    if (!vals.length) { lo = card.seed_value - 1; hi = card.seed_value + 1; }
+    else if (ZOOM === "full") {
+      const all = vals.concat([card.seed_value], card.published != null ? [card.published] : []);
+      lo = Math.min(...all); hi = Math.max(...all);
+    } else {
+      // "best region": the better three quarters of versions, plus the literature value
+      const good = vals.map(v => v * sign).sort((a, b) => a - b);
+      const cut = good[Math.floor(good.length * 0.25)];
+      const top = Math.max(good[good.length - 1], card.published != null ? card.published * sign : -Infinity);
+      const span = (top - cut) || Math.abs(top) * 1e-3 || 1;
+      const a = cut - span * 0.06, b = top + span * 0.1;
+      lo = sign > 0 ? a : -b; hi = sign > 0 ? b : -a;
+    }
+    if (hi === lo) { hi += 1; lo -= 1; }
+    const plotB = H - pad.b, failY = H - 14;
+    const X = v => pad.l + (v / xmax) * (W - pad.l - pad.r);
+    const Yraw = v => pad.t + (1 - (v - lo) / (hi - lo)) * (plotB - pad.t);
+    const Y = v => Math.max(pad.t, Math.min(plotB, Yraw(v)));
+    let g = "";
+    niceTicks(lo, hi, 5).forEach(tv => {
+      const y = Yraw(tv); if (y < pad.t - 1 || y > plotB + 1) return;
+      g += '<line x1="' + pad.l + '" x2="' + (W - pad.r) + '" y1="' + y + '" y2="' + y + '" stroke="rgba(0,0,0,0.06)"/>';
+      g += '<text x="' + (pad.l - 8) + '" y="' + (y + 4) + '" font-size="11" fill="#8a8a84" text-anchor="end">' + esc(fmt(tv, 6)) + '</text>';
+    });
+    niceTicks(0, xmax, W < 560 ? 4 : 7).forEach(tv => {
+      if (tv >= 0 && tv <= xmax) g += '<text x="' + X(tv) + '" y="' + (plotB + 16) + '" font-size="11" fill="#8a8a84" text-anchor="middle">' + tv + '</text>';
+    });
+    g += '<line x1="' + pad.l + '" x2="' + (W - pad.r) + '" y1="' + plotB + '" y2="' + plotB + '" stroke="rgba(0,0,0,0.18)"/>';
+    g += '<text x="' + (pad.l + (W - pad.l - pad.r) / 2) + '" y="' + (plotB + 33) + '" font-size="11.5" fill="#55554f" text-anchor="middle">version</text>';
+    g += '<text x="' + (pad.l - 8) + '" y="' + (failY + 4) + '" font-size="10.5" fill="#8a8a84" text-anchor="end">failed</text>';
+    if (card.published != null) {
+      const y = Yraw(card.published);
+      if (y >= pad.t - 1 && y <= plotB + 1) {
+        g += '<line x1="' + pad.l + '" x2="' + (W - pad.r) + '" y1="' + y + '" y2="' + y + '" stroke="#8a8a84" stroke-width="1.2" stroke-dasharray="4 4"/>';
+        g += '<text x="' + (W - pad.r) + '" y="' + (y - 6) + '" font-size="11" fill="#55554f" text-anchor="end">literature ' + esc(fmt(card.published, 8)) + '</text>';
+      }
+    }
+    let best = card.seed_value, d = "M" + X(0).toFixed(1) + " " + Y(best).toFixed(1);
+    for (const r of ok) if (sign * r.val > sign * best) { best = r.val; d += " H" + X(r.v).toFixed(1) + " V" + Y(best).toFixed(1); }
+    d += " H" + X(xmax).toFixed(1);
+    const pts = [];
+    for (const r of rows) {
+      const x = X(r.v);
+      if (r.ok) {
+        const yv = Yraw(r.val), clipped = yv < pad.t || yv > plotB, y = Y(r.val);
+        pts.push({ r, x, y });
+        g += clipped
+          ? '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2.5" fill="#fff" stroke="' + opColor(r.op) + '" stroke-width="1.4"/>'
+          : '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="4" fill="' + opColor(r.op) + '" stroke="#fff" stroke-width="1.5"/>';
+      } else {
+        pts.push({ r, x, y: failY });
+        g += '<path d="M' + (x - 3).toFixed(1) + ' ' + (failY - 3) + 'l6 6m0 -6l-6 6" stroke="#b5b5ae" stroke-width="1.4" stroke-linecap="round"/>';
+      }
+    }
+    g += '<path d="' + d + '" fill="none" stroke="#1a1a1a" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
+    g += '<g id="selmark"></g><line id="cross" x1="0" x2="0" y1="' + pad.t + '" y2="' + plotB + '" stroke="rgba(0,0,0,0.22)" visibility="hidden"/>';
+    wrap.innerHTML = '<svg class="chart" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Objective value of every program version for ' + esc(card.name) + '">' + g + '</svg>';
+    CH = { card, run, pts, W };
+    markSelected(ROUTE.v != null ? ROUTE.v : card.best_version);
+    const svg = $("svg.chart", wrap), tip = $("#tip"), cross = $("#cross", wrap);
+    const nearest = ev => {
+      const box = svg.getBoundingClientRect(), s = W / box.width;
+      const px = (ev.clientX - box.left) * s, py = (ev.clientY - box.top) * s;
+      let bp = null, bd = Infinity;
+      for (const p of pts) { const dd = (p.x - px) ** 2 + 0.35 * (p.y - py) ** 2; if (dd < bd) { bd = dd; bp = p; } }
+      return bd < (28 * s) ** 2 ? { p: bp, box, s } : null;
+    };
+    let lastHit = null;
+    svg.addEventListener("pointermove", ev => {
+      const hit = lastHit = nearest(ev);
+      if (!hit) { tip.hidden = true; cross.setAttribute("visibility", "hidden"); svg.style.cursor = "default"; return; }
+      const r = hit.p.r;
+      tip.innerHTML = 'version <b>' + r.v + '</b> · <span class="op" style="background:' + opColor(r.op) + '"></span>' + esc(opName(r.op)) + '<br>' + (r.ok ? 'value <b>' + esc(fmt(r.val, 10)) + '</b>' : 'failed');
+      tip.style.left = (hit.box.left + hit.p.x / hit.s) + "px"; tip.style.top = (hit.box.top + hit.p.y / hit.s) + "px"; tip.hidden = false;
+      cross.setAttribute("x1", hit.p.x); cross.setAttribute("x2", hit.p.x); cross.setAttribute("visibility", "visible");
+      svg.style.cursor = "pointer";
+    });
+    svg.addEventListener("pointerleave", () => { lastHit = null; tip.hidden = true; cross.setAttribute("visibility", "hidden"); });
+    // click picks the version the tooltip is showing
+    svg.addEventListener("click", ev => { const hit = lastHit || nearest(ev); if (hit) select(hit.p.r.v); });
+  }
+  function markSelected(v) {
+    const g = $("#selmark"); if (!g || !CH) return;
+    const p = CH.pts.find(q => q.r.v === v);
+    g.innerHTML = p ? '<circle cx="' + p.x + '" cy="' + p.y + '" r="8.5" fill="none" stroke="#1a1a1a" stroke-width="2"/>' : "";
+  }
+  function niceTicks(lo, hi, count) {
+    const span = hi - lo; if (!(span > 0)) return [lo];
+    const step0 = span / count, mag = Math.pow(10, Math.floor(Math.log10(step0)));
+    const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= step0) || 10 * mag;
+    const out = []; for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) out.push(Number(v.toPrecision(12)));
+    return out;
+  }
+  function select(v, fromHash) {
+    if (!CH) return;
+    if (!fromHash) history.replaceState(null, "", "#/run/" + encodeURIComponent(CH.card.run_id) + "/v/" + v);
+    ROUTE.v = v;
+    markSelected(v);
+    document.querySelectorAll("#imps tr[data-v]").forEach(tr => tr.classList.toggle("sel", +tr.dataset.v === v));
+    renderInspector(CH.card, CH.run, v);
+  }
+
+  async function renderInspector(card, run, v) {
+    const box = $("#inspector"); if (!box) return;
+    const rows = run.rows, i = rows.findIndex(r => r.v === v), r = rows[i];
+    if (!r) { box.innerHTML = '<p class="hint" style="margin:0">Click a marker to inspect that version.</p>'; return; }
+    const parent = r.par ? run.byId[r.par] : null;
+    const parentTxt = !r.par ? "—" : parent
+      ? '<a href="#/run/' + encodeURIComponent(card.run_id) + '/v/' + parent.v + '">version ' + parent.v + '</a> <span style="color:var(--faint)">' + (parent.ok ? "value " + esc(fmt(parent.val, 8)) : "") + '</span>'
+      : esc(r.par) + ' <span style="color:var(--faint)">(' + (i === 0 || /^p[01]$/.test(r.par) ? "starting program" : "program outside this run\'s version log") + ')</span>';
+    let delta = "";
+    if (r.ok && parent && parent.ok) {
+      const dlt = r.val - parent.val, better = (card.direction === "minimize" ? -dlt : dlt) > 0;
+      delta = ' <span style="color:' + (better ? "var(--good)" : "var(--muted)") + '">' + (dlt >= 0 ? "+" : "") + esc(fmt(dlt, 4)) + ' vs parent</span>';
+    }
+    const selBy = r.sel ? (SELECTOR[r.sel] || r.sel) : null;
+    box.innerHTML =
+      '<div class="ihead"><div><div class="t">Version <span class="num">' + r.v + '</span>' + (card.best_version === r.v ? ' <span class="badge beat" style="vertical-align:3px">best so far</span>' : '') + '</div>' +
+      '<div class="s">' + (r.e != null ? 'evaluation ' + r.e + ' · ' : '') + when(r.t) + (r.sec != null ? ' · evaluated in ' + r.sec + ' s' : '') + '</div></div>' +
+      '<div class="navbtns"><button data-nav="-1"' + (i <= 0 ? " disabled" : "") + '>← Previous</button><button data-nav="1"' + (i >= rows.length - 1 ? " disabled" : "") + '>Next →</button></div></div>' +
+      '<div class="icols">' +
+      '<div class="icard"><h4>Search step <span class="pill"><i style="background:' + opColor(r.op) + '"></i>' + esc(opName(r.op)) + '</span></h4><div class="step">' +
+      '<div class="row"><span class="k">Operator</span><span>' + esc(opName(r.op)) + ': ' + esc(OPDESC[opKey(r.op)]) + (r.req && r.req !== r.op ? '<br><span style="color:var(--muted)">requested ' + esc(opName(r.req)) + (r.fb ? '; fell back because ' + esc(r.fb) : '') + '</span>' : '') + '</span></div>' +
+      (selBy ? '<div class="row"><span class="k">Chosen by</span><span>' + esc(selBy) + (r.opp != null ? ' <span style="color:var(--faint)">(p = ' + esc(fmt(r.opp, 3)) + ')</span>' : '') + '</span></div>' : '') +
+      '<div class="row"><span class="k">Mode</span><span>' + esc(r.mode || "—") + '</span></div>' +
+      '<div class="row"><span class="k">Island</span><span>' + esc(r.isl ?? "—") + '</span></div>' +
+      '<div class="row"><span class="k">Parent</span><span>' + parentTxt + '</span></div>' +
+      '<div class="row"><span class="k">Model</span><span>' + esc(r.model || "—") + '</span></div>' +
+      '<div class="row"><span class="k">Result</span><span>' + (r.ok ? '<b class="num">' + esc(fmt(r.val, 12)) + '</b>' + delta + (r.conf === true ? '<br><span style="color:var(--muted)">re-measured, consistent</span>' : '') : '<span style="color:#9a3412">failed</span>') + '</span></div>' +
+      '</div></div>' +
+      '<div class="icard"><h4>Found algorithm</h4>' +
+      (r.bet ? '<p class="quote">' + esc(r.bet) + '</p>' + (r.q != null ? '<p style="font-size:12px;color:var(--faint);margin:6px 0 12px">The model\'s hypothesis for why this version should help, with its own estimate of success: ' + Math.round(r.q * 100) + '%.</p>' : '') : '') +
+      (r.err ? '<div class="err">' + esc(r.err) + '</div>' : '') +
+      (r.notes ? '<h4 style="margin-top:12px">Model notes</h4><div class="notes">' + esc(r.notes) + '</div>' : (!r.bet && !r.err ? '<p style="color:var(--faint);font-size:13px;margin:0">The model returned only code for this version; read it below.</p>' : '')) +
+      '</div></div>' +
+      (r.patch ? '<div class="codebox"><div class="codehead"><span>Patch the model applied to the parent (search → replace)</span></div><pre class="code collapsed"><code class="language-python" id="patchview">' + esc(r.patch) + '</code></pre></div>' : '') +
+      (r.code ? '<div class="codebox"><div class="codehead"><span>Full program of version ' + r.v + '</span><span style="display:flex;gap:14px"><button id="expand">Expand</button><a href="code/' + r.code + '.py" target="_blank" rel="noopener">Raw file</a></span></div><pre class="code collapsed"><code class="language-python" id="codeview">Loading…</code></pre></div>' : '');
+    box.querySelectorAll("[data-nav]").forEach(b => b.addEventListener("click", () => { const j = i + +b.dataset.nav; if (rows[j]) select(rows[j].v); }));
+    const pv = $("#patchview");
+    if (pv && window.hljs) hljs.highlightElement(pv);
+    if (r.code) {
+      const text = await code(r.code);
+      const el = $("#codeview");
+      if (!el || ROUTE.v != null && ROUTE.v !== v) return;
+      el.textContent = text;
+      if (window.hljs) hljs.highlightElement(el);
+      const ex = $("#expand");
+      ex.addEventListener("click", () => { const pre = el.parentElement; pre.classList.toggle("collapsed"); ex.textContent = pre.classList.contains("collapsed") ? "Expand" : "Collapse"; });
+    }
+  }
+
+  /* ---------- events & live refresh ---------- */
+  document.addEventListener("click", ev => {
+    const chip = ev.target.closest(".chip");
+    if (chip) { FILTER = chip.dataset.f; renderGrid(); return; }
+    const z = ev.target.closest("[data-zoom]");
+    if (z && CH) { ZOOM = z.dataset.zoom; document.querySelectorAll("[data-zoom]").forEach(b => b.setAttribute("aria-pressed", String(b === z))); drawChart(CH.card, CH.run); return; }
+    const tr = ev.target.closest("#imps tr[data-v]");
+    if (tr && CH) { select(+tr.dataset.v); $("#chartwrap").scrollIntoView({ behavior: "smooth", block: "center" }); }
+  });
+  let rz;
+  window.addEventListener("resize", () => { clearTimeout(rz); rz = setTimeout(() => { if (CH && ROUTE.view === "run") drawChart(CH.card, CH.run); }, 150); });
+
+  async function refresh() {
+    try {
+      await loadData();
+      renderTopbar();
+      if (ROUTE.view !== "run") return renderGrid();
+      const card = DATA.runs.find(r => r.run_id === ROUTE.id);
+      if (!card || !CH) return;
+      const run = await loadRun(card.run_id, card.status === "running");
+      // live update in place: keep the selected version and the scroll position
+      CH.card = card;
+      $("#kpis").innerHTML = kpis(card, digitsFor(card.best_value, card.published));
+      drawChart(card, run);
+      renderImprovements(card, run, ROUTE.v != null ? ROUTE.v : card.best_version);
+    } catch (e) { $("#liveText").textContent = "could not refresh"; }
+  }
+
+  (async function init() {
+    parseRoute();
+    try { await loadData(); } catch (e) { $("#app").innerHTML = '<div class="wrap empty">Could not load results.</div>'; return; }
+    route();
+    setInterval(refresh, 2 * 60 * 1000);
+    setInterval(() => DATA && renderTopbar(), 30 * 1000);
+  })();
+})();
+</script>
+</body>
+</html>

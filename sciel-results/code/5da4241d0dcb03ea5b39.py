@@ -1,0 +1,700 @@
+"""Circle packing in unit square - 26 circles maximizing sum of radii."""
+import numpy as np
+import time
+
+N = 26
+
+# EVOLVE-BLOCK-START
+
+def _is_valid(pos, radii, tol=1e-9):
+    """Check if circles are valid (inside square, disjoint interiors)."""
+    n = len(radii)
+    for i in range(n):
+        if pos[i, 0] - radii[i] < -tol or pos[i, 0] + radii[i] > 1.0 + tol:
+            return False
+        if pos[i, 1] - radii[i] < -tol or pos[i, 1] + radii[i] > 1.0 + tol:
+            return False
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = pos[i, 0] - pos[j, 0]
+            dy = pos[i, 1] - pos[j, 1]
+            dist = np.sqrt(dx * dx + dy * dy)
+            if dist < radii[i] + radii[j] - tol:
+                return False
+    return True
+
+
+def _penalty(pos, radii):
+    """Total constraint violation (sum of squared violations)."""
+    n = len(radii)
+    pen = 0.0
+    for i in range(n):
+        if pos[i, 0] < radii[i]:
+            pen += (radii[i] - pos[i, 0])**2
+        if pos[i, 0] > 1.0 - radii[i]:
+            pen += (pos[i, 0] - (1.0 - radii[i]))**2
+        if pos[i, 1] < radii[i]:
+            pen += (radii[i] - pos[i, 1])**2
+        if pos[i, 1] > 1.0 - radii[i]:
+            pen += (pos[i, 1] - (1.0 - radii[i]))**2
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = pos[i, 0] - pos[j, 0]
+            dy = pos[i, 1] - pos[j, 1]
+            dist = np.sqrt(dx * dx + dy * dy)
+            min_d = radii[i] + radii[j]
+            if dist < min_d:
+                pen += (min_d - dist)**2
+    return pen
+
+
+def _smooth_penalty(pos, radii, beta=80.0):
+    """Smooth log-sum-exp penalty for better gradient flow in optimization."""
+    n = len(radii)
+    violations = np.zeros(4 * n + n * (n - 1) // 2)
+    idx = 0
+    for i in range(n):
+        v = radii[i] - pos[i, 0]
+        violations[idx] = max(0.0, v)
+        idx += 1
+        v = pos[i, 0] - (1.0 - radii[i])
+        violations[idx] = max(0.0, v)
+        idx += 1
+        v = radii[i] - pos[i, 1]
+        violations[idx] = max(0.0, v)
+        idx += 1
+        v = pos[i, 1] - (1.0 - radii[i])
+        violations[idx] = max(0.0, v)
+        idx += 1
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = pos[i, 0] - pos[j, 0]
+            dy = pos[i, 1] - pos[j, 1]
+            dist = np.sqrt(dx * dx + dy * dy)
+            min_d = radii[i] + radii[j]
+            violations[idx] = max(0.0, min_d - dist)
+            idx += 1
+    
+    # Log-sum-exp for smooth max-like penalty
+    max_v = np.max(violations)
+    if max_v < 1e-15:
+        return 0.0
+    log_sum = max_v + np.log(np.sum(np.exp((violations - max_v) * beta)) / len(violations))
+    return log_sum / beta
+
+
+def _score(pos, radii):
+    """Sum of radii (the objective to maximize)."""
+    return float(np.sum(radii))
+
+
+def _fix_boundaries(pos, radii):
+    """Shrink radii to fit within boundaries."""
+    radii = radii.copy()
+    for i in range(N):
+        max_r = min(pos[i, 0], 1.0 - pos[i, 0], pos[i, 1], 1.0 - pos[i, 1])
+        if radii[i] > max_r:
+            radii[i] = max(0.001, max_r * 0.999)
+    return radii
+
+
+def _resolve_overlaps(pos, radii, max_iter=200):
+    """Iteratively shrink radii to resolve overlaps."""
+    radii = radii.copy()
+    for _ in range(max_iter):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = pos[i, 0] - pos[j, 0]
+                dy = pos[i, 1] - pos[j, 1]
+                dist = np.sqrt(dx * dx + dy * dy)
+                min_d = radii[i] + radii[j]
+                if dist < min_d:
+                    scale = (dist / min_d) * 0.999 if min_d > 0 else 0.999
+                    radii[i] *= scale
+                    radii[j] *= scale
+                    changed = True
+        radii = _fix_boundaries(pos, radii)
+        if not changed:
+            break
+    return radii
+
+
+def _growth_pass(pos, radii, max_iter=500, step=0.002):
+    """Try to grow each radius greedily while maintaining validity."""
+    radii = radii.copy()
+    for it in range(max_iter):
+        improved = False
+        for i in range(N):
+            # Try growing circle i
+            new_r = radii[i] + step
+            # Check boundary
+            if new_r > min(pos[i, 0], 1.0 - pos[i, 0], pos[i, 1], 1.0 - pos[i, 1]):
+                continue
+            # Check overlap with all others
+            valid = True
+            for j in range(N):
+                if i == j:
+                    continue
+                dx = pos[i, 0] - pos[j, 0]
+                dy = pos[i, 1] - pos[j, 1]
+                dist = np.sqrt(dx * dx + dy * dy)
+                if dist < new_r + radii[j] - 1e-10:
+                    valid = False
+                    break
+            if valid:
+                radii[i] = new_r
+                improved = True
+        if not improved:
+            # Try smaller steps
+            step *= 0.5
+            if step < 1e-6:
+                break
+    return radii
+
+
+def _make_grid(seed=42):
+    """5x5 grid with one extra circle."""
+    rng = np.random.RandomState(seed)
+    side = 5
+    pos = np.zeros((N, 2))
+    radii = np.zeros(N)
+    for i in range(5):
+        for j in range(5):
+            idx = i * 5 + j
+            if idx < N:
+                pos[idx] = [(i + 0.5) / side, (j + 0.5) / side]
+                radii[idx] = 0.5 / side - 0.003
+    # 26th circle in a gap
+    pos[25] = [0.5, 0.02]
+    radii[25] = 0.015
+    return pos, radii
+
+
+def _make_hexagonal(seed=42):
+    """Hexagonal packing pattern."""
+    rng = np.random.RandomState(seed)
+    pos = np.zeros((N, 2))
+    radii = np.zeros(N)
+    r = 0.095
+    idx = 0
+    for row in range(6):
+        y = 0.1 + row * r * np.sqrt(3)
+        if y > 0.9:
+            break
+        offset = r if row % 2 == 0 else 2 * r
+        for col in range(5):
+            x = offset + col * 2 * r
+            if x > 0.9:
+                break
+            if idx < N:
+                pos[idx] = [x, y]
+                radii[idx] = r
+                idx += 1
+    # Fill remaining
+    while idx < N:
+        pos[idx] = [0.5, 0.5]
+        radii[idx] = 0.05
+        idx += 1
+    return pos, radii
+
+
+def _make_random(seed=42):
+    """Random initial configuration."""
+    rng = np.random.RandomState(seed)
+    pos = rng.uniform(0.1, 0.9, size=(N, 2))
+    radii = rng.uniform(0.03, 0.08, size=N)
+    return pos, radii
+
+
+def _make_mixed(seed=42):
+    """Mixed: some grid, some random."""
+    rng = np.random.RandomState(seed)
+    pos = np.zeros((N, 2))
+    radii = np.zeros(N)
+    # 16 grid circles
+    side = 4
+    idx = 0
+    for i in range(4):
+        for j in range(4):
+            pos[idx] = [(i + 0.5) / side, (j + 0.5) / side]
+            radii[idx] = 0.5 / side - 0.005
+            idx += 1
+    # 10 random circles
+    pos[idx:idx+10] = rng.uniform(0.05, 0.95, size=(10, 2))
+    radii[idx:idx+10] = rng.uniform(0.03, 0.07, size=10)
+    return pos, radii
+
+
+def _make_center_ring(seed=42):
+    """Central circle with ring of circles around it, plus corners."""
+    rng = np.random.RandomState(seed)
+    pos = np.zeros((N, 2))
+    radii = np.zeros(N)
+    
+    # Central circle
+    pos[0] = [0.5, 0.5]
+    radii[0] = 0.18
+    
+    # Ring of 8 circles around center
+    ring_r = 0.12
+    ring_dist = 0.18 + ring_r + 0.01
+    for k in range(8):
+        angle = k * 2 * np.pi / 8
+        x = 0.5 + ring_dist * np.cos(angle)
+        y = 0.5 + ring_dist * np.sin(angle)
+        x = np.clip(x, ring_r, 1 - ring_r)
+        y = np.clip(y, ring_r, 1 - ring_r)
+        pos[1 + k] = [x, y]
+        radii[1 + k] = ring_r
+    
+    # Corner circles
+    corner_r = 0.10
+    corners = [(corner_r, corner_r), (1-corner_r, corner_r),
+               (corner_r, 1-corner_r), (1-corner_r, 1-corner_r)]
+    for k, (cx, cy) in enumerate(corners):
+        pos[9 + k] = [cx, cy]
+        radii[9 + k] = corner_r
+    
+    # Edge midpoints
+    edge_r = 0.09
+    edges = [(0.5, edge_r), (0.5, 1-edge_r), (edge_r, 0.5), (1-edge_r, 0.5)]
+    for k, (ex, ey) in enumerate(edges):
+        pos[13 + k] = [ex, ey]
+        radii[13 + k] = edge_r
+    
+    # Fill remaining with smaller circles in gaps
+    remaining = N - 17
+    for k in range(remaining):
+        angle = rng.uniform(0, 2*np.pi)
+        dist = rng.uniform(0.25, 0.42)
+        x = 0.5 + dist * np.cos(angle)
+        y = 0.5 + dist * np.sin(angle)
+        x = np.clip(x, 0.05, 0.95)
+        y = np.clip(y, 0.05, 0.95)
+        pos[17 + k] = [x, y]
+        radii[17 + k] = rng.uniform(0.04, 0.07)
+    
+    return pos, radii
+
+
+def _force_directed_anneal(pos, radii, time_budget=30.0, seed=42):
+    """Simulated annealing with force-directed moves."""
+    rng = np.random.RandomState(seed)
+    pos = pos.copy()
+    radii = radii.copy()
+    radii = _fix_boundaries(pos, radii)
+    radii = _resolve_overlaps(pos, radii)
+    
+    best_pos = pos.copy()
+    best_radii = radii.copy()
+    best_score = _score(pos, radii)
+    
+    T = 0.01
+    T_min = 1e-6
+    cooling = 0.995
+    max_iter = 50000
+    
+    start = time.time()
+    
+    for it in range(max_iter):
+        if time.time() - start > time_budget:
+            break
+        
+        # Random move: perturb positions and/or radii
+        move_type = rng.random()
+        if move_type < 0.5:
+            # Move one circle
+            i = rng.randint(N)
+            dx = rng.normal(0, 0.02)
+            dy = rng.normal(0, 0.02)
+            pos[i, 0] = np.clip(pos[i, 0] + dx, 0.01, 0.99)
+            pos[i, 1] = np.clip(pos[i, 1] + dy, 0.01, 0.99)
+        elif move_type < 0.8:
+            # Change radius of one circle
+            i = rng.randint(N)
+            dr = rng.normal(0, 0.005)
+            radii[i] = np.clip(radii[i] + dr, 0.005, 0.3)
+        else:
+            # Move two circles
+            i, j = rng.choice(N, size=2, replace=False)
+            pos[i, 0] = np.clip(pos[i, 0] + rng.normal(0, 0.02), 0.01, 0.99)
+            pos[i, 1] = np.clip(pos[i, 1] + rng.normal(0, 0.02), 0.01, 0.99)
+            pos[j, 0] = np.clip(pos[j, 0] + rng.normal(0, 0.02), 0.01, 0.99)
+            pos[j, 1] = np.clip(pos[j, 1] + rng.normal(0, 0.02), 0.01, 0.99)
+        
+        # Fix boundaries
+        radii = _fix_boundaries(pos, radii)
+        
+        # Compute new score with penalty
+        pen = _penalty(pos, radii)
+        new_score = _score(pos, radii) - 100.0 * pen
+        old_score = _score(best_pos, best_radii) - 100.0 * _penalty(best_pos, best_radii)
+        
+        delta = new_score - old_score
+        if delta > 0 or rng.random() < np.exp(delta / max(T, 1e-10)):
+            if new_score > best_score - 100.0 * _penalty(pos, radii):
+                # Accept
+                pos = pos.copy()
+                radii = radii.copy()
+                if pen < 1e-12:
+                    s = _score(pos, radii)
+                    if s > best_score:
+                        best_score = s
+                        best_pos = pos.copy()
+                        best_radii = radii.copy()
+        
+        T *= cooling
+        if T < T_min:
+            T = T_min
+    
+    return best_pos, best_radii, best_score
+
+
+def _gradient_polish(pos, radii, time_budget=15.0):
+    """Gradient-based polishing with smooth penalty to fine-tune positions and radii."""
+    from scipy.optimize import minimize
+    
+    pos = pos.copy()
+    radii = radii.copy()
+    radii = _fix_boundaries(pos, radii)
+    radii = _resolve_overlaps(pos, radii)
+    
+    best_pos = pos.copy()
+    best_radii = radii.copy()
+    best_score = _score(pos, radii)
+    
+    def objective(x):
+        p = x[:2*N].reshape(N, 2)
+        r = x[2*N:]
+        # Smooth penalty using soft-min formulation
+        n = len(r)
+        pen = 0.0
+        # Boundary violations
+        for i in range(n):
+            for coord in range(2):
+                v = r[i] - p[i, coord]
+                if v > 0:
+                    pen += v * v
+                v = p[i, coord] - (1.0 - r[i])
+                if v > 0:
+                    pen += v * v
+        # Overlap violations
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = p[i, 0] - p[j, 0]
+                dy = p[i, 1] - p[j, 1]
+                dist = np.sqrt(dx * dx + dy * dy)
+                min_d = r[i] + r[j]
+                if dist < min_d:
+                    pen += (min_d - dist) ** 2
+        return -np.sum(r) + 50.0 * pen
+    
+    x0 = np.concatenate([pos.flatten(), radii])
+    
+    bounds = []
+    for i in range(N):
+        bounds.append((0.005, 0.995))
+        bounds.append((0.005, 0.995))
+    for i in range(N):
+        bounds.append((0.005, 0.3))
+    
+    start = time.time()
+    
+    try:
+        result = minimize(objective, x0, method='L-BFGS-B', bounds=bounds,
+                          options={'maxiter': 800, 'ftol': 1e-14, 'gtol': 1e-12})
+        if time.time() - start < time_budget:
+            x_opt = result.x
+            p_opt = x_opt[:2*N].reshape(N, 2)
+            r_opt = x_opt[2*N:]
+            r_opt = _fix_boundaries(p_opt, r_opt)
+            r_opt = _resolve_overlaps(p_opt, r_opt)
+            if _is_valid(p_opt, r_opt):
+                s = _score(p_opt, r_opt)
+                if s > best_score:
+                    best_score = s
+                    best_pos = p_opt.copy()
+                    best_radii = r_opt.copy()
+    except Exception:
+        pass
+    
+    return best_pos, best_radii, best_score
+
+
+def _slsqp_polish(pos, radii, time_budget=10.0):
+    """SLSQP polishing with hard constraints."""
+    from scipy.optimize import minimize
+    
+    pos = pos.copy()
+    radii = radii.copy()
+    radii = _fix_boundaries(pos, radii)
+    radii = _resolve_overlaps(pos, radii)
+    
+    best_pos = pos.copy()
+    best_radii = radii.copy()
+    best_score = _score(pos, radii)
+    
+    def objective(x):
+        p = x[:2*N].reshape(N, 2)
+        r = x[2*N:]
+        return -np.sum(r)
+    
+    # Hard constraints
+    constraints = []
+    # Boundary constraints: r_i <= p_i, r_i <= 1-p_i, etc.
+    for i in range(N):
+        constraints.append({'type': 'ineq', 'fun': lambda x, i=i: x[2*i] - x[2*N+i]})  # x >= r
+        constraints.append({'type': 'ineq', 'fun': lambda x, i=i: (1.0 - x[2*i]) - x[2*N+i]})  # 1-x >= r
+        constraints.append({'type': 'ineq', 'fun': lambda x, i=i: x[2*i+1] - x[2*N+i]})  # y >= r
+        constraints.append({'type': 'ineq', 'fun': lambda x, i=i: (1.0 - x[2*i+1]) - x[2*N+i]})  # 1-y >= r
+    
+    # Overlap constraints: dist(i,j) >= r_i + r_j
+    for i in range(N):
+        for j in range(i + 1, N):
+            def overlap_con(x, i=i, j=j):
+                dx = x[2*i] - x[2*j]
+                dy = x[2*i+1] - x[2*j+1]
+                dist = np.sqrt(dx*dx + dy*dy)
+                return dist - x[2*N+i] - x[2*N+j]
+            constraints.append({'type': 'ineq', 'fun': overlap_con})
+    
+    x0 = np.concatenate([pos.flatten(), radii])
+    
+    bounds = []
+    for i in range(N):
+        bounds.append((0.005, 0.995))
+        bounds.append((0.005, 0.995))
+    for i in range(N):
+        bounds.append((0.005, 0.3))
+    
+    start = time.time()
+    
+    try:
+        result = minimize(objective, x0, method='SLSQP', bounds=bounds,
+                          constraints=constraints,
+                          options={'maxiter': 600, 'ftol': 1e-14, 'iprint': 0})
+        if time.time() - start < time_budget:
+            x_opt = result.x
+            p_opt = x_opt[:2*N].reshape(N, 2)
+            r_opt = x_opt[2*N:]
+            r_opt = _fix_boundaries(p_opt, r_opt)
+            r_opt = _resolve_overlaps(p_opt, r_opt)
+            if _is_valid(p_opt, r_opt):
+                s = _score(p_opt, r_opt)
+                if s > best_score:
+                    best_score = s
+                    best_pos = p_opt.copy()
+                    best_radii = r_opt.copy()
+    except Exception:
+        pass
+    
+    return best_pos, best_radii, best_score
+
+
+def _nelder_mead_radius_polish(pos, radii, time_budget=8.0):
+    """Nelder-Mead optimization on radii only, keeping positions fixed."""
+    from scipy.optimize import minimize
+    
+    pos = pos.copy()
+    radii = radii.copy()
+    radii = _fix_boundaries(pos, radii)
+    radii = _resolve_overlaps(pos, radii)
+    
+    best_radii = radii.copy()
+    best_score = _score(pos, radii)
+    
+    def objective(r):
+        r = np.maximum(r, 0.001)
+        # Check validity
+        for i in range(N):
+            if r[i] > min(pos[i, 0], 1.0 - pos[i, 0], pos[i, 1], 1.0 - pos[i, 1]) - 1e-10:
+                return 100.0  # Penalty for boundary violation
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = pos[i, 0] - pos[j, 0]
+                dy = pos[i, 1] - pos[j, 1]
+                dist = np.sqrt(dx * dx + dy * dy)
+                if dist < r[i] + r[j] - 1e-10:
+                    return 100.0  # Penalty for overlap
+        return -np.sum(r)
+    
+    x0 = radii.copy()
+    bounds = []
+    for i in range(N):
+        max_r = min(pos[i, 0], 1.0 - pos[i, 0], pos[i, 1], 1.0 - pos[i, 1]) * 0.999
+        bounds.append((0.001, max_r))
+    
+    start = time.time()
+    
+    try:
+        result = minimize(objective, x0, method='Nelder-Mead', bounds=bounds,
+                          options={'maxiter': 2000, 'xatol': 1e-12, 'fatol': 1e-14,
+                                   'adaptive': True})
+        if time.time() - start < time_budget:
+            r_opt = result.x
+            r_opt = _fix_boundaries(pos, r_opt)
+            r_opt = _resolve_overlaps(pos, r_opt)
+            if _is_valid(pos, r_opt):
+                s = _score(pos, r_opt)
+                if s > best_score:
+                    best_score = s
+                    best_radii = r_opt.copy()
+    except Exception:
+        pass
+    
+    return pos, best_radii, best_score
+
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 135.0  # 15s safety margin before 150s kill
+    
+    best_pos = None
+    best_radii = None
+    best_score = -np.inf
+    
+    strategies = [
+        ('grid', 42), ('grid', 123), ('grid', 7),
+        ('hexagonal', 42), ('hexagonal', 99),
+        ('center_ring', 42), ('center_ring', 123), ('center_ring', 7),
+        ('random', 42), ('random', 123), ('random', 7), ('random', 55),
+        ('mixed', 42), ('mixed', 123), ('mixed', 7),
+    ]
+    
+    for strat_name, seed in strategies:
+        if time.time() > deadline - 30:
+            break
+        
+        if strat_name == 'grid':
+            pos, radii = _make_grid(seed)
+        elif strat_name == 'hexagonal':
+            pos, radii = _make_hexagonal(seed)
+        elif strat_name == 'center_ring':
+            pos, radii = _make_center_ring(seed)
+        elif strat_name == 'random':
+            pos, radii = _make_random(seed)
+        elif strat_name == 'mixed':
+            pos, radii = _make_mixed(seed)
+        else:
+            continue
+        
+        # Force-directed annealing
+        remaining = deadline - time.time()
+        if remaining < 12:
+            break
+        anneal_budget = min(18.0, remaining * 0.45)
+        pos_a, radii_a, score_a = _force_directed_anneal(pos, radii, time_budget=anneal_budget, seed=seed)
+        
+        if score_a > best_score:
+            best_score = score_a
+            best_pos = pos_a.copy()
+            best_radii = radii_a.copy()
+        
+        # Gradient polish on annealed result
+        remaining = deadline - time.time()
+        if remaining < 18:
+            continue
+        polish_budget = min(12.0, remaining * 0.35)
+        pos_p, radii_p, score_p = _gradient_polish(pos_a, radii_a, time_budget=polish_budget)
+        
+        if score_p > best_score:
+            best_score = score_p
+            best_pos = pos_p.copy()
+            best_radii = radii_p.copy()
+        
+        # Growth pass to expand radii
+        remaining = deadline - time.time()
+        if remaining < 15:
+            continue
+        radii_grown = _growth_pass(best_pos, best_radii, max_iter=300, step=0.002)
+        if _is_valid(best_pos, radii_grown):
+            score_grown = _score(best_pos, radii_grown)
+            if score_grown > best_score:
+                best_score = score_grown
+                best_radii = radii_grown.copy()
+        
+        # SLSQP polish
+        remaining = deadline - time.time()
+        if remaining < 12:
+            continue
+        slsqp_budget = min(10.0, remaining * 0.3)
+        pos_s, radii_s, score_s = _slsqp_polish(best_pos, best_radii, time_budget=slsqp_budget)
+        
+        if score_s > best_score:
+            best_score = score_s
+            best_pos = pos_s.copy()
+            best_radii = radii_s.copy()
+        
+        # Nelder-Mead radius polish
+        remaining = deadline - time.time()
+        if remaining < 10:
+            continue
+        nm_budget = min(8.0, remaining * 0.3)
+        pos_nm, radii_nm, score_nm = _nelder_mead_radius_polish(best_pos, best_radii, time_budget=nm_budget)
+        
+        if score_nm > best_score:
+            best_score = score_nm
+            best_pos = pos_nm.copy()
+            best_radii = radii_nm.copy()
+        
+        # Final growth pass after all polishing
+        remaining = deadline - time.time()
+        if remaining < 5:
+            continue
+        radii_grown2 = _growth_pass(best_pos, best_radii, max_iter=200, step=0.001)
+        if _is_valid(best_pos, radii_grown2):
+            score_grown2 = _score(best_pos, radii_grown2)
+            if score_grown2 > best_score:
+                best_score = score_grown2
+                best_radii = radii_grown2.copy()
+    
+    # Final polish on best result if time allows
+    if best_pos is not None:
+        remaining = deadline - time.time()
+        if remaining > 18:
+            pos_f, radii_f, score_f = _gradient_polish(best_pos, best_radii, time_budget=min(12.0, remaining - 8))
+            if score_f > best_score:
+                best_score = score_f
+                best_pos = pos_f.copy()
+                best_radii = radii_f.copy()
+        
+        # Final SLSQP polish
+        remaining = deadline - time.time()
+        if remaining > 12:
+            pos_fs, radii_fs, score_fs = _slsqp_polish(best_pos, best_radii, time_budget=min(8.0, remaining - 5))
+            if score_fs > best_score:
+                best_score = score_fs
+                best_pos = pos_fs.copy()
+                best_radii = radii_fs.copy()
+        
+        # Final Nelder-Mead radius polish
+        remaining = deadline - time.time()
+        if remaining > 8:
+            pos_nm, radii_nm, score_nm = _nelder_mead_radius_polish(best_pos, best_radii, time_budget=min(6.0, remaining - 4))
+            if score_nm > best_score:
+                best_score = score_nm
+                best_pos = pos_nm.copy()
+                best_radii = radii_nm.copy()
+        
+        # Final growth pass
+        remaining = deadline - time.time()
+        if remaining > 3:
+            radii_final = _growth_pass(best_pos, best_radii, max_iter=300, step=0.001)
+            if _is_valid(best_pos, radii_final):
+                score_final = _score(best_pos, radii_final)
+                if score_final > best_score:
+                    best_score = score_final
+                    best_radii = radii_final.copy()
+    
+    # Fallback: simple grid
+    if best_pos is None:
+        side = 5
+        cells = [((i + 0.5) / side, (j + 0.5) / side, 0.5 / side - 0.005) for i in range(side) for j in range(side)]
+        result = np.array(cells[:N])
+        return result
+    
+    result = np.column_stack([best_pos, best_radii])
+    return result
+
+# EVOLVE-BLOCK-END

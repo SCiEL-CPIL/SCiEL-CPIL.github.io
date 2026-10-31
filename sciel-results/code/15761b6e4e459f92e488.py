@@ -1,0 +1,157 @@
+"""Rewritten program using robust multi-start FCC lattice construction with local relaxation."""
+N = 38
+
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+import sys
+from scipy.optimize import minimize
+
+def _lj_energy(pos):
+    """Compute total Lennard-Jones energy."""
+    diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
+    r2 = np.sum(diff ** 2, axis=-1)
+    mask = ~np.eye(len(pos), dtype=bool)
+    r2 = r2[mask]
+    r6 = r2 ** 3
+    r12 = r6 ** 2
+    energy = 4.0 * np.sum(1.0 / r12 - 1.0 / r6)
+    return energy
+
+def _lj_grad(pos):
+    """Compute gradient of total Lennard-Jones energy."""
+    diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
+    r2 = np.sum(diff ** 2, axis=-1)
+    r2 = np.where(r2 < 1e-12, 1e-12, r2)
+    r6 = r2 ** 3
+    r12 = r6 ** 2
+    coeff = 4.0 * (-12.0 / (r2 ** 7) + 6.0 / (r2 ** 4))
+    np.fill_diagonal(coeff, 0.0)
+    grad = np.sum(coeff[:, :, np.newaxis] * diff, axis=1)
+    return grad
+
+def _minimize_lbfgs(pos, max_iter=2000, tol=1e-10):
+    """L-BFGS minimization with tight tolerances."""
+    try:
+        res = minimize(
+            _lj_energy,
+            pos,
+            jac=_lj_grad,
+            method='L-BFGS-B',
+            options={'maxiter': max_iter, 'ftol': tol, 'gtol': tol, 'maxls': 50}
+        )
+        return res.x
+    except Exception:
+        return pos
+
+def _optimize_scale(pos, max_iter=1000):
+    """Optimize the 1D scale parameter to find optimal interatomic distance."""
+    def scale_energy(log_s):
+        s = np.exp(log_s[0])
+        scaled = pos * s
+        return _lj_energy(scaled)
+    
+    def scale_grad(log_s):
+        s = np.exp(log_s[0])
+        scaled = pos * s
+        # dE/ds = sum of dE/dpos_i * pos_i (chain rule)
+        grad_pos = _lj_grad(scaled)
+        dEds = np.sum(grad_pos * scaled)
+        dE_dlog_s = dEds * s
+        return np.array([dE_dlog_s])
+    
+    # Start from scale=1 (log_s=0)
+    try:
+        res = minimize(
+            scale_energy,
+            np.array([0.0]),
+            jac=scale_grad,
+            method='L-BFGS-B',
+            options={'maxiter': max_iter, 'ftol': 1e-12, 'gtol': 1e-12}
+        )
+        optimal_scale = np.exp(res.x[0])
+        return pos * optimal_scale
+    except Exception:
+        return pos
+
+def _generate_fcc_cluster(n_atoms, r_nn=2**(1/6)):
+    """Generate an FCC cluster of n_atoms closest to the origin."""
+    scale = r_nn / np.sqrt(2.0)
+    max_coord = 10  # Ensure we have enough points
+    
+    points = []
+    for i in range(-max_coord, max_coord + 1):
+        for j in range(-max_coord, max_coord + 1):
+            for k in range(-max_coord, max_coord + 1):
+                if (i + j + k) % 2 == 0:
+                    points.append((i, j, k))
+    
+    pts = np.array(points, dtype=float)
+    pts *= scale
+    
+    # Sort by distance to origin
+    dists = np.sum(pts**2, axis=1)
+    sorted_indices = np.argsort(dists)
+    
+    # Take the first n_atoms points
+    cluster = pts[sorted_indices[:n_atoms]].copy()
+    
+    # Center the cluster at the origin
+    center = np.mean(cluster, axis=0)
+    cluster -= center
+    
+    return cluster
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 115.0  # Safety margin (150s limit, 35s buffer)
+    
+    # 1. Generate the ideal FCC truncated octahedron
+    base_cluster = _generate_fcc_cluster(N)
+    
+    # Initial relaxation of the perfect lattice
+    best_pos = _minimize_lbfgs(base_cluster, max_iter=1000, tol=1e-10)
+    best_energy = _lj_energy(best_pos)
+    
+    # 2. Multi-start with perturbations
+    # We increase the number of restarts and vary the scales more aggressively
+    # to ensure we escape any shallow local minima and converge to the global one.
+    rng = np.random.RandomState(42)
+    
+    # Scales: small to medium
+    scales = [0.01, 0.05, 0.1, 0.2, 0.3, 0.5]
+    
+    # We will perform up to 5 restarts per scale
+    # Total max restarts: 30
+    for scale in scales:
+        for _ in range(5):
+            if time.time() > deadline - 15.0:
+                break
+            
+            perturbed = best_pos + rng.normal(0, scale, size=best_pos.shape)
+            
+            # Relax the perturbed configuration
+            relaxed = _minimize_lbfgs(perturbed, max_iter=1500, tol=1e-10)
+            
+            # Optimize scale to extract full energy benefit of this topology
+            scaled_relaxed = _optimize_scale(relaxed, max_iter=500)
+            energy = _lj_energy(scaled_relaxed)
+            
+            if energy < best_energy:
+                best_energy = energy
+                best_pos = scaled_relaxed
+    
+    # 3. Final high-precision polish
+    # Use a very tight tolerance to ensure we are at the bottom of the well
+    if time.time() < deadline - 10.0:
+        final_pos = _minimize_lbfgs(best_pos, max_iter=5000, tol=1e-12)
+        
+        # Final scale optimization for maximum precision
+        final_scaled = _optimize_scale(final_pos, max_iter=1000)
+        final_energy = _lj_energy(final_scaled)
+        if final_energy < best_energy:
+            best_pos = final_scaled
+            best_energy = final_energy
+
+    return best_pos
+# EVOLVE-BLOCK-END
