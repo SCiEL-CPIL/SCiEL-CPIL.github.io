@@ -1,147 +1,183 @@
 import numpy as np
 import time
-from scipy.optimize import minimize
-import itertools
-from functools import partial
+from scipy.optimize import minimize, differential_evolution
 
 N = 14
 D = 3
 
 def get_pairwise_sq_dists(points):
-    """
-    Returns a flat array of squared pairwise distances for N points.
-    """
-    # points shape (N, D)
-    # Use broadcasting to compute all pairwise squared distances
-    # diff shape (N, N, D)
     diff = points[:, np.newaxis, :] - points[np.newaxis, :, :]
     sq_dists = np.sum(diff**2, axis=2)
-    # We only need the upper triangle to avoid duplicates and zeros
     iu = np.triu_indices(N, k=1)
     return sq_dists[iu]
 
-def objective_ratio_smooth(x, tau=10.0):
-    """
-    Smooth approximation of the ratio of max to min squared distance.
-    x is flattened array of shape (N*D,)
-    """
+def objective_smooth(x, tau=20.0):
     points = x.reshape(N, D)
     sq_dists = get_pairwise_sq_dists(points)
-    
-    # Avoid log(0) if points coincide
-    # Add a small epsilon
     sq_dists = np.maximum(sq_dists, 1e-12)
     
-    # Soft max: (1/tau) * log(sum(exp(tau * x)))
-    # Soft min: -(1/tau) * log(sum(exp(-tau * x)))
-    
-    # To prevent overflow in exp, we can shift by max/min
     m_max = np.max(sq_dists)
     m_min = np.min(sq_dists)
     
-    # Soft max calculation
+    # Soft max
     exp_max_terms = np.exp(tau * (sq_dists - m_max))
     log_sum_exp_max = m_max + np.log(np.sum(exp_max_terms)) / tau
     
-    # Soft min calculation
+    # Soft min
     exp_min_terms = np.exp(-tau * (sq_dists - m_min))
     log_sum_exp_min = m_min - np.log(np.sum(exp_min_terms)) / tau
     
-    # We want to minimize the ratio. 
-    # If we minimize log(ratio) = log(soft_max) - log(soft_min), it's scale invariant.
-    # However, if soft_min is close to 0, log is very negative.
-    # Let's just return the ratio itself, but the gradient of ratio is tricky at 0.
-    # Minimizing log(soft_max) - log(soft_min) is better conditioned.
-    
     return np.log(log_sum_exp_max) - np.log(log_sum_exp_min)
+
+def raw_score(points):
+    sq_dists = get_pairwise_sq_dists(points)
+    if np.min(sq_dists) < 1e-10:
+        return np.inf
+    return (np.max(sq_dists) / np.min(sq_dists))
 
 def construct():
     start_time = time.time()
-    timeout = 110.0 # Safety margin
+    timeout = 110.0
     
     best_score = np.inf
     best_points = None
     
+    def update_best(pts):
+        nonlocal best_score, best_points
+        score = raw_score(pts)
+        if score < best_score:
+            best_score = score
+            best_points = pts
+
     # Initial candidates
-    # 1. The grid from the current solution
-    points_grid = []
-    for x in range(3):
-        for y in range(3):
-            for z in range(2):
-                points_grid.append((x, y, z))
-    to_remove = [(0,0,0), (0,0,1), (0,2,0), (0,2,1)]
-    final_points_grid = [p for p in points_grid if p not in to_remove]
-    init_grid = np.array(final_points_grid, dtype=float)
-    init_grid = init_grid - np.mean(init_grid, axis=0)
+    candidates = []
     
-    candidates = [init_grid.flatten()]
-    
-    # 2. Random starts
+    # 1. Icosahedron vertices (12) + 2 points
+    # Icosahedron vertices can be generated using golden ratio
+    phi = (1 + np.sqrt(5)) / 2
+    ico = np.array([
+        [0, 1, phi], [0, 1, -phi], [0, -1, phi], [0, -1, -phi],
+        [1, phi, 0], [1, -phi, 0], [-1, phi, 0], [-1, -phi, 0],
+        [phi, 0, 1], [phi, 0, -1], [-phi, 0, 1], [-phi, 0, -1]
+    ], dtype=float)
+    ico = ico / np.linalg.norm(ico, axis=1, keepdims=True) * 2.0 # Scale to radius 2
+    # Add 2 points at center? No, must be distinct. Add 2 points slightly off center or random.
+    # Let's add 2 random points inside the sphere
     rng = np.random.default_rng(42)
-    num_random_starts = 30
-    for _ in range(num_random_starts):
-        # Random points in a sphere
+    for _ in range(5):
+        p1 = rng.normal(size=D) * 0.5
+        p2 = rng.normal(size=D) * 0.5
+        pts = np.vstack([ico, p1, p2])
+        candidates.append(pts.flatten())
+        
+    # 2. Random points in sphere
+    for _ in range(10):
         pts = rng.normal(size=(N, D))
-        # Normalize to unit sphere roughly to keep scale reasonable
         norms = np.linalg.norm(pts, axis=1, keepdims=True)
         pts = pts / norms * 2.0
         candidates.append(pts.flatten())
         
-        if time.time() - start_time > timeout:
-            break
+    # 3. FCC Lattice subset
+    # Generate FCC points in a box and select 14
+    # FCC basis: (0,0,0), (0,0.5,0.5), (0.5,0,0.5), (0.5,0.5,0) scaled by 2
+    # Just use a simple grid for now
+    grid_pts = []
+    for x in range(3):
+        for y in range(3):
+            for z in range(3):
+                grid_pts.append([x, y, z])
+    grid_pts = np.array(grid_pts[:14], dtype=float)
+    grid_pts = grid_pts - np.mean(grid_pts, axis=0)
+    candidates.append(grid_pts.flatten())
 
-    # Tau schedule for annealing-like optimization
-    tau_schedule = [1.0, 5.0, 20.0, 100.0]
-    maxiter_schedule = [200, 300, 500, 500]
+    # Optimization Loop
+    # Use Differential Evolution to find good basins, then Polish with L-BFGS-B
+    # DE bounds: [-5, 5] for each coordinate
     
-    # Optimization loop
+    bounds = [(-5, 5)] * (N * D)
+    
     for i, init_x in enumerate(candidates):
         if time.time() - start_time > timeout:
             break
             
-        x_curr = init_x.copy()
+        # Skip DE for the first few to save time? No, DE is fast.
+        # But DE doesn't use the init_x. It starts from random population.
+        # So we can just run DE once or twice.
         
-        try:
-            for idx, tau in enumerate(tau_schedule):
-                if time.time() - start_time > timeout:
-                    break
-                
-                obj = partial(objective_ratio_smooth, tau=tau)
-                maxiter = maxiter_schedule[idx]
-                
-                # Use L-BFGS-B
-                res = minimize(
-                    obj, 
-                    x_curr, 
-                    method='L-BFGS-B', 
-                    options={'maxiter': maxiter, 'ftol': 1e-10, 'gtol': 1e-8}
+        if i == 0:
+            # Run DE
+            try:
+                res_de = differential_evolution(
+                    objective_smooth, 
+                    bounds, 
+                    maxiter=100, 
+                    popsize=15, 
+                    seed=42,
+                    tol=1e-8,
+                    polish=False # We will polish manually
                 )
-                
-                if res.x is not None:
-                    x_curr = res.x
+                if res_de.x is not None:
+                    # Polish with L-BFGS-B
+                    res_polish = minimize(
+                        objective_smooth, 
+                        res_de.x, 
+                        method='L-BFGS-B', 
+                        options={'maxiter': 500, 'ftol': 1e-10, 'gtol': 1e-8}
+                    )
+                    if res_polish.x is not None:
+                        update_best(res_polish.x.reshape(N, D))
+            except Exception:
+                pass
             
-            # Evaluate the true non-smooth score for the result
-            pts = x_curr.reshape(N, D)
-            sq_dists = get_pairwise_sq_dists(pts)
-            if np.min(sq_dists) > 1e-10:
-                true_score = (np.max(sq_dists) / np.min(sq_dists))
-                if true_score < best_score:
-                    best_score = true_score
-                    best_points = pts
-                    
-        except Exception:
-            pass
+            # Also polish the DE result without L-BFGS if it failed? No.
+            
+            # Run DE again with different seed
+            if time.time() - start_time < timeout - 30:
+                try:
+                    res_de2 = differential_evolution(
+                        objective_smooth, 
+                        bounds, 
+                        maxiter=100, 
+                        popsize=15, 
+                        seed=123,
+                        tol=1e-8,
+                        polish=False
+                    )
+                    if res_de2.x is not None:
+                        res_polish2 = minimize(
+                            objective_smooth, 
+                            res_de2.x, 
+                            method='L-BFGS-B', 
+                            options={'maxiter': 500, 'ftol': 1e-10, 'gtol': 1e-8}
+                        )
+                        if res_polish2.x is not None:
+                            update_best(res_polish2.x.reshape(N, D))
+                except Exception:
+                    pass
 
-    # If optimization didn't find anything better, fall back to the grid
+        # For other candidates, just polish directly (faster)
+        else:
+            try:
+                res_polish = minimize(
+                    objective_smooth, 
+                    init_x, 
+                    method='L-BFGS-B', 
+                    options={'maxiter': 300, 'ftol': 1e-10, 'gtol': 1e-8}
+                )
+                if res_polish.x is not None:
+                    update_best(res_polish.x.reshape(N, D))
+            except Exception:
+                pass
+
+    # Fallback
     if best_points is None:
-        best_points = init_grid
-        sq_dists = get_pairwise_sq_dists(best_points)
-        best_score = np.max(sq_dists) / np.min(sq_dists)
+        # Use the first candidate
+        best_points = candidates[0].reshape(N, D)
+        best_score = raw_score(best_points)
 
     return best_points
 
 if __name__ == "__main__":
     pts = construct()
-    sq_dists = get_pairwise_sq_dists(pts)
-    score = (np.max(sq_dists) / np.min(sq_dists))
+    score = raw_score(pts)
     print(f"Score: {score}")
