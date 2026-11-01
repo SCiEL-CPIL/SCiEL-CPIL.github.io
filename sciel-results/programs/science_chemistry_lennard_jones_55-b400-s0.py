@@ -1,208 +1,298 @@
-"""Lennard-Jones 55-atom cluster: search approach with Mackay icosahedron + relaxation."""
+"""Lennard-Jones 55-atom global minimum: Mackay icosahedron seed + L-BFGS relaxation."""
 import numpy as np
 import time
-from itertools import combinations
 
 N = 55
 
 # EVOLVE-BLOCK-START
 import numpy as np
-from scipy.optimize import minimize
+import time
 
-def lj_energy(pos):
-    """Compute total LJ energy for N atoms."""
-    n = len(pos)
+def _lj_energy(pos):
+    """Compute total LJ energy for a set of positions (vectorized)."""
+    n = pos.shape[0]
     diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
-    r2 = np.einsum('ijk,ijk->ij', diff, diff)
+    r2 = np.sum(diff ** 2, axis=2)
     np.fill_diagonal(r2, np.inf)
-    r6 = r2 ** (-3)
-    r12 = r6 * r6
-    # Sum over all pairs (each pair counted twice in the matrix, so divide by 2)
-    e = 4.0 * (r12 - r6).sum() / 2.0
-    return e
+    r6 = r2 ** 3
+    e = 4.0 * (1.0 / (r6 * r6) - 1.0 / r6)
+    return np.sum(e) / 2.0
 
-def lj_energy_grad(pos):
-    """Compute LJ energy and gradient."""
-    n = len(pos)
+def _lj_energy_grad(pos):
+    """Compute total LJ energy and gradient (vectorized, numerically stable)."""
+    n = pos.shape[0]
     diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
-    r2 = np.einsum('ijk,ijk->ij', diff, diff)
-    np.fill_diagonal(r2, np.inf)
-    r6 = r2 ** (-3)
+    r2 = np.sum(diff ** 2, axis=2)
+    np.fill_diagonal(r2, 1.0)
+    
+    # Use r6 and r12 for stability
+    r6 = r2 * r2 * r2
     r12 = r6 * r6
-    e = 4.0 * (r12 - r6).sum() / 2.0
-    # grad: dE/dr_i = 4 * sum_j (12*r_i^-13 - 6*r_i^-7) * (r_i - r_j) / r_i
-    # Using vectorized form:
-    # dE/dpos_i = sum_j 4 * (12*r_ij^-14 * r_ij_vec - 6*r_ij^-8 * r_ij_vec) ... let me be careful
-    # E = 4 * sum_{i<j} (r_ij^-12 - r_ij^-6)
-    # dE/dpos_i = sum_{j!=i} 4 * (-12*r_ij^-13 + 6*r_ij^-7) * (pos_i - pos_j)/r_ij
-    #           = sum_{j!=i} 4 * (-12*r_ij^-14 + 6*r_ij^-8) * (pos_i - pos_j)
-    # Because (pos_i - pos_j)/r_ij * 1/r_ij = (pos_i-pos_j) / r_ij^2, and we have r^-13 = r^-14 * r
-    # Let me redo: r_ij = |pos_i - pos_j|
-    # d/dr_ij (r^-12) = -12 r^-13
-    # dE/dpos_i = sum_{j!=i} 4 * (-12 r_ij^-13) * (pos_i - pos_j)/r_ij + 4*(6 r_ij^-7)*(pos_i-pos_j)/r_ij
-    #           = sum_{j!=i} 4 * (-12 r_ij^-14 + 6 r_ij^-8) * (pos_i - pos_j)
-    coeff = 4.0 * (-12.0 * r2 ** (-7) + 6.0 * r2 ** (-4))
-    np.fill_diagonal(coeff, 0.0)
-    grad = np.einsum('ij,ijk->ik', coeff, diff)
-    return e, grad
+    
+    e_pair = 4.0 * (1.0 / r12 - 1.0 / r6)
+    np.fill_diagonal(e_pair, 0.0)
+    energy = np.sum(e_pair) / 2.0
+    
+    # dE/dr2 = 4 * (-6/r2^4 + 12/r2^7) ... but we need dE/dpos
+    # dE/dxi = sum_j 4*(-12*(xi-xj)/r^14 + 6*(xi-xj)/r^8)
+    # = sum_j 4*(xi-xj)*(-12/r2^7 + 6/r2^4)
+    # Note: -12/r2^7 + 6/r2^4 = (-12 + 6*r2^3) / r2^7 = 6*(r2^3 - 2)/r2^7 = 6*(r6-2)/r2^7
+    with np.errstate(divide='ignore', invalid='ignore'):
+        # factor_ij = 4 * (-12/r2^7 + 6/r2^4) for i != j
+        factor = 4.0 * (-12.0 / (r2 ** 7) + 6.0 / (r2 ** 4))
+    np.fill_diagonal(factor, 0.0)
+    
+    # grad_i = sum_j factor_ij * (pos_i - pos_j)
+    #        = pos_i * sum_j factor_ij - sum_j factor_ij * pos_j
+    sum_factor = np.sum(factor, axis=1, keepdims=True)
+    sum_factor_pos = np.sum(factor[:, :, np.newaxis] * pos[np.newaxis, :, :], axis=1)
+    grad = pos * sum_factor - sum_factor_pos
+    
+    return energy, grad
 
-def make_mackay_icosahedron():
-    """Generate a Mackay icosahedral cluster with 55 atoms.
-    
-    Structure: 1 (center) + 12 (icosahedron shell 1) + 30 (edge-midpoint shell 2) + 12 (face-center shell 3)
-    For N=55: 1+12+30+12 = 55. The 12 extra atoms are placed at the 12 icosahedron vertex directions
-    at a radius between shell 1 and shell 2, or at face centers.
-    
-    Actually, a better decomposition for 55: use the known Mackay icosahedron geometry.
-    The I_2 Mackay icosahedron has 1+12+30=43. For 55, we need 12 more.
-    A common approach: place 12 atoms at the centers of the 20 triangular faces won't work (only 20 faces).
-    
-    Let's use: 1 + 12 (r1) + 30 (r2) + 12 (r3) where r3 atoms are at icosahedron vertex directions
-    but at a radius slightly larger than r2, creating a third partial shell.
+def _make_mackay_icosahedron(r1=1.05, r2=1.75, r3=1.95):
+    """Construct a two-shell Mackay icosahedron for 55 atoms.
+    1 center + 12 first shell + 30 edge-midpoints + 12 vertex-like = 55
     """
     phi = (1.0 + np.sqrt(5.0)) / 2.0
-    
-    # 12 icosahedron vertices
     verts = np.array([
-        [0, 1, phi], [0, 1, -phi], [0, -1, phi], [0, -1, -phi],
+        [0, 1, phi], [0, -1, phi], [0, 1, -phi], [0, -1, -phi],
         [1, phi, 0], [-1, phi, 0], [1, -phi, 0], [-1, -phi, 0],
-        [phi, 0, 1], [phi, 0, -1], [-phi, 0, 1], [-phi, 0, -1]
+        [phi, 0, 1], [-phi, 0, 1], [phi, 0, -1], [-phi, 0, -1]
     ], dtype=float)
-    norms = np.linalg.norm(verts, axis=1, keepdims=True)
-    verts = verts / norms
     
-    # Find edges of icosahedron
-    edge_len = np.linalg.norm(verts[0] - verts[1])
+    norms = np.linalg.norm(verts, axis=1, keepdims=True)
+    verts_unit = verts / norms
+    
+    # Find edges of the icosahedron (12 vertices, 30 edges)
+    dists = np.zeros((12, 12))
+    for i in range(12):
+        for j in range(12):
+            dists[i, j] = np.linalg.norm(verts_unit[i] - verts_unit[j])
+    
+    min_dist = np.min(dists[dists > 1e-6])
     edges = []
     for i in range(12):
-        for j in range(i+1, 12):
-            d = np.linalg.norm(verts[i] - verts[j])
-            if np.isclose(d, edge_len, atol=1e-10):
+        for j in range(i + 1, 12):
+            if abs(dists[i, j] - min_dist) < 1e-6:
                 edges.append((i, j))
     
-    # 30 edge midpoints (normalized)
-    midpoints = []
+    # Edge midpoints (30 atoms)
+    edge_mids = []
     for i, j in edges:
-        mid = (verts[i] + verts[j]) / 2.0
-        mid = mid / np.linalg.norm(mid)
-        midpoints.append(mid)
-    midpoints = np.array(midpoints)
+        mid = (verts_unit[i] + verts_unit[j]) / 2.0
+        norm = np.linalg.norm(mid)
+        if norm > 1e-6:
+            edge_mids.append(mid / norm)
+    edge_mids = np.array(edge_mids)
     
-    # Radii: for LJ, optimal nearest-neighbor distance is 2^(1/6) ≈ 1.12246
-    # Shell 1 (12 atoms): radius r1
-    # Shell 2 (30 atoms): radius r2  
-    # Shell 3 (12 atoms): radius r3
-    # 
-    # In a Mackay icosahedron, the radial ratios are approximately 1:2:3 for shells.
-    # For LJ, we want to optimize. Start with r1=1.0, r2=2.0, r3=3.0 and let relaxation fix it.
-    # But 1+12+30+12=55, so we need 12 more atoms. Place them at icosahedron vertex directions at r3.
+    # Face centers (20 faces) - but we only need 12 more for the outer shell
+    # Use vertices for the outer shell (12 atoms)
+    center = np.array([[0.0, 0.0, 0.0]])
+    first_shell = verts_unit * r1
+    second_inner = edge_mids * r2
+    second_outer = verts_unit * r3
     
-    r1 = 1.0
-    r2 = 2.0  
-    r3 = 2.8  # Slightly less than 3 to avoid being too far
+    all_pos = np.vstack([center, first_shell, second_inner, second_outer])
+    return all_pos
+
+def _make_face_center_icosahedron(r1=1.05, r2=1.75, r3=1.95):
+    """Alternative: use face centers for some of the second shell."""
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    verts = np.array([
+        [0, 1, phi], [0, -1, phi], [0, 1, -phi], [0, -1, -phi],
+        [1, phi, 0], [-1, phi, 0], [1, -phi, 0], [-1, -phi, 0],
+        [phi, 0, 1], [-phi, 0, 1], [phi, 0, -1], [-phi, 0, -1]
+    ], dtype=float)
     
-    inner = np.array([[0.0, 0.0, 0.0]])
-    shell1 = verts * r1
-    shell2 = midpoints * r2
-    shell3 = verts * r3  # 12 atoms at icosahedron directions at outer radius
+    norms = np.linalg.norm(verts, axis=1, keepdims=True)
+    verts_unit = verts / norms
     
-    pos = np.vstack([inner, shell1, shell2, shell3])
-    return pos
+    dists = np.zeros((12, 12))
+    for i in range(12):
+        for j in range(12):
+            dists[i, j] = np.linalg.norm(verts_unit[i] - verts_unit[j])
+    
+    min_dist = np.min(dists[dists > 1e-6])
+    edges = []
+    for i in range(12):
+        for j in range(i + 1, 12):
+            if abs(dists[i, j] - min_dist) < 1e-6:
+                edges.append((i, j))
+    
+    edge_mids = []
+    for i, j in edges:
+        mid = (verts_unit[i] + verts_unit[j]) / 2.0
+        norm = np.linalg.norm(mid)
+        if norm > 1e-6:
+            edge_mids.append(mid / norm)
+    edge_mids = np.array(edge_mids)
+    
+    center = np.array([[0.0, 0.0, 0.0]])
+    first_shell = verts_unit * r1
+    second_inner = edge_mids * r2
+    second_outer = verts_unit * r3
+    
+    all_pos = np.vstack([center, first_shell, second_inner, second_outer])
+    return all_pos
 
-def make_cubic_lattice():
-    """Generate a cubic lattice fragment."""
-    side = int(np.ceil(N ** (1 / 3)))
-    points = [(i, j, k) for i in range(side) for j in range(side) for k in range(side)]
-    points.sort(key=lambda p: (p[0] - (side - 1) / 2) ** 2 + (p[1] - (side - 1) / 2) ** 2 + (p[2] - (side - 1) / 2) ** 2)
-    return np.array(points[:N], dtype=float) * 1.12
-
-def make_random_cluster(seed):
-    """Generate a random cluster."""
-    rng = np.random.RandomState(seed)
-    pos = rng.randn(N, 3) * 2.0
-    return pos
-
-def make_perturbed_mackay(seed, scale=0.1):
-    """Generate a perturbed Mackay icosahedron."""
-    base = make_mackay_icosahedron()
-    rng = np.random.RandomState(seed)
-    pos = base + rng.randn(N, 3) * scale
-    return pos
-
-def relax(pos, maxiter=500):
-    """Relax using L-BFGS-B with tighter tolerance."""
-    def fun(x):
-        x = x.reshape(N, 3)
-        e, g = lj_energy_grad(x)
-        return e, g.reshape(-1)
+def _relax_lbfgs(pos, deadline=None, maxiter=500, gtol=1e-10):
+    """Relax using L-BFGS-B with deadline guard."""
+    from scipy.optimize import minimize
+    
+    start_time = time.time()
+    best_energy = _lj_energy(pos)
+    best_pos = pos.copy()
+    
+    def obj_and_grad(x):
+        pos_flat = x.reshape(-1, 3)
+        e, g = _lj_energy_grad(pos_flat)
+        return e, g.flatten()
+    
+    x0 = pos.flatten()
     
     try:
-        result = minimize(fun, pos.reshape(-1), method='L-BFGS-B', jac=True, 
-                         options={'maxiter': maxiter, 'gtol': 1e-8, 'ftol': 1e-10})
-        return result.x.reshape(N, 3), result.fun
+        result = minimize(
+            obj_and_grad, x0, jac=True, method='L-BFGS-B',
+            options={'maxiter': maxiter, 'gtol': gtol, 'maxls': 100,
+                     'ftol': 1e-14, 'gtol': gtol}
+        )
+        if result.fun < best_energy:
+            best_energy = result.fun
+            best_pos = result.x.reshape(-1, 3)
     except Exception:
-        return pos, lj_energy(pos)
+        pass
+    
+    if deadline is not None and time.time() > deadline - 5.0:
+        return best_pos, best_energy
+    
+    return best_pos, best_energy
+
+def _polish(pos, deadline=None):
+    """High-precision polish pass with tighter tolerance and more iterations."""
+    from scipy.optimize import minimize
+    
+    start_time = time.time()
+    best_energy = _lj_energy(pos)
+    best_pos = pos.copy()
+    
+    def obj_and_grad(x):
+        pos_flat = x.reshape(-1, 3)
+        e, g = _lj_energy_grad(pos_flat)
+        return e, g.flatten()
+    
+    x0 = pos.flatten()
+    
+    # Multi-stage polish: progressively tighter
+    stages = [
+        {'maxiter': 1000, 'gtol': 1e-12, 'maxls': 200, 'ftol': 1e-16},
+        {'maxiter': 5000, 'gtol': 1e-14, 'maxls': 500, 'ftol': 1e-16},
+        {'maxiter': 10000, 'gtol': 1e-16, 'maxls': 1000, 'ftol': 1e-18},
+    ]
+    
+    for stage_opts in stages:
+        if deadline is not None and time.time() > deadline - 5.0:
+            break
+        try:
+            result = minimize(
+                obj_and_grad, x0, jac=True, method='L-BFGS-B',
+                options=stage_opts
+            )
+            if result.fun < best_energy:
+                best_energy = result.fun
+                best_pos = result.x.reshape(-1, 3)
+                x0 = result.x
+        except Exception:
+            pass
+    
+    return best_pos, best_energy
 
 def construct():
+    """Construct 55-atom LJ cluster near global minimum."""
     start_time = time.time()
-    deadline = start_time + 135.0  # Safety margin before 150s kill
+    deadline = start_time + 145.0  # safety margin before 150s limit
     
-    best_pos = make_mackay_icosahedron()
-    best_e = lj_energy(best_pos)
-    
-    # Generate candidate structures
+    # Generate a focused set of Mackay variants
     candidates = []
     
-    # 1. Mackay icosahedron base (most promising)
-    candidates.append(("mackay_base", make_mackay_icosahedron()))
+    # Curated radius combinations - fewer but more diverse
+    radius_combos = [
+        (1.05, 1.75, 1.95),  # default Mackay
+        (1.0, 1.70, 1.90),
+        (1.10, 1.80, 2.00),
+        (0.95, 1.65, 1.85),
+        (1.15, 1.85, 2.05),
+        (1.05, 1.80, 2.00),
+        (1.0, 1.75, 1.95),
+    ]
     
-    # 2. Perturbed Mackay with small perturbations (multiple seeds)
-    for s in range(15):
-        candidates.append((f"perturbed_mackay_small_{s}", make_perturbed_mackay(s, scale=0.05)))
+    for r1, r2, r3 in radius_combos:
+        cand = _make_mackay_icosahedron(r1, r2, r3)
+        candidates.append(cand)
     
-    # 3. Perturbed Mackay with medium perturbations
-    for s in range(10):
-        candidates.append((f"perturbed_mackay_med_{s}", make_perturbed_mackay(s, scale=0.15)))
+    # Add a few random perturbations of the default Mackay
+    np.random.seed(42)
+    base = _make_mackay_icosahedron()
+    for scale in [0.03, 0.05, 0.10, 0.15]:
+        perturbed = base + np.random.randn(55, 3) * scale
+        candidates.append(perturbed)
     
-    # 4. Cubic lattice
-    candidates.append(("cubic", make_cubic_lattice()))
+    # Sort candidates by initial energy
+    cand_energies = [(c, _lj_energy(c)) for c in candidates]
+    cand_energies.sort(key=lambda x: x[1])
+    candidates = [c for c, _ in cand_energies]
     
-    # 5. Random clusters
-    for s in range(5):
-        candidates.append((f"random_{s}", make_random_cluster(s)))
+    # Relax the top candidates with generous iteration budgets
+    best_energy = float('inf')
+    best_pos = candidates[0].copy()
     
-    # Evaluate and relax each candidate within time budget
-    # Priority: relax Mackay-based candidates first (most likely to converge to good minimum)
-    for name, pos in candidates:
-        if time.time() > deadline:
+    # First pass: relax top 5 candidates with good tolerances
+    top_n = min(5, len(candidates))
+    for i in range(top_n):
+        if time.time() > deadline - 60.0:
             break
-        
-        # Skip if already better than current best
-        e_raw = lj_energy(pos)
-        
-        # Try to relax - use more iterations for promising candidates
-        if time.time() < deadline - 10:  # Leave 10s safety margin
-            # Use more iterations for Mackay-based candidates
-            if "mackay" in name:
-                pos_relaxed, e_relaxed = relax(pos, maxiter=500)
-            else:
-                pos_relaxed, e_relaxed = relax(pos, maxiter=300)
-            
-            if e_relaxed < best_e:
-                best_e = e_relaxed
-                best_pos = pos_relaxed.copy()
-        
-        if e_raw < best_e:
-            best_e = e_raw
-            best_pos = pos.copy()
+        remaining = deadline - time.time()
+        # Give each candidate a fair share of time
+        max_iter = max(200, int(remaining * 3))
+        relaxed, energy = _relax_lbfgs(candidates[i], deadline=deadline, maxiter=max_iter, gtol=1e-10)
+        if energy < best_energy:
+            best_energy = energy
+            best_pos = relaxed.copy()
     
-    # Final polish: one more relaxation on the best candidate
-    if time.time() < deadline - 5:
-        pos_final, e_final = relax(best_pos, maxiter=300)
-        if e_final < best_e:
-            best_e = e_final
-            best_pos = pos_final
+    # Second pass: aggressive polish on the best result
+    if time.time() < deadline - 20.0:
+        polished, polished_energy = _polish(best_pos, deadline=deadline)
+        if polished_energy < best_energy:
+            best_energy = polished_energy
+            best_pos = polished
+    
+    # Third pass: micro-perturbations around the best to escape shallow local min
+    if time.time() < deadline - 10.0:
+        np.random.seed(999)
+        for scale in [0.005, 0.01, 0.02]:
+            if time.time() > deadline - 8.0:
+                break
+            perturbed = best_pos + np.random.randn(55, 3) * scale
+            relaxed, energy = _relax_lbfgs(perturbed, deadline=deadline, maxiter=500, gtol=1e-12)
+            if energy < best_energy:
+                best_energy = energy
+                best_pos = relaxed.copy()
+        # Final ultra-tight polish
+        if time.time() < deadline - 5.0:
+            polished, polished_energy = _polish(best_pos, deadline=deadline)
+            if polished_energy < best_energy:
+                best_energy = polished_energy
+                best_pos = polished
+    
+    # Final check: ensure minimum distance >= 0.5
+    diff = best_pos[:, np.newaxis, :] - best_pos[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff ** 2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    min_dist_found = np.min(dists)
+    
+    if min_dist_found < 0.5:
+        scale = 0.5 / min_dist_found * 1.01
+        best_pos = best_pos * scale
     
     return best_pos
-
 # EVOLVE-BLOCK-END

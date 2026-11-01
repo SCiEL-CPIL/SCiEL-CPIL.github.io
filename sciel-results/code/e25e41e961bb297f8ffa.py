@@ -1,0 +1,141 @@
+import numpy as np
+import time
+
+DIMENSIONS = [2, 3, 3]
+
+def construct():
+    n, m, p = DIMENSIONS
+    # Schoolbook rank
+    R_school = n * m * p
+    U_school = np.zeros((n * m, R_school))
+    V_school = np.zeros((m * p, R_school))
+    W_school = np.zeros((p * n, R_school))
+    
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U_school[i * m + j, col] = 1
+                V_school[j * p + k, col] = 1
+                W_school[k * n + i, col] = 1
+                col += 1
+                
+    # Build the target tensor T[i,j,k] = 1 for all valid indices
+    T = np.ones((n, m, p))
+    
+    start_time = time.time()
+    timeout = 140  # Safety margin
+    
+    best_U, best_V, best_W = U_school, V_school, W_school
+    best_rank = R_school
+    
+    def compute_error(U, V, W, target_rank):
+        """Compute the error of the tensor decomposition."""
+        # Tensor = sum_r U[:, :, r] * V[:, :, r] * W[:, :, r]
+        # U has shape (n*m, target_rank), V has shape (m*p, target_rank), W has shape (p*n, target_rank)
+        # We need to reshape and contract
+        U_r = U.reshape(n, m, target_rank)
+        V_r = V.reshape(m, p, target_rank)
+        W_r = W.reshape(p, n, target_rank)
+        
+        # Contract over r: result[i,j,k] = sum_r U_r[i,j,r] * V_r[j,k,r] * W_r[k,i,r]
+        # Use einsum
+        result = np.einsum('ijr,jkr,kir->ijk', U_r, V_r, W_r)
+        return np.linalg.norm(result - T)
+    
+    def als_decompose(target_rank, max_iters=200, tol=1e-8, seed=None):
+        """Alternating Least Squares for tensor decomposition."""
+        if seed is not None:
+            rng = np.random.RandomState(seed)
+        else:
+            rng = np.random.RandomState()
+            
+        U = rng.randn(n * m, target_rank)
+        V = rng.randn(m * p, target_rank)
+        W = rng.randn(p * n, target_rank)
+        
+        for iter_ in range(max_iters):
+            if time.time() - start_time > timeout:
+                return None, None, None, None
+                
+            # Update U: for each (i,j), solve least squares
+            for i in range(n):
+                for j in range(m):
+                    # T[i,j,:] = sum_r U[i*m+j, r] * V[j,:,r] * W[:,i,r]
+                    # Let A[r, k] = V[j*p+k, r] * W[k*n+i, r] for k in range(p)
+                    A = np.zeros((target_rank, p))
+                    for k in range(p):
+                        A[:, k] = V[j * p + k, :] * W[k * n + i, :]
+                    # Solve: A^T * U[i*m+j, :] = T[i,j,:]
+                    # i.e., U[i*m+j, :] = (A A^T)^{-1} A T[i,j,:]
+                    try:
+                        U[i * m + j, :] = np.linalg.lstsq(A, T[i, j, :].reshape(-1), rcond=None)[0]
+                    except:
+                        pass
+                        
+            # Update V: for each (j,k), solve least squares
+            for j in range(m):
+                for k in range(p):
+                    # T[:,j,k] = sum_r U[:,j,r] * V[j*p+k, r] * W[k*n+i, r] for i in range(n)
+                    # Let A[r, i] = U[i*m+j, r] * W[k*n+i, r] for i in range(n)
+                    A = np.zeros((target_rank, n))
+                    for i in range(n):
+                        A[:, i] = U[i * m + j, :] * W[k * n + i, :]
+                    # Solve: A^T * V[j*p+k, :] = T[:,j,k]
+                    try:
+                        V[j * p + k, :] = np.linalg.lstsq(A, T[:, j, k].reshape(-1), rcond=None)[0]
+                    except:
+                        pass
+                        
+            # Update W: for each (k,i), solve least squares
+            for k in range(p):
+                for i in range(n):
+                    # T[i,:,k] = sum_r U[i*m+j, r] * V[j*p+k, r] * W[k*n+i, r] for j in range(m)
+                    # Let A[r, j] = U[i*m+j, r] * V[j*p+k, r] for j in range(m)
+                    A = np.zeros((target_rank, m))
+                    for j in range(m):
+                        A[:, j] = U[i * m + j, :] * V[j * p + k, :]
+                    # Solve: A^T * W[k*n+i, :] = T[i,:,k]
+                    try:
+                        W[k * n + i, :] = np.linalg.lstsq(A, T[i, :, k].reshape(-1), rcond=None)[0]
+                    except:
+                        pass
+                        
+            # Check convergence
+            err = compute_error(U, V, W, target_rank)
+            if err < tol:
+                return U, V, W, err
+                
+        err = compute_error(U, V, W, target_rank)
+        return U, V, W, err
+    
+    # Try ranks from 14 upward
+    for target_rank in range(14, R_school + 1):
+        if time.time() - start_time > timeout:
+            break
+            
+        found = False
+        max_restarts = 30
+        for restart in range(max_restarts):
+            if time.time() - start_time > timeout:
+                break
+                
+            U, V, W, err = als_decompose(target_rank, max_iters=100, tol=1e-7, seed=restart)
+            
+            if U is None:
+                break
+                
+            if err < 1e-6:
+                best_U, best_V, best_W = U, V, W
+                best_rank = target_rank
+                found = True
+                break
+                
+        if found:
+            # Try to go even lower
+            continue
+        else:
+            # If we couldn't find a solution at this rank, try next
+            continue
+            
+    return {"U": best_U.tolist(), "V": best_V.tolist(), "W": best_W.tolist()}
