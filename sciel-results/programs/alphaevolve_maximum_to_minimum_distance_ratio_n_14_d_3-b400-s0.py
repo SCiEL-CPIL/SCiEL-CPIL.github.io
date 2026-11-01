@@ -20,9 +20,10 @@ def raw_score(points):
     Calculate the actual score: (max_dist / min_dist)^2.
     """
     sq_dists = get_pairwise_sq_dists(points)
-    if np.min(sq_dists) < 1e-12:
+    min_d = np.min(sq_dists)
+    if min_d < 1e-12:
         return np.inf
-    return (np.max(sq_dists) / np.min(sq_dists))
+    return (np.max(sq_dists) / min_d)
 
 def normalize_points(points):
     """
@@ -51,25 +52,22 @@ def objective_smooth(x, tau=100.0):
     
     # Soft max
     m_max = np.max(sq_dists)
-    # Subtract max for numerical stability in exp
     exp_max = np.exp(tau * (sq_dists - m_max))
     log_sum_exp_max = m_max + np.log(np.sum(exp_max)) / tau
     
     # Soft min
     m_min = np.min(sq_dists)
-    # Subtract min for numerical stability in exp
     exp_min = np.exp(-tau * (sq_dists - m_min))
     log_sum_exp_min = m_min - np.log(np.sum(exp_min)) / tau
     
     # We want to minimize log(soft_max) - log(soft_min)
-    # This is equivalent to minimizing log(soft_max / soft_min)
     obj_val = np.log(log_sum_exp_max) - np.log(log_sum_exp_min)
     
     return obj_val
 
 def construct():
     start_time = time.time()
-    timeout = 145.0 # Safety margin
+    timeout = 140.0 # Safety margin (10s buffer)
     
     best_score = np.inf
     best_points = None
@@ -104,8 +102,15 @@ def construct():
     # 2. Initial candidates
     candidates = []
     
-    # Candidate 1: Ico + 2 random points on sphere
-    for i in range(8):
+    # Candidate 1: Ico + Poles (High Symmetry)
+    p_top = np.array([0, 0, 1.0])
+    p_bot = np.array([0, 0, -1.0])
+    pts_sym = np.vstack([ico, p_top.reshape(1, D), p_bot.reshape(1, D)])
+    candidates.append(pts_sym.flatten())
+    
+    # Candidate 2: Ico + 2 points on the "equator" perpendicular to poles? 
+    # Or just random on sphere
+    for i in range(10):
         p1 = rng.normal(size=D)
         p2 = rng.normal(size=D)
         p1 /= np.linalg.norm(p1)
@@ -113,22 +118,26 @@ def construct():
         pts = np.vstack([ico, p1.reshape(1, D), p2.reshape(1, D)])
         candidates.append(pts.flatten())
         
-    # Candidate 2: Ico + 2 points at (0,0,1) and (0,0,-1) 
-    p_top = np.array([0, 0, 1.0])
-    p_bot = np.array([0, 0, -1.0])
-    pts_sym = np.vstack([ico, p_top.reshape(1, D), p_bot.reshape(1, D)])
-    candidates.append(pts_sym.flatten())
-    
-    # Candidate 3: Fully random points
+    # Candidate 3: Fully random points on sphere
+    for i in range(10):
+        pts = rng.normal(size=(N, D))
+        pts = pts / np.linalg.norm(pts, axis=1, keepdims=True)
+        candidates.append(pts.flatten())
+        
+    # Candidate 4: Random Gaussian (will be normalized anyway)
     for i in range(5):
         pts = rng.normal(size=(N, D))
         candidates.append(pts.flatten())
-    
+
     # 3. Optimization Loop
     n_restarts = len(candidates)
     
+    # Annealing schedule for tau
+    # Start very smooth, end very sharp
+    taus = [1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0]
+    
     for i in range(n_restarts):
-        if time.time() - start_time > timeout - 15:
+        if time.time() - start_time > timeout - 10:
             break
             
         x0 = candidates[i].copy()
@@ -139,8 +148,6 @@ def construct():
         x0 = x0.flatten()
         
         try:
-            # Annealing schedule for tau - more aggressive
-            taus = [5.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0]
             current_x = x0
             
             for tau in taus:
@@ -148,12 +155,13 @@ def construct():
                     break
                 
                 # Optimize with current tau
+                # L-BFGS-B is good for smooth functions
                 res = minimize(
                     objective_smooth, 
                     current_x, 
                     method='L-BFGS-B', 
                     args=(tau,),
-                    options={'maxiter': 150, 'ftol': 1e-10, 'gtol': 1e-8}
+                    options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-8}
                 )
                 
                 if res.x is not None:
@@ -165,7 +173,7 @@ def construct():
             pass
     
     # 4. Final high-precision polish pass on best point
-    if best_points is not None and time.time() - start_time < timeout - 10:
+    if best_points is not None and time.time() - start_time < timeout - 5:
         try:
             x_polish = best_points.flatten()
             # Use very high tau for precise max/min
@@ -173,8 +181,8 @@ def construct():
                 objective_smooth, 
                 x_polish, 
                 method='L-BFGS-B', 
-                args=(2000.0,),
-                options={'maxiter': 300, 'ftol': 1e-12, 'gtol': 1e-10}
+                args=(5000.0,),
+                options={'maxiter': 500, 'ftol': 1e-14, 'gtol': 1e-10}
             )
             if res.x is not None:
                 pts_polish = res.x.reshape(N, D)

@@ -1,234 +1,335 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
 import time
 import random
+import math
 
 # EVOLVE-BLOCK-START
-def _build_greedy(n_rows, k):
-    """Fast greedy: each row takes smallest next mark with no difference collision."""
-    used = set()
+
+def _greedy_init(n_rows, k, gap_factor=10):
+    """
+    Standard greedy initialization: each row takes the smallest next mark with no difference collision.
+    """
     rows = []
-    for _ in range(n_rows):
+    used = set()
+    for r in range(n_rows):
         row = [0]
         x = 0
         while len(row) < k + 1:
             x += 1
-            new = {x - a for a in row}
-            if not new & used:
+            new_diffs = {x - a for a in row}
+            if not new_diffs & used:
                 row.append(x)
-                used |= new
+                used |= new_diffs
         rows.append(row)
+    
     return rows
 
-def _valid(rows, n_rows, k):
-    """Check all rows are valid and all differences are globally distinct."""
-    used = set()
+def _row_diffs_set(row):
+    """Compute the set of all positive differences in a row."""
+    diffs = set()
+    n = len(row)
+    for i in range(n):
+        for j in range(i + 1, n):
+            diffs.add(row[j] - row[i])
+    return diffs
+
+def _compute_all_used(rows):
+    """Compute the union of all differences across all rows."""
+    all_used = set()
     for row in rows:
-        if len(row) != k + 1:
-            return False
-        if row[0] != 0:
-            return False
-        for i in range(len(row)):
-            if i > 0 and row[i] <= row[i - 1]:
-                return False
-        for i in range(len(row)):
-            for j in range(i + 1, len(row)):
-                d = row[j] - row[i]
-                if d in used:
-                    return False
-                used.add(d)
-    return True
+        all_used |= _row_diffs_set(row)
+    return all_used
 
-def _max_entry(rows):
-    return max(max(r) for r in rows)
-
-def _row_diffs(row):
-    s = set()
-    n = len(row)
-    for i in range(n):
-        for j in range(i + 1, n):
-            s.add(row[j] - row[i])
-    return s
-
-def _row_diffs_list(row):
-    out = []
-    n = len(row)
-    for i in range(n):
-        for j in range(i + 1, n):
-            out.append(row[j] - row[i])
-    return out
-
-def _check_row_valid(row, k):
-    """Check if a single row is strictly increasing and starts at 0."""
-    if len(row) != k + 1:
-        return False
-    if row[0] != 0:
-        return False
-    for i in range(1, len(row)):
-        if row[i] <= row[i - 1]:
-            return False
-    return True
+def _global_max(rows):
+    """Compute the maximum entry across all rows."""
+    return max(max(row) for row in rows)
 
 def construct(n_rows, k):
     start_time = time.time()
-    deadline = start_time + 105  # safety margin before 120s limit
-    random.seed(42)
-
-    # Start from greedy
-    rows = _build_greedy(n_rows, k)
-    best = [r[:] for r in rows]
-    best_val = _max_entry(best)
-    best_used = set()
-    for r in best:
-        best_used |= _row_diffs(r)
-
-    # Local search with incremental difference tracking
-    cur = [r[:] for r in best]
-    cur_val = best_val
-    cur_used = set(best_used)
+    deadline = start_time + 105.0  # Safety margin for 120s limit
     
-    # Track diffs per row for efficient updates
-    cur_row_diffs = [_row_diffs(r) for r in cur]
+    # 1. Initialization
+    rows = _greedy_init(n_rows, k)
     
-    T = 50.0
+    # Track used differences for fast checking
+    all_used = _compute_all_used(rows)
+    
+    best_rows = [r[:] for r in rows]
+    best_val = _global_max(rows)
+    
+    # Maintain row maxes for efficient global max computation
+    row_maxes = [max(r) for r in rows]
+    
+    # 2. Simulated Annealing
+    current_rows = [r[:] for r in rows]
+    current_val = best_val
+    T = 200.0
     T_min = 0.5
-    cool = 0.9999
+    cool = 0.99995
     
-    step = 0
-    no_improve_steps = 0
-    max_no_improve = 50000
+    no_improve = 0
+    max_no_improve = 30000
+    steps = 0
     
-    while time.time() < deadline and no_improve_steps < max_no_improve:
-        step += 1
+    # Precompute row diffs for each row
+    row_diffs = [_row_diffs_set(r) for r in current_rows]
+    
+    while time.time() < deadline and no_improve < max_no_improve:
+        steps += 1
         
-        # Pick a random row and a random position to perturb
+        # Pick a row and position to modify
         ri = random.randrange(n_rows)
-        pi = random.randrange(1, k + 1)  # positions 1..k (0 is fixed)
-        old_val = cur[ri][pi]
+        pi = random.randrange(1, k + 1)  # 1..k
         
-        # Generate candidate moves: try to reduce the value
-        # Focus on positions that contribute to the max
-        is_max_pos = (old_val == cur_val and cur[ri][-1] == cur_val)
+        old_val = current_rows[ri][pi]
         
-        # Try decreasing first (to reduce max), then small increases
-        if is_max_pos or random.random() < 0.7:
-            # Try decreasing
-            candidates = []
-            for d in range(1, 20):
-                new_val = old_val - d
-                if new_val <= cur[ri][pi - 1]:
-                    break
-                candidates.append(new_val)
-            # Also try small increases for diversification
-            for d in range(1, 10):
-                new_val = old_val + d
-                if pi < k and new_val >= cur[ri][pi + 1]:
-                    break
-                candidates.append(new_val)
-            random.shuffle(candidates)
-        else:
-            # Random perturbation
-            candidates = []
-            for d in range(-15, 16):
-                if d == 0:
-                    continue
-                new_val = old_val + d
-                if new_val <= cur[ri][pi - 1]:
-                    continue
-                if pi < k and new_val >= cur[ri][pi + 1]:
-                    continue
-                candidates.append(new_val)
-            random.shuffle(candidates)
+        # Generate candidates with bias toward reducing max
+        candidates = []
+        
+        # Decreasing candidates - try more of these
+        min_allowed = current_rows[ri][pi - 1] + 1
+        max_decrease = min(50, old_val - min_allowed)
+        for d in range(1, max_decrease + 1):
+            new_v = old_val - d
+            candidates.append(new_v)
+            
+        # Increasing candidates (for exploration) - fewer
+        max_allowed = (current_rows[ri][pi + 1] - 1) if pi < k else current_val + 30
+        max_increase = min(15, max_allowed - old_val)
+        for d in range(1, max_increase + 1):
+            new_v = old_val + d
+            candidates.append(new_v)
+            
+        # Random jump (large perturbation)
+        if random.random() < 0.15:
+            low = current_rows[ri][pi - 1] + 1
+            high = (current_rows[ri][pi + 1] - 1) if pi < k else current_val + 20
+            if low <= high:
+                candidates.append(random.randint(low, high))
+        
+        if not candidates:
+            no_improve += 1
+            T = max(T_min, T * cool)
+            continue
+            
+        random.shuffle(candidates)
         
         moved = False
         for new_val in candidates:
-            # Check strict increase within row
-            if new_val <= cur[ri][pi - 1]:
+            # Basic validity check for this position
+            if new_val <= current_rows[ri][pi - 1]:
                 continue
-            if pi < k and new_val >= cur[ri][pi + 1]:
+            if pi < k and new_val >= current_rows[ri][pi + 1]:
                 continue
-            
+                
             # Build candidate row
-            cand_row = cur[ri][:]
+            cand_row = current_rows[ri][:]
             cand_row[pi] = new_val
             
-            # Check row validity
-            if not _check_row_valid(cand_row, k):
+            # Calculate new diffs for this row efficiently
+            n = len(cand_row)
+            new_diffs = set()
+            valid_internal = True
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = cand_row[j] - cand_row[i]
+                    if d in new_diffs:
+                        valid_internal = False
+                        break
+                    new_diffs.add(d)
+                if not valid_internal:
+                    break
+            
+            if not valid_internal:
                 continue
+                
+            # Get old diffs of row ri
+            old_diffs = row_diffs[ri]
             
-            # Compute new diffs for this row
-            new_diffs = _row_diffs(cand_row)
+            # Check for conflicts: new_diffs should not intersect with (all_used - old_diffs)
+            conflict = False
+            for d in new_diffs:
+                if d in all_used and d not in old_diffs:
+                    conflict = True
+                    break
             
-            # Check for conflicts with other rows' diffs
-            # cur_used contains all diffs from all rows
-            # We need to check if new_diffs conflicts with (cur_used - cur_row_diffs[ri])
-            other_diffs = cur_used - cur_row_diffs[ri]
-            if new_diffs & other_diffs:
+            if conflict:
                 continue
+                
+            # Move is valid - compute new global max efficiently
+            cand_row_max = max(cand_row)
             
-            # Also check internal uniqueness in new_diffs (should be guaranteed by valid row)
-            # But let's verify: a valid increasing row can have duplicate diffs
-            # e.g., [0, 1, 2] has diffs {1, 1, 2} -> as a set {1, 2}, but the multiset has 1 twice
-            # The requirement is that all differences a_j - a_i for i < j are distinct over all rows
-            # This means within a row, all pairwise differences must be distinct (Sidon set property)
-            diff_list = _row_diffs_list(cand_row)
-            if len(diff_list) != len(set(diff_list)):
-                continue
+            # Update row_maxes temporarily
+            old_row_max = row_maxes[ri]
+            row_maxes[ri] = cand_row_max
+            new_global_max = max(row_maxes)
+            row_maxes[ri] = old_row_max  # restore
             
-            # Compute new max
-            cand_max = max(max(r) for r in cur if r is not cand_row) if n_rows > 1 else 0
-            cand_max = max(cand_max, max(cand_row))
+            delta = new_global_max - current_val
             
-            # Acceptance
-            delta_e = cand_max - cur_val
             accept = False
-            if delta_e < 0:
+            if delta < 0:
                 accept = True
-            elif delta_e == 0:
-                if random.random() < 0.5:
+            elif delta == 0:
+                if random.random() < 0.2:  # Allow some neutral moves to shuffle
                     accept = True
             else:
-                # Simulated annealing: accept worse with probability
+                # Accept worse moves with probability
                 if T > T_min:
-                    prob = 1.0 / (1.0 + delta_e / max(T, 0.01))
+                    prob = math.exp(-delta / max(T, 0.1))
                     if random.random() < prob:
                         accept = True
             
             if accept:
                 # Update state
-                cur_used -= cur_row_diffs[ri]
-                cur_used |= new_diffs
-                cur[ri] = cand_row
-                cur_row_diffs[ri] = new_diffs
-                cur_val = cand_max
+                all_used -= old_diffs
+                all_used |= new_diffs
+                current_rows[ri] = cand_row
+                row_diffs[ri] = new_diffs
+                row_maxes[ri] = cand_row_max
+                current_val = max(row_maxes)
                 
-                if cur_val < best_val:
-                    best_val = cur_val
-                    best = [r[:] for r in cur]
-                    best_used = set(cur_used)
-                    no_improve_steps = 0
+                if current_val < best_val:
+                    best_val = current_val
+                    best_rows = [r[:] for r in current_rows]
+                    no_improve = 0
                 else:
-                    no_improve_steps += 1
-                
+                    no_improve += 1
+                    
                 moved = True
                 break
         
         if not moved:
-            no_improve_steps += 1
-        
-        # Cool down
+            no_improve += 1
+            
         T = max(T_min, T * cool)
         
-        # Periodic restart: if stuck for too long, reset to best and restart SA
-        if no_improve_steps > 20000:
-            cur = [r[:] for r in best]
-            cur_val = best_val
-            cur_used = set(best_used)
-            cur_row_diffs = [_row_diffs(r) for r in cur]
-            T = 50.0
-            no_improve_steps = 0
+        # Periodic restart if stuck
+        if no_improve > 15000:
+            current_rows = [r[:] for r in best_rows]
+            current_val = best_val
+            all_used = _compute_all_used(current_rows)
+            row_diffs = [_row_diffs_set(r) for r in current_rows]
+            row_maxes = [max(r) for r in current_rows]
+            T = 200.0
+            no_improve = 0
     
-    # Ensure best is valid
-    if not _valid(best, n_rows, k):
-        best = _build_greedy(n_rows, k)
-    return best
+    # 3. Final polishing phase with tighter tolerance
+    polish_deadline = min(deadline, start_time + 108.0)
+    T = 1.0
+    T_min = 0.1
+    cool = 0.99999
+    no_improve = 0
+    max_no_improve_polish = 10000
+    
+    # Reset state to best
+    current_rows = [r[:] for r in best_rows]
+    current_val = best_val
+    all_used = _compute_all_used(current_rows)
+    row_diffs = [_row_diffs_set(r) for r in current_rows]
+    row_maxes = [max(r) for r in current_rows]
+    
+    while time.time() < polish_deadline and no_improve < max_no_improve_polish:
+        # Pick a row and position
+        ri = random.randrange(n_rows)
+        pi = random.randrange(1, k + 1)
+        
+        old_val = current_rows[ri][pi]
+        
+        # Only try decreasing moves in polish phase
+        min_allowed = current_rows[ri][pi - 1] + 1
+        max_decrease = min(20, old_val - min_allowed)
+        
+        candidates = []
+        for d in range(1, max_decrease + 1):
+            candidates.append(old_val - d)
+        
+        if not candidates:
+            no_improve += 1
+            T = max(T_min, T * cool)
+            continue
+            
+        random.shuffle(candidates)
+        
+        moved = False
+        for new_val in candidates:
+            if new_val <= current_rows[ri][pi - 1]:
+                continue
+            if pi < k and new_val >= current_rows[ri][pi + 1]:
+                continue
+                
+            cand_row = current_rows[ri][:]
+            cand_row[pi] = new_val
+            
+            n = len(cand_row)
+            new_diffs = set()
+            valid_internal = True
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d = cand_row[j] - cand_row[i]
+                    if d in new_diffs:
+                        valid_internal = False
+                        break
+                    new_diffs.add(d)
+                if not valid_internal:
+                    break
+            
+            if not valid_internal:
+                continue
+                
+            old_diffs = row_diffs[ri]
+            
+            conflict = False
+            for d in new_diffs:
+                if d in all_used and d not in old_diffs:
+                    conflict = True
+                    break
+            
+            if conflict:
+                continue
+                
+            cand_row_max = max(cand_row)
+            old_row_max = row_maxes[ri]
+            row_maxes[ri] = cand_row_max
+            new_global_max = max(row_maxes)
+            row_maxes[ri] = old_row_max
+            
+            delta = new_global_max - current_val
+            
+            accept = False
+            if delta < 0:
+                accept = True
+            elif delta == 0:
+                if random.random() < 0.1:
+                    accept = True
+            else:
+                if T > T_min:
+                    prob = math.exp(-delta / max(T, 0.05))
+                    if random.random() < prob:
+                        accept = True
+            
+            if accept:
+                all_used -= old_diffs
+                all_used |= new_diffs
+                current_rows[ri] = cand_row
+                row_diffs[ri] = new_diffs
+                row_maxes[ri] = cand_row_max
+                current_val = max(row_maxes)
+                
+                if current_val < best_val:
+                    best_val = current_val
+                    best_rows = [r[:] for r in current_rows]
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                    
+                moved = True
+                break
+        
+        if not moved:
+            no_improve += 1
+            
+        T = max(T_min, T * cool)
+    
+    return best_rows
+
 # EVOLVE-BLOCK-END
