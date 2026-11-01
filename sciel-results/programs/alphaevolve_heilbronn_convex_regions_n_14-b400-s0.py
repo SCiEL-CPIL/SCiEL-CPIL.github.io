@@ -53,6 +53,8 @@ def _normalize(points):
         ha = _hull_area(points)
         if ha < 1e-12:
             return points
+        # Scale so that hull area = 1 (since score = min_area / hull_area,
+        # and both scale by s^2, the ratio is invariant under uniform scaling)
         return points / np.sqrt(ha)
     except Exception:
         return points
@@ -245,9 +247,9 @@ def construct():
             sc = _score(_normalize(pts))
             return -sc
 
-        # More starting points
-        for r_init in [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]:
-            for rot_init in [0.0, np.pi/n1, np.pi/n2, 2*np.pi/n1]:
+        # More starting points with wider range
+        for r_init in [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+            for rot_init in [0.0, np.pi/n1, np.pi/n2, 2*np.pi/n1, np.pi/(n1+n2)]:
                 if time.time() > deadline:
                     continue
                 x0 = np.array([r_init, 0.0, rot_init])
@@ -256,20 +258,20 @@ def construct():
                         _two_ring_score,
                         x0,
                         method='Nelder-Mead',
-                        options={'maxiter': 500, 'xatol': 1e-8, 'fatol': 1e-10}
+                        options={'maxiter': 400, 'xatol': 1e-9, 'fatol': 1e-11}
                     )
                     r_ratio, rot1, rot2 = res.x
                     pts = _generate_two_ring_config(n1, n2, 1.0, r_ratio, rot1, rot2)
                     sc = _update_best(pts)
                     
-                    if sc > best_score * 0.95 and time.time() < deadline - 15:
-                        _try_optimize_smooth(pts, maxiter=1500)
+                    if sc > best_score * 0.9 and time.time() < deadline - 12:
+                        _try_optimize_smooth(pts, maxiter=1200)
                         
                 except Exception:
                     pass
 
     # 2. Explore three-ring configurations
-    three_ring_splits = [(5, 4, 5), (4, 5, 5), (5, 5, 4), (6, 4, 4), (4, 6, 4), (4, 4, 6), (7, 3, 4), (3, 7, 4)]
+    three_ring_splits = [(5, 4, 5), (4, 5, 5), (5, 5, 4), (6, 4, 4), (4, 6, 4), (4, 4, 6), (7, 3, 4), (3, 7, 4), (5, 5, 4), (4, 4, 6)]
     
     for n1, n2, n3 in three_ring_splits:
         if time.time() > deadline - 5:
@@ -293,8 +295,8 @@ def construct():
             sc = _score(_normalize(pts))
             return -sc
 
-        for r2_init in [0.4, 0.5, 0.6]:
-            for r3_init in [0.2, 0.3, 0.4]:
+        for r2_init in [0.3, 0.4, 0.5, 0.6]:
+            for r3_init in [0.15, 0.25, 0.35, 0.45]:
                 if time.time() > deadline - 5:
                     continue
                 x0 = np.array([r2_init, r3_init, 0.0, np.pi/n2, np.pi/n3])
@@ -303,45 +305,61 @@ def construct():
                         _three_ring_score,
                         x0,
                         method='Nelder-Mead',
-                        options={'maxiter': 300, 'xatol': 1e-8, 'fatol': 1e-10}
+                        options={'maxiter': 250, 'xatol': 1e-9, 'fatol': 1e-11}
                     )
                     r2_ratio, r3_ratio, rot1, rot2, rot3 = res.x
                     pts = _generate_three_ring_config(n1, n2, n3, 1.0, r2_ratio, r3_ratio, rot1, rot2, rot3)
                     sc = _update_best(pts)
                     
-                    if sc > best_score * 0.95 and time.time() < deadline - 15:
-                        _try_optimize_smooth(pts, maxiter=1000)
+                    if sc > best_score * 0.9 and time.time() < deadline - 12:
+                        _try_optimize_smooth(pts, maxiter=800)
                         
                 except Exception:
                     pass
 
-    # 3. Regular polygon and perturbations
+    # 3. Regular polygon and perturbations with varying noise levels
     reg = _regular_polygon(N, 1.0)
     _update_best(reg)
     
-    for i in range(10):
-        if time.time() > deadline - 10:
+    noise_levels = [0.05, 0.1, 0.15, 0.2, 0.3]
+    for noise_scale in noise_levels:
+        if time.time() > deadline - 8:
             break
-        noise = rng.uniform(-0.1, 0.1, (N, 2))
-        init = _regular_polygon(N, 1.0) + noise
-        _try_optimize_smooth(init, maxiter=1000)
+        for trial in range(3):
+            if time.time() > deadline - 8:
+                break
+            noise = rng.uniform(-noise_scale, noise_scale, (N, 2))
+            init = _regular_polygon(N, 1.0) + noise
+            _try_optimize_smooth(init, maxiter=1000)
 
-    # 4. Random restarts
-    for i in range(5):
-        if time.time() > deadline - 10:
+    # 4. Random restarts with diverse distributions
+    for i in range(8):
+        if time.time() > deadline - 8:
             break
-        r = np.sqrt(rng.uniform(0, 1, N))
-        theta = rng.uniform(0, 2 * np.pi, N)
+        if i % 3 == 0:
+            r = np.sqrt(rng.uniform(0, 1, N))
+            theta = rng.uniform(0, 2 * np.pi, N)
+        elif i % 3 == 1:
+            # Points biased toward boundary
+            r = rng.uniform(0.5, 1.0, N)
+            theta = rng.uniform(0, 2 * np.pi, N)
+        else:
+            # Mix of inner and outer
+            r = np.concatenate([rng.uniform(0, 0.5, 5), rng.uniform(0.7, 1.0, 9)])
+            rng.shuffle(r)
+            theta = rng.uniform(0, 2 * np.pi, N)
         init = np.column_stack([r * np.cos(theta), r * np.sin(theta)])
         _try_optimize_smooth(init, maxiter=800)
 
-    # 5. Coordinate Descent Polish
+    # 5. Coordinate Descent Polish - more aggressive
     if best_points is not None and time.time() < deadline - 5:
         pts = best_points.copy()
-        for iteration in range(3):
+        for iteration in range(5):
             if time.time() > deadline - 2:
                 break
             for i in range(N):
+                if time.time() > deadline - 2:
+                    break
                 def _neg_score_one_point(params):
                     new_pts = pts.copy()
                     new_pts[i, 0] = params[0]
@@ -354,17 +372,40 @@ def construct():
                         _neg_score_one_point,
                         x0,
                         method='Nelder-Mead',
-                        options={'maxiter': 50, 'xatol': 1e-8, 'fatol': 1e-10}
+                        options={'maxiter': 80, 'xatol': 1e-10, 'fatol': 1e-12}
                     )
                     pts[i, 0] = res.x[0]
                     pts[i, 1] = res.x[1]
                 except Exception:
                     pass
         _update_best(pts)
+        
+        # 6. Final high-precision polish with smooth objective at high beta
+        if time.time() < deadline - 3:
+            x0 = pts.flatten()
+            try:
+                def _obj_and_grad_final(x_flat):
+                    return _neg_smooth_score_and_grad(x_flat, 2000.0)
+                
+                res = scipy.optimize.minimize(
+                    _obj_and_grad_final,
+                    x0,
+                    jac=True,
+                    method='L-BFGS-B',
+                    options={'maxiter': 500, 'gtol': 1e-12, 'ftol': 1e-15}
+                )
+                _update_best(res.x.reshape(-1, 2))
+            except Exception:
+                pass
 
     if best_points is None:
         best_points = _normalize(_regular_polygon(N, 1.0))
     else:
         best_points = _normalize(best_points)
+        
+    # Final sanity check
+    final_score = _score(best_points)
+    if final_score < 1e-10:
+        best_points = _normalize(_regular_polygon(N, 1.0))
         
     return best_points
