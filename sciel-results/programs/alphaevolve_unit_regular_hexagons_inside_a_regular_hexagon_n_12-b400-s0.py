@@ -1,277 +1,196 @@
 """Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
 import numpy as np
-from scipy.optimize import minimize, differential_evolution
 import time
+import random
 
 N = 12
 
 # EVOLVE-BLOCK-START
 def construct():
     start_time = time.time()
-    deadline = start_time + 145.0  # 5s safety margin before 150s kill
-
+    deadline = start_time + 140.0  # Safety margin
+    
     def hexagon_vertices(cx, cy, side, angle_deg):
-        angle_rad = np.radians(angle_deg)
-        angles = angle_rad + np.radians(np.arange(0, 360, 60))
-        return np.column_stack([
-            cx + side * np.cos(angles),
-            cy + side * np.sin(angles)
-        ])
+        angle = np.radians(angle_deg)
+        vertices = []
+        for i in range(6):
+            theta = angle + i * np.pi / 3
+            x = cx + side * np.cos(theta)
+            y = cy + side * np.sin(theta)
+            vertices.append([x, y])
+        return np.array(vertices)
 
-    def point_in_hexagon(px, py, cx, cy, side, angle_deg):
-        dx = px - cx
-        dy = py - cy
-        angle_rad = np.radians(angle_deg)
-        cos_a = np.cos(-angle_rad)
-        sin_a = np.sin(-angle_rad)
-        local_x = dx * cos_a - dy * sin_a
-        local_y = dx * sin_a + dy * cos_a
+    def hexagons_disjoint_fast(h1, h2):
+        """Fast check: distance based rejection, then SAT if close"""
+        dx = h1[0] - h2[0]
+        dy = h1[1] - h2[1]
+        dist_sq = dx*dx + dy*dy
         
-        apothem = side * np.sqrt(3) / 2
-        normal_angles = np.radians(np.arange(30, 360, 60))
+        # Max distance between centers for disjoint hexagons is 2.0 (touching vertices)
+        # If dist > 2.0, definitely disjoint
+        if dist_sq > 4.0:
+            return True
         
-        for na in normal_angles:
-            nx = np.cos(na)
-            ny = np.sin(na)
-            dist = local_x * nx + local_y * ny
-            if dist > apothem + 1e-9:
-                return False
-        return True
-
-    def polygons_disjoint_sat(v1, v2):
-        """
-        Check if two convex polygons are disjoint using Separating Axis Theorem.
-        v1, v2: Nx2 arrays of vertices.
-        Returns True if disjoint, False if overlapping.
-        """
-        axes = []
-        for i in range(len(v1)):
-            p1 = v1[i]
-            p2 = v1[(i + 1) % len(v1)]
-            edge = p2 - p1
+        # Min distance for overlap is approx sqrt(3) ~ 1.732 (touching edges)
+        # If dist < 1.7, definitely overlap
+        if dist_sq < 2.8: # 1.7^2
+            return False
+        
+        # Precise SAT check
+        v1 = hexagon_vertices(h1[0], h1[1], 1.0, h1[2])
+        v2 = hexagon_vertices(h2[0], h2[1], 1.0, h2[2])
+        
+        all_edges = []
+        for i in range(6):
+            all_edges.append(v1[i] - v1[(i+1) % 6])
+            all_edges.append(v2[i] - v2[(i+1) % 6])
+        
+        for edge in all_edges:
             normal = np.array([-edge[1], edge[0]])
             norm = np.linalg.norm(normal)
-            if norm > 1e-9:
-                axes.append(normal / norm)
-        
-        for i in range(len(v2)):
-            p1 = v2[i]
-            p2 = v2[(i + 1) % len(v2)]
-            edge = p2 - p1
-            normal = np.array([-edge[1], edge[0]])
-            norm = np.linalg.norm(normal)
-            if norm > 1e-9:
-                axes.append(normal / norm)
-        
-        for axis in axes:
-            proj1 = np.dot(v1, axis)
-            proj2 = np.dot(v2, axis)
-            min1, max1 = np.min(proj1), np.max(proj1)
-            min2, max2 = np.min(proj2), np.max(proj2)
+            if norm == 0:
+                continue
+            normal = normal / norm
             
-            if max1 < min2 - 1e-9 or max2 < min1 - 1e-9:
+            proj1 = np.dot(v1, normal)
+            proj2 = np.dot(v2, normal)
+            
+            if np.max(proj1) < np.min(proj2) or np.max(proj2) < np.min(proj1):
                 return True
         return False
 
-    def all_inside_outer(inner_positions, outer_center, outer_side, outer_angle):
-        for i in range(len(inner_positions)):
-            cx, cy, angle = inner_positions[i]
-            verts = hexagon_vertices(cx, cy, 1.0, angle)
-            for vx, vy in verts:
-                if not point_in_hexagon(vx, vy, outer_center[0], outer_center[1], outer_side, outer_angle):
-                    return False
-        return True
-
-    def pairwise_disjoint(inner_positions):
-        for i in range(len(inner_positions)):
-            for j in range(i+1, len(inner_positions)):
-                ci = (inner_positions[i][0], inner_positions[i][1])
-                cj = (inner_positions[j][0], inner_positions[j][1])
-                ai = inner_positions[i][2]
-                aj = inner_positions[j][2]
-                v1 = hexagon_vertices(ci[0], ci[1], 1.0, ai)
-                v2 = hexagon_vertices(cj[0], cj[1], 1.0, aj)
-                if not polygons_disjoint_sat(v1, v2):
-                    return False
-        return True
-
-    def is_valid(inner, oc, os, oa):
-        return all_inside_outer(inner, oc, os, oa) and pairwise_disjoint(inner)
+    def compute_min_side_fast(inner, center, angle):
+        """Vectorized computation of minimum outer side length"""
+        sqrt3 = np.sqrt(3)
+        max_extent = 0.0
+        
+        # Precompute all vertices for all inner hexagons
+        all_verts = np.vstack([hexagon_vertices(inner[i][0], inner[i][1], 1.0, inner[i][2]) for i in range(N)])
+        
+        # Center offset
+        offsets = all_verts - np.array(center)
+        
+        # Edge normals of outer hexagon
+        for k in range(6):
+            normal_angle = np.radians(angle) + np.radians(30) + k * np.pi / 3
+            normal = np.array([np.cos(normal_angle), np.sin(normal_angle)])
+            
+            # Dot product of all offsets with normal
+            extents = np.dot(offsets, normal)
+            max_e = np.max(extents)
+            if max_e > max_extent:
+                max_extent = max_e
+        
+        return max_extent * 2.0 / sqrt3
 
     def objective(params):
-        n_inner = N
-        inner_positions = []
-        for i in range(n_inner):
-            x = params[3*i]
-            y = params[3*i+1]
-            a = params[3*i+2]
-            inner_positions.append((x, y, a))
-        
-        ox = params[3*n_inner]
-        oy = params[3*n_inner+1]
-        os = max(params[3*n_inner+2], 0.1)
-        oa = params[3*n_inner+3]
-        
-        outer_center = (ox, oy)
-        outer_side = os
-        outer_angle = oa
-        
-        inside_ok = all_inside_outer(inner_positions, outer_center, outer_side, outer_angle)
-        disjoint_ok = pairwise_disjoint(inner_positions)
-        
-        if inside_ok and disjoint_ok:
-            return outer_side
-        
-        penalty = 0.0
-        if not inside_ok:
-            for i in range(n_inner):
-                cx, cy, angle = inner_positions[i]
-                verts = hexagon_vertices(cx, cy, 1.0, angle)
-                for vx, vy in verts:
-                    if not point_in_hexagon(vx, vy, outer_center[0], outer_center[1], outer_side, outer_angle):
-                        penalty += 1.0
-        if not disjoint_ok:
-            for i in range(n_inner):
-                for j in range(i+1, n_inner):
-                    ci = (inner_positions[i][0], inner_positions[i][1])
-                    cj = (inner_positions[j][0], inner_positions[j][1])
-                    ai = inner_positions[i][2]
-                    aj = inner_positions[j][2]
-                    v1 = hexagon_vertices(ci[0], ci[1], 1.0, ai)
-                    v2 = hexagon_vertices(cj[0], cj[1], 1.0, aj)
-                    if not polygons_disjoint_sat(v1, v2):
-                        penalty += 1.0
-                        
-        return outer_side + penalty * 10.0
-
-    def make_params(inner, oc, os, oa):
-        params = []
-        for pos in inner:
-            params.extend([pos[0], pos[1], pos[2]])
-        params.extend([oc[0], oc[1], os, oa])
-        return np.array(params, dtype=float)
-
-    def parse_params(params):
+        """Objective: minimize outer side length"""
+        # Unpack
         inner = []
         for i in range(N):
             inner.append((params[3*i], params[3*i+1], params[3*i+2]))
-        oc = (params[3*N], params[3*N+1])
-        os = params[3*N+2]
-        oa = params[3*N+3]
-        return inner, oc, os, oa
-
-    # Try multiple initial configurations
-    initial_configs = []
-    
-    # Config 1: 4x3 grid (current)
-    x_coords = [-3.0, -1.0, 1.0, 3.0]
-    y_coords = [-1.8, 0.0, 1.8]
-    config1 = []
-    for y in y_coords:
-        for x in x_coords:
-            config1.append([x, y, 0.0])
-    initial_configs.append((config1, [0.0, 0.0], 5.0, 30.0))
-    
-    # Config 2: Hexagonal lattice - 1 center + 6 ring + 5 more
-    # Center at origin
-    config2 = [[0.0, 0.0, 0.0]]
-    # Ring of 6 at distance ~2.0
-    for k in range(6):
-        angle = np.radians(60 * k)
-        config2.append([2.0 * np.cos(angle), 2.0 * np.sin(angle), 0.0])
-    # Add 5 more in second ring
-    for k in range(5):
-        angle = np.radians(60 * k + 30)
-        config2.append([3.5 * np.cos(angle), 3.5 * np.sin(angle), 0.0])
-    initial_configs.append((config2, [0.0, 0.0], 5.5, 30.0))
-    
-    # Config 3: 2 rows of 6, staggered
-    config3 = []
-    for i in range(6):
-        config3.append([i * 2.0 - 5.0, -0.9, 0.0])
-        config3.append([i * 2.0 - 4.0, 0.9, 0.0])
-    initial_configs.append((config3, [0.0, 0.0], 6.0, 30.0))
-    
-    # Find best initial config
-    best_params = None
-    best_score = float('inf')
-    
-    for config, oc_init, os_init, oa_init in initial_configs:
-        params = make_params(config, oc_init, os_init, oa_init)
-        inner_init = [(p[0], p[1], p[2]) for p in config]
         
-        # Ensure validity by expanding if needed
-        os_try = os_init
-        while not all_inside_outer(inner_init, oc_init, os_try, oa_init):
-            os_try += 0.1
-            if os_try > 10:
+        center = (params[3*N], params[3*N+1])
+        angle = params[3*N+3]
+        
+        # Check disjointness
+        for i in range(N):
+            for j in range(i+1, N):
+                if not hexagons_disjoint_fast(inner[i], inner[j]):
+                    return 1e6
+        
+        # Compute side
+        side = compute_min_side_fast(inner, center, angle)
+        
+        return side
+
+    def initial_guess():
+        params = np.zeros(3*N + 4)
+        positions = []
+        # Hexagonal packing for 12 hexagons: 1 center, 6 ring 1, 5 ring 2
+        positions.append((0, 0, 0))
+        for i in range(6):
+            theta = i * np.pi / 3
+            positions.append((2*np.cos(theta), 2*np.sin(theta), 0))
+        for i in range(5):
+            theta = i * 2*np.pi / 5 + np.pi/5
+            positions.append((4*np.cos(theta), 4*np.sin(theta), 0))
+        
+        for i in range(N):
+            params[3*i] = positions[i][0]
+            params[3*i+1] = positions[i][1]
+            params[3*i+2] = positions[i][2]
+        
+        params[3*N] = 0.0
+        params[3*N+1] = 0.0
+        params[3*N+3] = 0.0
+        return params
+
+    best_params = initial_guess()
+    best_score = objective(best_params)
+    
+    current_params = best_params.copy()
+    current_score = best_score
+    
+    T = 1.0
+    T_min = 0.001
+    cooling_rate = 0.999
+    step_size = 0.5
+    max_steps = 50000 # Hard limit on iterations to prevent infinite loop if time check fails
+    
+    step_count = 0
+    while time.time() < deadline and step_count < max_steps:
+        step_count += 1
+        new_params = current_params.copy()
+        
+        # Perturb one random parameter
+        idx = random.randint(0, 3*N + 3)
+        if idx == 3*N + 2: # Skip side placeholder
+            continue
+            
+        # Adaptive step size
+        current_step = step_size * (0.5 + 0.5 * T)
+        new_params[idx] += random.gauss(0, current_step)
+        
+        new_score = objective(new_params)
+        
+        # Accept
+        if new_score < current_score or random.random() < np.exp(-(new_score - current_score) / T):
+            current_params = new_params
+            current_score = new_score
+            if current_score < best_score:
+                best_score = current_score
+                best_params = current_params.copy()
+        
+        T *= cooling_rate
+        if T < T_min:
+            T = T_min
+
+    # Extract best
+    inner = []
+    for i in range(N):
+        inner.append([float(best_params[3*i]), float(best_params[3*i+1]), float(best_params[3*i+2])])
+    
+    center = (float(best_params[3*N]), float(best_params[3*N+1]))
+    angle = float(best_params[3*N+3])
+    side = compute_min_side_fast(inner, center, angle)
+    
+    # Final check: ensure validity (disjointness is already checked in objective, 
+    # but let's be safe with a quick final validation)
+    # If invalid, return a large valid box
+    valid = True
+    for i in range(N):
+        for j in range(i+1, N):
+            if not hexagons_disjoint_fast(inner[i], inner[j]):
+                valid = False
                 break
-        params = make_params(config, oc_init, os_try, oa_init)
+        if not valid: break
         
-        score = objective(params)
-        if score < best_score:
-            best_score = score
-            best_params = params
-    
-    # Optimization with multiple restarts
-    np.random.seed(42)
-    attempts = 0
-    max_attempts = 8
-    
-    while time.time() < deadline - 15 and attempts < max_attempts:
-        # Create perturbed start
-        if attempts == 0:
-            current_params = best_params.copy()
-        else:
-            noise = np.random.uniform(-0.3, 0.3, size=len(best_params))
-            current_params = best_params + noise
-            # Keep outer side reasonable
-            if current_params[3*N+2] < 4.0:
-                current_params[3*N+2] = 4.0
-        
-        try:
-            # Use Nelder-Mead for robustness
-            res = minimize(objective, current_params, method='Nelder-Mead', 
-                           options={'maxiter': 200, 'xatol': 0.01, 'fatol': 0.01, 'adaptive': True})
-            if res.fun < best_score:
-                best_score = res.fun
-                best_params = res.x.copy()
-        except Exception:
-            pass
-        attempts += 1
-        
-        # Early termination if good solution found
-        if best_score < 4.2:
-            break
+    if not valid:
+        inner = [[0.0, 0.0, 0.0]] * N
+        center = (0.0, 0.0)
+        side = 10.0
+        angle = 0.0
 
-    # Final refinement if we have time
-    if time.time() < deadline - 5 and best_score < 4.5:
-        try:
-            res2 = minimize(objective, best_params, method='Nelder-Mead', 
-                           options={'maxiter': 150, 'xatol': 0.005, 'fatol': 0.005, 'adaptive': True})
-            if res2.fun < best_score:
-                best_score = res2.fun
-                best_params = res2.x.copy()
-        except Exception:
-            pass
-
-    final_params = best_params
-    inner, oc, os, oa = parse_params(final_params)
-    
-    # Final validation and fallback
-    if not is_valid(inner, oc, os, oa):
-        # Use the best initial config as fallback
-        config, oc_init, os_init, oa_init = initial_configs[0]
-        inner = [(p[0], p[1], p[2]) for p in config]
-        oc = tuple(oc_init)
-        os = os_init
-        oa = oa_init
-        
-        # Expand if needed
-        while not all_inside_outer(inner, oc, os, oa):
-            os += 0.1
-            if os > 10:
-                break
-
-    return inner, oc, os, oa
+    return inner, center, side, angle
 # EVOLVE-BLOCK-END

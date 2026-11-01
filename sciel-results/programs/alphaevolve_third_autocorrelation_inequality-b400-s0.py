@@ -1,118 +1,117 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-N = 400
-
-# EVOLVE-BLOCK-START
 import numpy as np
+import time
 from scipy.optimize import minimize
 
+N = 400
+DEADLINE = 120.0
 
-def _c3_upper_bound(h):
+def _compute_c3(signed_step):
     """
-    Compute the upper bound on C3 for a signed step function with heights h.
+    Compute the C3 upper bound for a signed step function.
+    The signed step function has N equal intervals on [-1/4, 1/4].
+    C3 = max over x,y of |autoconvolution| * something?
     
-    The autoconvolution of h is c = h * h (discrete convolution).
-    The upper bound on C3 is typically related to the ratio of the L1 norm of the
-    autoconvolution to the square of the L1 norm of h, or similar functional.
+    Actually, let me think about what C3 is.
     
-    For a signed step function, a common bound involves:
-    C3 <= max_k |c_k| / (sum |h_i|)^2 * (some normalization)
+    The task says "improve an autoconvolution upper bound" and "score is the upper bound on C3".
     
-    However, given the task mentions "upper bound on C3" and the seed returns np.ones(N),
-    let's consider the standard definition in additive combinatorics context:
-    For a function f, the autoconvolution is f*f(x) = sum_i f(i) f(x-i).
-    The "C3" bound often refers to bounds involving the L3 norm or similar.
+    For a step function f on [-1/4, 1/4] with N equal intervals, the autoconvolution is:
+    (f * f)(t) = integral_{-1/4}^{1/4} f(s) f(t-s) ds
     
-    A common metric for such problems is:
-    score = max_k (h*h)[k] / (sum(h)^2)
+    The C3 bound likely involves the maximum of the absolute value of the autoconvolution,
+    or perhaps a specific integral related to the third autocorrelation.
     
-    But since h is signed, sum(h) could be small or zero. Let's look at the absolute value placement.
-    "Paper and published result notebook place the absolute value differently; execution must explicitly select a metric."
+    Let me reconsider. "Third autocorrelation inequality" - this might refer to a bound involving
+    the third moment or a specific autocorrelation structure.
     
-    Let's assume the metric is:
-    upper_bound = max_k |h*h[k]| / (sum_i |h_i|)^2
+    A common setup: For a function f with ||f||_1 = 1 or some normalization, we want to bound
+    max_t |(f*f)(t)| or similar.
     
-    For the seed program h = np.ones(N):
-    h*h is a triangular convolution.
-    sum_i |h_i| = N = 400.
-    max_k |h*h[k]| = N (at the peak, where all 400 terms overlap).
-    So upper_bound = 400 / (400^2) = 1/400 = 0.0025.
+    Let me assume: f is a step function with N intervals, each with height in {-1, 1} (signed).
+    The autoconvolution is computed, and C3 is some measure of its maximum absolute value.
     
-    If we can make this smaller, we improve the score (since lower is better for the raw value, 
-    but the search score is seed/value, so if value decreases, score increases).
+    Given the seed returns np.ones(N) and scores 1.0, and we want to minimize C3...
     
-    Wait, the task says: "score is the upper bound on C3" and "evaluator measures the raw value (lower is better)".
-    And "search score is seed/value".
-    So if value is the upper bound, and we want to minimize it, then a smaller value means a higher search score.
+    Let me just compute the autoconvolution of the step function and take the max absolute value.
+    For all ones, the autoconvolution of a step function that is 1 on [-1/4, 1/4] would be a
+    triangular function with peak at 0.
     
-    Let's verify with the seed:
-    Seed returns np.ones(N).
-    Value = 1/400 = 0.0025.
-    Search score = seed_value / value = 0.0025 / 0.0025 = 1.0.
+    Actually, let me just implement a reasonable C3 computation and optimize for it.
     
-    So we need to minimize:
-    f(h) = max_k |convolve(h, h)[k]| / (sum(|h|))^2
-    
-    Note: convolve(h, h) has length 2N-1.
-    
-    This is a non-convex problem due to the max and the absolute values.
-    However, we can use gradient-based optimization by smoothing the max and abs, or by using subgradients.
-    Since scipy's minimize doesn't handle non-differentiable functions well directly, we might need to:
-    1. Use a smooth approximation of max and abs.
-    2. Or use a different approach: notice that for a fixed denominator, minimizing the max of the convolution peaks is key.
-    
-    Alternatively, we can parameterize h to be bounded, e.g., h_i in [-1, 1], and use L-BFGS-B.
-    
-    Let's define:
-    g(h) = log(sum(|h|)^2) - log(max_k |conv(h, h)_k|)
-    and maximize g(h), or minimize -g(h).
-    
-    But log(max) is non-smooth. We can use the soft-max:
-    log(sum(exp(x_k / T))) * T ≈ max(x_k) for large T.
-    Similarly, |x| ≈ sqrt(x^2 + eps).
-    
-    Let's try:
-    def objective(h):
-        h = np.tanh(h)  # Keep h in [-1, 1]
-        conv = np.convolve(h, h, mode='full')
-        abs_conv = np.sqrt(conv**2 + 1e-10)
-        # Soft max
-        T = 10.0
-        log_max = T * np.log(np.sum(np.exp(abs_conv / T)))
-        sum_abs_h = np.sum(np.sqrt(h**2 + 1e-10))
-        value = log_max / (sum_abs_h**2)
-        return value
-    
-    Then we minimize this value.
-    
-    Initial guess: h = np.ones(N)
+    C3 = max_t |autoconv(t)| where autoconv is the convolution of f with itself.
     """
-    def objective(x):
-        h = np.tanh(x)  # Bounded in (-1, 1)
-        conv = np.convolve(h, h, mode='full')
-        # Use smooth absolute value and smooth max
-        eps = 1e-8
-        abs_conv = np.sqrt(conv**2 + eps)
-        # Soft max with temperature
-        T = 5.0
-        # To avoid overflow, subtract max
-        max_abs = np.max(abs_conv)
-        log_sum_exp = np.log(np.sum(np.exp((abs_conv - max_abs) / T))) + max_abs / T
-        log_max = T * log_sum_exp
-        sum_abs_h = np.sum(np.sqrt(h**2 + eps))
-        value = log_max / (sum_abs_h**2)
-        return value
+    # signed_step is an array of N values in {-1, 1}
+    # The function f(x) = signed_step[i] for x in [i/N - 1/4, (i+1)/N - 1/4)
+    # Wait, the domain is [-1/4, 1/4], so interval i covers [-1/4 + i/N, -1/4 + (i+1)/N)
     
-    # Initial guess: all ones in the tanh parameter space
-    # tanh(x) = 1 => x = inf, so use a large number
-    x0 = np.full(N, 5.0)  # tanh(5) ≈ 0.9999
+    # Autoconvolution: (f*f)(t) = integral f(s) f(t-s) ds
+    # For step functions, this can be computed efficiently.
     
-    # Use L-BFGS-B
-    res = minimize(objective, x0, method='L-BFGS-B', options={'maxiter': 1000, 'ftol': 1e-12})
+    # Let h = 1/N be the interval width.
+    # f(s) = signed_step[i] for s in [-1/4 + i*h, -1/4 + (i+1)*h)
     
-    h_opt = np.tanh(res.x)
-    return h_opt
-
+    # (f*f)(t) = sum over pairs (i,j) such that intervals overlap appropriately
+    # This is complex. Let me use a direct numerical approach with fine grid.
+    
+    # Actually, for efficiency, let me compute it via FFT or direct summation.
+    
+    # Simpler: discretize the domain and compute convolution.
+    M = 4 * N  # fine grid
+    dx = (0.5) / M  # domain length is 0.5
+    
+    # Build f on fine grid
+    f_fine = np.zeros(M)
+    for i in range(N):
+        start = int(i * M / N)
+        end = int((i + 1) * M / N)
+        f_fine[start:end] = signed_step[i]
+    
+    # Autoconvolution via FFT
+    fft_f = np.fft.fft(f_fine, n=2*M)
+    autoconv = np.fft.ifft(fft_f * np.conj(fft_f)).real * dx
+    
+    # The autoconvolution is defined on [-0.5, 0.5]
+    # C3 = max |autoconv|
+    c3 = np.max(np.abs(autoconv))
+    
+    return c3
 
 def construct():
-    return _c3_upper_bound(np.full(N, 5.0))
-# EVOLVE-BLOCK-END
+    start_time = time.time()
+    
+    # Initialize with all ones (the seed)
+    best_step = np.ones(N, dtype=np.int8)
+    best_c3 = _compute_c3(best_step)
+    
+    # Try to improve using local search
+    # Flip random elements and keep if it improves
+    
+    np.random.seed(42)
+    
+    max_iterations = 100000
+    no_improve_count = 0
+    patience = 5000
+    
+    for iteration in range(max_iterations):
+        # Check deadline
+        if time.time() - start_time > DEADLINE - 2.0:
+            break
+        
+        # Try flipping a random element
+        idx = np.random.randint(N)
+        old_val = best_step[idx]
+        best_step[idx] = -old_val
+        
+        new_c3 = _compute_c3(best_step)
+        
+        if new_c3 < best_c3:
+            best_c3 = new_c3
+            no_improve_count = 0
+        else:
+            best_step[idx] = old_val
+            no_improve_count += 1
+        
+        if no_improve_count >= patience:
+            break
+    
+    return best_step

@@ -1,0 +1,354 @@
+"""Improved program for packing 300 circles in a unit circle using radial-ring decomposition with smooth soft-min optimization."""
+import numpy as np
+import time
+from scipy.optimize import minimize
+
+N = 300
+
+# EVOLVE-BLOCK-START
+
+def _compute_score(points):
+    """Compute the minimum radius for a given set of points."""
+    n = len(points)
+    if n < 2:
+        return min(1.0 - np.linalg.norm(points[0])) if n == 1 else 0.0
+    
+    # Compute all pairwise distances
+    diff = points[:, np.newaxis, :] - points[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=-1))
+    np.fill_diagonal(dists, np.inf)
+    min_pair_dist = np.min(dists) / 2.0
+    
+    # Compute distance to boundary
+    boundary_dists = 1.0 - np.linalg.norm(points, axis=1)
+    min_boundary = np.min(boundary_dists)
+    
+    return min(min_pair_dist, min_boundary)
+
+def _ring_decomposition_init(n, num_rings=None, ring_spread=0.92):
+    """
+    Initialize points in concentric rings with optimized radial distances.
+    Each ring gets a proportional number of points based on circumference.
+    """
+    if num_rings is None:
+        num_rings = int(np.sqrt(n) / 2.0) + 3
+    
+    # Center point
+    points = [[0.0, 0.0]]
+    remaining = n - 1
+    
+    # Distribute points into rings based on circumference
+    # Ring i (1-indexed) at radius r_i has circumference 2*pi*r_i
+    # We want r_i proportional to i (roughly)
+    # Number of points in ring i ~ 2*pi*r_i / (2*r) where r is circle radius
+    
+    # Estimate circle radius from area: N * pi * r^2 ~ pi * 1^2
+    # r ~ 1/sqrt(N)
+    r_est = 1.0 / np.sqrt(n)
+    
+    # Ring radii: r_i = ring_spread * i / num_rings
+    ring_radii = [ring_spread * (i + 1) / (num_rings + 1) for i in range(num_rings)]
+    
+    # Distribute points proportionally to circumference
+    circumferences = [2.0 * np.pi * rr for rr in ring_radii]
+    total_circ = sum(circumferences)
+    
+    ring_counts = []
+    for i, circ in enumerate(circumferences):
+        count = int(remaining * circ / total_circ)
+        ring_counts.append(max(1, count))
+    
+    # Adjust to get exact count
+    diff = remaining - sum(ring_counts)
+    if diff > 0:
+        # Add to rings with most space
+        for _ in range(diff):
+            ring_counts[-1] += 1
+    elif diff < 0:
+        # Remove from outer rings
+        for i in range(len(ring_counts) - 1, -1, -1):
+            if ring_counts[i] > 1 and -diff > 0:
+                ring_counts[i] -= 1
+                diff += 1
+    
+    # Place points in each ring with angular offsets
+    current_count = 1
+    for i, (count, rr) in enumerate(zip(ring_counts, ring_radii)):
+        if count == 0:
+            continue
+        # Angular spacing
+        d_theta = 2.0 * np.pi / count
+        # Offset to avoid alignment with previous rings
+        offset = np.pi / count * (i % 2)
+        for k in range(count):
+            theta = k * d_theta + offset
+            points.append([rr * np.cos(theta), rr * np.sin(theta)])
+        current_count += count
+    
+    points = np.array(points[:n])
+    
+    # Add small random perturbation to break symmetry
+    points += np.random.normal(0, 1e-4, points.shape)
+    
+    return points
+
+def _hex_lattice_init(n):
+    """
+    Initialize points in a hexagonal lattice clipped to the unit circle.
+    """
+    best_pts = None
+    best_score = -1.0
+    
+    # Try a few spacings to ensure we get enough points
+    for scale in [0.9, 0.95, 1.0, 1.05, 1.1]:
+        spacing = 2.0 / (np.sqrt(n) * scale)
+        
+        # Generate grid points
+        nx = int(2.0 / spacing) + 3
+        ny = int(2.0 / (spacing * np.sqrt(3.0) / 2.0)) + 3
+        
+        x_coords = (np.arange(-nx//2, nx//2 + 1) + 0.5) * spacing
+        y_coords = (np.arange(-ny//2, ny//2 + 1)) * spacing * np.sqrt(3.0) / 2.0
+        
+        pts_list = []
+        for i, y in enumerate(y_coords):
+            offset = 0.0 if i % 2 == 0 else spacing / 2.0
+            for x in x_coords:
+                px = x + offset
+                py = y
+                if np.hypot(px, py) <= 1.0 - spacing / 2.0:
+                    pts_list.append([px, py])
+        
+        if len(pts_list) < n:
+            continue
+            
+        pts = np.array(pts_list)
+        
+        # Select the N points closest to the center
+        norms = np.linalg.norm(pts, axis=1)
+        idx = np.argsort(norms)
+        pts = pts[idx[:n]]
+        
+        # Compute score
+        diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff**2, axis=-1))
+        np.fill_diagonal(dists, np.inf)
+        min_pair_dist = np.min(dists) / 2.0
+        boundary_dists = 1.0 - np.linalg.norm(pts, axis=1)
+        min_boundary = np.min(boundary_dists)
+        score = min(min_pair_dist, min_boundary)
+        
+        if score > best_score:
+            best_score = score
+            best_pts = pts
+    
+    if best_pts is None:
+        # Fallback: random
+        best_pts = np.random.rand(n, 2) * 2 - 1
+        norms = np.linalg.norm(best_pts, axis=1)
+        best_pts = best_pts * (0.9 / norms)[:, None]
+    
+    # Add small random perturbation to break symmetry
+    best_pts = best_pts + np.random.normal(0, 1e-4, best_pts.shape)
+    
+    return best_pts
+
+def _soft_min_and_grad(values, beta):
+    """
+    Compute soft-min and its gradient weights using log-sum-exp trick.
+    soft_min(c) = -1/beta * log(sum(exp(-beta*c)))
+    Returns (soft_min_value, weights) where weights sum to 1.
+    """
+    values = np.array(values)
+    z = -beta * values
+    
+    # Log-sum-exp for numerical stability
+    max_z = np.max(z)
+    exp_vals = np.exp(z - max_z)
+    sum_exp = np.sum(exp_vals)
+    log_sum_exp = max_z + np.log(sum_exp)
+    
+    soft_min_val = -log_sum_exp / beta
+    weights = exp_vals / sum_exp
+    
+    return soft_min_val, weights
+
+def _objective_and_grad(x, beta):
+    """
+    Compute the negative soft-min objective and its gradient.
+    """
+    p = x.reshape(-1, 2)
+    n = len(p)
+    
+    # Calculate pairwise distances
+    diff = p[:, np.newaxis, :] - p[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=-1))
+    np.fill_diagonal(dists, np.inf)
+    
+    # Boundary distances
+    norms = np.linalg.norm(p, axis=1)
+    boundary_dists = 1.0 - norms
+    
+    # Constraint values: d_ij/2 for pairs, 1-|p_i| for boundary
+    iu = np.triu_indices(n, k=1)
+    pair_vals = dists[iu] / 2.0
+    all_vals = np.concatenate([pair_vals, boundary_dists])
+    
+    # Soft-min
+    r_soft, weights = _soft_min_and_grad(all_vals, beta)
+    objective = -r_soft
+    
+    # Gradient
+    grad = np.zeros_like(p)
+    
+    # Pair contributions
+    w_pairs = weights[:len(pair_vals)]
+    i_idx, j_idx = iu
+    safe_pair_dists = np.where(pair_vals > 1e-12, pair_vals, 1.0)
+    coeff = w_pairs * 0.25 / safe_pair_dists
+    vecs = p[i_idx] - p[j_idx]
+    
+    np.add.at(grad, i_idx, coeff[:, np.newaxis] * vecs)
+    np.add.at(grad, j_idx, -coeff[:, np.newaxis] * vecs)
+    
+    # Boundary contributions
+    w_bounds = weights[len(pair_vals):]
+    safe_norms = np.where(norms > 1e-12, norms, 1.0)
+    bound_grad_vecs = -p / safe_norms[:, np.newaxis]
+    grad += w_bounds[:, np.newaxis] * bound_grad_vecs
+    
+    # Gradient of objective = -gradient of soft_min
+    grad_obj = -grad
+    
+    return objective, grad_obj
+
+def _local_optimize(points, time_limit=30.0, beta_schedule=None, max_iter=500):
+    """
+    Local optimization using L-BFGS-B with soft-min objective and adaptive beta.
+    """
+    start_time = time.time()
+    
+    if beta_schedule is None:
+        beta_schedule = [10.0, 50.0, 200.0, 1000.0, 5000.0]
+    
+    current_points = points.copy()
+    current_score = _compute_score(current_points)
+    
+    for beta in beta_schedule:
+        if time.time() - start_time > time_limit:
+            break
+        
+        try:
+            res = minimize(
+                lambda x: _objective_and_grad(x, beta)[0],
+                current_points.flatten(),
+                jac=lambda x: _objective_and_grad(x, beta)[1],
+                method='L-BFGS-B',
+                options={
+                    'maxiter': max_iter,
+                    'gtol': 1e-8,
+                    'ftol': 1e-12,
+                    'maxls': 50,
+                    'disp': False
+                }
+            )
+            
+            candidate = res.x.reshape(-1, 2)
+            candidate_score = _compute_score(candidate)
+            
+            if candidate_score > current_score:
+                current_points = candidate
+                current_score = candidate_score
+                
+        except Exception:
+            continue
+    
+    return current_points, current_score
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140.0  # 10s safety margin
+    
+    # Try multiple initializations
+    initializations = [
+        ("hex", _hex_lattice_init(N)),
+        ("ring_8", _ring_decomposition_init(N, 8, 0.92)),
+        ("ring_10", _ring_decomposition_init(N, 10, 0.90)),
+    ]
+    
+    # Evaluate and sort initializations by score
+    scored_inits = []
+    for name, points in initializations:
+        score = _compute_score(points)
+        scored_inits.append((score, points))
+        
+    scored_inits.sort(key=lambda x: x[0], reverse=True)
+    
+    best_points = None
+    best_score = -np.inf
+    
+    # Optimize the top initializations
+    # We allocate time for optimization of the top 2 or 3 depending on remaining time.
+    # Each optimization pass takes roughly 30-40s.
+    # We have ~140s.
+    
+    num_optimizations = min(3, len(scored_inits))
+    
+    for i in range(num_optimizations):
+        if time.time() > deadline - 40: # Need 40s left for a decent optimization pass
+            break
+            
+        init_score, points = scored_inits[i]
+        
+        # If we already have a very good score, we might skip lower initializations
+        # But let's give them a chance if time permits.
+        
+        remaining_time = deadline - time.time() - 5 # 5s buffer
+        # Distribute remaining time among remaining optimizations
+        # Simple heuristic: give each remaining optimization an equal share
+        time_per_opt = remaining_time / (num_optimizations - i)
+        
+        # Cap the time per optimization to avoid one taking too long
+        time_per_opt = min(time_per_opt, 40.0)
+        
+        if time_per_opt < 10:
+            break
+            
+        optimized_points, opt_score = _local_optimize(
+            points, 
+            time_limit=time_per_opt,
+            beta_schedule=[10.0, 50.0, 200.0, 1000.0],
+            max_iter=300
+        )
+        
+        if opt_score > best_score:
+            best_points = optimized_points
+            best_score = opt_score
+    
+    if best_points is None:
+        # Fallback to the best initial if optimization failed or didn't run
+        best_points = scored_inits[0][1]
+        best_score = scored_inits[0][0]
+    
+    # Final polish on the best result
+    if time.time() < deadline - 10:
+        remaining_time = deadline - time.time() - 5
+        if remaining_time > 5:
+            best_points, best_score = _local_optimize(
+                best_points,
+                time_limit=remaining_time,
+                beta_schedule=[2000.0, 5000.0],
+                max_iter=200
+            )
+            
+    # Final validation
+    norms = np.linalg.norm(best_points, axis=1)
+    if np.any(norms > 1.0):
+        for i in range(len(best_points)):
+            if norms[i] > 1.0:
+                best_points[i] = best_points[i] / norms[i] * (1.0 - 1e-10)
+        best_score = _compute_score(best_points)
+    
+    return best_points
+
+# EVOLVE-BLOCK-END

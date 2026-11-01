@@ -1,35 +1,44 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
 import time
 import numpy as np
 
 DIMENSIONS = [2, 5, 6]
 
-# EVOLVE-BLOCK-START
 def construct():
     n, m, p = DIMENSIONS
     start_time = time.time()
-    deadline = start_time + 120.0
+    deadline = start_time + 110.0
 
-    # Total standard terms
-    total_terms = n * m * p
-    # We will use rank 59
-    rank = total_terms - 1
+    # We will build a rank-54 decomposition by applying Strassen's 7-term
+    # algorithm to all six disjoint 2x2x2 sub-blocks in the j-k plane.
+    # j pairs: (0,1), (2,3); k pairs: (0,1), (2,3), (4,5)
+    # Each block saves 1 rank compared to the 8 standard terms.
+    # Total rank = 60 - 6 = 54.
 
-    # Initialize matrices with zeros
+    rank = 54
     U = [[0] * rank for _ in range(n * m)]
     V = [[0] * rank for _ in range(m * p)]
     W = [[0] * rank for _ in range(p * n)]
 
-    # Define the specific 2x2x2 block to replace with Strassen
-    strassen_block = {(0,0,0), (0,0,1), (0,1,0), (0,1,1), (1,0,0), (1,0,1), (1,1,0), (1,1,1)}
+    # Identify all 2x2x2 blocks to apply Strassen to
+    j_pairs = [(0, 1), (2, 3)]
+    k_pairs = [(0, 1), (2, 3), (4, 5)]
+
+    # Set of (i, j, k) tuples covered by Strassen blocks (to skip in standard terms)
+    strassen_cells = set()
+    for j1, j2 in j_pairs:
+        for k1, k2 in k_pairs:
+            for i in range(n):
+                for j in (j1, j2):
+                    for k in (k1, k2):
+                        strassen_cells.add((i, j, k))
 
     col = 0
 
-    # Add all standard terms except those in the Strassen block
+    # Add standard (rank-8) terms for cells NOT in any Strassen block
     for i in range(n):
         for j in range(m):
             for k in range(p):
-                if (i, j, k) in strassen_block:
+                if (i, j, k) in strassen_cells:
                     continue
                 u_idx = i * m + j
                 v_idx = j * p + k
@@ -39,164 +48,126 @@ def construct():
                 W[w_idx][col] = 1
                 col += 1
 
-    # Add Strassen terms for the block i in {0,1}, j in {0,1}, k in {0,1}
-    def add_term(u_coeffs, v_coeffs, w_coeffs):
-        nonlocal col
-        for u_idx, coeff in u_coeffs:
-            U[u_idx][col] += coeff
-        for v_idx, coeff in v_coeffs:
-            V[v_idx][col] += coeff
-        for w_idx, coeff in w_coeffs:
-            W[w_idx][col] += coeff
-        col += 1
+    # Add Strassen terms for each 2x2x2 block
+    for j1, j2 in j_pairs:
+        for k1, k2 in k_pairs:
+            # Index computations for this block
+            u00 = 0 * m + j1
+            u01 = 0 * m + j2
+            u10 = 1 * m + j1
+            u11 = 1 * m + j2
 
-    # Pre-calculate indices
-    u00, u01 = 0, 1
-    u10, u11 = 5, 6
-    v00, v01 = 0, 1
-    v10, v11 = 6, 7
-    w00, w01 = 0, 2
-    w10, w11 = 1, 3
+            v00 = j1 * p + k1
+            v01 = j1 * p + k2
+            v10 = j2 * p + k1
+            v11 = j2 * p + k2
 
-    # M1 = (A00 + A11)(B00 + B11) -> C00 +1, C11 +1
-    add_term([(u00, 1), (u11, 1)], [(v00, 1), (v11, 1)], [(w00, 1), (w11, 1)])
-    # M2 = (A10 + A11)B00 -> C10 +1, C11 -1
-    add_term([(u10, 1), (u11, 1)], [(v00, 1)], [(w10, 1), (w11, -1)])
-    # M3 = A00(B01 - B11) -> C01 +1, C11 +1
-    add_term([(u00, 1)], [(v01, 1), (v11, -1)], [(w01, 1), (w11, 1)])
-    # M4 = A11(B10 - B00) -> C00 +1, C10 +1
-    add_term([(u11, 1)], [(v10, 1), (v00, -1)], [(w00, 1), (w10, 1)])
-    # M5 = (A00 + A01)B11 -> C00 -1, C01 +1
-    add_term([(u00, 1), (u01, 1)], [(v11, 1)], [(w00, -1), (w01, 1)])
-    # M6 = (A10 - A00)(B00 + B01) -> C11 +1
-    add_term([(u10, 1), (u00, -1)], [(v00, 1), (v01, 1)], [(w11, 1)])
-    # M7 = (A01 - A11)(B10 + B11) -> C00 +1
-    add_term([(u01, 1), (u11, -1)], [(v10, 1), (v11, 1)], [(w00, 1)])
+            w00 = k1 * n + 0
+            w01 = k2 * n + 0
+            w10 = k1 * n + 1
+            w11 = k2 * n + 1
 
-    # Now try to reduce rank further by combining terms
-    # We have 60 - 8 + 7 = 59 terms
-    # Try to find a linear combination that reduces rank
-    # This is a search problem. We'll use a simple greedy approach.
-    # But first, let's check if we can do better with a different block split.
-    # For 2x5x6, we can split into 2x2x6 and 2x3x6
-    # 2x2x6: rank 2*2*6 = 24, with Strassen on 2x2x2: 24 - 8 + 7 = 23
-    # 2x3x6: rank 2*3*6 = 36, with Strassen on 2x2x2: 36 - 8 + 7 = 35
-    # Total: 23 + 35 = 58
+            # Strassen's 7 products for C = A*B where
+            # A = [[a00, a01], [a10, a11]], B = [[b00, b01], [b10, b11]]
+            # P1 = (a00+a11)(b00+b11)
+            # P2 = (a10+a11)b00
+            # P3 = a00(b01-b11)
+            # P4 = a11(b10-b00)
+            # P5 = (a00+a01)b11
+            # P6 = (a10-a00)(b00+b01)
+            # P7 = (a01-a11)(b10+b11)
+            # C00 = P1 + P4 - P5 + P7
+            # C01 = P3 + P5
+            # C10 = P2 + P4
+            # C11 = P1 - P2 + P3 + P6
 
-    # Let's implement this split
-    U2 = [[0] * 58 for _ in range(n * m)]
-    V2 = [[0] * 58 for _ in range(m * p)]
-    W2 = [[0] * 58 for _ in range(p * n)]
-    col2 = 0
+            # P1
+            U[u00][col] += 1
+            U[u11][col] += 1
+            V[v00][col] += 1
+            V[v11][col] += 1
+            W[w00][col] += 1
+            W[w11][col] += 1
+            col += 1
 
-    # First part: 2x2x6 (i in {0,1}, j in {0,1}, k in {0,1,2,3,4,5})
-    # Use Strassen for j in {0,1}, k in {0,1}
-    strassen_block2 = {(0,0,0), (0,0,1), (0,1,0), (0,1,1), (1,0,0), (1,0,1), (1,1,0), (1,1,1)}
+            # P2
+            U[u10][col] += 1
+            U[u11][col] += 1
+            V[v00][col] += 1
+            W[w10][col] += 1
+            W[w11][col] += -1
+            col += 1
 
-    for i in range(n):
-        for j in range(2):
-            for k in range(p):
-                if (i, j, k) in strassen_block2:
-                    continue
-                u_idx = i * m + j
-                v_idx = j * p + k
-                w_idx = k * n + i
-                U2[u_idx][col2] = 1
-                V2[v_idx][col2] = 1
-                W2[w_idx][col2] = 1
-                col2 += 1
+            # P3
+            U[u00][col] += 1
+            V[v01][col] += 1
+            V[v11][col] += -1
+            W[w01][col] += 1
+            W[w11][col] += 1
+            col += 1
 
-    # Add Strassen terms for the block i in {0,1}, j in {0,1}, k in {0,1}
-    def add_term2(u_coeffs, v_coeffs, w_coeffs):
-        nonlocal col2
-        for u_idx, coeff in u_coeffs:
-            U2[u_idx][col2] += coeff
-        for v_idx, coeff in v_coeffs:
-            V2[v_idx][col2] += coeff
-        for w_idx, coeff in w_coeffs:
-            W2[w_idx][col2] += coeff
-        col2 += 1
+            # P4
+            U[u11][col] += 1
+            V[v10][col] += 1
+            V[v00][col] += -1
+            W[w00][col] += 1
+            W[w10][col] += 1
+            col += 1
 
-    # M1
-    add_term2([(u00, 1), (u11, 1)], [(v00, 1), (v11, 1)], [(w00, 1), (w11, 1)])
-    # M2
-    add_term2([(u10, 1), (u11, 1)], [(v00, 1)], [(w10, 1), (w11, -1)])
-    # M3
-    add_term2([(u00, 1)], [(v01, 1), (v11, -1)], [(w01, 1), (w11, 1)])
-    # M4
-    add_term2([(u11, 1)], [(v10, 1), (v00, -1)], [(w00, 1), (w10, 1)])
-    # M5
-    add_term2([(u00, 1), (u01, 1)], [(v11, 1)], [(w00, -1), (w01, 1)])
-    # M6
-    add_term2([(u10, 1), (u00, -1)], [(v00, 1), (v01, 1)], [(w11, 1)])
-    # M7
-    add_term2([(u01, 1), (u11, -1)], [(v10, 1), (v11, 1)], [(w00, 1)])
+            # P5
+            U[u00][col] += 1
+            U[u01][col] += 1
+            V[v11][col] += 1
+            W[w00][col] += -1
+            W[w01][col] += 1
+            col += 1
 
-    # Second part: 2x3x6 (i in {0,1}, j in {2,3,4}, k in {0,1,2,3,4,5})
-    # Use Strassen for i in {0,1}, j in {2,3}, k in {0,1}
-    strassen_block3 = {(0,2,0), (0,2,1), (0,3,0), (0,3,1), (1,2,0), (1,2,1), (1,3,0), (1,3,1)}
+            # P6
+            U[u10][col] += 1
+            U[u00][col] += -1
+            V[v00][col] += 1
+            V[v01][col] += 1
+            W[w11][col] += 1
+            col += 1
 
-    for i in range(n):
-        for j in range(2, m):
-            for k in range(p):
-                if (i, j, k) in strassen_block3:
-                    continue
-                u_idx = i * m + j
-                v_idx = j * p + k
-                w_idx = k * n + i
-                U2[u_idx][col2] = 1
-                V2[v_idx][col2] = 1
-                W2[w_idx][col2] = 1
-                col2 += 1
-
-    # Add Strassen terms for the block i in {0,1}, j in {2,3}, k in {0,1}
-    u20, u21 = 0*5+2, 0*5+3
-    u30, u31 = 1*5+2, 1*5+3
-    v20, v21 = 2*6+0, 2*6+1
-    v30, v31 = 3*6+0, 3*6+1
-    w20, w21 = 0*2+0, 1*2+0
-    w30, w31 = 0*2+1, 1*2+1
-
-    # M1
-    add_term2([(u20, 1), (u31, 1)], [(v20, 1), (v31, 1)], [(w20, 1), (w31, 1)])
-    # M2
-    add_term2([(u30, 1), (u31, 1)], [(v20, 1)], [(w30, 1), (w31, -1)])
-    # M3
-    add_term2([(u20, 1)], [(v21, 1), (v31, -1)], [(w21, 1), (w31, 1)])
-    # M4
-    add_term2([(u31, 1)], [(v30, 1), (v20, -1)], [(w20, 1), (w30, 1)])
-    # M5
-    add_term2([(u20, 1), (u21, 1)], [(v31, 1)], [(w20, -1), (w21, 1)])
-    # M6
-    add_term2([(u30, 1), (u20, -1)], [(v20, 1), (v21, 1)], [(w31, 1)])
-    # M7
-    add_term2([(u21, 1), (u31, -1)], [(v30, 1), (v31, 1)], [(w20, 1)])
-
-    # Check if col2 is 58
-    assert col2 == 58, f"Expected 58, got {col2}"
+            # P7
+            U[u01][col] += 1
+            U[u11][col] += -1
+            V[v10][col] += 1
+            V[v11][col] += 1
+            W[w00][col] += 1
+            col += 1
 
     # Verify the decomposition
-    def verify(U, V, W, n, m, p, rank):
-        U_np = np.array(U)
-        V_np = np.array(V)
-        W_np = np.array(W)
-
-        # For each (i, j, k), sum over r of U[i*m+j, r] * V[j*p+k, r] * W[k*n+i, r] should be 1
+    def verify(U_mat, V_mat, W_mat):
+        U_np = np.array(U_mat)
+        V_np = np.array(V_mat)
+        W_np = np.array(W_mat)
         for i in range(n):
             for j in range(m):
                 for k in range(p):
-                    u_row = U_np[i*m+j, :]
-                    v_row = V_np[j*p+k, :]
-                    w_row = W_np[k*n+i, :]
+                    u_row = U_np[i * m + j, :]
+                    v_row = V_np[j * p + k, :]
+                    w_row = W_np[k * n + i, :]
                     result = np.sum(u_row * v_row * w_row)
-                    if abs(result - 1) > 1e-10:
+                    if abs(result - 1) > 1e-9:
                         return False
         return True
 
-    if verify(U2, V2, W2, n, m, p, 58):
-        return {"U": U2, "V": V2, "W": W2}
-    else:
-        # Fall back to rank 59
-        return {"U": U, "V": V, "W": W}
+    if not verify(U, V, W):
+        # Fallback: return a rank-60 trivial decomposition
+        rank_fallback = n * m * p
+        U_f = [[0] * rank_fallback for _ in range(n * m)]
+        V_f = [[0] * rank_fallback for _ in range(m * p)]
+        W_f = [[0] * rank_fallback for _ in range(p * n)]
+        col_f = 0
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    U_f[i * m + j][col_f] = 1
+                    V_f[j * p + k][col_f] = 1
+                    W_f[k * n + i][col_f] = 1
+                    col_f += 1
+        return {"U": U_f, "V": V_f, "W": W_f}
 
-# EVOLVE-BLOCK-END
+    return {"U": U, "V": V, "W": W}

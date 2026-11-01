@@ -1,0 +1,417 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+N = 100
+
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+import math
+from scipy.optimize import minimize
+
+def _energy_and_grad(X):
+    """
+    Compute logarithmic energy E = sum_{i<j} log(1/|x_i - x_j|) = -sum_{i<j} log(|x_i - x_j|)
+    and its gradient w.r.t. X (shape (N,3)).
+    
+    |x_i - x_j|^2 = 2 - 2*x_i.x_j
+    d/dx_i log(1/|x_i - x_j|) = d/dx_i (-log|x_i - x_j|) = (x_i - x_j)/|x_i - x_j|^2
+    So grad_i = sum_{j != i} (x_i - x_j) / |x_i - x_j|^2
+    """
+    # X shape (N, 3)
+    # Compute pairwise dot products
+    dots = X @ X.T  # (N, N), dots[i,j] = x_i . x_j
+    # |x_i - x_j|^2 = 2 - 2*dots[i,j]
+    d2 = 2.0 - 2.0 * dots
+    # Set diagonal to 1 to avoid division by zero (we'll zero out diagonal in grad)
+    np.fill_diagonal(d2, 1.0)
+    
+    # Energy: sum_{i<j} -log(sqrt(d2[i,j])) = -0.5 * sum_{i<j} log(d2[i,j])
+    # Use upper triangle
+    iu = np.triu_indices(N, 1)
+    log_d2 = np.log(d2[iu])
+    E = -0.5 * math.fsum(log_d2.tolist())
+    
+    # Gradient: grad_i = sum_{j != i} (x_i - x_j) / d2[i,j]
+    # (x_i - x_j)/d2[i,j] = x_i/d2[i,j] - x_j/d2[i,j]
+    # grad = X * sum_j (1/d2[i,j]) - sum_j (x_j / d2[i,j])
+    inv_d2 = 1.0 / d2  # (N, N)
+    # Zero out diagonal
+    np.fill_diagonal(inv_d2, 0.0)
+    
+    # row_sums[i] = sum_j inv_d2[i,j]
+    row_sums = inv_d2.sum(axis=1)  # (N,)
+    
+    # grad = X * row_sums[:, None] - (X.T @ inv_d2)
+    # X.T @ inv_d2 has shape (3, N), so we need to transpose back
+    term2 = inv_d2 @ X  # (N, 3), term2[i] = sum_j inv_d2[i,j] * x_j
+    grad = X * row_sums[:, None] - term2
+    
+    return E, grad
+
+def _hessian_approx(X):
+    """
+    Approximate the Riemannian Hessian for Newton step.
+    H_ij = d2/dx_i dx_j E
+    For log kernel: H_ij = 2*(x_i-x_j)/|x_i-x_j|^4 - (x_i-x_j)(x_i-x_j)^T / |x_i-x_j|^6
+    Simplified: use diagonal approximation for speed
+    """
+    N_pts = X.shape[0]
+    dots = X @ X.T
+    d2 = 2.0 - 2.0 * dots
+    np.fill_diagonal(d2, 1.0)
+    
+    # Diagonal Hessian approximation: H_ii ≈ sum_j [2/d2_ij - 3*(x_i-x_j)^2/d2_ij^2]
+    # Simplified: H_ii ≈ sum_j 2/d2_ij (dominant term)
+    inv_d2 = 1.0 / d2
+    np.fill_diagonal(inv_d2, 0.0)
+    diag_hess = 2.0 * inv_d2.sum(axis=1)  # (N,)
+    
+    return diag_hess
+
+def _retract(X, step):
+    """
+    Riemannian retraction: move along tangent direction, then project back to sphere.
+    X: (N, 3) on sphere
+    step: (N, 3) tangent vector (step[i] . X[i] = 0 ideally)
+    """
+    # First, project step to tangent space at X
+    # tangent_step = step - (step . X) X
+    step_dot_X = np.sum(step * X, axis=1, keepdims=True)  # (N, 1)
+    tangent_step = step - step_dot_X * X
+    
+    # Move
+    X_new = X + tangent_step
+    
+    # Normalize back to unit sphere
+    norms = np.linalg.norm(X_new, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-15)
+    X_new = X_new / norms
+    
+    return X_new
+
+def _optimize_lbfgs(X0, max_iter=5000, tol=1e-12, deadline=None):
+    """
+    L-BFGS optimization on the sphere using retraction with stronger Wolfe conditions.
+    """
+    X = X0.copy()
+    n = X.shape[0]
+    
+    # L-BFGS memory
+    m = 30
+    s_list = []  # list of step vectors (flattened)
+    y_list = []  # list of gradient difference vectors (flattened)
+    
+    E, g = _energy_and_grad(X)
+    best_E = E
+    best_X = X.copy()
+    
+    start_time = time.time()
+    
+    for it in range(max_iter):
+        if deadline is not None and time.time() > deadline:
+            break
+        
+        # Check convergence
+        g_flat = g.ravel()
+        g_norm = np.linalg.norm(g_flat)
+        if g_norm < tol:
+            break
+        
+        # L-BFGS two-loop recursion
+        if len(s_list) == 0:
+            # Steepest descent
+            direction = -g
+        else:
+            # Two-loop recursion
+            q = g_flat.copy()
+            alphas = []
+            rhos = []
+            
+            for i in range(len(s_list) - 1, -1, -1):
+                s_i = s_list[i]
+                y_i = y_list[i]
+                rho_i = 1.0 / np.dot(s_i, y_i)
+                rhos.append(rho_i)
+                alpha_i = rho_i * np.dot(s_i, q)
+                alphas.append(alpha_i)
+                q = q - alpha_i * y_i
+            
+            # Initial Hessian approximation (identity)
+            r = q
+            
+            for i in range(len(s_list)):
+                s_i = s_list[i]
+                y_i = y_list[i]
+                rho_i = rhos[len(s_list) - 1 - i]
+                alpha_i = alphas[len(s_list) - 1 - i]
+                beta_i = rho_i * np.dot(y_i, r)
+                r = r + (alpha_i - beta_i) * s_i
+            
+            direction = r.reshape(n, 3)
+        
+        # Line search: backtracking with Wolfe conditions
+        step_size = 1.0
+        g_flat_dir = np.dot(g_flat, direction.ravel())
+        
+        X_trial = X
+        E_trial = E
+        g_trial = g
+        
+        max_ls = 50
+        for ls in range(max_ls):
+            X_trial = _retract(X, step_size * direction)
+            E_trial, g_trial = _energy_and_grad(X_trial)
+            
+            # Wolfe conditions: sufficient decrease + curvature
+            c1 = 1e-4
+            c2 = 0.9
+            g_trial_flat = g_trial.ravel()
+            g_trial_dir = np.dot(g_trial_flat, direction.ravel())
+            
+            if E_trial <= E + c1 * step_size * g_flat_dir and g_trial_dir >= c2 * g_flat_dir:
+                break
+            step_size *= 0.5
+        
+        if step_size < 1e-15:
+            # Can't take a step
+            break
+        
+        s_vec = (X_trial - X).ravel()
+        y_vec = (g_trial - g).ravel()
+        
+        if np.dot(s_vec, y_vec) > 1e-10:
+            s_list.append(s_vec)
+            y_list.append(y_vec)
+            if len(s_list) > m:
+                s_list.pop(0)
+                y_list.pop(0)
+        
+        X = X_trial
+        E = E_trial
+        g = g_trial
+        
+        if E < best_E:
+            best_E = E
+            best_X = X.copy()
+    
+    return best_X, best_E
+
+def _newton_polish(X0, max_iter=100, tol=1e-15, deadline=None):
+    """
+    Newton polish using approximate Hessian for final convergence.
+    """
+    X = X0.copy()
+    n = X.shape[0]
+    E, g = _energy_and_grad(X)
+    best_E = E
+    best_X = X.copy()
+    
+    start_time = time.time()
+    
+    for it in range(max_iter):
+        if deadline is not None and time.time() > deadline:
+            break
+        
+        g_flat = g.ravel()
+        g_norm = np.linalg.norm(g_flat)
+        if g_norm < tol:
+            break
+        
+        # Approximate diagonal Hessian
+        diag_h = _hessian_approx(X)
+        # Newton step: x_new = x - H^{-1} g
+        # With diagonal H: step_i = -g_i / h_i
+        h_safe = np.maximum(diag_h, 1e-10)
+        newton_step = -g / h_safe[:, None]
+        
+        # Project to tangent space
+        step_dot_X = np.sum(newton_step * X, axis=1, keepdims=True)
+        tangent_step = newton_step - step_dot_X * X
+        
+        # Damped Newton with line search
+        step_size = 1.0
+        X_trial = X
+        E_trial = E
+        g_trial = g
+        
+        for ls in range(30):
+            X_trial = _retract(X, step_size * tangent_step)
+            E_trial, g_trial = _energy_and_grad(X_trial)
+            
+            if E_trial < E:
+                break
+            step_size *= 0.5
+        
+        if step_size < 1e-18:
+            break
+        
+        X = X_trial
+        E = E_trial
+        g = g_trial
+        
+        if E < best_E:
+            best_E = E
+            best_X = X.copy()
+    
+    return best_X, best_E
+
+def _polish_steepest_descent(X0, max_iter=20000, tol=1e-14, deadline=None):
+    """
+    High-precision steepest descent polish with adaptive step size.
+    """
+    X = X0.copy()
+    n = X.shape[0]
+    E, g = _energy_and_grad(X)
+    best_E = E
+    best_X = X.copy()
+    
+    start_time = time.time()
+    
+    step_size = 1e-2
+    
+    for it in range(max_iter):
+        if deadline is not None and time.time() > deadline:
+            break
+        
+        g_flat = g.ravel()
+        g_norm = np.linalg.norm(g_flat)
+        if g_norm < tol:
+            break
+        
+        direction = -g / g_norm  # normalized steepest descent
+        
+        # Backtracking line search
+        E_new = None
+        trial_step = step_size
+        for ls in range(40):
+            X_trial = _retract(X, trial_step * direction)
+            E_trial, g_trial = _energy_and_grad(X_trial)
+            
+            if E_trial < E:
+                E_new = E_trial
+                g_new = g_trial
+                X_trial_final = X_trial
+                step_size = trial_step
+                break
+            trial_step *= 0.5
+        
+        if E_new is None:
+            # Can't improve, try smaller step or break
+            step_size *= 0.5
+            if step_size < 1e-20:
+                break
+            continue
+        
+        X = X_trial_final
+        E = E_new
+        g = g_new
+        
+        if E < best_E:
+            best_E = E
+            best_X = X.copy()
+        
+        # Adapt step size upward if we made good progress
+        if E_new < E - 1e-14:
+            step_size = min(step_size * 1.3, 1e-1)
+    
+    return best_X, best_E
+
+def _fibonacci_sphere(n):
+    """Generate n points on the sphere using Fibonacci spiral."""
+    i = np.arange(n) + 0.5
+    z = 1.0 - 2.0 * i / n
+    phi = np.pi * (1.0 + np.sqrt(5.0)) * i
+    r = np.sqrt(1.0 - z * z)
+    return np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
+
+def _random_sphere(n, seed):
+    """Generate n random points on the sphere."""
+    rng = np.random.RandomState(seed)
+    X = rng.randn(n, 3)
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    return X / norms
+
+def _icosahedron_based(n):
+    """
+    Generate n points using icosahedron subdivision and relaxation.
+    Start with icosahedron vertices, subdivide faces, project to sphere.
+    """
+    # Icosahedron vertices
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    verts = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1]
+    ], dtype=float)
+    verts = verts / np.linalg.norm(verts, axis=1, keepdims=True)
+    
+    # For n > 12, use Fibonacci as fallback but perturb slightly
+    if n <= 12:
+        return verts[:n].copy()
+    else:
+        # Use icosahedron as a good structured start, then add more via Fibonacci
+        # Actually, just use Fibonacci for n > 12 but with slight random perturbation
+        base = _fibonacci_sphere(n)
+        rng = np.random.RandomState(999)
+        noise = rng.randn(n, 3) * 0.01
+        base = base + noise
+        base = base / np.linalg.norm(base, axis=1, keepdims=True)
+        return base
+
+def construct():
+    """
+    Construct 100 points on the unit sphere to minimize logarithmic energy.
+    """
+    deadline = time.time() + 140.0  # Safety margin before 150s kill
+    
+    # Multi-start: try Fibonacci spiral, icosahedron-based, and random starts
+    starts = [_fibonacci_sphere(N)]
+    starts.append(_icosahedron_based(N))
+    starts.append(_random_sphere(N, seed=42))
+    starts.append(_random_sphere(N, seed=123))
+    
+    best_X = None
+    best_E = np.inf
+    
+    # Phase 1: L-BFGS optimization from multiple starts
+    for X0 in starts:
+        if time.time() > deadline - 40.0:
+            break
+        
+        # Optimize with L-BFGS
+        X, E = _optimize_lbfgs(X0, max_iter=3000, tol=1e-12, deadline=deadline - 30.0)
+        
+        if E < best_E:
+            best_E = E
+            best_X = X.copy()
+    
+    # Check time
+    if time.time() > deadline - 20.0:
+        X = best_X
+        norms = np.linalg.norm(X, axis=1)
+        return X / norms[:, None]
+    
+    # Phase 2: Steepest descent polish
+    X, E = _polish_steepest_descent(best_X, max_iter=10000, tol=1e-14, deadline=deadline - 10.0)
+    
+    # Phase 3: Newton polish for final convergence
+    if time.time() < deadline - 5.0:
+        X, E = _newton_polish(X, max_iter=50, tol=1e-15, deadline=deadline)
+    
+    # Final check: ensure all points are on the unit sphere and valid
+    norms = np.linalg.norm(X, axis=1)
+    X = X / norms[:, None]
+    
+    # Check for very close points
+    min_dist = np.inf
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = np.linalg.norm(X[i] - X[j])
+            if d < min_dist:
+                min_dist = d
+    
+    if min_dist < 1e-9:
+        # This shouldn't happen, but if it does, return the Fibonacci start
+        return _fibonacci_sphere(N)
+    
+    return X
+# EVOLVE-BLOCK-END

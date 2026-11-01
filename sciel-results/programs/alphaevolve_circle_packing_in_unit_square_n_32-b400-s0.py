@@ -66,6 +66,38 @@ def _objective(params, start):
     mu = 50.0
     return obj + mu * (overlap_pen + bound_pen)
 
+def _objective_tight(params, start):
+    """Tighter penalty objective for final polishing."""
+    if _elapsed(start) > TIME_LIMIT:
+        return 1e10
+    x = params[:N]
+    y = params[N:2*N]
+    r = params[2*N:3*N]
+    r = np.maximum(r, 0.0)
+    obj = -np.sum(r)
+
+    # Vectorized overlap penalty with tighter smoothing
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist = np.sqrt(dx*dx + dy*dy + 1e-14)
+    min_dist = r[:, None] + r[None, :]
+    diff = min_dist - dist
+    smooth_max = 0.5 * (diff + np.sqrt(diff*diff + 1e-12))
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    overlap_pen = np.sum(smooth_max[mask])
+
+    # Boundary penalties with tighter smoothing
+    dneg_x = r - x
+    dpos_x = x - (1.0 - r)
+    dneg_y = r - y
+    dpos_y = y - (1.0 - r)
+    def sm(v):
+        return 0.5 * (v + np.sqrt(v*v + 1e-12))
+    bound_pen = np.sum(sm(dneg_x)) + np.sum(sm(dpos_x)) + np.sum(sm(dneg_y)) + np.sum(sm(dpos_y))
+
+    mu = 200.0
+    return obj + mu * (overlap_pen + bound_pen)
+
 def _push_apart(x, y, r, iters=500):
     """Move centers to resolve overlaps; never shrink radii. Keep in bounds."""
     x = x.copy()
@@ -236,6 +268,45 @@ def _physics_optimize(x, y, r, start, max_iter=2000):
     bx, by, br = _make_valid(bx, by, br)
     return bx, by, br
 
+def _tight_polish(x, y, r, start, max_iter=3000):
+    """
+    High-precision polish using tight penalty objective.
+    Uses L-BFGS-B with bounds for better convergence.
+    """
+    p0 = np.concatenate([x, y, r])
+    
+    # Define bounds for L-BFGS-B
+    # x[i] in [r[i], 1-r[i]], but since r varies, use loose bounds
+    # We'll handle tight constraints via penalty
+    bounds = []
+    for i in range(N):
+        bounds.append((0.001, 0.999))  # x
+    for i in range(N):
+        bounds.append((0.001, 0.999))  # y
+    for i in range(N):
+        bounds.append((0.001, 0.45))   # r
+    
+    best = (x.copy(), y.copy(), r.copy())
+    best_score = _sum_r(r)
+    
+    try:
+        res = minimize(
+            _objective_tight, p0, args=(start,),
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': max_iter, 'ftol': 1e-14, 'gtol': 1e-8, 'maxls': 50}
+        )
+        vx, vy, vr = _make_valid(res.x[:N], res.x[N:2*N], res.x[2*N:3*N])
+        if _is_valid(vx, vy, vr):
+            s = _sum_r(vr)
+            if s > best_score:
+                best_score = s
+                best = (vx, vy, vr)
+    except Exception:
+        pass
+    
+    return best
+
 def _make_valid(x, y, r):
     """Guarantee validity: push apart, then shrink any residual overlap/bounds."""
     x = x.copy()
@@ -389,6 +460,18 @@ def _optimize(x, y, r, start):
         except Exception:
             pass
             
+    # Tight L-BFGS-B polish
+    if _elapsed(start) < TIME_LIMIT - 2:
+        try:
+            vx, vy, vr = _tight_polish(best[0], best[1], best[2], start, max_iter=2000)
+            if _is_valid(vx, vy, vr):
+                s = _sum_r(vr)
+                if s > best_score:
+                    best_score = s
+                    best = (vx, vy, vr)
+        except Exception:
+            pass
+            
     return best
 
 def _final_polish(x, y, r, start):
@@ -416,11 +499,23 @@ def _final_polish(x, y, r, start):
         except Exception:
             pass
     
-    # Local perturbation search
+    # Tight L-BFGS-B polish
     if _elapsed(start) < TIME_LIMIT - 2:
+        try:
+            vx, vy, vr = _tight_polish(best[0], best[1], best[2], start, max_iter=3000)
+            if _is_valid(vx, vy, vr):
+                s = _sum_r(vr)
+                if s > best_score:
+                    best_score = s
+                    best = (vx, vy, vr)
+        except Exception:
+            pass
+    
+    # Local perturbation search
+    if _elapsed(start) < TIME_LIMIT - 1:
         rng = np.random.RandomState(123)
         for _ in range(50):
-            if _elapsed(start) > TIME_LIMIT - 2:
+            if _elapsed(start) > TIME_LIMIT - 1:
                 break
             # Small random perturbation
             scale = 0.01 * (1 - _ / 50.0)
@@ -507,6 +602,17 @@ def construct():
             s = _sum_r(res[2])
             if s > best_score:
                 best = res
+
+    # Additional tight polish if time permits
+    if _elapsed(start) < TIME_LIMIT - 3:
+        try:
+            vx, vy, vr = _tight_polish(best[0], best[1], best[2], start, max_iter=5000)
+            if _is_valid(vx, vy, vr):
+                s = _sum_r(vr)
+                if s > best_score:
+                    best = (vx, vy, vr)
+        except Exception:
+            pass
 
     x, y, r = best
     # ensure final validity

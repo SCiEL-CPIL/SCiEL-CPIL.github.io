@@ -53,219 +53,225 @@ def _solve_ternary_8_1(deadline):
     best_size = total
     best_set = None
     
-    # We will run multiple iterations of Greedy + Local Search
-    iteration = 0
-    while time.time() < deadline - 5.0:
-        iteration += 1
-        
-        # 1. Randomized Greedy Construction
-        # To get diverse starts, we can randomize the tie-breaking in greedy
+    # Simulated Annealing approach
+    # Start with a greedy solution
+    selected = []
+    cover_count = np.zeros(total, dtype=np.int32)
+    uncovered_mask = np.ones(total, dtype=bool)
+    
+    # Initial greedy construction
+    while np.any(uncovered_mask):
+        if time.time() > deadline - 10.0:
+            break
+        counts = uncovered_mask[balls].sum(axis=1)
+        if np.max(counts) == 0:
+            break
+        max_count = np.max(counts)
+        candidates = np.where(counts == max_count)[0]
+        best_idx = candidates[np.random.randint(len(candidates))]
+        selected.append(best_idx)
+        cover_count[balls[best_idx]] += 1
+        uncovered_mask = (cover_count == 0)
+    
+    if np.any(uncovered_mask):
+        # Fallback to simple greedy if timeout
         selected = []
         cover_count = np.zeros(total, dtype=np.int32)
         uncovered_mask = np.ones(total, dtype=bool)
-        
-        # Greedy Loop
         while np.any(uncovered_mask):
-            if time.time() > deadline - 10.0:
-                break # Time out for this iteration
-                
-            # Count coverage for each candidate among uncovered words
-            # counts[c] = number of uncovered words in balls[c]
             counts = uncovered_mask[balls].sum(axis=1)
-            
-            if np.max(counts) == 0:
-                break # Should not happen if uncovered_mask has True
-                
             max_count = np.max(counts)
             candidates = np.where(counts == max_count)[0]
-            
-            # Random selection among best to encourage diversity
-            best_idx = candidates[np.random.randint(len(candidates))]
-            
+            best_idx = candidates[0]
             selected.append(best_idx)
-            
-            # Update cover counts
             cover_count[balls[best_idx]] += 1
-            
-            # Update uncovered mask
             uncovered_mask = (cover_count == 0)
-            
-        if np.any(uncovered_mask):
-            continue # Invalid solution due to timeout in greedy
-            
-        # 2. Local Search
-        # Phase 1: Remove redundant codewords
-        # We iterate until no more can be removed
-        changed = True
-        while changed and time.time() < deadline - 5.0:
-            changed = False
-            new_selected = []
-            for c in selected:
-                # Check if c is removable: all words in balls[c] are covered by >= 2 codewords
-                # i.e., min(cover_count[balls[c]]) > 1
-                if np.min(cover_count[balls[c]]) > 1:
-                    cover_count[balls[c]] -= 1
-                    changed = True
-                else:
-                    new_selected.append(c)
-            selected = new_selected
-            
-        # Phase 2: Swap / Replace (Vectorized)
-        # Try to replace a codeword c with c' if it leads to a better state
-        improved = True
-        while improved and time.time() < deadline - 5.0:
-            improved = False
-            new_selected = []
-            for c in selected:
-                # First, try to remove (might have become removable due to previous swaps in this pass)
-                if np.min(cover_count[balls[c]]) > 1:
-                    cover_count[balls[c]] -= 1
-                    improved = True
-                    continue
-                
-                # Try to swap c with some c'
-                swapped = False
-                
-                # Critical set: words covered ONLY by c
-                critical_mask = (cover_count[balls[c]] == 1)
-                critical_words = balls[c][critical_mask]
-                
-                if len(critical_words) == 0:
-                    # Should have been removed, but just in case
-                    cover_count[balls[c]] -= 1
-                    improved = True
-                    continue
-
-                # Generate candidate c' values that could cover the critical words
-                # A candidate c' must have all critical_words in balls[c']
-                # i.e., ball_membership[c_prime, critical_words] must all be True
-                
-                # Strategy: For each critical word, find codewords that cover it
-                # Then intersect these sets to get candidates that cover ALL critical words
-                
-                # Start with all possible candidates
-                candidate_mask = np.ones(total, dtype=bool)
-                
-                for cw in critical_words:
-                    # Find all codewords c' such that cw is in balls[c']
-                    # This is equivalent to: c' is in balls[cw] (by symmetry of Hamming distance)
-                    candidate_mask &= ball_membership[:, cw]
-                
-                # Get the list of valid candidates
-                valid_candidates = np.where(candidate_mask)[0]
-                
-                # Remove c itself from candidates (we want a different codeword)
-                valid_candidates = valid_candidates[valid_candidates != c]
-                
-                if len(valid_candidates) > 0:
-                    # Pick a random candidate from the valid ones
-                    c_prime = valid_candidates[np.random.randint(len(valid_candidates))]
-                    
-                    # Perform the swap
-                    cover_count[balls[c]] -= 1
-                    cover_count[balls[c_prime]] += 1
-                    new_selected.append(c_prime)
-                    swapped = True
-                    improved = True
-                else:
-                    new_selected.append(c)
-            
-            selected = new_selected
-            
-        # Phase 3: 2-Exchange (Remove 2, Add 1)
-        # Try to find two codewords c1, c2 that can be removed and replaced by c3
-        if len(selected) > 450 and time.time() < deadline - 8.0:
-            # For each pair of codewords, check if there's a single codeword that covers
-            # all words that would become uncovered
-            improved_2ex = True
-            while improved_2ex and time.time() < deadline - 5.0:
-                improved_2ex = False
-                new_selected = list(selected)
-                
-                # Try pairs in random order
-                indices = list(range(len(new_selected)))
-                np.random.shuffle(indices)
-                
-                for i in range(len(indices)):
-                    for j in range(i + 1, len(indices)):
-                        if time.time() > deadline - 5.0:
-                            break
-                            
-                        c1 = new_selected[indices[i]]
-                        c2 = new_selected[indices[j]]
-                        
-                        # Words that would become uncovered if we remove both c1 and c2
-                        # These are words covered by exactly one of {c1, c2} and no other codeword
-                        # i.e., cover_count[x] == 1 and x is in balls[c1] xor balls[c2]
-                        
-                        # Simpler: temporarily remove both, see what becomes uncovered
-                        cover_count[balls[c1]] -= 1
-                        cover_count[balls[c2]] -= 1
-                        
-                        uncovered_after = (cover_count == 0)
-                        
-                        if np.any(uncovered_after):
-                            # Need to find a codeword c3 that covers all uncovered words
-                            uncovered_words = np.where(uncovered_after)[0]
-                            
-                            # Find c3 that covers all uncovered_words
-                            candidate_mask = np.ones(total, dtype=bool)
-                            for uw in uncovered_words[:10]:  # Limit to first 10 for speed
-                                candidate_mask &= ball_membership[:, uw]
-                            
-                            valid_c3 = np.where(candidate_mask)[0]
-                            valid_c3 = valid_c3[(valid_c3 != c1) & (valid_c3 != c2)]
-                            
-                            if len(valid_c3) > 0:
-                                c3 = valid_c3[np.random.randint(len(valid_c3))]
-                                cover_count[balls[c3]] += 1
-                                
-                                # Remove c1 and c2, add c3
-                                new_selected.remove(c1)
-                                new_selected.remove(c2)
-                                new_selected.append(c3)
-                                improved_2ex = True
-                                break
-                            else:
-                                # Revert
-                                cover_count[balls[c1]] += 1
-                                cover_count[balls[c2]] += 1
-                        else:
-                            # Both can be removed without adding anything
-                            new_selected.remove(c1)
-                            new_selected.remove(c2)
-                            improved_2ex = True
-                            break
-                        # Revert if not improved
-                        if not improved_2ex:
-                            cover_count[balls[c1]] += 1
-                            cover_count[balls[c2]] += 1
-                    
-                    if improved_2ex:
-                        break
-                
-                selected = new_selected
+    
+    best_size = len(selected)
+    best_set = selected.copy()
+    
+    # Simulated annealing parameters
+    T_start = 1.0
+    T_end = 0.01
+    cooling_rate = 0.995
+    T = T_start
+    
+    # SA loop
+    while time.time() < deadline - 5.0 and T > T_end:
+        T *= cooling_rate
         
+        # Random move: pick a random codeword and either remove it, swap it, or add a new one
+        move_type = np.random.random()
+        
+        if move_type < 0.3 and len(selected) > 100:
+            # Try to remove a random codeword
+            idx = np.random.randint(len(selected))
+            c = selected[idx]
+            
+            # Check if removing c leaves any word uncovered
+            cover_count[balls[c]] -= 1
+            uncovered = np.any(cover_count == 0)
+            
+            if not uncovered:
+                # Accept removal (improvement)
+                selected.pop(idx)
+                if len(selected) < best_size:
+                    best_size = len(selected)
+                    best_set = selected.copy()
+                    if best_size <= 403:
+                        break
+            else:
+                # Revert and accept with probability exp(-delta/T)
+                cover_count[balls[c]] += 1
+                # delta = number of newly uncovered words (penalty)
+                # For simplicity, use a fixed penalty for invalid states
+                delta = 100  # High penalty for invalid
+                if np.random.random() < np.exp(-delta / T):
+                    # Accept invalid state temporarily
+                    selected.pop(idx)
+        elif move_type < 0.7:
+            # Try to swap a random codeword with another
+            if len(selected) == 0:
+                continue
+            idx = np.random.randint(len(selected))
+            c = selected[idx]
+            
+            # Find candidates that cover all critical words of c
+            critical_mask = (cover_count[balls[c]] == 1)
+            critical_words = balls[c][critical_mask]
+            
+            if len(critical_words) == 0:
+                # Can remove c
+                cover_count[balls[c]] -= 1
+                selected.pop(idx)
+                if len(selected) < best_size:
+                    best_size = len(selected)
+                    best_set = selected.copy()
+                    if best_size <= 403:
+                        break
+                continue
+            
+            candidate_mask = np.ones(total, dtype=bool)
+            for cw in critical_words:
+                candidate_mask &= ball_membership[:, cw]
+            
+            valid_candidates = np.where(candidate_mask)[0]
+            valid_candidates = valid_candidates[valid_candidates != c]
+            
+            if len(valid_candidates) > 0:
+                c_prime = valid_candidates[np.random.randint(len(valid_candidates))]
+                
+                # Perform swap
+                cover_count[balls[c]] -= 1
+                cover_count[balls[c_prime]] += 1
+                selected[idx] = c_prime
+        else:
+            # Try to add a new codeword (to escape local minima)
+            # Pick a random uncovered word or a random word
+            if np.any(cover_count == 0):
+                uncovered_words = np.where(cover_count == 0)[0]
+                c_new = uncovered_words[np.random.randint(len(uncovered_words))]
+            else:
+                c_new = np.random.randint(total)
+            
+            # Check if c_new is already in selected
+            if c_new in selected:
+                continue
+            
+            # Add c_new
+            cover_count[balls[c_new]] += 1
+            selected.append(c_new)
+            
+            # With some probability, accept this (even though it increases size)
+            # This helps escape local minima
+            if np.random.random() < 0.1:  # 10% chance to keep the added codeword
+                pass  # Keep it
+            else:
+                # Revert
+                cover_count[balls[c_new]] -= 1
+                selected.pop()
+        
+        # Periodically clean up: remove redundant codewords
+        if np.random.random() < 0.1:
+            new_selected = []
+            for c in selected:
+                if np.min(cover_count[balls[c]]) > 1:
+                    cover_count[balls[c]] -= 1
+                else:
+                    new_selected.append(c)
+            selected = new_selected
+        
+        # Track best
         if len(selected) < best_size:
             best_size = len(selected)
             best_set = selected.copy()
-            
             if best_size <= 403:
-                break # Hit lower bound (unlikely)
-            if best_size <= 486:
-                # We hit the known best. We can try to improve further or break.
-                # Let's keep searching for a bit to see if we can go lower.
-                # But 486 is the proven best for a while.
-                # Actually, 486 is the BEST KNOWN. If we find 486, we are at the state-of-the-art.
-                # We should break to save time for other restarts or just return.
-                # But maybe we can find 485? Unlikely.
-                # Let's break if we find <= 486 to ensure we return a valid good answer quickly.
                 break
+            if best_size <= 486:
+                break
+
+    # Final local search polish on best_set
+    selected = best_set.copy()
+    cover_count = np.zeros(total, dtype=np.int32)
+    for c in selected:
+        cover_count[balls[c]] += 1
+    
+    # Phase 1: Remove redundant
+    changed = True
+    while changed and time.time() < deadline - 2.0:
+        changed = False
+        new_selected = []
+        for c in selected:
+            if np.min(cover_count[balls[c]]) > 1:
+                cover_count[balls[c]] -= 1
+                changed = True
+            else:
+                new_selected.append(c)
+        selected = new_selected
+    
+    # Phase 2: Swap
+    improved = True
+    while improved and time.time() < deadline - 1.0:
+        improved = False
+        new_selected = []
+        for c in selected:
+            if np.min(cover_count[balls[c]]) > 1:
+                cover_count[balls[c]] -= 1
+                improved = True
+                continue
+            
+            critical_mask = (cover_count[balls[c]] == 1)
+            critical_words = balls[c][critical_mask]
+            
+            if len(critical_words) == 0:
+                cover_count[balls[c]] -= 1
+                improved = True
+                continue
+
+            candidate_mask = np.ones(total, dtype=bool)
+            for cw in critical_words:
+                candidate_mask &= ball_membership[:, cw]
+            
+            valid_candidates = np.where(candidate_mask)[0]
+            valid_candidates = valid_candidates[valid_candidates != c]
+            
+            if len(valid_candidates) > 0:
+                c_prime = valid_candidates[np.random.randint(len(valid_candidates))]
+                cover_count[balls[c]] -= 1
+                cover_count[balls[c_prime]] += 1
+                new_selected.append(c_prime)
+                improved = True
+            else:
+                new_selected.append(c)
+        
+        selected = new_selected
+    
+    if len(selected) < best_size:
+        best_size = len(selected)
+        best_set = selected.copy()
 
     # Convert best_set to output format
     if best_set is None:
-        # Fallback: Return a valid (though large) code
-        # Simple greedy without local search
         selected = []
         cover_count = np.zeros(total, dtype=np.int32)
         uncovered_mask = np.ones(total, dtype=bool)

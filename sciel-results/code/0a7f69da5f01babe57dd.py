@@ -1,0 +1,661 @@
+"""Rewritten program for 50-circle packing inside unit circle."""
+import numpy as np
+import time
+from scipy.optimize import minimize
+
+N = 50
+DEADLINE = 115.0  # Safety margin for 120s limit
+
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.optimize import minimize
+
+def _compute_score(centers):
+    """Compute the packing score for given centers."""
+    n = len(centers)
+    if n == 0:
+        return 0.0
+    if not np.all(np.isfinite(centers)):
+        return 0.0
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.linalg.norm(diff, axis=2)
+    np.fill_diagonal(dists, np.inf)
+    min_pair = np.min(dists)
+    norms = np.linalg.norm(centers, axis=1)
+    min_bound = np.min(1.0 - norms)
+    r = min(min_pair / 2.0, min_bound)
+    if r < 0:
+        return 0.0
+    return r
+
+def _get_initial_hex_lattice(n):
+    """Generate a hexagonal lattice and pick n points inside unit circle."""
+    r_est = 0.12
+    s = 2 * r_est
+    points = []
+    max_range = int(2.0 / s) + 3
+    for j in range(-max_range, max_range + 1):
+        for i in range(-max_range, max_range + 1):
+            x = i * s + (j % 2) * s / 2.0
+            y = j * s * np.sqrt(3) / 2.0
+            if np.hypot(x, y) <= 0.95:
+                points.append([x, y])
+    if len(points) == 0:
+        return _get_random_initialization(n, seed=42)
+    points = np.array(points)
+    if len(points) < n:
+        return _get_random_initialization(n, seed=42)
+    dists = np.linalg.norm(points, axis=1)
+    sorted_idx = np.argsort(dists)
+    return points[sorted_idx[:n]]
+
+def _get_random_initialization(n, seed=42):
+    """Generate random initialization."""
+    rng = np.random.default_rng(seed)
+    centers = []
+    for _ in range(n):
+        angle = rng.uniform(0, 2 * np.pi)
+        while True:
+            radius = rng.uniform(0, 1.0)
+            if radius <= 0.95:
+                break
+        x = radius * np.cos(angle)
+        y = radius * np.sin(angle)
+        centers.append([x, y])
+    return np.array(centers)
+
+def _get_ring_initialization(n):
+    """Generate ring-based initialization."""
+    centers = []
+    centers.append([0.0, 0.0])
+    rings = [
+        (6, 0.25),
+        (12, 0.5),
+        (12, 0.75),
+        (10, 0.9)
+    ]
+    count = 1
+    for count_in_ring, radius in rings:
+        angles = np.linspace(0, 2 * np.pi, count_in_ring, endpoint=False)
+        for angle in angles:
+            if count >= n:
+                break
+            centers.append([radius * np.cos(angle), radius * np.sin(angle)])
+            count += 1
+        if count >= n:
+            break
+    return np.array(centers[:n])
+
+def _get_perturbed_hex_lattice(n, seed=1):
+    """Generate a hexagonal lattice with small random perturbations."""
+    base = _get_initial_hex_lattice(n)
+    rng = np.random.default_rng(seed)
+    perturbed = base + rng.normal(0, 0.01, size=base.shape)
+    norms = np.linalg.norm(perturbed, axis=1)
+    mask = norms > 0.95
+    if np.any(mask):
+        perturbed[mask] *= 0.95 / norms[mask]
+    return perturbed
+
+def _objective_soft_min(params, n, beta):
+    """
+    Objective to minimize: -soft_min(constraints)
+    Uses log-sum-exp for numerical stability.
+    """
+    centers = params.reshape(n, 2)
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.linalg.norm(diff, axis=2)
+    
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    pair_dists = dists[i_idx, j_idx]
+    
+    norms = np.linalg.norm(centers, axis=1)
+    vals = np.concatenate([pair_dists / 2.0, 1.0 - norms])
+    
+    m = np.min(vals)
+    vals_shifted = vals - m
+    exp_terms = np.exp(-beta * vals_shifted)
+    obj = -(m - (1.0 / beta) * np.log(np.sum(exp_terms)))
+    
+    grad = np.zeros_like(centers)
+    
+    exp_vals = exp_terms
+    S = np.sum(exp_vals)
+    weights = exp_vals / S
+    
+    pair_weights = weights[:n*(n-1)//2]
+    for k in range(len(pair_weights)):
+        w = pair_weights[k]
+        if w < 1e-8:
+            continue
+        i, j = i_idx[k], j_idx[k]
+        d = dists[i, j]
+        if d > 1e-8:
+            vec = (centers[i] - centers[j]) / d
+            grad[i] += w * vec / 2.0
+            grad[j] -= w * vec / 2.0
+            
+    bound_weights = weights[n*(n-1)//2:]
+    for i in range(n):
+        w = bound_weights[i]
+        if w < 1e-8:
+            continue
+        if norms[i] > 1e-8:
+            grad[i] -= w * centers[i] / norms[i]
+            
+    return obj, -grad
+
+def _polish_subgradient(centers, start_time, max_iters=2000, initial_step=0.005):
+    """
+    Direct approach: Sub-gradient ascent on the minimum distance.
+    Identifies the tightest constraint and pushes points apart.
+    Uses a simple adaptive step size.
+    """
+    current = centers.copy()
+    best_score = _compute_score(current)
+    best_centers = current.copy()
+    step_size = initial_step
+    no_improve_count = 0
+    
+    for it in range(max_iters):
+        if time.time() - start_time > DEADLINE - 5:
+            break
+        
+        n = len(current)
+        diff = current[:, np.newaxis, :] - current[np.newaxis, :, :]
+        dists = np.linalg.norm(diff, axis=2)
+        np.fill_diagonal(dists, np.inf)
+        
+        norms = np.linalg.norm(current, axis=1)
+        bound_dists = 1.0 - norms
+        
+        min_pair_dist = np.min(dists)
+        min_bound_dist = np.min(bound_dists)
+        
+        if min_pair_dist / 2.0 < min_bound_dist:
+            i, j = np.unravel_index(np.argmin(dists), dists.shape)
+            if i > j: i, j = j, i
+            d = dists[i, j]
+            if d > 1e-8:
+                vec = (current[i] - current[j]) / d
+                current[i] += vec * step_size * 0.5
+                current[j] -= vec * step_size * 0.5
+        else:
+            i = np.argmin(bound_dists)
+            norm = norms[i]
+            if norm > 1e-8:
+                vec = current[i] / norm
+                current[i] -= vec * step_size
+        
+        new_norms = np.linalg.norm(current, axis=1)
+        mask = new_norms > 0.99
+        if np.any(mask):
+            current[mask] *= 0.99 / new_norms[mask]
+            
+        new_score = _compute_score(current)
+        if new_score > best_score:
+            best_score = new_score
+            best_centers = current.copy()
+            no_improve_count = 0
+            step_size *= 1.01
+        else:
+            no_improve_count += 1
+            step_size *= 0.95
+            if no_improve_count > 50:
+                break
+
+    return best_centers, best_score
+
+def _optimize_from_start(centers, start_time):
+    """
+    Multi-stage optimization:
+    1. L-BFGS-B with soft min (beta 50 -> 500)
+    2. Sub-gradient polish
+    """
+    current = centers.copy()
+    
+    betas = [50.0, 200.0, 500.0]
+    for beta in betas:
+        if time.time() - start_time > DEADLINE - 20:
+            break
+        try:
+            res = minimize(
+                _objective_soft_min, 
+                current.flatten(), 
+                args=(N, beta),
+                method='L-BFGS-B',
+                jac=True,
+                options={'maxiter': 100, 'gtol': 1e-6}
+            )
+            if res.success or np.isfinite(res.fun):
+                candidate = res.x.reshape(N, 2)
+                if np.all(np.isfinite(candidate)):
+                    current = candidate
+        except Exception:
+            pass
+            
+    if time.time() - start_time < DEADLINE - 5:
+        current, _ = _polish_subgradient(current, start_time, max_iters=5000, initial_step=0.002)
+        
+    return current
+
+def _nelder_mead_objective(params):
+    """Objective for Nelder-Mead: negative of the packing score."""
+    centers = params.reshape(N, 2)
+    return -_compute_score(centers)
+
+def _optimize_nelder_mead(centers, start_time):
+    """
+    Optimize using Nelder-Mead method.
+    """
+    current = centers.copy()
+    
+    norms = np.linalg.norm(current, axis=1)
+    mask = norms > 0.95
+    if np.any(mask):
+        current[mask] *= 0.95 / norms[mask]
+    
+    try:
+        res = minimize(
+            _nelder_mead_objective,
+            current.flatten(),
+            method='Nelder-Mead',
+            options={
+                'maxiter': 2000,
+                'xatol': 1e-8,
+                'fatol': 1e-10,
+                'adaptive': True
+            }
+        )
+        if np.isfinite(res.fun):
+            candidate = res.x.reshape(N, 2)
+            if np.all(np.isfinite(candidate)):
+                norms = np.linalg.norm(candidate, axis=1)
+                if np.all(norms <= 1.0):
+                    current = candidate
+    except Exception:
+        pass
+    
+    if time.time() - start_time < DEADLINE - 5:
+        current, _ = _polish_subgradient(current, start_time, max_iters=3000, initial_step=0.002)
+        
+    return current
+
+def _refine_with_high_beta(centers, start_time, max_betas=5):
+    """
+    Refine using very high beta soft-min to sharpen the minimum.
+    This helps escape shallow local minima by focusing gradient on the tightest constraints.
+    """
+    current = centers.copy()
+    best_score = _compute_score(current)
+    best_centers = current.copy()
+    
+    betas = [1000, 5000, 10000, 50000, 100000][:max_betas]
+    for beta in betas:
+        if time.time() - start_time > DEADLINE - 5:
+            break
+        try:
+            res = minimize(
+                _objective_soft_min, 
+                current.flatten(), 
+                args=(N, beta),
+                method='L-BFGS-B',
+                jac=True,
+                options={'maxiter': 50, 'gtol': 1e-8}
+            )
+            if np.isfinite(res.fun):
+                candidate = res.x.reshape(N, 2)
+                if np.all(np.isfinite(candidate)):
+                    score = _compute_score(candidate)
+                    if score > best_score:
+                        best_score = score
+                        best_centers = candidate.copy()
+                        current = candidate
+        except Exception:
+            pass
+            
+    return best_centers, best_score
+
+def _perturb_and_retry(centers, start_time, n_perturbations=5):
+    """
+    Perturb the best solution slightly and re-optimize to escape local minima.
+    """
+    best_centers = centers.copy()
+    best_score = _compute_score(best_centers)
+    
+    rng = np.random.default_rng(12345)
+    
+    for p in range(n_perturbations):
+        if time.time() - start_time > DEADLINE - 10:
+            break
+        
+        perturbed = best_centers.copy()
+        noise_scale = 0.01 * (1.0 + p * 0.5)
+        noise = rng.normal(0, noise_scale, size=perturbed.shape)
+        perturbed += noise
+        
+        norms = np.linalg.norm(perturbed, axis=1)
+        mask = norms > 0.95
+        if np.any(mask):
+            perturbed[mask] *= 0.95 / norms[mask]
+            
+        optimized = _optimize_from_start(perturbed, start_time)
+        if np.all(np.isfinite(optimized)):
+            score = _compute_score(optimized)
+            if score > best_score:
+                best_score = score
+                best_centers = optimized.copy()
+                
+    return best_centers, best_score
+
+def _sdqp_solve(centers, start_time, max_iters=200, tol=1e-10):
+    """
+    Final polishing using high-beta soft-min and subgradient.
+    """
+    current = centers.copy()
+    best_score = _compute_score(current)
+    best_centers = current.copy()
+    
+    if time.time() - start_time < DEADLINE - 5:
+        refined, refined_score = _refine_with_high_beta(current, start_time, max_betas=3)
+        if refined_score > best_score:
+            best_score = refined_score
+            best_centers = refined.copy()
+            current = refined
+    
+    if time.time() - start_time < DEADLINE - 2:
+        polished, polished_score = _polish_subgradient(current, start_time, max_iters=5000, initial_step=0.0005)
+        if polished_score > best_score:
+            best_score = polished_score
+            best_centers = polished.copy()
+    
+    return best_centers, best_score
+
+def _qcqp_sdr_solve(centers, start_time):
+    """
+    Sequential quadratic programming-like approach using SDR relaxation ideas.
+    Iteratively refines by solving a smoothed problem with increasing beta,
+    then polishing with a local search that identifies active constraints.
+    """
+    current = centers.copy()
+    best_score = _compute_score(current)
+    best_centers = current.copy()
+    
+    # Stage 1: Multi-beta L-BFGS-B with increasing sharpness
+    betas = [100, 500, 2000, 10000, 50000]
+    for beta in betas:
+        if time.time() - start_time > DEADLINE - 8:
+            break
+        try:
+            res = minimize(
+                _objective_soft_min,
+                current.flatten(),
+                args=(N, beta),
+                method='L-BFGS-B',
+                jac=True,
+                options={'maxiter': 80, 'gtol': 1e-9, 'ftol': 1e-12}
+            )
+            if np.isfinite(res.fun):
+                candidate = res.x.reshape(N, 2)
+                if np.all(np.isfinite(candidate)):
+                    score = _compute_score(candidate)
+                    if score > best_score:
+                        best_score = score
+                        best_centers = candidate.copy()
+                        current = candidate
+        except Exception:
+            pass
+    
+    # Stage 2: Active-set identification and targeted refinement
+    # Find the tightest constraints and try to move points to equalize them
+    if time.time() - start_time < DEADLINE - 5:
+        n = len(current)
+        diff = current[:, np.newaxis, :] - current[np.newaxis, :, :]
+        dists = np.linalg.norm(diff, axis=2)
+        np.fill_diagonal(dists, np.inf)
+        norms = np.linalg.norm(current, axis=1)
+        bound_dists = 1.0 - norms
+        
+        current_r = _compute_score(current)
+        
+        # Identify constraints within 10% of the minimum
+        pair_vals = dists.copy()
+        np.fill_diagonal(pair_vals, np.inf)
+        pair_vals = pair_vals / 2.0
+        threshold = current_r * 1.1
+        tight_pairs = []
+        for i in range(n):
+            for j in range(i+1, n):
+                if pair_vals[i, j] <= threshold:
+                    tight_pairs.append((i, j, pair_vals[i, j]))
+        tight_bounds = []
+        for i in range(n):
+            if bound_dists[i] <= threshold:
+                tight_bounds.append((i, bound_dists[i]))
+        
+        # Try small random kicks in directions that help tight constraints
+        rng = np.random.default_rng(777)
+        for _ in range(20):
+            if time.time() - start_time > DEADLINE - 5:
+                break
+            candidate = current.copy()
+            for i, j, _ in tight_pairs[:10]:
+                d = np.linalg.norm(candidate[i] - candidate[j])
+                if d > 1e-8:
+                    direction = (candidate[i] - candidate[j]) / d
+                    kick = rng.normal(0, 0.002)
+                    candidate[i] += direction * kick * 0.5
+                    candidate[j] -= direction * kick * 0.5
+            for i, _ in tight_bounds[:5]:
+                norm = np.linalg.norm(candidate[i])
+                if norm > 1e-8:
+                    direction = candidate[i] / norm
+                    kick = rng.normal(0, 0.002)
+                    candidate[i] -= direction * kick
+            
+            new_norms = np.linalg.norm(candidate, axis=1)
+            mask = new_norms > 0.99
+            if np.any(mask):
+                candidate[mask] *= 0.99 / new_norms[mask]
+            
+            score = _compute_score(candidate)
+            if score > best_score:
+                best_score = score
+                best_centers = candidate.copy()
+                current = candidate
+    
+    return best_centers, best_score
+
+def _check_feasibility_at_radius(centers, r):
+    """Check if all circles of radius r fit without overlap and inside unit circle."""
+    n = len(centers)
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :]
+    dists = np.linalg.norm(diff, axis=2)
+    np.fill_diagonal(dists, np.inf)
+    min_pair = np.min(dists)
+    norms = np.linalg.norm(centers, axis=1)
+    max_norm = np.max(norms)
+    return min_pair >= 2 * r and max_norm <= 1.0 - r
+
+def _objective_radius_feasible(params, r, n, beta):
+    """
+    Objective: penalize constraint violations for circles of radius r.
+    Returns sum of squared violations (smooth approximation).
+    """
+    centers = params.reshape(n, 2)
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :]
+    dists = np.linalg.norm(diff, axis=2)
+    
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    pair_dists = dists[i_idx, j_idx]
+    
+    norms = np.linalg.norm(centers, axis=1)
+    
+    # Violations: pair_dists - 2*r (should be >= 0), r + norm - 1 (should be <= 0)
+    pair_viol = np.maximum(0.0, 2 * r - pair_dists)
+    bound_viol = np.maximum(0.0, r + norms - 1.0)
+    
+    # Smooth sum of squares
+    obj = np.sum(pair_viol ** 2) + np.sum(bound_viol ** 2)
+    
+    grad = np.zeros_like(centers)
+    
+    # Gradient for pair violations
+    pair_viol_grad = np.where(pair_viol > 0, -2 * pair_viol, 0.0)
+    for k in range(len(pair_viol_grad)):
+        i, j = i_idx[k], j_idx[k]
+        d = pair_dists[k]
+        if d > 1e-8:
+            vec = (centers[i] - centers[j]) / d
+            grad[i] += pair_viol_grad[k] * vec
+            grad[j] -= pair_viol_grad[k] * vec
+    
+    # Gradient for bound violations
+    bound_viol_grad = np.where(bound_viol > 0, 2 * bound_viol, 0.0)
+    for i in range(n):
+        norm = norms[i]
+        if norm > 1e-8:
+            vec = centers[i] / norm
+            grad[i] += bound_viol_grad[i] * vec
+    
+    return obj, grad
+
+def _binary_search_radius(centers, start_time, r_lo=0.12, r_hi=0.13, max_iters=20):
+    """
+    Binary search on radius: find maximum r such that a feasible configuration exists.
+    For each r, optimize to minimize constraint violations.
+    """
+    current = centers.copy()
+    best_r = r_lo
+    best_centers = current.copy()
+    
+    for it in range(max_iters):
+        if time.time() - start_time > DEADLINE - 5:
+            break
+        
+        r_mid = (r_lo + r_hi) / 2.0
+        
+        # Try to find a feasible configuration at radius r_mid
+        try:
+            res = minimize(
+                _objective_radius_feasible,
+                current.flatten(),
+                args=(r_mid, N, 50.0),
+                method='L-BFGS-B',
+                jac=True,
+                options={'maxiter': 50, 'gtol': 1e-8}
+            )
+            candidate = res.x.reshape(N, 2)
+            
+            if _check_feasibility_at_radius(candidate, r_mid):
+                r_lo = r_mid
+                best_r = r_mid
+                best_centers = candidate.copy()
+                current = candidate
+            else:
+                r_hi = r_mid
+        except Exception:
+            r_hi = r_mid
+    
+    return best_r, best_centers
+
+def construct():
+    start_time = time.time()
+    best_score = 0.0
+    best_centers = None
+    
+    # Diverse initializations
+    initializations = [
+        _get_initial_hex_lattice(N),
+        _get_ring_initialization(N),
+        _get_random_initialization(N, seed=1),
+        _get_random_initialization(N, seed=42),
+        _get_random_initialization(N, seed=99),
+        _get_random_initialization(N, seed=123),
+        _get_random_initialization(N, seed=777),
+        _get_perturbed_hex_lattice(N, seed=1),
+        _get_perturbed_hex_lattice(N, seed=2),
+    ]
+    
+    # Optimize each initialization with both methods
+    for init in initializations:
+        if time.time() - start_time > DEADLINE - 15:
+            break
+        
+        norms = np.linalg.norm(init, axis=1)
+        mask = norms > 0.95
+        if np.any(mask):
+            init = init.copy()
+            init[mask] *= 0.95 / norms[mask]
+            
+        # Try L-BFGS-B optimization
+        if time.time() - start_time < DEADLINE - 20:
+            optimized_lbfgs = _optimize_from_start(init, start_time)
+            if np.all(np.isfinite(optimized_lbfgs)):
+                r = _compute_score(optimized_lbfgs)
+                if r > best_score:
+                    best_score = r
+                    best_centers = optimized_lbfgs.copy()
+        
+        # Try Nelder-Mead optimization
+        if time.time() - start_time < DEADLINE - 15:
+            optimized_nm = _optimize_nelder_mead(init, start_time)
+            if np.all(np.isfinite(optimized_nm)):
+                r = _compute_score(optimized_nm)
+                if r > best_score:
+                    best_score = r
+                    best_centers = optimized_nm.copy()
+                
+    if best_centers is None:
+        return initializations[0]
+    
+    # Binary search on radius to find the maximum feasible radius
+    if time.time() - start_time < DEADLINE - 10:
+        r_found, centers_found = _binary_search_radius(best_centers, start_time, 
+                                                        r_lo=best_score * 0.95, 
+                                                        r_hi=best_score * 1.05,
+                                                        max_iters=15)
+        if r_found > best_score:
+            best_score = r_found
+            best_centers = centers_found
+    
+    # Final polish on the absolute best
+    if time.time() - start_time < DEADLINE - 2:
+        best_centers, best_score = _polish_subgradient(best_centers, start_time, max_iters=10000, initial_step=0.001)
+        
+    # High-beta refinement to sharpen the minimum
+    if time.time() - start_time < DEADLINE - 5:
+        refined, refined_score = _refine_with_high_beta(best_centers, start_time, max_betas=5)
+        if refined_score > best_score:
+            best_score = refined_score
+            best_centers = refined
+        
+    # QCQP/SDR-based refinement
+    if time.time() - start_time < DEADLINE - 8:
+        qres, qscore = _qcqp_sdr_solve(best_centers, start_time)
+        if qscore > best_score:
+            best_score = qscore
+            best_centers = qres
+            
+    # Perturbation-retry loop to escape local minima
+    if time.time() - start_time < DEADLINE - 10:
+        perturbed, perturbed_score = _perturb_and_retry(best_centers, start_time, n_perturbations=3)
+        if perturbed_score > best_score:
+            best_score = perturbed_score
+            best_centers = perturbed
+            
+    # Final high-precision polish
+    if time.time() - start_time < DEADLINE - 2:
+        final_centers, final_score = _sdqp_solve(best_centers, start_time)
+        if final_score > best_score:
+            best_score = final_score
+            best_centers = final_centers
+            
+    # Final subgradient polish
+    if time.time() - start_time < DEADLINE - 1:
+        best_centers, best_score = _polish_subgradient(best_centers, start_time, max_iters=5000, initial_step=0.0005)
+        
+    return best_centers
+# EVOLVE-BLOCK-END

@@ -1,34 +1,132 @@
 """
 Solver for packing 50 equal spheres in a unit cube [-0.5, 0.5]^3.
 Strategy: Multi-stage optimization combining:
-1. Structured initialization (FCC-like lattice)
-2. Simulated annealing with repulsion to escape local minima
-3. Lloyd's algorithm (Voronoi centroid moves) to equalize clearance
-4. Smooth gradient-based polishing (soft-min via log-sum-exp)
-5. Final high-precision polish pass
+1. Structured initial configurations (FCC-inspired, grid, random)
+2. Repulsion-based simulated annealing for global search
+3. Voronoi Lloyd's algorithm for balanced spacing
+4. Softmin gradient polishing for fine-tuning
+5. Local search on binding constraints
 """
 
 import numpy as np
 import time
 from scipy.optimize import minimize
 from scipy.spatial import Voronoi
+from scipy.spatial import cKDTree
 
 N = 50
 
-# EVOLVE-BLOCK-START
+# Precompute upper triangle indices for pairwise distances
+_iu, _ju = np.triu_indices(N, k=1)
+_PAIR_IDX = np.column_stack([_iu, _ju])
+_NUM_PAIRS = len(_iu)
+
+def _seed_fcc():
+    """
+    Generate an FCC-inspired initial configuration for 50 spheres.
+    """
+    m = 4
+    spacing = 1.0 / m
+    points = []
+    for i in range(m):
+        for j in range(m):
+            for k in range(m):
+                x = (i + 0.5) * spacing - 0.5
+                y = (j + 0.5) * spacing - 0.5
+                z = (k + 0.5) * spacing - 0.5
+                for dx, dy, dz in [(0, 0, 0),
+                                    (0.5, 0.5, 0),
+                                    (0.5, 0, 0.5),
+                                    (0, 0.5, 0.5)]:
+                    px = x + dx * spacing
+                    py = y + dy * spacing
+                    pz = z + dz * spacing
+                    if -0.5 <= px <= 0.5 and -0.5 <= py <= 0.5 and -0.5 <= pz <= 0.5:
+                        points.append([px, py, pz])
+    
+    points = np.array(points)
+    if len(points) < N:
+        extra = np.random.uniform(-0.45, 0.45, size=(N - len(points), 3))
+        points = np.vstack([points, extra])
+    else:
+        idx = np.random.choice(len(points), N, replace=False)
+        points = points[idx]
+    
+    return points
+
+def _seed_grid():
+    """
+    Generate a grid-based initial configuration.
+    """
+    m = 4
+    ticks = (np.arange(m) + 0.5) / m - 0.5
+    grid = np.array([(x, y, z) for z in ticks for y in ticks for x in ticks])
+    idx = np.random.choice(len(grid), N, replace=False)
+    return grid[idx]
+
+def _seed_random():
+    """
+    Generate a random initial configuration.
+    """
+    return np.random.uniform(-0.45, 0.45, size=(N, 3))
+
+def _seed_bcc():
+    """
+    Generate a BCC-inspired initial configuration.
+    """
+    m = 3
+    spacing = 1.0 / m
+    points = []
+    for i in range(m):
+        for j in range(m):
+            for k in range(m):
+                x = (i + 0.5) * spacing - 0.5
+                y = (j + 0.5) * spacing - 0.5
+                z = (k + 0.5) * spacing - 0.5
+                # BCC: corner + center
+                points.append([x, y, z])
+                points.append([x + 0.5*spacing, y + 0.5*spacing, z + 0.5*spacing])
+    
+    points = np.array(points)
+    if len(points) < N:
+        extra = np.random.uniform(-0.45, 0.45, size=(N - len(points), 3))
+        points = np.vstack([points, extra])
+    else:
+        idx = np.random.choice(len(points), N, replace=False)
+        points = points[idx]
+    
+    return points
+
+def _seed_shell_core():
+    """
+    Generate a shell-core initial configuration.
+    """
+    n_core = 20
+    n_shell = N - n_core
+    
+    core = np.random.uniform(-0.25, 0.25, size=(n_core, 3))
+    
+    theta = np.random.uniform(0, 2 * np.pi, size=n_shell)
+    phi = np.random.uniform(0, np.pi, size=n_shell)
+    r = 0.35 + np.random.uniform(-0.05, 0.05, size=n_shell)
+    shell = np.column_stack([
+        r * np.sin(phi) * np.cos(theta),
+        r * np.sin(phi) * np.sin(theta),
+        r * np.cos(phi)
+    ])
+    
+    return np.vstack([core, shell])
 
 def _compute_radius(c):
     """
     Compute the largest common radius for centers c (N, 3) in cube [-0.5, 0.5]^3.
-    r = min( min_{i<j} dist(i,j)/2, min_i min_k (0.5 - |c_ik|) )
     """
     if len(c) == 0:
         return 0.0
     
-    # Pairwise distances
-    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+    # Pairwise distances using precomputed indices
+    diff = c[_iu] - c[_ju]
     dists = np.sqrt(np.sum(diff * diff, axis=-1))
-    np.fill_diagonal(dists, np.inf)
     min_pair = np.min(dists)
     
     # Distance to walls
@@ -40,285 +138,148 @@ def _compute_radius(c):
 def _softmin_radius_and_grad(c, t):
     """
     Compute softmin radius and its gradient.
-    Uses only unique pairs (i < j) to avoid double-counting.
     Returns (radius, gradient) where gradient is (N, 3).
-    softmin(x) = -t * log(sum(exp(-x/t)))
     """
-    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+    diff = c[_iu] - c[_ju]
     dists = np.sqrt(np.sum(diff * diff, axis=-1))
-    np.fill_diagonal(dists, np.inf)
+    pair_vals = dists / 2.0
     
-    # Use only upper triangle for unique pairs
-    iu = np.triu_indices(N, k=1)
-    pair_dists = dists[iu]  # shape (N*(N-1)/2,)
-    pair_vals = pair_dists / 2.0
+    wall_vals = 0.5 - np.abs(c)
     
-    wall_vals = 0.5 - np.abs(c)  # shape (N, 3)
-    wall_flat = wall_vals.ravel()
+    # Use log-sum-exp for numerical stability
+    all_vals = np.concatenate([pair_vals, wall_vals.ravel()])
+    m_val = np.min(all_vals)
     
-    # Concatenate all constraints
-    all_vals = np.concatenate([pair_vals, wall_flat])
+    # Weights for pairs
+    pair_weights = np.exp(-pair_vals / t)
     
-    if len(all_vals) == 0:
-        return 0.0, np.zeros_like(c)
+    # Weights for walls
+    wall_weights = np.exp(-wall_vals / t)
+    
+    total_sum = np.sum(pair_weights) + np.sum(wall_weights)
+    
+    if total_sum < 1e-300:
+        return m_val, np.zeros_like(c)
         
-    # Stable log-sum-exp
-    m = np.min(all_vals)
-    exp_vals = np.exp(-(all_vals - m) / t)
-    s = np.sum(exp_vals)
-    radius = m - t * np.log(s)
+    # Softmin value
+    softmin_val = -t * np.log(total_sum)
     
-    weights = exp_vals / s  # normalized weights
-    
-    grad = np.zeros_like(c)
+    # Gradient calculation
+    grad_c = np.zeros_like(c)
     
     # Pair contributions
-    n_pairs = len(pair_vals)
-    pair_w = weights[:n_pairs]  # weights for unique pairs
+    with np.errstate(divide='ignore', invalid='ignore'):
+        unit_vecs = diff / dists[:, np.newaxis]
+    unit_vecs[np.isnan(unit_vecs)] = 0.0
     
-    # For each unique pair (i, j) with i < j:
-    # constraint = dist(i,j)/2
-    # d(constraint)/d(c_i) = (c_i - c_j) / dist(i,j)  [note: d(dist/2)/d(c_i) = (c_i-c_j)/dist]
-    # Wait: d(dist)/d(c_i) = (c_i - c_j)/dist, so d(dist/2)/d(c_i) = (c_i-c_j)/(2*dist)
-    # d(constraint)/d(c_j) = (c_j - c_i) / (2*dist)
+    # For each pair (i,j), the gradient contribution to c[i] is -0.5 * w * (c[i]-c[j])/d
+    # and to c[j] is +0.5 * w * (c[i]-c[j])/d
+    pair_grad = 0.5 * pair_weights[:, np.newaxis] * unit_vecs
     
-    # grad[i] -= w * (c_i - c_j)/(2*dist)  for the i-index of the pair
-    # grad[j] -= w * (c_j - c_i)/(2*dist)  for the j-index of the pair
-    
-    pi, pj = iu
-    safe_dists = np.where(pair_dists > 1e-10, pair_dists, 1.0)
-    
-    # Vectorized: for each pair, compute contribution
-    # diff_pair[k] = c[pi[k]] - c[pj[k]]
-    diff_pair = c[pi] - c[pj]  # shape (n_pairs, 3)
-    
-    # factor[k] = pair_w[k] / (2 * safe_dists[k])
-    factor = pair_w / (2.0 * safe_dists)  # shape (n_pairs,)
-    
-    # Contribution to grad[pi[k]]: -factor[k] * diff_pair[k]
-    # Contribution to grad[pj[k]]: +factor[k] * diff_pair[k]
-    
-    np.add.at(grad, pi, -factor[:, np.newaxis] * diff_pair)
-    np.add.at(grad, pj, factor[:, np.newaxis] * diff_pair)
+    for idx in range(_NUM_PAIRS):
+        i, j = _PAIR_IDX[idx]
+        grad_c[i] -= pair_grad[idx]
+        grad_c[j] += pair_grad[idx]
     
     # Wall contributions
-    wall_w = weights[n_pairs:]  # N*3 weights
-    wall_w = wall_w.reshape(N, 3)
-    
-    # d(wall_vals[i,k])/d(c[i,k]) = -sign(c[i,k])
-    # grad[i,k] -= wall_w[i,k] * (-sign(c[i,k])) = wall_w[i,k] * sign(c[i,k])
     signs = np.sign(c)
-    signs[np.abs(c) < 1e-10] = 0.0
-    grad += wall_w * signs
+    grad_c += wall_weights * signs
     
-    return radius, grad
+    # Normalize by total_sum
+    grad_c /= total_sum
+    
+    return softmin_val, grad_c
 
-def _repulsion_anneal(c_init, deadline, r_target=None, max_iters=5000):
+def _repulsion_anneal(c_init, deadline, t_start=2.0, t_end=0.01, iters_per_temp=50):
     """
-    Simulated annealing with repulsion to spread points apart.
-    Uses adaptive perturbation size and tracks best radius.
+    Repulsion-based simulated annealing.
     """
     c = c_init.copy()
-    best_r = _compute_radius(c)
     best_c = c.copy()
+    best_r = _compute_radius(c)
     
-    if r_target is None:
-        r_target = best_r + 0.01
+    temps = np.logspace(np.log10(t_start), np.log10(t_end), 15)
     
-    temp = 0.05
-    decay = 0.998
-    pert_scale = 0.008
-    
-    for it in range(max_iters):
+    for t in temps:
         if time.time() > deadline:
             break
         
-        # Compute energy: sum of squared overlaps
-        diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
-        dists = np.sqrt(np.sum(diff * diff, axis=-1))
-        np.fill_diagonal(dists, np.inf)
-        
-        # Target: all pair distances >= 2*r_target, wall distances >= r_target
-        overlap_pair = np.maximum(0.0, 2.0 * r_target - dists)
-        wall_dists = 0.5 - np.abs(c)
-        overlap_wall = np.maximum(0.0, r_target - wall_dists)
-        
-        E = np.sum(overlap_pair ** 2) + np.sum(overlap_wall ** 2)
-        
-        # Adaptive perturbation: larger when stuck, smaller when improving
-        move = np.random.normal(0.0, pert_scale, size=c.shape)
-        c_new = c + move
-        c_new = np.clip(c_new, -0.49, 0.49)
-        
-        # Compute new energy
-        diff_new = c_new[:, np.newaxis, :] - c_new[np.newaxis, :, :]
-        dists_new = np.sqrt(np.sum(diff_new * diff_new, axis=-1))
-        np.fill_diagonal(dists_new, np.inf)
-        
-        overlap_pair_new = np.maximum(0.0, 2.0 * r_target - dists_new)
-        wall_dists_new = 0.5 - np.abs(c_new)
-        overlap_wall_new = np.maximum(0.0, r_target - wall_dists_new)
-        
-        E_new = np.sum(overlap_pair_new ** 2) + np.sum(overlap_wall_new ** 2)
-        
-        # Accept
-        dE = E_new - E
-        if dE < 0 or np.random.random() < np.exp(-dE / max(temp, 1e-6)):
-            c = c_new
-            r_check = _compute_radius(c)
-            if r_check > best_r:
-                best_r = r_check
-                best_c = c.copy()
-                # Reduce perturbation on improvement
-                pert_scale *= 0.95
-            else:
-                # Slightly increase perturbation if no improvement
-                pert_scale = min(pert_scale * 1.02, 0.02)
-        else:
-            # No improvement, increase perturbation
-            pert_scale = min(pert_scale * 1.03, 0.02)
-        
-        temp *= decay
-        
-        # Periodically try to increase r_target
-        if it % 300 == 0 and E < 1e-4:
-            r_target += 0.003
+        for it in range(iters_per_temp):
+            if time.time() > deadline:
+                break
+            
+            # Compute repulsive forces
+            forces = np.zeros_like(c)
+            
+            # Pair repulsion
+            diff = c[_iu] - c[_ju]
+            dists = np.sqrt(np.sum(diff * diff, axis=-1))
+            
+            with np.errstate(divide='ignore', invalid='ignore'):
+                force_mag = 1.0 / (dists * dists)
+            force_mag = np.where(force_mag > 1e6, 1e6, force_mag)
+            
+            unit_vecs = diff / dists[:, np.newaxis]
+            unit_vecs[np.isnan(unit_vecs)] = 0.0
+            
+            pair_forces = force_mag[:, np.newaxis] * unit_vecs
+            
+            for idx in range(_NUM_PAIRS):
+                i, j = _PAIR_IDX[idx]
+                forces[i] += pair_forces[idx]
+                forces[j] -= pair_forces[idx]
+            
+            # Wall repulsion
+            wall_dists = 0.5 - np.abs(c)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                wall_force_mag = 1.0 / (wall_dists * wall_dists)
+            wall_force_mag = np.where(wall_force_mag > 1e6, 1e6, wall_force_mag)
+            wall_force_mag = np.where(np.isnan(wall_force_mag), 0, wall_force_mag)
+            
+            signs = np.sign(c)
+            forces += wall_force_mag * signs
+            
+            # Add noise and update
+            noise = np.random.normal(0, t * 0.1, size=c.shape)
+            c_new = c + forces * 0.01 + noise
+            c_new = np.clip(c_new, -0.499999, 0.499999)
+            
+            # Accept if better or with probability exp(-delta_r / t)
+            r_new = _compute_radius(c_new)
+            if r_new > best_r:
+                best_r = r_new
+                best_c = c_new.copy()
+            
+            delta_r = r_new - _compute_radius(c)
+            if delta_r > 0 or np.random.random() < np.exp(delta_r / max(t, 1e-10)):
+                c = c_new
     
     return best_c, best_r
 
-def _lloyds_algorithm(c_init, deadline, max_iters=200, step_size=0.1):
+def _smooth_polish(c_init, deadline, t_start=0.05, t_end=0.0001, iters_per_temp=100):
     """
-    Lloyd's algorithm variant: move each center toward the centroid of its
-    Voronoi cell (clipped to the cube) to equalize clearance.
-    """
-    c = c_init.copy()
-    best_c = c.copy()
-    best_r = _compute_radius(c)
-    
-    # Add boundary points for Voronoi computation
-    # We need points outside the cube to define the Voronoi cells properly
-    # Add points at the faces, edges, and corners extended outward
-    
-    # For Voronoi, we need to include the cube boundaries
-    # Add points just outside each face
-    boundary_points = []
-    eps = 0.1
-    
-    # Face centers extended outward
-    for axis in range(3):
-        for sign in [-1, 1]:
-            p = np.zeros(3)
-            p[axis] = sign * (0.5 + eps)
-            boundary_points.append(p)
-    
-    # Edge midpoints extended outward
-    for i in range(3):
-        for j in range(i+1, 3):
-            for si in [-1, 1]:
-                for sj in [-1, 1]:
-                    p = np.zeros(3)
-                    p[i] = si * (0.5 + eps)
-                    p[j] = sj * (0.5 + eps)
-                    boundary_points.append(p)
-    
-    # Corners extended outward
-    for sx in [-1, 1]:
-        for sy in [-1, 1]:
-            for sz in [-1, 1]:
-                p = np.array([sx * (0.5 + eps), sy * (0.5 + eps), sz * (0.5 + eps)])
-                boundary_points.append(p)
-    
-    boundary_points = np.array(boundary_points)
-    
-    for it in range(max_iters):
-        if time.time() > deadline:
-            break
-        
-        # Compute Voronoi diagram
-        all_points = np.vstack([c, boundary_points])
-        
-        try:
-            vor = Voronoi(all_points)
-        except Exception:
-            # Voronoi computation failed, break
-            break
-        
-        # For each original point, find its Voronoi cell and compute centroid
-        new_c = c.copy()
-        
-        for i in range(N):
-            # Find the region corresponding to point i
-            # vor.regions gives lists of vertex indices
-            # vor.point_region[i] gives the region index for point i
-            
-            region_idx = vor.point_region[i]
-            if region_idx == -1:
-                continue
-                
-            region = vor.regions[region_idx]
-            if len(region) == 0:
-                continue
-            
-            # Get vertices of this region
-            verts = vor.vertices[region]
-            
-            # Clip vertices to the cube [-0.5, 0.5]^3
-            verts_clipped = np.clip(verts, -0.5, 0.5)
-            
-            # Compute centroid of the clipped region
-            # Simple centroid: mean of vertices (approximate)
-            # Better: use the actual polygon area, but mean is a good approximation
-            centroid = np.mean(verts_clipped, axis=0)
-            
-            # Move toward centroid
-            new_c[i] = c[i] + step_size * (centroid - c[i])
-            new_c[i] = np.clip(new_c[i], -0.499, 0.499)
-        
-        # Check if this improved the radius
-        r_new = _compute_radius(new_c)
-        if r_new > best_r:
-            best_r = r_new
-            best_c = new_c.copy()
-            c = new_c.copy()
-        else:
-            # If it got worse, revert
-            c = best_c.copy()
-        
-        # Decrease step size
-        step_size *= 0.95
-    
-    return best_c, best_r
-
-def _polish(c_init, deadline, t_start=0.05, t_end=0.0001, iters_per_temp=50):
-    """
-    Polish the configuration using gradient descent on the softmin radius.
-    Uses analytical gradient for speed.
+    Polish using gradient descent on the softmin radius.
     """
     c = c_init.copy()
     best_c = c.copy()
     best_r = _compute_radius(c)
     
-    # Use more temperature steps for finer polishing
-    n_temps = 20
-    temps = np.logspace(np.log10(t_start), np.log10(t_end), n_temps)
+    temps = np.logspace(np.log10(t_start), np.log10(t_end), 12)
     
-    for ti, t in enumerate(temps):
+    for t in temps:
         if time.time() > deadline:
             break
             
-        # More iterations for later (smaller t) temperatures
-        max_iter = 50 + 50 * (ti // (n_temps // 2))
-        
-        def obj(x, t=t):
+        def obj(x):
             r, _ = _softmin_radius_and_grad(x.reshape(N, 3), t)
             return -r
         
-        def grad(x, t=t):
+        def grad(x):
             _, g = _softmin_radius_and_grad(x.reshape(N, 3), t)
             return g.ravel()
-        
+            
         x0 = c.flatten()
-        bounds = [(-0.499999, 0.499999)] * (N * 3)
+        bounds = [(-0.5, 0.5)] * (N * 3)
         
         try:
             res = minimize(
@@ -327,7 +288,7 @@ def _polish(c_init, deadline, t_start=0.05, t_end=0.0001, iters_per_temp=50):
                 jac=grad,
                 method='L-BFGS-B',
                 bounds=bounds,
-                options={'maxiter': max_iter, 'ftol': 1e-15, 'gtol': 1e-13, 'maxls': 30}
+                options={'maxiter': 300, 'ftol': 1e-14, 'gtol': 1e-12}
             )
             c_new = res.x.reshape(N, 3)
             c_new = np.clip(c_new, -0.499999, 0.499999)
@@ -343,7 +304,73 @@ def _polish(c_init, deadline, t_start=0.05, t_end=0.0001, iters_per_temp=50):
             
     return best_c, best_r
 
-def _local_search(c_init, deadline, max_iters=300):
+def _lloyd_step(c, step_size=0.5):
+    """
+    Perform one Lloyd's algorithm iteration.
+    """
+    try:
+        vor = Voronoi(c)
+    except Exception:
+        return c
+    
+    c_new = c.copy()
+    
+    for i in range(N):
+        region_idx = vor.point_region[i]
+        region = vor.regions[region_idx]
+        
+        if len(region) == 0 or -1 in region:
+            continue
+            
+        verts = vor.vertices[region]
+        
+        if len(verts) == 0:
+            continue
+            
+        centroid = np.mean(verts, axis=0)
+        centroid = np.clip(centroid, -0.499999, 0.499999)
+        
+        c_new[i] = c[i] + step_size * (centroid - c[i])
+        c_new[i] = np.clip(c_new[i], -0.499999, 0.499999)
+    
+    return c_new
+
+def _lloyd_optimize(c_init, deadline, max_iters=500, step_decay=0.995):
+    """
+    Run Lloyd's algorithm iterations.
+    """
+    c = c_init.copy()
+    best_c = c.copy()
+    best_r = _compute_radius(c)
+    step_size = 0.3
+    
+    for it in range(max_iters):
+        if time.time() > deadline:
+            break
+        
+        c_new = _lloyd_step(c, step_size)
+        
+        diff = c_new[_iu] - c_new[_ju]
+        dists = np.sqrt(np.sum(diff * diff, axis=-1))
+        if np.min(dists) < 1e-6:
+            c_new += np.random.normal(0, 1e-4, size=c_new.shape)
+            c_new = np.clip(c_new, -0.499999, 0.499999)
+        
+        r_new = _compute_radius(c_new)
+        
+        if r_new > best_r:
+            best_r = r_new
+            best_c = c_new.copy()
+            c = c_new.copy()
+        else:
+            step_size *= 0.95
+        
+        step_size *= step_decay
+        step_size = max(step_size, 0.001)
+    
+    return best_c, best_r
+
+def _local_search(c_init, deadline, max_iters=500):
     """
     Local search: Perturb points that are constraining the radius.
     """
@@ -360,21 +387,18 @@ def _local_search(c_init, deadline, max_iters=300):
              c = best_c.copy()
              r = best_r
              
-        # Find the binding constraint
-        diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+        diff = c[_iu] - c[_ju]
         dists = np.sqrt(np.sum(diff * diff, axis=-1))
-        np.fill_diagonal(dists, np.inf)
         min_pair_dist = np.min(dists)
         
         wall_dists = 0.5 - np.abs(c)
         min_wall_dist = np.min(wall_dists)
         
         if min_wall_dist < min_pair_dist / 2.0:
-            # Wall binding
             idx = np.unravel_index(np.argmin(wall_dists), wall_dists.shape)
             i, k = idx
             sign = 1.0 if c[i, k] > 0 else -1.0
-            for step in (0.002, 0.005, 0.01):
+            for step in (0.005, 0.01, 0.02):
                 c_try = c.copy()
                 c_try[i, k] += step * sign
                 c_try = np.clip(c_try, -0.499999, 0.499999)
@@ -385,9 +409,8 @@ def _local_search(c_init, deadline, max_iters=300):
                     c = c_try.copy()
                     break
         else:
-            # Pair binding
-            idx = np.unravel_index(np.argmin(dists), dists.shape)
-            i, j = idx
+            idx = np.argmin(dists)
+            i, j = _PAIR_IDX[idx]
             vec = c[i] - c[j]
             norm = np.linalg.norm(vec)
             if norm < 1e-6:
@@ -395,7 +418,7 @@ def _local_search(c_init, deadline, max_iters=300):
                 norm = np.linalg.norm(vec)
             vec = vec / norm
             
-            for step in (0.002, 0.005, 0.01):
+            for step in (0.005, 0.01, 0.02):
                 c_try = c.copy()
                 c_try[i] += step * vec
                 c_try[j] -= step * vec
@@ -408,128 +431,110 @@ def _local_search(c_init, deadline, max_iters=300):
                     break
     return best_c, best_r
 
-def _initial_fcc_like():
+def _epigraph_polish(c_init, deadline, t_start=0.02, t_end=0.00005, max_iters_per_t=200):
     """
-    Generate an FCC-like initial configuration for 50 points.
-    FCC lattice in a cube has points at (0,0,0), (0,0.5,0.5), (0.5,0,0.5), (0.5,0.5,0)
-    scaled and shifted to [-0.5, 0.5]^3.
+    Epigraph formulation polish.
     """
-    # FCC basis vectors
-    a = 0.5  # lattice constant
+    c = c_init.copy()
+    best_c = c.copy()
+    best_r = _compute_radius(c)
     
-    # Generate FCC points in a larger region, then select 50
-    points = []
+    temps = np.logspace(np.log10(t_start), np.log10(t_end), 10)
     
-    for i in range(-1, 3):
-        for j in range(-1, 3):
-            for k in range(-1, 3):
-                # FCC has 4 atoms per unit cell
-                # Positions: (0,0,0), (0,0.5,0.5), (0.5,0,0.5), (0.5,0.5,0) * a
-                base = np.array([i*a, j*a, k*a])
-                offsets = [
-                    np.array([0, 0, 0]),
-                    np.array([0, 0.5*a, 0.5*a]),
-                    np.array([0.5*a, 0, 0.5*a]),
-                    np.array([0.5*a, 0.5*a, 0]),
-                ]
-                for off in offsets:
-                    p = base + off
-                    # Shift to center around origin
-                    p_centered = p - np.array([a, a, a])
-                    if np.all(np.abs(p_centered) < 0.6):
-                        points.append(p_centered)
-    
-    points = np.array(points)
-    
-    # Randomly select 50
-    if len(points) >= N:
-        idx = np.random.choice(len(points), N, replace=False)
-        return points[idx]
-    else:
-        # Pad with random points
-        remaining = N - len(points)
-        random_pts = np.random.uniform(-0.4, 0.4, size=(remaining, 3))
-        return np.vstack([points, random_pts])
+    for t in temps:
+        if time.time() > deadline:
+            break
+        
+        def obj(x):
+            c_x = x.reshape(N, 3)
+            r_soft, _ = _softmin_radius_and_grad(c_x, t)
+            return -r_soft
+        
+        def grad(x):
+            c_x = x.reshape(N, 3)
+            _, g = _softmin_radius_and_grad(c_x, t)
+            return g.ravel()
+        
+        x0 = c.flatten()
+        bounds = [(-0.5, 0.5)] * (N * 3)
+        
+        try:
+            res = minimize(
+                obj,
+                x0,
+                jac=grad,
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={'maxiter': max_iters_per_t, 'ftol': 1e-15, 'gtol': 1e-13}
+            )
+            c_new = res.x.reshape(N, 3)
+            c_new = np.clip(c_new, -0.499999, 0.499999)
+            r_new = _compute_radius(c_new)
+            
+            if r_new > best_r:
+                best_r = r_new
+                best_c = c_new.copy()
+                c = c_new.copy()
+                
+        except Exception:
+            continue
+            
+    return best_c, best_r
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 145.0  # 5s safety margin
+    deadline = start_time + 140.0  # 10s safety margin
     
     # Initial configurations
     seeds = []
     
-    # 1. FCC-like
-    seeds.append(_initial_fcc_like())
-    
-    # 2. Random
-    seeds.append(np.random.uniform(-0.4, 0.4, size=(N, 3)))
-    
-    # 3. Grid-like
-    m = 4
-    ticks = (np.arange(m) + 0.5) / m - 0.5
-    grid = np.array([(x, y, z) for z in ticks for y in ticks for x in ticks])
-    idx = np.random.choice(len(grid), N, replace=False)
-    seeds.append(grid[idx])
+    seeds.append(_seed_fcc())
+    seeds.append(_seed_grid())
+    seeds.append(_seed_random())
+    seeds.append(_seed_bcc())
+    seeds.append(_seed_shell_core())
+    seeds.append(_seed_random())
     
     best_c = seeds[0]
     best_r = _compute_radius(best_c)
     
-    # Allocate time to each seed, giving more time to later seeds
-    # since they can benefit from a better initial guess
-    total_time = deadline - start_time
-    time_per_seed = total_time / len(seeds)
+    n_seeds = len(seeds)
+    time_per_seed = (deadline - start_time) / n_seeds
     
     for i, s in enumerate(seeds):
+        if time.time() > deadline - 5.0:
+            break
+        
         seed_start = time.time()
-        # Give later seeds slightly more time
-        seed_deadline = seed_start + time_per_seed * (1.0 + 0.1 * i)
+        seed_deadline = min(seed_start + time_per_seed, deadline - 5.0)
         
-        # Stage 1: Repulsion annealing (use current best as target)
-        c_anneal, r_anneal = _repulsion_anneal(s, seed_deadline, r_target=best_r + 0.005, max_iters=3000)
+        c_anneal, r_anneal = _repulsion_anneal(s, seed_deadline, t_start=2.0, t_end=0.05, iters_per_temp=30)
+        c_lloyd, r_lloyd = _lloyd_optimize(c_anneal, seed_deadline, max_iters=200)
+        c_polish, r_polish = _smooth_polish(c_lloyd, seed_deadline, t_start=0.05, t_end=0.005)
+        c_ls, r_ls = _local_search(c_polish, seed_deadline, max_iters=100)
         
-        # Stage 2: Lloyd's algorithm
-        c_lloyd, r_lloyd = _lloyds_algorithm(c_anneal, seed_deadline, max_iters=100)
-        
-        # Stage 3: Polish
-        c_polish, r_polish = _polish(c_lloyd, seed_deadline, t_start=0.05, t_end=0.001)
-        
-        # Stage 4: Local Search
-        c_ls, r_ls = _local_search(c_polish, seed_deadline, max_iters=200)
-        
-        # Update global best
         if r_ls > best_r:
             best_r = r_ls
             best_c = c_ls.copy()
             
-        # If time is running out, break early
-        if time.time() > deadline - 15.0:
-            break
-            
-    # Final high-precision polish on the global best if time remains
-    if time.time() < deadline - 15.0:
+    # Final polish on the global best if time remains
+    if time.time() < deadline - 10.0:
         final_deadline = deadline - 3.0
-        c_final, r_final = _polish(best_c, final_deadline, t_start=0.01, t_end=0.00005)
+        
+        c_lloyd2, r_lloyd2 = _lloyd_optimize(best_c, final_deadline, max_iters=150)
+        if r_lloyd2 > best_r:
+            best_r = r_lloyd2
+            best_c = c_lloyd2.copy()
+        
+        c_final, r_final = _smooth_polish(best_c, final_deadline, t_start=0.03, t_end=0.0001, iters_per_temp=80)
         if r_final > best_r:
             best_r = r_final
             best_c = c_final.copy()
             
-        # One last local search
         if time.time() < final_deadline - 3.0:
-            c_ls, r_ls = _local_search(best_c, final_deadline, max_iters=500)
+            c_ls, r_ls = _local_search(best_c, final_deadline, max_iters=300)
             if r_ls > best_r:
                 best_r = r_ls
                 best_c = c_ls.copy()
                 
-        # Final ultra-fine polish
-        if time.time() < final_deadline - 2.0:
-            c_final2, r_final2 = _polish(best_c, final_deadline - 1.0, t_start=0.001, t_end=0.00001)
-            if r_final2 > best_r:
-                best_r = r_final2
-                best_c = c_final2.copy()
-                
-    # Ensure all points are strictly inside the cube
-    best_c = np.clip(best_c, -0.4999999, 0.4999999)
-    
     return best_c
-
-# EVOLVE-BLOCK-END
