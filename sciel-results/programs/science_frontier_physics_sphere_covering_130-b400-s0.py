@@ -1,328 +1,295 @@
-"""Program for covering the sphere with 130 equal caps."""
 import numpy as np
-import time
-from scipy.spatial import ConvexHull
+from scipy.spatial import ConvexHull, Delaunay
 from scipy.optimize import minimize
+import time
+import warnings
 
 N = 130
 
-# EVOLVE-BLOCK-START
+def _covering_radius_from_hull(points):
+    """
+    Compute the exact covering radius from the convex hull.
+    The covering radius is the maximum circumradius of the spherical caps
+    corresponding to the facets of the convex hull.
+    
+    For a facet with normal n (pointing outward from origin), the cap center is n.
+    The angular radius is the maximum angle between n and any vertex of that facet.
+    """
+    try:
+        hull = ConvexHull(points)
+    except Exception:
+        return np.pi  # fallback
+    
+    max_radius = 0.0
+    for simplex in hull.simplices:
+        # Get the vertices of this facet
+        verts = points[simplex]
+        
+        # The normal of the facet (pointing away from origin)
+        # For a triangle with vertices a, b, c on unit sphere:
+        # normal = cross(b-a, c-a) normalized
+        a, b, c = verts[0], verts[1], verts[2]
+        normal = np.cross(b - a, c - a)
+        norm_val = np.linalg.norm(normal)
+        
+        if norm_val < 1e-12:
+            continue
+            
+        normal = normal / norm_val
+        
+        # Ensure normal points away from origin
+        # The centroid of the facet should be in the direction of the normal
+        centroid = np.mean(verts, axis=0)
+        if np.dot(normal, centroid) < 0:
+            normal = -normal
+            norm_val = -norm_val
+        
+        # The cap center is the normal direction
+        # The angular radius is the maximum angle between normal and each vertex
+        # cos(angle) = dot(normal, vertex)
+        dots = np.clip(np.dot(verts, normal), -1.0, 1.0)
+        angles = np.arccos(dots)
+        
+        facet_radius = np.max(angles)
+        max_radius = max(max_radius, facet_radius)
+    
+    return max_radius
+
+def _soft_covering_radius(points, grid_points, sigma=0.05):
+    """
+    Soft approximation of the covering radius for smooth optimization.
+    Uses a soft-min over the grid to create a differentiable objective.
+    """
+    # Compute angular distances from each grid point to each configuration point
+    # dot product gives cos(angle)
+    dots = grid_points @ points.T  # (M, N)
+    dots = np.clip(dots, -1.0, 1.0)
+    angles = np.arccos(dots)  # (M, N)
+    
+    # For each grid point, find the minimum angle (nearest neighbor)
+    min_angles = np.min(angles, axis=1)  # (M,)
+    
+    # Soft max to make it smooth
+    # Use log-sum-exp trick for numerical stability
+    # soft_max(x) = log(sum(exp(x/sigma))) * sigma
+    scaled = min_angles / sigma
+    max_scaled = np.max(scaled)
+    soft_max_val = sigma * (max_scaled + np.log(np.sum(np.exp(scaled - max_scaled))))
+    
+    return soft_max_val
+
+def _gradient_of_soft_covering_radius(points, grid_points, sigma=0.05):
+    """
+    Compute gradient of the soft covering radius with respect to points.
+    """
+    M = grid_points.shape[0]
+    N_pts = points.shape[0]
+    
+    # Compute angles
+    dots = grid_points @ points.T  # (M, N)
+    dots = np.clip(dots, -1.0, 1.0)
+    angles = np.arccos(dots)  # (M, N)
+    
+    # Find which point is nearest for each grid point
+    nearest_idx = np.argmin(angles, axis=1)  # (M,)
+    min_angles = angles[np.arange(M), nearest_idx]  # (M,)
+    
+    # Soft max weights
+    scaled = min_angles / sigma
+    max_scaled = np.max(scaled)
+    exp_scaled = np.exp(scaled - max_scaled)
+    weights = exp_scaled / np.sum(exp_scaled)  # (M,)
+    
+    # Gradient with respect to points
+    # d(soft_max)/d(point_j) = sum_i w_i * d(min_angle_i)/d(point_j)
+    # For the nearest point j to grid point i:
+    # d(angle)/d(point_j) where angle = arccos(dot(grid_i, point_j))
+    # = -dot(grid_i, point_j) / sqrt(1 - dot(grid_i, point_j)^2) * (grid_i - dot(grid_i, point_j)*point_j) / ||...||
+    # Actually, d(arccos(x))/dx = -1/sqrt(1-x^2)
+    # d(dot(g, p))/dp = g
+    # So d(angle)/dp = -g / sqrt(1 - dot(g,p)^2) ... but need to project onto sphere
+    
+    grad = np.zeros_like(points)
+    
+    for i in range(M):
+        w = weights[i]
+        if w < 1e-10:
+            continue
+        
+        j = nearest_idx[i]
+        g = grid_points[i]
+        p = points[j]
+        
+        dot_val = np.dot(g, p)
+        dot_val = np.clip(dot_val, -1.0 + 1e-9, 1.0 - 1e-9)
+        
+        # d(angle)/dp = -g / sqrt(1 - dot^2)
+        # But we need to project this gradient onto the tangent plane of the sphere at p
+        # The tangent plane constraint: grad_tangent = grad - (grad . p) * p
+        grad_raw = -g / np.sqrt(1.0 - dot_val * dot_val)
+        
+        # Project onto tangent plane
+        grad_tangent = grad_raw - np.dot(grad_raw, p) * p
+        
+        grad[j] += w * grad_tangent
+    
+    # Normalize gradient to have reasonable magnitude
+    grad_norm = np.linalg.norm(grad)
+    if grad_norm > 1e-10:
+        grad = grad / grad_norm * np.max(np.abs(grad))
+    
+    return grad
+
+def _lloyd_step(points, grid_points, n_iters=5):
+    """
+    Perform Lloyd's algorithm iterations using grid-based Voronoi.
+    """
+    for _ in range(n_iters):
+        # Assign each grid point to nearest configuration point
+        dots = grid_points @ points.T
+        nearest = np.argmin(np.arccos(np.clip(dots, -1.0, 1.0)), axis=1)
+        
+        # For each configuration point, compute the centroid of its Voronoi region
+        new_points = np.zeros_like(points)
+        counts = np.zeros(N)
+        
+        for j in range(N):
+            mask = (nearest == j)
+            if np.sum(mask) > 0:
+                new_points[j] = np.mean(grid_points[mask], axis=0)
+                counts[j] = np.sum(mask)
+            else:
+                # If no points assigned, keep the old position
+                new_points[j] = points[j]
+        
+        # Normalize to unit sphere
+        norms = np.linalg.norm(new_points, axis=1, keepdims=True)
+        norms = np.where(norms < 1e-12, 1.0, norms)
+        new_points = new_points / norms
+        
+        # Check for convergence
+        diff = np.linalg.norm(new_points - points, axis=1)
+        points = new_points
+        
+        if np.max(diff) < 1e-6:
+            break
+    
+    return points
+
 def construct():
     start_time = time.time()
-    deadline = start_time + 135.0  # Leave 15s margin for safety
-
-    def fibonacci_spiral(n):
-        i = np.arange(n) + 0.5
-        z = 1.0 - 2.0 * i / n
-        phi = np.pi * (1.0 + np.sqrt(5.0)) * i
-        r = np.sqrt(1.0 - z * z)
-        return np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
-
-    def compute_covering_radius(pts):
-        """Compute covering radius as max circumradius over convex hull faces (vectorized)."""
-        try:
-            hull = ConvexHull(pts)
-            faces = hull.simplices  # shape (F, 3)
-            a = pts[faces[:, 0]]
-            b = pts[faces[:, 1]]
-            c = pts[faces[:, 2]]
-            
-            ab = np.cross(a, b)
-            bc = np.cross(b, c)
-            ca = np.cross(c, a)
-            c_dir = ab + bc + ca
-            norms = np.linalg.norm(c_dir, axis=1)
-            
-            radii = np.zeros(len(faces))
-            valid = norms > 1e-10
-            
-            if np.any(valid):
-                c_dir_valid = c_dir[valid] / norms[valid, np.newaxis]
-                cos_r = np.clip(np.sum(c_dir_valid * a[valid], axis=1), -1.0, 1.0)
-                r = np.arccos(cos_r)
-                r[r > np.pi / 2] = np.pi - r[r > np.pi / 2]
-                radii[valid] = r
-            
-            if np.any(~valid):
-                a_deg = a[~valid]
-                b_deg = b[~valid]
-                c_deg = c[~valid]
-                d_ab = np.arccos(np.clip(np.sum(a_deg * b_deg, axis=1), -1, 1))
-                d_bc = np.arccos(np.clip(np.sum(b_deg * c_deg, axis=1), -1, 1))
-                d_ca = np.arccos(np.clip(np.sum(c_deg * a_deg, axis=1), -1, 1))
-                radii[~valid] = np.maximum(np.maximum(d_ab, d_bc), d_ca)
-            
-            return float(np.max(radii))
-        except Exception:
-            # Fallback: grid-based estimate
-            lat = np.linspace(-np.pi/2, np.pi/2, 50)
-            lon = np.linspace(0, 2*np.pi, 100, endpoint=False)
-            LA, LO = np.meshgrid(lat, lon, indexing='ij')
-            z = np.sin(LA)
-            x = np.cos(LA) * np.cos(LO)
-            y = np.cos(LA) * np.sin(LO)
-            grid_pts = np.column_stack([x.ravel(), y.ravel(), z.ravel()])
-            dot = np.dot(grid_pts, pts.T)
-            dot = np.clip(dot, -1.0, 1.0)
-            ang_dists = np.arccos(dot)
-            min_dists = np.min(ang_dists, axis=1)
-            return float(np.max(min_dists))
-
-    # Precompute a dense spherical grid for smooth covering radius
-    n_lat = 50
-    n_lon = 100
-    lat = np.linspace(-np.pi/2, np.pi/2, n_lat)
-    lon = np.linspace(0, 2*np.pi, n_lon, endpoint=False)
-    LA, LO = np.meshgrid(lat, lon, indexing='ij')
-    grid_z = np.sin(LA)
-    grid_x = np.cos(LA) * np.cos(LO)
-    grid_y = np.cos(LA) * np.sin(LO)
-    grid_pts = np.column_stack([grid_x.ravel(), grid_y.ravel(), grid_z.ravel()])
-    n_grid = len(grid_pts)
-
-    def compute_covering_radius_grid(pts):
-        """Compute covering radius using dense grid (smooth approximation)."""
-        dot = np.dot(grid_pts, pts.T)  # (n_grid, N)
-        dot = np.clip(dot, -1.0, 1.0)
-        ang_dists = np.arccos(dot)  # (n_grid, N)
-        min_dists = np.min(ang_dists, axis=1)
-        return float(np.max(min_dists))
-
-    def soft_max_objective(pts_flat, beta=80.0):
-        """
-        Smooth surrogate: soft-max of angular distances over the grid.
-        pts_flat is a flat array of shape (3*N,).
-        Returns (objective_value, gradient_flat).
-        """
-        pts = pts_flat.reshape(N, 3)
-        # Re-normalize to unit sphere
-        norms = np.linalg.norm(pts, axis=1, keepdims=True)
-        norms[norms < 1e-15] = 1.0
-        pts = pts / norms
-
-        # Compute angular distances: (n_grid, N)
-        dot = np.dot(grid_pts, pts.T)
-        dot = np.clip(dot, -1.0, 1.0)
-        ang_dists = np.arccos(dot)  # (n_grid, N)
-
-        # For each grid point, the nearest point distance
-        min_dists = np.min(ang_dists, axis=1)  # (n_grid,)
-
-        # Soft-max over grid points
-        m = np.max(min_dists)
-        if m < 1e-15:
-            return 0.0, np.zeros(3 * N)
-        shifted = min_dists - m
-        exp_vals = np.exp(beta * shifted)
-        sum_exp = np.sum(exp_vals)
-        obj = m + np.log(sum_exp) / beta
-
-        # Gradient: d(obj)/d(pts_flat)
-        weights = exp_vals / sum_exp  # (n_grid,)
-
-        # For each grid point j, d_j = min_i arccos(dot(grid_j, pts_i))
-        nearest_idx = np.argmin(ang_dists, axis=1)  # (n_grid,)
-
-        grad = np.zeros_like(pts)  # (N, 3)
-        for j in range(n_grid):
-            w = weights[j]
-            if w < 1e-10:
-                continue
-            i = nearest_idx[j]
-            g = grid_pts[j]
-            p = pts[i]
-            u = np.dot(g, p)
-            u = np.clip(u, -1.0 + 1e-12, 1.0 - 1e-12)
-            g_perp = g - u * p
-            denom = np.sqrt(1.0 - u * u)
-            if denom < 1e-12:
-                continue
-            grad[i] += w * (-g_perp / denom)
-
-        # Project gradient to tangent space and scale for raw coordinates
-        raw_norms = np.linalg.norm(pts_flat.reshape(N, 3), axis=1, keepdims=True)
-        raw_norms[raw_norms < 1e-15] = 1.0
-
-        grad_dot_p = np.sum(grad * pts, axis=1, keepdims=True)
-        grad_tan = grad - grad_dot_p * pts
-
-        grad_flat = (grad_tan / raw_norms).ravel()
-
-        return obj, grad_flat
-
-    def repulsion_force(points, exponent=1.5):
-        """Compute repulsion forces between all point pairs."""
-        dot = np.dot(points, points.T)
-        dot = np.clip(dot, -1.0, 1.0)
-        np.fill_diagonal(dot, 1.0)
-        dist_sq = 2.0 - 2.0 * dot
-        dist_sq[dist_sq < 1e-10] = 1e-10
-        w = 1.0 / (dist_sq ** exponent)
-        np.fill_diagonal(w, 0.0)
-        sum_w = np.sum(w, axis=1)
-        sum_p_w = w @ points
-        forces = points * sum_w[:, np.newaxis] - sum_p_w
-        return forces
-
-    def gradient_descent(points, alpha_init, decay, max_iter, exponent=1.5):
-        """Optimize points via gradient descent on the repulsion energy."""
-        alpha = alpha_init
-        for _ in range(max_iter):
-            if time.time() > deadline - 5.0:
-                break
-            forces = repulsion_force(points, exponent)
-            points = points + alpha * forces
-            norms = np.linalg.norm(points, axis=1, keepdims=True)
-            points = points / norms
-            alpha *= decay
-        return points
-
-    def polish_step(points, alpha, n_iter=50):
-        """High-precision polish with very small steps."""
-        for _ in range(n_iter):
-            dot = np.dot(points, points.T)
-            dot = np.clip(dot, -1.0, 1.0)
-            np.fill_diagonal(dot, 1.0)
-            dist_sq = 2.0 - 2.0 * dot
-            dist_sq[dist_sq < 1e-10] = 1e-10
-            w = 1.0 / (dist_sq ** 1.5)
-            np.fill_diagonal(w, 0.0)
-            sum_w = np.sum(w, axis=1)
-            sum_p_w = w @ points
-            forces = points * sum_w[:, np.newaxis] - sum_p_w
-            points = points + alpha * forces
-            norms = np.linalg.norm(points, axis=1, keepdims=True)
-            points = points / norms
-        return points
-
-    best_points = None
-    best_rad = np.inf
-
-    # Phase 1: Multiple random starts with repulsion-based optimization
-    n_restarts = 4
-    exponents = [1.0, 1.5, 2.0, 3.0]
+    total_time_limit = 140.0  # Leave 10s margin for 150s limit
     
-    for restart in range(n_restarts):
-        if time.time() > deadline - 50.0:
+    # Generate a dense grid on the sphere for evaluation
+    n_grid = 20000
+    i = np.arange(n_grid) + 0.5
+    z_grid = 1.0 - 2.0 * i / n_grid
+    phi_grid = np.pi * (1.0 + np.sqrt(5.0)) * i
+    r_grid = np.sqrt(1.0 - z_grid * z_grid)
+    grid_points = np.column_stack([r_grid * np.cos(phi_grid), r_grid * np.sin(phi_grid), z_grid])
+    
+    best_score = np.inf
+    best_points = None
+    
+    # Generate multiple starting configurations
+    rng = np.random.default_rng(42)
+    
+    starts = []
+    
+    # 1. Fibonacci spiral
+    i = np.arange(N) + 0.5
+    z = 1.0 - 2.0 * i / N
+    phi = np.pi * (1.0 + np.sqrt(5.0)) * i
+    r = np.sqrt(1.0 - z * z)
+    spiral_points = np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
+    starts.append(spiral_points)
+    
+    # 2. Random points
+    for _ in range(10):
+        rp = rng.normal(size=(N, 3))
+        rp /= np.linalg.norm(rp, axis=1, keepdims=True)
+        starts.append(rp)
+    
+    # 3. Icosahedron-based with jitter
+    t = (1 + np.sqrt(5)) / 2
+    ico_verts = np.array([
+        [-1,  t,  0], [ 1,  t,  0], [-1, -t,  0], [ 1, -t,  0],
+        [ 0, -1,  t], [ 0,  1,  t], [ 0, -1, -t], [ 0,  1, -t],
+        [ t,  0, -1], [ t,  0,  1], [-t,  0, -1], [-t,  0,  1]
+    ])
+    ico_verts /= np.linalg.norm(ico_verts, axis=1, keepdims=True)
+    
+    # Create 130 points by jittering and duplicating the icosahedron vertices
+    ico_jittered = ico_verts + rng.normal(scale=0.1, size=(12, 3))
+    ico_jittered /= np.linalg.norm(ico_jittered, axis=1, keepdims=True)
+    
+    # Tile to get 130 points
+    ico_tiled = np.tile(ico_jittered, (11, 1))[:N]
+    starts.append(ico_tiled)
+    
+    # Process each start
+    for idx, start_pts in enumerate(starts):
+        if time.time() - start_time > total_time_limit - 20.0:
             break
         
-        if restart == 0:
-            points = fibonacci_spiral(N).astype(np.float64)
-        elif restart == 1:
-            # Random start
-            rng = np.random.RandomState(42 + restart)
-            points = rng.randn(N, 3)
-            points /= np.linalg.norm(points, axis=1, keepdims=True)
-        elif restart == 2:
-            # Perturbed fibonacci
-            points = fibonacci_spiral(N).astype(np.float64)
-            rng = np.random.RandomState(100 + restart)
-            points = points + 0.3 * rng.randn(N, 3)
-            points /= np.linalg.norm(points, axis=1, keepdims=True)
-        else:
-            # Use best found so far with perturbation
-            if best_points is not None:
-                rng = np.random.RandomState(200 + restart)
-                points = best_points + 0.15 * rng.randn(N, 3)
-                points /= np.linalg.norm(points, axis=1, keepdims=True)
-            else:
-                points = fibonacci_spiral(N).astype(np.float64)
-
-        exp = exponents[restart % len(exponents)]
-        points = gradient_descent(points, 0.05, 0.995, 200, exp)
-        rad = compute_covering_radius(points)
+        points = start_pts.copy()
         
-        if rad < best_rad:
-            best_rad = rad
-            best_points = points.copy()
-
-    # Phase 2: L-BFGS-B optimization on the smooth grid-based objective
-    if best_points is not None and time.time() < deadline - 30.0:
-        x0 = best_points.ravel()
-        beta = 80.0
-
-        def obj_and_grad(x):
-            if time.time() > deadline - 10.0:
-                return 1e6, np.zeros_like(x)
-            val, grad = soft_max_objective(x, beta=beta)
-            return val, grad
-
-        try:
-            result = minimize(
-                obj_and_grad,
-                x0,
-                method='L-BFGS-B',
-                jac=True,
-                options={'maxiter': 300, 'ftol': 1e-10, 'gtol': 1e-8,
-                         'maxfun': 300, 'disp': False}
-            )
-            opt_pts = result.x.reshape(N, 3)
-            opt_norms = np.linalg.norm(opt_pts, axis=1, keepdims=True)
-            opt_norms[opt_norms < 1e-15] = 1.0
-            opt_pts = opt_pts / opt_norms
-
-            rad_opt = compute_covering_radius(opt_pts)
-            if rad_opt < best_rad:
-                best_rad = rad_opt
-                best_points = opt_pts.copy()
-        except Exception:
-            pass
-
-    # Phase 3: Repulsion-based refinement after L-BFGS-B
-    if best_points is not None and time.time() < deadline - 15.0:
-        points = best_points.copy()
-        alpha = 0.01
-        decay = 0.998
-        max_iter = 100
-        for _ in range(max_iter):
-            if time.time() > deadline - 5.0:
+        # Step 1: Lloyd's algorithm iterations
+        remaining_time = total_time_limit - (time.time() - start_time)
+        lloyd_iters = min(20, max(5, int(remaining_time / 5)))
+        
+        for _ in range(lloyd_iters):
+            if time.time() - start_time > total_time_limit - 15.0:
                 break
-            forces = repulsion_force(points, 1.5)
-            points = points + alpha * forces
-            norms = np.linalg.norm(points, axis=1, keepdims=True)
-            points = points / norms
-            alpha *= decay
+            points = _lloyd_step(points, grid_points, n_iters=3)
         
-        rad = compute_covering_radius(points)
-        if rad < best_rad:
-            best_rad = rad
+        # Step 2: Gradient descent with soft covering radius
+        if time.time() - start_time < total_time_limit - 10.0:
+            # Use L-BFGS-B with the soft covering radius
+            def objective_and_grad(x_flat):
+                pts = x_flat.reshape(N, 3)
+                # Normalize
+                norms = np.linalg.norm(pts, axis=1, keepdims=True)
+                norms = np.where(norms < 1e-12, 1.0, norms)
+                pts = pts / norms
+                
+                val = _soft_covering_radius(pts, grid_points, sigma=0.03)
+                grad = _gradient_of_soft_covering_radius(pts, grid_points, sigma=0.03)
+                
+                return val, grad.flatten()
+            
+            x0 = points.flatten()
+            
+            try:
+                res = minimize(
+                    objective_and_grad,
+                    x0,
+                    jac=True,
+                    method='L-BFGS-B',
+                    options={'maxiter': 50, 'ftol': 1e-8, 'gtol': 1e-5, 'disp': False}
+                )
+                if res.x is not None:
+                    points = res.x.reshape(N, 3)
+                    norms = np.linalg.norm(points, axis=1, keepdims=True)
+                    norms = np.where(norms < 1e-12, 1.0, norms)
+                    points = points / norms
+            except Exception:
+                pass
+        
+        # Evaluate exact covering radius
+        score = _covering_radius_from_hull(points)
+        
+        if score < best_score:
+            best_score = score
             best_points = points.copy()
-
-    # Phase 4: Final polish with L-BFGS-B at higher beta
-    if best_points is not None and time.time() < deadline - 5.0:
-        x0 = best_points.ravel()
-        beta = 120.0
-
-        def obj_and_grad_final(x):
-            if time.time() > deadline - 2.0:
-                return 1e6, np.zeros_like(x)
-            val, grad = soft_max_objective(x, beta=beta)
-            return val, grad
-
-        try:
-            result = minimize(
-                obj_and_grad_final,
-                x0,
-                method='L-BFGS-B',
-                jac=True,
-                options={'maxiter': 100, 'ftol': 1e-12, 'gtol': 1e-10,
-                         'maxfun': 100, 'disp': False}
-            )
-            opt_pts = result.x.reshape(N, 3)
-            opt_norms = np.linalg.norm(opt_pts, axis=1, keepdims=True)
-            opt_norms[opt_norms < 1e-15] = 1.0
-            opt_pts = opt_pts / opt_norms
-
-            rad_opt = compute_covering_radius(opt_pts)
-            if rad_opt < best_rad:
-                best_rad = rad_opt
-                best_points = opt_pts.copy()
-        except Exception:
-            pass
-
+        
+        # Early exit if we're close to the known best
+        if best_score < 0.1975:  # ~11.3 degrees
+            break
+    
+    # Final fallback
     if best_points is None:
-        best_points = fibonacci_spiral(N).astype(np.float64)
-
+        best_points = spiral_points
+        best_points /= np.linalg.norm(best_points, axis=1, keepdims=True)
+    
     return best_points
-
-# EVOLVE-BLOCK-END
