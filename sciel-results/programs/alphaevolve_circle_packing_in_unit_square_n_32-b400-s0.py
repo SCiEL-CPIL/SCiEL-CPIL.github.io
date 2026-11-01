@@ -3,7 +3,7 @@ from scipy.optimize import minimize
 import time
 
 N = 32
-TIME_LIMIT = 140.0  # evaluator kills at 150s; keep 10s margin
+TIME_LIMIT = 138.0  # evaluator kills at 150s; keep 12s margin
 
 def _elapsed(start):
     return time.time() - start
@@ -63,9 +63,6 @@ def _make_valid(x, y, r, max_iter=200):
 
 def _hex_init():
     """Hexagonal packing initialization for 32 circles."""
-    # 6x6 hex grid gives 36, take first 32
-    # Or 5 rows with varying counts
-    # Row-based hex packing
     rows = [6, 5, 6, 5, 6, 4]  # 32 total
     x = []
     y = []
@@ -80,12 +77,10 @@ def _hex_init():
         for c in range(count):
             cx = (c + 0.5 + offset) / count
             cr = 0.48 * row_h
-            # Adjust radius to fit
             cr = min(cr, cx * 0.99, (1.0 - cx) * 0.99, ry * 0.99, (1.0 - ry) * 0.99)
             x.append(cx)
             y.append(ry)
             r.append(cr)
-    # Trim to N
     x = x[:N]
     y = y[:N]
     r = r[:N]
@@ -134,7 +129,6 @@ def _objective(params, soft_eps=1e-4):
     dist = np.sqrt(dx*dx + dy*dy)
     min_dist = r[:, None] + r[None, :]
     diff = min_dist - dist
-    # Soft max of positive part
     smooth_max = 0.5 * (diff + np.sqrt(diff*diff + soft_eps*soft_eps))
     mask = np.triu(np.ones((N, N), dtype=bool), k=1)
     overlap_pen = np.sum(smooth_max[mask])
@@ -229,6 +223,49 @@ def _tight_polish(params, start_time, time_budget=10):
     except Exception:
         return params
 
+def _local_search(params, start_time, max_iter=1000):
+    """Local search with random perturbations to escape local minima."""
+    best_params = params.copy()
+    best_score = -_sum_r(best_params[2*N:3*N])
+    rng = np.random.RandomState(12345)
+    
+    for i in range(max_iter):
+        if _elapsed(start_time) > TIME_LIMIT - 10:
+            break
+        
+        # Random perturbation
+        scale = 0.05 * (1 - i / max_iter)  # annealing
+        perturbed = best_params + rng.normal(0, scale, size=3*N)
+        
+        # Push apart
+        px = perturbed[:N].copy()
+        py = perturbed[N:2*N].copy()
+        pr = perturbed[2*N:3*N].copy()
+        px, py = _push_apart(px, py, pr, iterations=20)
+        p_opt = np.concatenate([px, py, pr])
+        
+        # Quick optimize
+        try:
+            res = minimize(_objective, p_opt, method='L-BFGS-B',
+                           options={'maxiter': 500, 'ftol': 1e-12, 'gtol': 1e-10,
+                                    'maxfun': 5000})
+            p_opt = res.x
+        except Exception:
+            continue
+        
+        # Make valid
+        vx = p_opt[:N]
+        vy = p_opt[N:2*N]
+        vr = p_opt[2*N:3*N]
+        vx, vy, vr = _make_valid(vx, vy, vr)
+        
+        score = _sum_r(vr)
+        if score > best_score:
+            best_score = score
+            best_params = np.concatenate([vx, vy, vr])
+    
+    return best_params
+
 def construct():
     start_time = time.time()
     
@@ -244,13 +281,13 @@ def construct():
     inits.append(np.concatenate([rx, ry, rr]))
     
     # Multiple random inits
-    for seed in [42, 123, 456, 789, 101, 202, 303]:
+    for seed in [42, 123, 456, 789, 101, 202, 303, 404, 505, 606]:
         rx2, ry2, rr2 = _random_init(seed)
         inits.append(np.concatenate([rx2, ry2, rr2]))
     
     # Perturbed hex
     rng = np.random.RandomState(7)
-    for _ in range(4):
+    for _ in range(6):
         hx2, hy2, hr2 = _hex_init()
         hx2 += rng.uniform(-0.05, 0.05, N)
         hy2 += rng.uniform(-0.05, 0.05, N)
@@ -262,7 +299,7 @@ def construct():
     best_score = -np.inf
     
     for init_idx, x0 in enumerate(inits):
-        if _elapsed(start_time) > TIME_LIMIT - 20:
+        if _elapsed(start_time) > TIME_LIMIT - 30:
             break
         
         # Push apart first
@@ -288,7 +325,7 @@ def construct():
             best_params = np.concatenate([vx, vy, vr])
     
     # Final tight polish on best
-    if best_params is not None and _elapsed(start_time) < TIME_LIMIT - 15:
+    if best_params is not None and _elapsed(start_time) < TIME_LIMIT - 20:
         polished = _tight_polish(best_params, start_time)
         px = polished[:N]
         py = polished[N:2*N]
@@ -298,6 +335,18 @@ def construct():
         if p_score > best_score:
             best_score = p_score
             best_params = np.concatenate([px, py, pr])
+    
+    # Local search from best result
+    if best_params is not None and _elapsed(start_time) < TIME_LIMIT - 15:
+        ls_result = _local_search(best_params, start_time, max_iter=200)
+        ls_x = ls_result[:N]
+        ls_y = ls_result[N:2*N]
+        ls_r = ls_result[2*N:3*N]
+        ls_x, ls_y, ls_r = _make_valid(ls_x, ls_y, ls_r)
+        ls_score = _sum_r(ls_r)
+        if ls_score > best_score:
+            best_score = ls_score
+            best_params = np.concatenate([ls_x, ls_y, ls_r])
     
     # One more round of optimization from polished result if time permits
     if best_params is not None and _elapsed(start_time) < TIME_LIMIT - 10:
@@ -310,6 +359,18 @@ def construct():
         if s2 > best_score:
             best_score = s2
             best_params = np.concatenate([vx2, vy2, vr2])
+    
+    # Final tight polish
+    if best_params is not None and _elapsed(start_time) < TIME_LIMIT - 5:
+        polished2 = _tight_polish(best_params, start_time)
+        px2 = polished2[:N]
+        py2 = polished2[N:2*N]
+        pr2 = polished2[2*N:3*N]
+        px2, py2, pr2 = _make_valid(px2, py2, pr2)
+        p2_score = _sum_r(pr2)
+        if p2_score > best_score:
+            best_score = p2_score
+            best_params = np.concatenate([px2, py2, pr2])
     
     if best_params is None:
         # Fallback

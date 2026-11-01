@@ -1,0 +1,676 @@
+import numpy as np
+import scipy.spatial
+import scipy.optimize
+import time
+
+N = 14
+DEADLINE = 142.0  # wall-clock guard (evaluator kills at 150s)
+
+def _triangle_indices(n):
+    idx = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            for k in range(j + 1, n):
+                idx.append((i, j, k))
+    return np.array(idx, dtype=np.int32)
+
+_TRI = _triangle_indices(N)
+_I = _TRI[:, 0]
+_J = _TRI[:, 1]
+_K = _TRI[:, 2]
+_NTRI = _TRI.shape[0]
+
+def _min_triangle_area(points):
+    pi = points[_I]
+    pj = points[_J]
+    pk = points[_K]
+    v1 = pj - pi
+    v2 = pk - pi
+    cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+    return 0.5 * np.abs(cross).min()
+
+def _hull_area(points):
+    try:
+        return float(scipy.spatial.ConvexHull(points).volume)
+    except Exception:
+        return 0.0
+
+def _score(points):
+    try:
+        if len(points) < 3:
+            return 0.0
+        ha = _hull_area(points)
+        if ha < 1e-12:
+            return 0.0
+        return _min_triangle_area(points) / ha
+    except Exception:
+        return 0.0
+
+def _neg_score(flat):
+    return -_score(flat.reshape(-1, 2))
+
+def _normalize(points):
+    try:
+        ha = _hull_area(points)
+        if ha < 1e-12:
+            return points
+        scaled = points / np.sqrt(ha)
+        ha_check = _hull_area(scaled)
+        if ha_check < 1e-6:
+            return points
+        return scaled
+    except Exception:
+        return points
+
+def _regular_polygon(n, radius=1.0, rotation=0.0):
+    a = np.linspace(0, 2 * np.pi, n, endpoint=False) + rotation
+    return np.column_stack([radius * np.cos(a), radius * np.sin(a)])
+
+def _two_heptagons(r_inner, phi):
+    outer = _regular_polygon(7, 1.0, 0.0)
+    inner = _regular_polygon(7, r_inner, phi)
+    return np.vstack([outer, inner])
+
+def _score_two_heptagons(params):
+    try:
+        r_inner, phi = params
+        if r_inner < 0:
+            r_inner = 0.0
+        points = _two_heptagons(r_inner, phi)
+        return _score(points)
+    except Exception:
+        return 0.0
+
+def _neg_score_two_heptagons(params):
+    return -_score_two_heptagons(params)
+
+# ---------- Structured parameterizations (inspired) ----------
+
+def _heptagon_plus_seven(params):
+    """Outer regular heptagon (R, phi) + 7 points on symmetry axes (radius s_k)."""
+    R, phi = params[0], params[1]
+    s = np.maximum(params[2:9], 0.0)
+    a_hep = phi + np.linspace(0, 2 * np.pi, 7, endpoint=False)
+    p_hep = np.column_stack((R * np.cos(a_hep), R * np.sin(a_hep)))
+    a_ax = phi + np.linspace(0, 2 * np.pi, 7, endpoint=False) + np.pi / 7
+    p_ax = np.column_stack((s * np.cos(a_ax), s * np.sin(a_ax)))
+    return np.vstack((p_hep, p_ax))
+
+def _neg_heptagon_score(params):
+    try:
+        pts = _heptagon_plus_seven(params)
+        return -_score(pts)
+    except Exception:
+        return 0.0
+
+def _edge_heptagon(params):
+    """Outer regular heptagon (R, phi) + 7 points on its edges (1D param u_k in [0,1])."""
+    R, phi = params[0], params[1]
+    u = params[2:9]
+    u = np.clip(u, 0.0, 1.0)
+    a = phi + np.linspace(0, 2 * np.pi, 7, endpoint=False)
+    outer = np.column_stack((R * np.cos(a), R * np.sin(a)))
+    # point k lies on edge between outer[k] and outer[k+1]
+    inner = np.zeros((7, 2))
+    for k in range(7):
+        p0 = outer[k]
+        p1 = outer[(k + 1) % 7]
+        inner[k] = (1.0 - u[k]) * p0 + u[k] * p1
+    return np.vstack((outer, inner))
+
+def _neg_edge_heptagon(params):
+    try:
+        pts = _edge_heptagon(params)
+        return -_score(pts)
+    except Exception:
+        return 0.0
+
+# ---------- Exact gradient machinery ----------
+
+def _exact_maxmin_obj_grad(points):
+    pi = points[_I]
+    pj = points[_J]
+    pk = points[_K]
+    v1 = pj - pi
+    v2 = pk - pi
+    cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+    areas = 0.5 * np.abs(cross)
+
+    ha = _hull_area(points)
+    if ha < 1e-12:
+        return 1e10, np.zeros((N, 2))
+
+    m = areas.min()
+    tol = 1e-10 * max(1.0, m)
+    mask = areas <= (m + tol)
+    cnt = mask.sum()
+    w = np.zeros(_NTRI)
+    w[mask] = 1.0 / cnt
+
+    g_a_x = v1[:, 1] - v2[:, 1]
+    g_a_y = v2[:, 0] - v1[:, 0]
+    g_b_x = v2[:, 1]
+    g_b_y = -v2[:, 0]
+    g_c_x = -v1[:, 1]
+    g_c_y = v1[:, 0]
+
+    wh = 0.5 * w
+    grad = np.zeros((N, 2))
+    np.add.at(grad, (_I, 0), wh * g_a_x)
+    np.add.at(grad, (_I, 1), wh * g_a_y)
+    np.add.at(grad, (_J, 0), wh * g_b_x)
+    np.add.at(grad, (_J, 1), wh * g_b_y)
+    np.add.at(grad, (_K, 0), wh * g_c_x)
+    np.add.at(grad, (_K, 1), wh * g_c_y)
+
+    val = -m / ha
+    grad = -grad / ha
+    return val, grad
+
+def _soft_min_score(x, tau):
+    points = x.reshape(-1, 2)
+    try:
+        ha = _hull_area(points)
+        if ha < 1e-12:
+            return 0.0
+    except Exception:
+        return 0.0
+
+    pi = points[_I]
+    pj = points[_J]
+    pk = points[_K]
+    v1 = pj - pi
+    v2 = pk - pi
+    cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+    areas = 0.5 * np.abs(cross)
+    areas = np.maximum(areas, 1e-12)
+
+    scaled = -areas / tau
+    max_scaled = np.max(scaled)
+    sum_exp = np.sum(np.exp(scaled - max_scaled))
+    soft_min_val = -tau * (max_scaled + np.log(sum_exp))
+
+    return -soft_min_val / ha
+
+def _hull_area_grad(points):
+    try:
+        hull = scipy.spatial.ConvexHull(points)
+        verts = hull.vertices
+        n_v = len(verts)
+        if n_v < 3:
+            return np.zeros((N, 2))
+        centroid = points[verts].mean(axis=0)
+        angles = np.arctan2(points[verts, 1] - centroid[1], points[verts, 0] - centroid[0])
+        order = np.argsort(angles)
+        ordered_verts = verts[order]
+
+        grad = np.zeros((N, 2))
+        for k in range(n_v):
+            vi = ordered_verts[k]
+            vp = ordered_verts[(k - 1) % n_v]
+            vn = ordered_verts[(k + 1) % n_v]
+            grad[vi, 0] += 0.5 * (points[vn, 1] - points[vp, 1])
+            grad[vi, 1] += 0.5 * (points[vp, 0] - points[vn, 0])
+        return grad
+    except Exception:
+        return np.zeros((N, 2))
+
+def _soft_min_score_grad(x, tau):
+    points = x.reshape(-1, 2)
+    try:
+        ha = _hull_area(points)
+        if ha < 1e-12:
+            return 0.0, np.zeros((N, 2))
+    except Exception:
+        return 0.0, np.zeros((N, 2))
+
+    pi = points[_I]
+    pj = points[_J]
+    pk = points[_K]
+    v1 = pj - pi
+    v2 = pk - pi
+    cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+    areas = 0.5 * np.abs(cross)
+    areas = np.maximum(areas, 1e-12)
+
+    scaled = -areas / tau
+    max_scaled = np.max(scaled)
+    exp_scaled = np.exp(scaled - max_scaled)
+    sum_exp = np.sum(exp_scaled)
+    probs = exp_scaled / sum_exp
+
+    soft_min_val = -tau * (max_scaled + np.log(sum_exp))
+
+    g_areas = -probs
+
+    g_a_x = v1[:, 1] - v2[:, 1]
+    g_a_y = v2[:, 0] - v1[:, 0]
+    g_b_x = v2[:, 1]
+    g_b_y = -v2[:, 0]
+    g_c_x = -v1[:, 1]
+    g_c_y = v1[:, 0]
+
+    grad_num = np.zeros((N, 2))
+    np.add.at(grad_num, (_I, 0), g_areas * g_a_x)
+    np.add.at(grad_num, (_I, 1), g_areas * g_a_y)
+    np.add.at(grad_num, (_J, 0), g_areas * g_b_x)
+    np.add.at(grad_num, (_J, 1), g_areas * g_b_y)
+    np.add.at(grad_num, (_K, 0), g_areas * g_c_x)
+    np.add.at(grad_num, (_K, 1), g_areas * g_c_y)
+
+    grad_ha = _hull_area_grad(points)
+
+    val = soft_min_val / ha
+    grad = (grad_num * ha - soft_min_val * grad_ha) / (ha * ha)
+
+    return -val, -grad
+
+def _ring_configuration(params):
+    r1, r2, r3, r4, th1, th2, th3, th4, n1, n2, n3, n4 = params
+    n1 = int(round(n1))
+    n2 = int(round(n2))
+    n3 = int(round(n3))
+    n4 = int(round(n4))
+
+    total = n1 + n2 + n3 + n4
+    while total > N:
+        if n4 >= 1:
+            n4 -= 1
+        elif n3 >= 1:
+            n3 -= 1
+        elif n2 >= 1:
+            n2 -= 1
+        else:
+            n1 -= 1
+        total -= 1
+    while total < N:
+        n4 += 1
+        total += 1
+
+    points = []
+
+    if n1 > 0:
+        angles = th1 + np.linspace(0, 2 * np.pi, n1, endpoint=False)
+        points.append(np.column_stack((r1 * np.cos(angles), r1 * np.sin(angles))))
+
+    if n2 > 0:
+        angles = th2 + np.linspace(0, 2 * np.pi, n2, endpoint=False)
+        points.append(np.column_stack((r2 * np.cos(angles), r2 * np.sin(angles))))
+
+    if n3 > 0:
+        angles = th3 + np.linspace(0, 2 * np.pi, n3, endpoint=False)
+        points.append(np.column_stack((r3 * np.cos(angles), r3 * np.sin(angles))))
+
+    if n4 > 0:
+        angles = th4 + np.linspace(0, 2 * np.pi, n4, endpoint=False)
+        points.append(np.column_stack((r4 * np.cos(angles), r4 * np.sin(angles))))
+
+    if not points:
+        return np.zeros((N, 2))
+
+    result = np.vstack(points)
+
+    if len(result) < N:
+        extra = np.zeros((N - len(result), 2))
+        result = np.vstack([result, extra])
+    elif len(result) > N:
+        result = result[:N]
+
+    return result
+
+def _neg_ring_score(params):
+    try:
+        points = _ring_configuration(params)
+        return -_score(points)
+    except Exception:
+        return 0.0
+
+def _convex_polygon_from_edge_lengths(edge_lengths, angles=None):
+    n = len(edge_lengths)
+    if angles is None:
+        angles = np.full(n, 2 * np.pi / n)
+
+    angle_sum = np.sum(angles)
+    if angle_sum < 1e-10:
+        angles = np.full(n, 2 * np.pi / n)
+    else:
+        angles = angles / angle_sum * 2 * np.pi
+
+    directions = np.cumsum(angles)
+    directions = np.roll(directions, -1) - angles / 2
+
+    edge_vectors = np.column_stack([
+        edge_lengths * np.cos(directions),
+        edge_lengths * np.sin(directions)
+    ])
+
+    vertices = np.cumsum(edge_vectors, axis=0)
+    vertices -= vertices.mean(axis=0)
+
+    return vertices
+
+def _neg_convex_poly_score(params):
+    try:
+        n = N
+        e = params[:n]
+        a = params[n:n + n - 1]
+
+        e = np.maximum(e, 0.01)
+        a = np.maximum(a, 0.01)
+
+        a_full = np.append(a, 2 * np.pi - np.sum(a))
+        a_full = np.maximum(a_full, 0.01)
+
+        a_sum = np.sum(a_full)
+        a_full = a_full / a_sum * 2 * np.pi
+
+        vertices = _convex_polygon_from_edge_lengths(e, a_full)
+
+        try:
+            hull = scipy.spatial.ConvexHull(vertices)
+            if len(hull.vertices) < n:
+                return 1e10
+        except Exception:
+            return 1e10
+
+        return -_score(vertices)
+    except Exception:
+        return 1e10
+
+def construct():
+    t0 = time.time()
+
+    def left():
+        return DEADLINE - (time.time() - t0)
+
+    best_score = 0.0
+    best_pts = _normalize(_regular_polygon(N, 1.0, 0.0))
+    rng = np.random.default_rng(42)
+
+    def try_update(points):
+        nonlocal best_score, best_pts
+        sc = _score(points)
+        if sc > best_score:
+            best_score = sc
+            best_pts = points.copy()
+        return sc
+
+    # Phase 0: Two-nested-heptagons 2D global search (cheap, symmetry-friendly)
+    if left() > 4.0:
+        r_vals = np.linspace(0.0, 1.0, 40)
+        phi_vals = np.linspace(0.0, np.pi / 7, 40, endpoint=False)
+        for r in r_vals:
+            if left() <= 2.0:
+                break
+            for phi in phi_vals:
+                pts = _two_heptagons(r, phi)
+                try_update(pts)
+
+        if left() > 4.0:
+            best_r, best_phi, best_s = 0.0, 0.0, 0.0
+            for r in np.linspace(0.0, 1.0, 30):
+                for phi in np.linspace(0.0, np.pi / 7, 30, endpoint=False):
+                    s = _score_two_heptagons([r, phi])
+                    if s > best_s:
+                        best_s, best_r, best_phi = s, r, phi
+            gr = 0.6180339887498949
+            a_r, b_r = max(0.0, best_r - 0.1), min(1.0, best_r + 0.1)
+            c_r = b_r - gr * (b_r - a_r)
+            d_r = a_r + gr * (b_r - a_r)
+            fc = _score_two_heptagons([c_r, best_phi])
+            fd = _score_two_heptagons([d_r, best_phi])
+            for _ in range(40):
+                if left() <= 2.0:
+                    break
+                if fc < fd:
+                    a_r = c_r
+                    c_r = d_r
+                    fc = fd
+                    d_r = b_r - gr * (b_r - a_r)
+                    fd = _score_two_heptagons([d_r, best_phi])
+                else:
+                    b_r = d_r
+                    d_r = c_r
+                    fd = fc
+                    c_r = a_r + gr * (b_r - a_r)
+                    fc = _score_two_heptagons([c_r, best_phi])
+            best_r = (a_r + b_r) / 2
+            a_p, b_p = 0.0, np.pi / 7
+            c_p = b_p - gr * (b_p - a_p)
+            d_p = a_p + gr * (b_p - a_p)
+            fc = _score_two_heptagons([best_r, c_p])
+            fd = _score_two_heptagons([best_r, d_p])
+            for _ in range(40):
+                if left() <= 2.0:
+                    break
+                if fc < fd:
+                    a_p = c_p
+                    c_p = d_p
+                    fc = fd
+                    d_p = b_p - gr * (b_p - a_p)
+                    fd = _score_two_heptagons([best_r, d_p])
+                else:
+                    b_p = d_p
+                    d_p = c_p
+                    fd = fc
+                    c_p = a_p + gr * (b_p - a_p)
+                    fc = _score_two_heptagons([best_r, c_p])
+            best_phi = (a_p + b_p) / 2
+            pts = _two_heptagons(best_r, best_phi)
+            try_update(pts)
+
+    # Phase 1: Global search in structured parameterizations (DE)
+    structured_inits = []
+
+    # 1a: Heptagon + 7-axis
+    bounds_hep = [(0.5, 1.5), (0, 2 * np.pi)] + [(0.0, 1.0)] * 7
+    for restart in range(2):
+        if left() <= 30.0:
+            break
+        try:
+            res = scipy.optimize.differential_evolution(
+                _neg_heptagon_score,
+                bounds_hep,
+                seed=int(rng.integers(0, 2**31)),
+                maxiter=50,
+                tol=1e-6,
+                popsize=10,
+                mutation=(0.3, 1.2),
+                recombination=0.9,
+                polish=True,
+                init='latinhypercube',
+            )
+            if res is not None and res.x is not None and res.fun < 0:
+                pts = _heptagon_plus_seven(res.x)
+                try_update(pts)
+                structured_inits.append(pts)
+        except Exception:
+            pass
+
+    # 1b: Edge-constrained heptagon (asymmetric via 7 edge params)
+    bounds_edge = [(0.5, 1.5), (0, 2 * np.pi)] + [(0.0, 1.0)] * 7
+    for restart in range(2):
+        if left() <= 28.0:
+            break
+        try:
+            res = scipy.optimize.differential_evolution(
+                _neg_edge_heptagon,
+                bounds_edge,
+                seed=int(rng.integers(0, 2**31)),
+                maxiter=50,
+                tol=1e-6,
+                popsize=10,
+                mutation=(0.3, 1.2),
+                recombination=0.9,
+                polish=True,
+                init='latinhypercube',
+            )
+            if res is not None and res.x is not None and res.fun < 0:
+                pts = _edge_heptagon(res.x)
+                try_update(pts)
+                structured_inits.append(pts)
+        except Exception:
+            pass
+
+    # 1c: 4-ring DE (global, low-dim)
+    bounds = [
+        (0.3, 1.5),
+        (0.1, 1.0),
+        (0.0, 0.7),
+        (0.0, 0.4),
+        (0, 2 * np.pi),
+        (0, 2 * np.pi),
+        (0, 2 * np.pi),
+        (0, 2 * np.pi),
+        (1, 14),
+        (1, 14),
+        (1, 14),
+        (1, 14),
+    ]
+    for restart in range(2):
+        if left() <= 26.0:
+            break
+        try:
+            res = scipy.optimize.differential_evolution(
+                _neg_ring_score,
+                bounds,
+                seed=int(rng.integers(0, 2**31)),
+                maxiter=40,
+                tol=1e-5,
+                popsize=8,
+                mutation=(0.3, 1.2),
+                recombination=0.9,
+                polish=True,
+                init='latinhypercube',
+            )
+            if res.success or res.fun < 0:
+                points = _ring_configuration(res.x)
+                try_update(points)
+                structured_inits.append(points)
+        except Exception:
+            pass
+
+    # Phase 2: Build diverse full-space starts
+    starts = [best_pts.copy()]
+    starts.append(_normalize(_regular_polygon(N, 1.0, 0.0)))
+    for p in structured_inits:
+        starts.append(_normalize(p.copy()))
+
+    a_out = np.linspace(0, 2 * np.pi, 7, endpoint=False)
+    a_in = a_out + np.pi / 7
+    for r_in in [0.4, 0.6, 0.8]:
+        starts.append(_normalize(np.vstack((
+            np.column_stack((np.cos(a_out), np.sin(a_out))),
+            np.column_stack((r_in * np.cos(a_in), r_in * np.sin(a_in)))
+        ))))
+
+    a1 = np.linspace(0, 2 * np.pi, 5, endpoint=False)
+    a2 = a1 + np.pi / 5
+    a3 = np.linspace(0, 2 * np.pi, 4, endpoint=False) + np.pi / 4
+    for (r2, r3) in [(0.5, 0.2), (0.6, 0.35)]:
+        starts.append(_normalize(np.vstack((
+            np.column_stack((np.cos(a1), np.sin(a1))),
+            np.column_stack((r2 * np.cos(a2), r2 * np.sin(a2))),
+            np.column_stack((r3 * np.cos(a3), r3 * np.sin(a3)))
+        ))))
+
+    for _ in range(4):
+        if left() <= 12.0:
+            break
+        jittered = best_pts + rng.normal(0, 0.05, (N, 2))
+        starts.append(_normalize(jittered))
+
+    def try_opt(x0, method, maxiter, fatol, xatol, use_grad=False):
+        nonlocal best_score, best_pts
+        if left() <= 3.0:
+            return
+        try:
+            if use_grad:
+                def obj_and_grad(flat):
+                    val, grad = _exact_maxmin_obj_grad(flat.reshape(-1, 2))
+                    return val, grad.flatten()
+                opts = {'maxiter': maxiter, 'fatol': fatol, 'xatol': xatol,
+                        'maxfev': 8000, 'maxls': 30}
+                res = scipy.optimize.minimize(obj_and_grad, x0.flatten(), method=method,
+                                              jac=True, options=opts)
+            else:
+                opts = {'maxiter': maxiter, 'fatol': fatol, 'xatol': xatol, 'maxfev': 12000}
+                if method == 'Nelder-Mead':
+                    opts['adaptive'] = True
+                res = scipy.optimize.minimize(_neg_score, x0.flatten(), method=method, options=opts)
+            opt = _normalize(res.x.reshape(-1, 2))
+            sc = _score(opt)
+            if sc > best_score:
+                best_score, best_pts = sc, opt.copy()
+        except Exception:
+            pass
+
+    # Phase 3: Gradient-based local refinement on diverse starts
+    for start in starts:
+        if left() <= 8.0:
+            break
+        try_opt(start, 'L-BFGS-B', 1500, 1e-12, 1e-11, use_grad=True)
+        if left() <= 6.0:
+            break
+        try_opt(start, 'Nelder-Mead', 2000, 1e-12, 1e-9)
+
+    # Phase 4: Soft-min annealing (smooth surrogate for the nonsmooth min)
+    if left() > 22.0:
+        soft_starts = [best_pts.copy()]
+        rng_soft = np.random.default_rng(777)
+        for jitter in [0.03, 0.06, 0.10, 0.15]:
+            if left() <= 10.0:
+                break
+            jittered = best_pts + rng_soft.normal(0, jitter, (N, 2))
+            soft_starts.append(_normalize(jittered))
+        for p in structured_inits:
+            soft_starts.append(_normalize(p.copy()))
+
+        tau_vals = [0.08, 0.04, 0.02, 0.01, 0.005, 0.002, 0.001]
+        for tau in tau_vals:
+            if left() <= 5.0:
+                break
+            best_in_tau = None
+            best_sc_in_tau = best_score
+            for start in soft_starts[:]:
+                if left() <= 3.0:
+                    break
+                try:
+                    def obj_and_grad(flat, _tau=tau):
+                        val, grad = _soft_min_score_grad(flat, _tau)
+                        return val, grad.flatten()
+                    res = scipy.optimize.minimize(obj_and_grad, start.flatten(), method='L-BFGS-B',
+                                                  jac=True, options={'maxiter': 800, 'fatol': 1e-13, 'xatol': 1e-12, 'maxfev': 5000})
+                    opt = _normalize(res.x.reshape(-1, 2))
+                    sc = _score(opt)
+                    if sc > best_sc_in_tau:
+                        best_sc_in_tau = sc
+                        best_in_tau = opt.copy()
+                except Exception:
+                    pass
+            if best_in_tau is not None:
+                best_score = best_sc_in_tau
+                best_pts = best_in_tau
+                soft_starts = [best_in_tau.copy()]
+                if len(soft_starts) < 3 and left() > 8.0:
+                    soft_starts.append(best_pts + rng_soft.normal(0, 0.05, (N, 2)))
+
+    # Phase 5: Fine polish (tighter tolerance, more iterations, exact local solve)
+    if left() > 15.0:
+        try_opt(best_pts, 'L-BFGS-B', 4000, 1e-13, 1e-12, use_grad=True)
+    if left() > 12.0:
+        try_opt(best_pts, 'Nelder-Mead', 5000, 1e-14, 1e-12)
+    if left() > 10.0:
+        try_opt(best_pts, 'L-BFGS-B', 3000, 1e-14, 1e-13, use_grad=True)
+    if left() > 8.0:
+        try_opt(best_pts, 'Nelder-Mead', 4000, 1e-15, 1e-14)
+    if left() > 6.0:
+        try_opt(best_pts, 'L-BFGS-B', 2500, 1e-15, 1e-14, use_grad=True)
+    if left() > 4.5:
+        try_opt(best_pts, 'Nelder-Mead', 3000, 1e-16, 1e-15)
+    if left() > 3.0:
+        try_opt(best_pts, 'L-BFGS-B', 2000, 1e-16, 1e-15, use_grad=True)
+    if left() > 2.0:
+        try_opt(best_pts, 'Nelder-Mead', 2000, 1e-17, 1e-16)
+
+    return _normalize(best_pts)
