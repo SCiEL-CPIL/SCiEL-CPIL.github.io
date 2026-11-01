@@ -19,7 +19,7 @@ def _vectorized_objective(z, penalty_weight=1000.0):
 
     obj = -np.sum(r)
 
-    # Vectorized pairwise overlap penalty
+    # Vectorized pairwise overlap penalty (smooth via soft-min)
     dx = x[:, None] - x[None, :]
     dy = y[:, None] - y[None, :]
     d_sq = dx * dx + dy * dy
@@ -55,6 +55,75 @@ def _vectorized_objective(z, penalty_weight=1000.0):
         obj += penalty_weight * (0.5 - w) ** 2
     elif w > 1.5:
         obj += penalty_weight * (w - 1.5) ** 2
+
+    return obj
+
+
+def _smooth_objective(z, beta=50.0):
+    """
+    Smooth log-sum-exp based objective. Uses soft-max to create a differentiable
+    surrogate for the max-overlap constraint, enabling better gradient flow.
+    """
+    x = z[0::3][:N]
+    y = z[1::3][:N]
+    r = z[2::3][:N]
+    w = z[-1]
+    h = 2.0 - w
+
+    if w < 0.2 or h < 0.2 or np.any(r < 0):
+        return 1e6
+
+    obj = -np.sum(r)
+
+    # Smooth pairwise overlap: use log-sum-exp of (r_i + r_j - d_ij)
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    d_sq = dx * dx + dy * dy
+    r_sum = r[:, None] + r[None, :]
+
+    iu = np.triu_indices(N, k=1)
+    d_sq_pairs = d_sq[iu]
+    r_sum_pairs = r_sum[iu]
+    d_pairs = np.sqrt(np.maximum(d_sq_pairs, 1e-12))
+
+    # overlap_ij = r_i + r_j - d_ij (positive when overlapping)
+    overlap_vals = r_sum_pairs - d_pairs
+
+    # Smooth max via log-sum-exp: (1/beta) * log(sum(exp(beta * v)))
+    # This gives a smooth approximation to max(overlap_vals, 0)
+    shifted = beta * overlap_vals
+    shifted = np.clip(shifted, -500, 500)  # numerical safety
+    max_shifted = np.max(shifted)
+    lse = max_shifted + np.log(np.sum(np.exp(shifted - max_shifted)))
+    smooth_max_overlap = lse / beta
+
+    # Also penalize individual overlaps with quadratic for local structure
+    hard_overlap = np.maximum(overlap_vals, 0.0)
+    quad_penalty = 100.0 * np.sum(hard_overlap * hard_overlap)
+
+    obj += 500.0 * smooth_max_overlap + quad_penalty
+
+    # Smooth boundary violations
+    left_viol = r - x
+    right_viol = x + r - w
+    bottom_viol = r - y
+    top_viol = y + r - h
+
+    all_viol = np.concatenate([left_viol, right_viol, bottom_viol, top_viol])
+    shifted_b = beta * all_viol
+    shifted_b = np.clip(shifted_b, -500, 500)
+    max_b = np.max(shifted_b)
+    lse_b = max_b + np.log(np.sum(np.exp(shifted_b - max_b)))
+    smooth_max_viol = lse_b / beta
+
+    hard_viol = np.maximum(all_viol, 0.0)
+    obj += 500.0 * smooth_max_viol + 100.0 * np.sum(hard_viol * hard_viol)
+
+    # Aspect ratio penalty (smooth)
+    if w < 0.5:
+        obj += 200.0 * (0.5 - w) ** 2
+    elif w > 1.5:
+        obj += 200.0 * (w - 1.5) ** 2
 
     return obj
 
@@ -161,6 +230,54 @@ def construct():
         z[-1] = w0
         guesses.append(z)
 
+        # Add a "staggered grid" guess with tighter packing
+        w0 = 1.0
+        h0 = 1.0
+        z = np.zeros(3 * N + 1)
+        rows = 5
+        cols = 5
+        sx = w0 / (cols + 0.3)
+        sy = h0 / (rows + 0.3)
+        for i in range(N):
+            row, col = divmod(i, cols)
+            cx = (col + 0.5 + (0.5 if row % 2 == 1 else 0)) * sx
+            cy = (row + 0.5) * sy
+            r0 = min(sx, sy) * 0.49
+            cx = min(max(cx, r0), w0 - r0)
+            cy = min(max(cy, r0), h0 - r0)
+            z[3 * i] = cx
+            z[3 * i + 1] = cy
+            z[3 * i + 2] = r0
+        z[-1] = w0
+        guesses.append(z)
+
+        # Add a "corner-biased" guess: place larger circles at corners
+        w0 = 1.0
+        h0 = 1.0
+        z = np.zeros(3 * N + 1)
+        # 4 corners
+        corner_positions = [(0.15, 0.15), (0.85, 0.15), (0.15, 0.85), (0.85, 0.85)]
+        for k, (cx, cy) in enumerate(corner_positions):
+            z[3 * k] = cx * w0
+            z[3 * k + 1] = cy * h0
+            z[3 * k + 2] = 0.12
+        # Remaining 17 in a grid in the center
+        remaining = N - 4
+        r_side = int(np.ceil(np.sqrt(remaining)))
+        cx0, cy0 = 0.3, 0.3
+        cw, ch = 0.4, 0.4
+        for k in range(remaining):
+            row, col = divmod(k, r_side)
+            cx = (cx0 + (col + 0.5) / r_side * cw) * w0
+            cy = (cy0 + (row + 0.5) / r_side * ch) * h0
+            r0 = min(cw / r_side, ch / r_side) * 0.45
+            idx = 4 + k
+            z[3 * idx] = cx
+            z[3 * idx + 1] = cy
+            z[3 * idx + 2] = r0
+        z[-1] = w0
+        guesses.append(z)
+
         return guesses
 
     guesses = get_initial_guesses()
@@ -172,7 +289,7 @@ def construct():
         # Force-directed relaxation to resolve initial overlaps
         z0_relaxed = _force_relax_unified(z0, max_iter=500)
 
-        # SLSQP optimization
+        # SLSQP optimization with penalty objective
         remaining = deadline - (time.time() - start_time)
         maxiter = int(min(600, max(150, remaining * 50)))
         try:
@@ -197,7 +314,21 @@ def construct():
                     best_result = z_repair.copy()
 
         except Exception:
-            continue
+            pass
+
+        # Second pass: try smooth log-sum-exp objective from same start
+        if time.time() < deadline - 25:
+            try:
+                res2 = minimize(_smooth_objective, z0_relaxed, method='SLSQP',
+                                bounds=[(0, 2)] * (3 * N) + [(0.3, 1.7)],
+                                options={'maxiter': 300, 'ftol': 1e-12, 'maxls': 60})
+                z_opt2 = res2.x
+                valid2, val2 = check_validity(z_opt2)
+                if valid2 and val2 > best_value:
+                    best_value = val2
+                    best_result = z_opt2.copy()
+            except Exception:
+                pass
 
     # --- Phase 2: Advanced Polish on best result ---
     if best_result is not None and time.time() < deadline - 25:
@@ -217,6 +348,36 @@ def construct():
                 if valid and val > best_value:
                     best_value = val
                     best_result = expanded
+
+        # 2b. Multi-start perturbation + expansion polish
+        if best_result is not None and time.time() < deadline - 12:
+            rng2 = np.random.default_rng(123)
+            for trial in range(5):
+                if time.time() > deadline - 12:
+                    break
+                z_pert = best_result.copy()
+                # Small random perturbation to positions
+                x_p = z_pert[0::3][:N] + rng2.normal(0, 0.01, N)
+                y_p = z_pert[1::3][:N] + rng2.normal(0, 0.01, N)
+                # Clamp
+                w_p = z_pert[-1]
+                h_p = 2.0 - w_p
+                r_p = z_pert[2::3][:N]
+                x_p = np.clip(x_p, r_p, w_p - r_p)
+                y_p = np.clip(y_p, r_p, h_p - r_p)
+                z_pert[0::3][:N] = x_p
+                z_pert[1::3][:N] = y_p
+
+                # Quick force relaxation
+                z_pert = _force_relax_unified(z_pert, max_iter=200)
+
+                # Expansion polish
+                expanded2 = _expansion_relaxation_polish(z_pert, deadline - (time.time() - start_time) - 10)
+                if expanded2 is not None:
+                    valid2, val2 = check_validity(expanded2)
+                    if valid2 and val2 > best_value:
+                        best_value = val2
+                        best_result = expanded2
 
         # 3. Constraint-based SLSQP refinement
         if best_result is not None and time.time() < deadline - 12:
@@ -622,7 +783,7 @@ def _is_valid_move(x, y, r, w, h, i, new_x, new_y):
 
 
 def _constraint_refine(z, time_budget):
-    """High-precision SLSQP refinement using explicit constraints."""
+    """High-precision SLSQP refinement using explicit constraints with smooth epigraph."""
     z = z.copy().astype(float)
     n = N
 
@@ -677,9 +838,15 @@ def _constraint_refine(z, time_budget):
         y = z_opt[1::3][:n]
         r = z_opt[2::3][:n]
         w = z_opt[-1]
-        h = z_opt[-1] if False else 2.0 - z_opt[-1] # Correct h calculation
+        h = 2.0 - z_opt[-1]
 
         if _is_valid(x, y, r, w, h):
+            return z_opt
+
+        # If slightly invalid, try a small shrink
+        r_shrunk = r * 0.999
+        if _is_valid(x, y, r_shrunk, w, h):
+            z_opt[2::3][:n] = r_shrunk
             return z_opt
         return None
     except Exception:
@@ -707,6 +874,7 @@ def _high_precision_polish(z, time_budget):
     """
     High-precision polish: iterative radius growth with position adjustment.
     Uses tighter tolerances and more iterations for final squeeze.
+    Added: alternating individual expansion + position micro-adjustment.
     """
     z = z.copy().astype(float)
     n = N
@@ -770,15 +938,15 @@ def _high_precision_polish(z, time_budget):
         x = np.clip(x, r, w - r)
         y = np.clip(y, r, h - r)
     
-    # Phase 2: Greedy radius expansion with binary search
-    # Try to expand each circle as much as possible
-    for _ in range(50):
+    # Phase 2: Alternating individual expansion + micro position adjustment
+    # Multiple rounds of: expand each circle, then nudge positions to free space
+    for round_num in range(80):
         if time.time() > time_budget:
             break
         
         improved = False
         for i in range(n):
-            # Calculate max possible radius
+            # Calculate max possible radius given current positions
             r_wall = min(x[i], w - x[i], y[i], h - y[i])
             r_max = r_wall
             for j in range(n):
@@ -796,7 +964,7 @@ def _high_precision_polish(z, time_budget):
                 # Binary search for max valid radius
                 lo = r[i]
                 hi = r_max
-                for _ in range(30):
+                for _ in range(25):
                     mid = (lo + hi) / 2.0
                     r_test = r.copy()
                     r_test[i] = mid
@@ -807,15 +975,54 @@ def _high_precision_polish(z, time_budget):
                 if lo > r[i] + 1e-10:
                     r[i] = lo
                     improved = True
-        
-        if not improved:
-            break
+            
+            # After expanding, try to nudge circle i slightly to create more room
+            # for subsequent expansions
+            if improved:
+                # Find the direction of least constraint
+                dx_move = 0.0
+                dy_move = 0.0
+                # Check which wall is closest
+                d_left = x[i] - r[i]
+                d_right = w - x[i] - r[i]
+                d_bot = y[i] - r[i]
+                d_top = h - y[i] - r[i]
+                min_d = min(d_left, d_right, d_bot, d_top)
+                if d_left == min_d:
+                    dx_move = 0.003
+                elif d_right == min_d:
+                    dx_move = -0.003
+                elif d_bot == min_d:
+                    dy_move = 0.003
+                elif d_top == min_d:
+                    dy_move = -0.003
+                
+                if dx_move != 0 or dy_move != 0:
+                    new_xi = x[i] + dx_move
+                    new_yi = y[i] + dy_move
+                    if _is_valid_move(x, y, r, w, h, i, new_xi, new_yi):
+                        x[i] = new_xi
+                        y[i] = new_yi
     
-    # Phase 3: Uniform expansion with very fine steps
-    for _ in range(200):
+    # Phase 3: Uniform expansion with very fine steps (binary search for global factor)
+    lo_factor = 1.0
+    hi_factor = 1.02
+    for _ in range(40):
         if time.time() > time_budget:
             break
-        r_trial = r * 1.0001
+        mid_factor = (lo_factor + hi_factor) / 2.0
+        r_trial = r * mid_factor
+        if _is_valid(x, y, r_trial, w, h, tol=1e-10):
+            lo_factor = mid_factor
+            r = r_trial
+        else:
+            hi_factor = mid_factor
+    
+    # Phase 4: Final micro-expansion
+    for _ in range(100):
+        if time.time() > time_budget:
+            break
+        r_trial = r * 1.00005
         if _is_valid(x, y, r_trial, w, h, tol=1e-10):
             r = r_trial
         else:

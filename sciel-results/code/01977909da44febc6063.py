@@ -1,0 +1,1 @@
+BET: {mechanism: "Vectorized gain computation via matrix-vector product replaces O(n_blocks * C(k,t)) Python loop with O(n_blocks * n_t_subs) BLAS call, reducing per-iteration cost from ~50k*35=1.75M Python ops to a single optimized dot product, enabling ~5-10x faster greedy iterations and more restarts within time budget", q: 0.72, delta: [0.05, 0.15]}

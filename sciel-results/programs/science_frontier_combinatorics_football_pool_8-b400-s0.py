@@ -1,187 +1,211 @@
 import time
 import numpy as np
 import random
+from collections import defaultdict
 
 def construct(q, n, radius):
     start_time = time.time()
-    deadline = start_time + 115.0
+    deadline = start_time + 115.0  # Safety margin for 120s limit
     
     if q == 3 and n == 8 and radius == 1:
-        return _solve_ternary_8_1(deadline)
+        return _construct_ternary_8_1(deadline)
     
-    # Fallbacks
+    # Fallback for other cases
     import itertools
     if q == 3 and n >= 4:
         tetracode = [[a, b, (a + b) % 3, (a + 2 * b) % 3] for a in range(3) for b in range(3)]
         return [h + list(tail) for h in tetracode for tail in itertools.product(range(3), repeat=n - 4)]
-        
+    
     return [list(c) for c in itertools.product(range(q), repeat=n)]
 
-def _solve_ternary_8_1(deadline):
+def _construct_ternary_8_1(deadline):
     n = 8
     q = 3
-    N = q ** n # 6561
+    total = q ** n  # 6561
+    ball_size = 1 + 2 * n  # 17
     
-    # Precompute balls
-    # balls[i] is a list of neighbors of i (including i)
+    # Precompute balls efficiently
     weights = [3 ** (n - 1 - i) for i in range(n)]
-    balls = []
-    balls_matrix = np.zeros((N, 1 + 2 * n), dtype=np.int32)
     
-    for w in range(N):
-        neighbors = [w]
+    # Build balls array: balls[w] = [w, neighbors...]
+    balls = np.zeros((total, ball_size), dtype=np.int32)
+    
+    for w in range(total):
+        balls[w, 0] = w
+        idx = 1
         for pos in range(n):
             weight = weights[pos]
             digit = (w // weight) % 3
             for new_digit in range(q):
                 if new_digit == digit:
                     continue
-                new_w = w + (new_digit - digit) * weight
-                neighbors.append(new_w)
-        balls.append(neighbors)
-        balls_matrix[w] = neighbors
-        
-    best_size = N
+                balls[w, idx] = w + (new_digit - digit) * weight
+                idx += 1
+    
+    # Build inverse mapping: for each word w, which ball centers cover it
+    # inv[w] = list of center indices c such that w is in balls[c]
+    inv = [defaultdict(int) for _ in range(total)]
+    for c in range(total):
+        for w in balls[c]:
+            inv[w][c] += 1
+            
+    # Convert to lists for faster iteration
+    inv_lists = [list(inv[w].keys()) for w in range(total)]
+    
+    best_size = total
     best_set = None
     
-    # Helper to convert index to list of digits
-    def idx_to_list(idx):
-        digits = []
-        temp = idx
-        for _ in range(n):
-            digits.append(temp % 3)
-            temp //= 3
-        return digits[::-1]
-        
-    # Main Loop
-    while time.time() < deadline - 10.0:
-        # 1. Greedy Construction
+    # Use multiple random restarts with greedy + pruning + local search
+    np.random.seed(42)
+    random.seed(42)
+    
+    while time.time() < deadline - 5.0:
+        # Randomized greedy construction with incremental updates
         selected = []
-        cover_count = np.zeros(N, dtype=np.int32)
-        uncovered = np.ones(N, dtype=bool)
+        cover_count = np.zeros(total, dtype=np.int32)
+        uncovered = np.ones(total, dtype=bool)
+        uncovered_count = total
         
-        while np.any(uncovered):
-            if time.time() > deadline - 10.0:
+        # For each candidate center, track how many uncovered words it covers
+        # cand_count[c] = number of uncovered words in balls[c]
+        cand_count = np.zeros(total, dtype=np.int32)
+        for c in range(total):
+            cand_count[c] = ball_size  # Initially all words are uncovered
+        
+        # Track which centers are still "active" (not yet selected)
+        active = np.ones(total, dtype=bool)
+        
+        while uncovered_count > 0:
+            # Find the best candidate among active centers
+            # Use a simple approach: find max cand_count among active
+            active_counts = np.where(active, cand_count, -1)
+            max_count = np.max(active_counts)
+            
+            if max_count <= 0:
                 break
             
-            # Find word covering most uncovered
-            # Vectorized: sum uncovered mask over balls
-            gains = uncovered[balls_matrix].sum(axis=1)
-            
-            if np.max(gains) == 0:
-                break # Should not happen if logic correct
-                
-            # Random tie-breaking
-            max_gain = np.max(gains)
-            candidates = np.where(gains == max_gain)[0]
+            # Pick randomly among max-count active candidates for diversity
+            candidates = np.where((active_counts == max_count) & active)[0]
+            if len(candidates) == 0:
+                break
             best_idx = candidates[np.random.randint(len(candidates))]
             
             selected.append(best_idx)
+            active[best_idx] = False
             
-            # Update cover_count and uncovered
-            # Only update uncovered if count was 0
-            ball = balls[best_idx]
-            # We need to check which were 0
-            # cover_count[ball] += 1
-            # uncovered[ball] = False  <-- WRONG if count was already > 0? No, if count > 0, uncovered is already False.
-            # So setting to False is safe.
-            cover_count[ball] += 1
-            uncovered[ball] = False
+            # Update cover counts and candidate counts
+            for w in balls[best_idx]:
+                if cover_count[w] == 0:
+                    uncovered_count -= 1
+                    # Decrement cand_count for all centers that cover w
+                    for c in inv_lists[w]:
+                        if active[c]:
+                            cand_count[c] -= 1
+                cover_count[w] += 1
             
-        if np.any(uncovered):
-            continue # Invalid
-            
-        # 2. Prune
+            if time.time() > deadline - 10.0:
+                break
+        
+        # Check if valid
+        if uncovered_count > 0:
+            continue
+        
+        # Pruning: iteratively remove codewords that are not needed
+        # A codeword c is removable if for all w in balls[c], cover_count[w] > 1
         changed = True
-        while changed and time.time() < deadline - 5.0:
+        while changed and time.time() < deadline - 3.0:
             changed = False
             new_selected = []
-            # Check each codeword
-            # Vectorized check:
-            # For each c in selected, min(cover_count[balls[c]])
-            # If > 1, remove.
-            
-            # To do this efficiently in a loop (since selected changes size):
-            # We can do it in batches or one by one.
-            # One by one is O(K * BallSize). K~500, BallSize~17. ~8500 ops. Fast.
-            
-            i = 0
-            while i < len(selected):
-                c = selected[i]
+            for c in selected:
                 if np.min(cover_count[balls[c]]) > 1:
-                    # Remove
                     cover_count[balls[c]] -= 1
-                    selected.pop(i)
                     changed = True
                 else:
-                    i += 1
+                    new_selected.append(c)
+            selected = new_selected
             
-        # 3. Local Search (Swaps)
-        # Try to swap codewords to enable further pruning
-        # We will run many swap attempts
-        # Pre-allocate masks for speed?
-        mask_u = np.zeros(N, dtype=bool)
-        mask_v = np.zeros(N, dtype=bool)
-        
-        swap_attempts = 0
-        while time.time() < deadline - 5.0:
-            swap_attempts += 1
-            if not selected:
-                break
+        # Local Search: Swap-based optimization
+        # We try to swap a critical codeword with a non-selected one to enable further removals
+        improved = True
+        while improved and time.time() < deadline - 2.0:
+            improved = False
+            # Recompute cover counts from scratch to be safe after swaps/removals
+            cover_count = np.zeros(total, dtype=np.int32)
+            for c in selected:
+                cover_count[balls[c]] += 1
                 
-            # Pick random index
-            i = np.random.randint(len(selected))
-            u = selected[i]
+            selected_set = set(selected)
             
-            # Pick random replacement
-            v = np.random.randint(N)
-            if v == u:
-                continue
+            # Identify critical codewords and their unique words
+            critical_candidates = []
+            for c in selected:
+                unique_words = [w for w in balls[c] if cover_count[w] == 1]
+                if unique_words:
+                    critical_candidates.append((c, unique_words))
+            
+            # Try to find a swap for any critical codeword
+            for c, unique_words in critical_candidates:
+                # Find intersection of inv_lists for all unique words
+                # These are the candidates c' that cover ALL unique words
+                if not unique_words:
+                    continue
+                    
+                # Start with inv_lists of the first word
+                common_candidates = set(inv_lists[unique_words[0]])
+                for w in unique_words[1:]:
+                    common_candidates.intersection_update(inv_lists[w])
+                    
+                # Check if any common candidate is NOT in selected
+                for c_prime in common_candidates:
+                    if c_prime not in selected_set:
+                        # Perform swap
+                        selected.remove(c)
+                        selected.append(c_prime)
+                        selected_set.remove(c)
+                        selected_set.add(c_prime)
+                        improved = True
+                        break # Restart the loop to re-evaluate criticals
+                if improved:
+                    break
+            
+            # After swaps, try to remove redundant codewords again
+            if time.time() < deadline - 2.0:
+                cover_count = np.zeros(total, dtype=np.int32)
+                for c in selected:
+                    cover_count[balls[c]] += 1
                 
-            # Check safety
-            # Risk = N[u] \ N[v]
-            mask_u.fill(False)
-            mask_u[balls[u]] = True
-            mask_v.fill(False)
-            mask_v[balls[v]] = True
-            
-            risk = mask_u & ~mask_v
-            
-            safe = True
-            if np.any(risk):
-                if np.min(cover_count[risk]) <= 1:
-                    safe = False
-            
-            if safe:
-                # Perform swap
-                cover_count[balls[u]] -= 1
-                cover_count[balls[v]] += 1
-                selected[i] = v
+                new_selected = []
+                for c in selected:
+                    if np.min(cover_count[balls[c]]) > 1:
+                        cover_count[balls[c]] -= 1
+                    else:
+                        new_selected.append(c)
                 
-                # Try to prune
-                pruned = False
-                changed = True
-                while changed:
-                    changed = False
-                    new_selected = []
-                    for c in selected:
-                        if np.min(cover_count[balls[c]]) > 1:
-                            cover_count[balls[c]] -= 1
-                            changed = True
-                            pruned = True
-                        else:
-                            new_selected.append(c)
+                if len(new_selected) < len(selected):
                     selected = new_selected
-                
-                # If we pruned, we improved. If not, we are at same size but different state.
-                # We keep the state to explore further.
-                
+                    improved = True
+        
         if len(selected) < best_size:
             best_size = len(selected)
             best_set = selected.copy()
-
-    if best_set is None:
-        # Fallback
-        return [idx_to_list(w) for w in range(N)]
         
-    return [idx_to_list(w) for w in best_set]
+        # Early stop if we've found a very good solution and time is running low
+        if time.time() > deadline - 8.0:
+            break
+    
+    # Convert to list of digit lists
+    if best_set is None:
+        # Fallback: return a large valid set
+        best_set = list(range(total))
+    
+    result = []
+    for w in best_set:
+        digits = []
+        temp = w
+        for _ in range(n):
+            digits.append(temp % 3)
+            temp //= 3
+        digits.reverse()
+        result.append(digits)
+        
+    return result

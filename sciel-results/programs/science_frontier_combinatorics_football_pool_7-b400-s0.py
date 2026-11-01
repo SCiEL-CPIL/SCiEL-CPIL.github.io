@@ -4,7 +4,7 @@ import random
 
 def construct(q, n, radius):
     t0 = time.time()
-    deadline = t0 + 110.0  # Safety margin for 120s limit (evaluator kills at 150s, but task says 120s)
+    deadline = t0 + 113.0  # Safety margin for 120s limit
     
     total = q ** n
     ball_size = 1 + n * (q - 1)
@@ -38,26 +38,28 @@ def construct(q, n, radius):
     # Convert to numpy arrays for faster vectorized operations
     ball_indices_np = [np.array(b, dtype=np.int32) for b in ball_indices]
     
-    # Precompute a membership matrix for quick intersection checks?
-    # membership[i, j] = 1 if j is in ball(i)
-    # This is 2187x2187 boolean matrix. 4.7M booleans ~ 4.7MB. Acceptable.
-    # But we can also just use sets for the small balls if needed.
-    # For swap validity, we need: for all x in ball(c_remove) \ ball(c_add), cnt[x] >= 2.
-    # Using numpy:
-    # mask_remove = np.zeros(total, dtype=bool); mask_remove[ball_indices_np[c_remove]] = True
-    # mask_add = np.zeros(total, dtype=bool); mask_add[ball_indices_np[c_add]] = True
-    # candidates = mask_remove & ~mask_add
-    # if np.any(cnt[candidates] < 2): invalid
+    # Precompute ball membership matrix: ball_mem[i, j] = True if j is in ball(i)
+    ball_mem = np.zeros((total, total), dtype=bool)
+    for i in range(total):
+        ball_mem[i, ball_indices_np[i]] = True
     
-    # Greedy construction
-    def greedy_build():
+    # Greedy construction with randomization
+    def greedy_build(seed=None):
+        if seed is not None:
+            rng = random.Random(seed)
+        else:
+            rng = random.Random()
+            
         covered = np.zeros(total, dtype=bool)
         code = []
         
         while not np.all(covered):
             best_c = -1
             max_new = -1
-            for c in range(total):
+            candidates = list(range(total))
+            rng.shuffle(candidates)
+            
+            for c in candidates:
                 ball = ball_indices_np[c]
                 new_cov = np.sum(~covered[ball])
                 if new_cov > max_new:
@@ -69,8 +71,23 @@ def construct(q, n, radius):
             covered[ball_indices_np[best_c]] = True
         return code
     
-    # Initial greedy
-    current_code = set(greedy_build())
+    # Multiple greedy restarts to find good starting points
+    best_initial = None
+    best_initial_size = float('inf')
+    
+    init_code = greedy_build(seed=0)
+    best_initial = set(init_code)
+    best_initial_size = len(init_code)
+    
+    for seed in [1, 2, 3, 4, 5]:
+        if time.time() > deadline - 40.0:
+            break
+        init_code = greedy_build(seed=seed)
+        if len(init_code) < best_initial_size:
+            best_initial_size = len(init_code)
+            best_initial = set(init_code)
+    
+    current_code = set(best_initial)
     best_code = list(current_code)
     best_size = len(current_code)
     
@@ -80,84 +97,66 @@ def construct(q, n, radius):
         cnt[ball_indices_np[c]] += 1
         
     def run_delete_phase(code_set, cnt_arr):
-        """Removes redundant codewords. Returns True if any removed."""
-        changed = False
-        # Iterate over a copy to allow modification
-        for c in list(code_set):
-            ball = ball_indices_np[c]
-            if np.min(cnt_arr[ball]) >= 2:
-                code_set.remove(c)
-                cnt_arr[ball] -= 1
-                changed = True
-        return changed
+        """Removes redundant codewords. Returns number removed."""
+        removed = 0
+        changed = True
+        while changed:
+            changed = False
+            for c in list(code_set):
+                ball = ball_indices_np[c]
+                if np.min(cnt_arr[ball]) >= 2:
+                    code_set.remove(c)
+                    cnt_arr[ball] -= 1
+                    removed += 1
+                    changed = True
+        return removed
     
-    def try_swap(c_remove, c_add, code_set, cnt_arr):
-        """Try a swap. Returns True if successful."""
-        if c_add in code_set:
-            return False
-        if c_remove == c_add:
-            return False
-            
-        ball_rem = ball_indices_np[c_remove]
-        ball_add = ball_indices_np[c_add]
-        
-        # We need to check if removing c_remove and adding c_add keeps coverage.
-        # cnt' = cnt - ball_rem + ball_add
-        # We need cnt' > 0 everywhere.
-        # This is equivalent to:
-        # For x in ball_rem: cnt[x] - 1 + (1 if x in ball_add else 0) > 0
-        # For x not in ball_rem: cnt[x] + (1 if x in ball_add else 0) > 0 (always true since cnt[x] >= 1)
-        
-        # So we only need to check x in ball_rem.
-        # Specifically, for x in ball_rem \ ball_add, we need cnt[x] >= 2.
-        # For x in ball_rem ∩ ball_add, cnt'[x] = cnt[x], which is >= 1.
-        
-        # Efficient check:
-        # Create a mask for ball_add
-        # Or just iterate ball_rem and check membership in ball_add set?
-        # Ball size is 15. Iterating 15 elements is fast.
-        # But let's use numpy for vectorization if possible.
-        
-        # Simple loop might be faster due to overhead of numpy array creation for small sizes
-        # But let's try a hybrid:
-        # in_add = np.zeros(total, dtype=bool)
-        # in_add[ball_add] = True
-        # mask = in_add[ball_rem]
-        # # For x in ball_rem where NOT in_add, check cnt[x] >= 2
-        
-        # Actually, creating a mask of size 2187 every swap is expensive.
-        # Let's use the property that balls are small.
-        set_add = set(ball_add.tolist())
-        
-        valid = True
-        for x in ball_rem:
-            if x not in set_add:
-                if cnt_arr[x] < 2:
-                    valid = False
-                    break
-                    
-        if not valid:
-            return False
-            
-        # Perform swap
-        code_set.remove(c_remove)
-        code_set.add(c_add)
-        cnt_arr[ball_rem] -= 1
-        cnt_arr[ball_add] += 1
-        return True
-
+    # Compute unique words for each codeword: words in ball(c) with cnt==1
+    def compute_unique_words(c, cnt_arr):
+        """Return list of words in ball(c) with cnt==1."""
+        ball = ball_indices_np[c]
+        unique = ball[cnt_arr[ball] == 1]
+        return unique
+    
+    def get_valid_swaps(c, code_set, cnt_arr):
+        """Return list of valid c_add for removing c."""
+        unique = compute_unique_words(c, cnt_arr)
+        if len(unique) == 0:
+            # Any word not in code_set is valid
+            # Return a sample for efficiency
+            return None  # Signal: any non-code word works
+        # Intersection of balls of all unique words
+        # Start with ball of first unique word
+        valid_set = set(ball_indices_np[unique[0]].tolist())
+        for u in unique[1:]:
+            valid_set &= set(ball_indices_np[u].tolist())
+            if len(valid_set) == 0:
+                return []
+        # Filter out words already in code_set
+        valid_list = [v for v in valid_set if v not in code_set]
+        return valid_list
+    
     # Local Search Loop
-    while time.time() < deadline - 5.0:
+    no_improve_counter = 0
+    max_no_improve = 15
+    
+    while time.time() < deadline - 3.0:
         # 1. Delete Phase
-        while run_delete_phase(current_code, cnt):
+        removed = run_delete_phase(current_code, cnt)
+        if removed > 0:
             if len(current_code) < best_size:
                 best_size = len(current_code)
                 best_code = list(current_code)
-                
-        # 2. Swap Phase
+                no_improve_counter = 0
+            else:
+                no_improve_counter += 1
+        else:
+            no_improve_counter += 1
+        
+        # 2. Swap Phase with smarter candidate selection
         swaps_attempted = 0
         max_swaps = 500
-        while swaps_attempted < max_swaps and time.time() < deadline - 5.0:
+        while swaps_attempted < max_swaps and time.time() < deadline - 3.0:
             swaps_attempted += 1
             if len(current_code) == 0:
                 break
@@ -165,24 +164,54 @@ def construct(q, n, radius):
             # Pick random codeword to remove
             c = random.choice(list(current_code))
             
-            # Pick random candidate to add
-            c_prime = random.randint(0, total - 1)
+            # Get valid swaps
+            valid_swaps = get_valid_swaps(c, current_code, cnt)
             
-            # Try the swap
-            if try_swap(c, c_prime, current_code, cnt):
-                # After a valid swap, run delete phase
-                while run_delete_phase(current_code, cnt):
-                    if len(current_code) < best_size:
-                        best_size = len(current_code)
-                        best_code = list(current_code)
-                    
-                    # Early exit if we've hit a very good solution
-                    if best_size <= 160:
-                        break
-                        
-                if best_size <= 160:
-                    break
-                    
+            if valid_swaps is None:
+                # Any non-code word works; pick one that maximizes new coverage
+                # of words with cnt==1 in ball(c)
+                # Actually, just pick a random non-code word
+                c_prime = random.randint(0, total - 1)
+                while c_prime in current_code:
+                    c_prime = random.randint(0, total - 1)
+            elif len(valid_swaps) == 0:
+                no_improve_counter += 1
+                continue
+            else:
+                # Pick from valid swaps, preferring those that cover many unique words
+                # or just random
+                c_prime = random.choice(valid_swaps)
+            
+            # Perform swap
+            current_code.remove(c)
+            current_code.add(c_prime)
+            cnt[ball_indices_np[c]] -= 1
+            cnt[ball_indices_np[c_prime]] += 1
+            
+            # After swap, run delete phase
+            removed = run_delete_phase(current_code, cnt)
+            if removed > 0:
+                if len(current_code) < best_size:
+                    best_size = len(current_code)
+                    best_code = list(current_code)
+                    no_improve_counter = 0
+                else:
+                    no_improve_counter += 1
+            else:
+                no_improve_counter += 1
+        
+        # If no improvement for many iterations, try a restart
+        if no_improve_counter > max_no_improve and time.time() < deadline - 15.0:
+            # Try a new greedy initialization
+            seed = int(time.time() * 1000) % 10000
+            init_code = greedy_build(seed=seed)
+            if len(init_code) < len(current_code) + 5:
+                current_code = set(init_code)
+                cnt = np.zeros(total, dtype=np.int32)
+                for c in current_code:
+                    cnt[ball_indices_np[c]] += 1
+                no_improve_counter = 0
+                
         if best_size <= 160:
             break
 

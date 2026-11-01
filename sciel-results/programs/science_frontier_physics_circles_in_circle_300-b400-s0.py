@@ -85,14 +85,103 @@ def _hex_lattice_init(n):
     
     return points
 
+def _ring_init(n):
+    """
+    Initialize points in concentric rings with optimized angular phases.
+    """
+    points = []
+    # Estimate ring structure
+    # Number of rings ~ sqrt(n)
+    num_rings = int(np.sqrt(n * 2 / np.sqrt(3)))
+    
+    # Distribute points among rings
+    # Ring k has roughly proportional to circumference
+    ring_counts = []
+    remaining = n
+    for k in range(num_rings):
+        if k == 0:
+            count = 1
+        else:
+            # Approximate count based on circumference
+            count = int(2 * np.pi * k / (2 * np.sqrt(3) * np.sqrt(n)))
+            count = max(1, count)
+        ring_counts.append(count)
+    
+    # Adjust to match total
+    diff = n - sum(ring_counts)
+    if diff > 0:
+        # Add extra to outer rings
+        for i in range(len(ring_counts)-1, -1, -1):
+            add = min(diff, max(1, ring_counts[i]//3))
+            ring_counts[i] += add
+            diff -= add
+            if diff == 0:
+                break
+    elif diff < 0:
+        # Remove from outer rings
+        for i in range(len(ring_counts)-1, -1, -1):
+            rem = min(-diff, ring_counts[i]-1)
+            ring_counts[i] -= rem
+            diff += rem
+            if diff == 0:
+                break
+    
+    # Remove empty rings
+    ring_counts = [c for c in ring_counts if c > 0]
+    num_rings = len(ring_counts)
+    
+    # Radius of each ring
+    # Total area ~ pi
+    # Ring k area ~ 2*pi*r_k*dr
+    # For hex packing, dr ~ s = 2r_circle
+    # r_k ~ k * s
+    s = np.sqrt(2.0 * np.pi / (n * np.sqrt(3.0)))
+    
+    for k, count in enumerate(ring_counts):
+        if k == 0:
+            points.append([0.0, 0.0])
+        else:
+            r_k = k * s * 0.95  # Slightly less than full hex spacing
+            angles = np.linspace(0, 2*np.pi, count, endpoint=False) + np.pi/count  # Offset
+            for angle in angles:
+                points.append([r_k * np.cos(angle), r_k * np.sin(angle)])
+    
+    points = np.array(points[:n])
+    
+    # Add small random perturbation to break symmetry
+    points += np.random.normal(0, 1e-4, points.shape)
+    
+    return points
+
 def construct():
     start_time = time.time()
     deadline = start_time + 145.0  # 5s safety margin
     
-    # 1. Initialization
-    points = _hex_lattice_init(N)
+    # 1. Initialization - try multiple initializations and keep the best
+    np.random.seed(42)
+    
+    inits = [
+        _hex_lattice_init(N),
+        _ring_init(N),
+    ]
+    
+    # Also add a random initialization
+    random_points = np.random.rand(N, 2) * 2 - 1
+    norms = np.linalg.norm(random_points, axis=1)
+    mask = norms > 1.0
+    random_points[mask] = random_points[mask] / norms[mask, np.newaxis] * 0.95
+    inits.append(random_points)
+    
+    points = inits[0]
     best_points = points.copy()
     best_score = _compute_score(points)
+    
+    for init in inits[1:]:
+        score = _compute_score(init)
+        if score > best_score:
+            best_score = score
+            best_points = init
+            points = init
     
     # 2. Optimization using L-BFGS-B with smooth soft-min objective
     # Objective: minimize -soft_min(dists, boundary_dists)
@@ -177,7 +266,7 @@ def construct():
         # Vectorized pair gradient
         # For each pair (i,j) with weight w_k:
         # grad[p_i] += w_k * 0.5 * (p_i - p_j) / dists[i,j]
-        # grad[p_j] += w_k * 0.5 * (p_j - p_i) / dists[i,j]
+        # grad[p_j] -= w_k * 0.5 * (p_j - p_i) / dists[i,j]
         
         # dists[i,j] = 2 * pair_dists[k]
         # So 0.5 / dists[i,j] = 0.5 / (2 * pair_dists[k]) = 0.25 / pair_dists[k]
@@ -225,12 +314,12 @@ def construct():
 
     # Optimization loop with increasing beta
     # Start with low beta (smooth), increase to high beta (sharp)
-    betas = [10.0, 50.0, 100.0, 500.0, 1000.0]
+    betas = [10.0, 50.0, 100.0, 500.0, 1000.0, 3000.0]
     
     current_points = points.copy()
     
     for beta in betas:
-        if time.time() > deadline - 10:
+        if time.time() > deadline - 15:
             break
             
         try:
@@ -240,15 +329,15 @@ def construct():
                 jac=lambda x: objective_and_grad(x, beta)[1],
                 method='L-BFGS-B',
                 options={
-                    'maxiter': 200,
-                    'gtol': 1e-8,
-                    'ftol': 1e-10,
-                    'maxls': 20,
+                    'maxiter': 300,
+                    'gtol': 1e-9,
+                    'ftol': 1e-11,
+                    'maxls': 25,
                     'disp': False
                 }
             )
             
-            if time.time() > deadline - 5:
+            if time.time() > deadline - 8:
                 break
                 
             candidate = res.x.reshape(-1, 2)
@@ -270,18 +359,42 @@ def construct():
             pass
 
     # Final polish with very high beta if time permits
-    if time.time() < deadline - 2:
+    if time.time() < deadline - 5:
         try:
             res = minimize(
                 lambda x: objective_and_grad(x, 5000.0)[0],
                 best_points.flatten(),
-                jac=lambda x: objective_and_grad(x, 5000.0)[1],
+                jac=lambda x: objective_and_grad(x, beta)[1],
                 method='L-BFGS-B',
                 options={
-                    'maxiter': 100,
-                    'gtol': 1e-10,
-                    'ftol': 1e-12,
-                    'maxls': 10,
+                    'maxiter': 200,
+                    'gtol': 1e-11,
+                    'ftol': 1e-13,
+                    'maxls': 15,
+                    'disp': False
+                }
+            )
+            candidate = res.x.reshape(-1, 2)
+            candidate_score = _compute_score(candidate)
+            if candidate_score > best_score:
+                best_points = candidate
+                best_score = candidate_score
+        except Exception:
+            pass
+
+    # Second polish pass with even higher beta and tighter tolerance
+    if time.time() < deadline - 2:
+        try:
+            res = minimize(
+                lambda x: objective_and_grad(x, 10000.0)[0],
+                best_points.flatten(),
+                jac=lambda x: objective_and_grad(x, 10000.0)[1],
+                method='L-BFGS-B',
+                options={
+                    'maxiter': 150,
+                    'gtol': 1e-12,
+                    'ftol': 1e-14,
+                    'maxls': 20,
                     'disp': False
                 }
             )
