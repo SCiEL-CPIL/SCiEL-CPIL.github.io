@@ -1,0 +1,400 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import time as _time
+import random as _random
+from collections import deque
+
+def _verify_girth_fast(adj, n, g):
+    """Check if graph has girth >= g using non-backtracking BFS from each vertex.
+    Returns True if girth >= g, False otherwise. Optimized with early termination."""
+    for start in range(n):
+        dist = {}
+        dq = deque()
+        dq.append((start, -1))
+        dist[(start, -1)] = 0
+        while dq:
+            v, prev = dq.popleft()
+            d = dist[(v, prev)]
+            if d >= g - 1:
+                continue
+            for w in adj[v]:
+                if w == prev:
+                    continue
+                if w == start and d + 1 >= 3:
+                    return False
+                state = (w, v)
+                if state not in dist:
+                    dist[state] = d + 1
+                    dq.append(state)
+    return True
+
+def _verify_girth_array(adj_list, n, g):
+    """Faster verification using array-based distance tracking.
+    adj_list: list of lists (sorted neighbor lists)
+    Returns True if girth >= g."""
+    # For each start vertex, do BFS tracking (vertex, prev) -> depth
+    # Use a dict keyed by (v, prev) but with early termination
+    for start in range(n):
+        # dist[v][prev] = depth, but we'll use a flat dict
+        dist = {}
+        dq = deque()
+        dq.append((start, -1))
+        dist[(start, -1)] = 0
+        while dq:
+            v, prev = dq.popleft()
+            d = dist[(v, prev)]
+            if d >= g - 1:
+                continue
+            for w in adj_list[v]:
+                if w == prev:
+                    continue
+                if w == start and d + 1 >= 3:
+                    return False
+                state = (w, v)
+                if state not in dist:
+                    dist[state] = d + 1
+                    dq.append(state)
+    return True
+
+def _luw_construct(q, g):
+    """LUW (Lubotzky-Phillips-Sarnak / Marcus-Spielman-Srivastava style) construction.
+    Builds a (q+1)-regular graph of girth at least g using voltage graph over Z_q.
+    Returns (n, edges)."""
+    if q == 3:
+        d = max(3, g - 5 if (g - 5) % 2 else g - 4)
+        add, sub, mul = (lambda x,y:(x+y)%q), (lambda x,y:(x-y)%q), (lambda x,y:x*y%q)
+        rule = {2:(1,1), 3:(2,1), 4:(1,2)}
+        for c in range(5, d+1):
+            r, c0 = (c-5)%4, c-(c-5)%4
+            rule[c] = [(1,c0-2),(c0-1,1),(c0,1),(1,c0+1)][r]
+        def neighbours(vertex):
+            side, x = vertex
+            for first in range(q):
+                y = [None, first] + [0]*(d-1)
+                for c in range(2, d+1):
+                    a, b = rule[c]
+                    y[c] = add(x[c], mul(y[a], x[b])) if side==0 else sub(x[c], mul(x[a], y[b]))
+                yield 1-side, tuple(y)
+        start = (0, (None,) + (0,)*d)
+        index, order, edges = {start:0}, [start], []
+        for vertex in order:
+            for other in neighbours(vertex):
+                if other not in index:
+                    index[other] = len(order)
+                    order.append(other)
+                if vertex[0] == 0:
+                    edges.append((index[vertex], index[other]))
+        return len(order), edges
+    elif q == 4:
+        table = [[0,0,0,0],[0,1,2,3],[0,2,3,1],[0,3,1,2]]
+        add, sub, mul = (lambda x,y: x^y), (lambda x,y: x^y), (lambda x,y: table[x][y])
+        d = max(3, g - 5 if (g - 5) % 2 else g - 4)
+        rule = {2:(1,1), 3:(2,1), 4:(1,2)}
+        for c in range(5, d+1):
+            r, c0 = (c-5)%4, c-(c-5)%4
+            rule[c] = [(1,c0-2),(c0-1,1),(c0,1),(1,c0+1)][r]
+        def neighbours(vertex):
+            side, x = vertex
+            for first in range(q):
+                y = [None, first] + [0]*(d-1)
+                for c in range(2, d+1):
+                    a, b = rule[c]
+                    y[c] = add(x[c], mul(y[a], x[b])) if side==0 else sub(x[c], mul(x[a], y[b]))
+                yield 1-side, tuple(y)
+        start = (0, (None,) + (0,)*d)
+        index, order, edges = {start:0}, [start], []
+        for vertex in order:
+            for other in neighbours(vertex):
+                if other not in index:
+                    index[other] = len(order)
+                    order.append(other)
+                if vertex[0] == 0:
+                    edges.append((index[vertex], index[other]))
+        return len(order), edges
+    else:
+        # Generic prime q: use the standard LPS construction
+        p = q
+        d = max(3, g - 5 if (g - 5) % 2 else g - 4)
+        add, sub, mul = (lambda x,y:(x+y)%p), (lambda x,y:(x-y)%p), (lambda x,y:x*y%p)
+        rule = {2:(1,1), 3:(2,1), 4:(1,2)}
+        for c in range(5, d+1):
+            r, c0 = (c-5)%4, c-(c-5)%4
+            rule[c] = [(1,c0-2),(c0-1,1),(c0,1),(1,c0+1)][r]
+        def neighbours(vertex):
+            side, x = vertex
+            for first in range(p):
+                y = [None, first] + [0]*(d-1)
+                for c in range(2, d+1):
+                    a, b = rule[c]
+                    y[c] = add(x[c], mul(y[a], x[b])) if side==0 else sub(x[c], mul(x[a], y[b]))
+                yield 1-side, tuple(y)
+        start = (0, (None,) + (0,)*d)
+        index, order, edges = {start:0}, [start], []
+        for vertex in order:
+            for other in neighbours(vertex):
+                if other not in index:
+                    index[other] = len(order)
+                    order.append(other)
+                if vertex[0] == 0:
+                    edges.append((index[vertex], index[other]))
+        return len(order), edges
+
+def _get_base_graphs():
+    """Return a list of base 3-regular graphs as (edges, n_base).
+    We use Petersen (10 vertices) and K_{3,3} (6 vertices) as base graphs."""
+    # Petersen graph
+    petersen_edges = [
+        (0, 1), (1, 2), (2, 3), (3, 4), (4, 0),
+        (5, 7), (7, 9), (9, 6), (6, 8), (8, 5),
+        (0, 5), (1, 6), (2, 7), (3, 8), (4, 9)
+    ]
+    # K_{3,3}
+    k33_edges = [
+        (0, 3), (0, 4), (0, 5),
+        (1, 3), (1, 4), (1, 5),
+        (2, 3), (2, 4), (2, 5)
+    ]
+    return [(petersen_edges, 10), (k33_edges, 6)]
+
+def _build_lift(base_edges, n_base, m, voltages, g):
+    """Build a voltage graph lift of a base graph with given voltages.
+    voltages: dict mapping (u,v) -> voltage for each directed edge
+    Returns (n, adj_list, edges) or None if invalid."""
+    n = n_base * m
+    adj = [set() for _ in range(n)]
+    edges = []
+    
+    for u, v in base_edges:
+        vol = voltages[(u, v)]
+        for i in range(m):
+            a = u * m + i
+            b = v * m + (i + vol) % m
+            if b not in adj[a]:
+                adj[a].add(b)
+                adj[b].add(a)
+                edges.append((a, b))
+    
+    for i in range(n):
+        if len(adj[i]) != 3:
+            return None
+    
+    # Convert to sorted lists for faster access
+    adj_list = [sorted(adj[i]) for i in range(n)]
+    return n, adj_list, edges
+
+def _find_primitive_root(m):
+    """Find a primitive root modulo m, or return None if m is not prime or no primitive root exists."""
+    if m <= 1:
+        return None
+    import math
+    if m < 2:
+        return None
+    for i in range(2, int(math.isqrt(m)) + 1):
+        if m % i == 0:
+            return None
+    phi = m - 1
+    factors = []
+    temp = phi
+    d = 2
+    while d * d <= temp:
+        if temp % d == 0:
+            factors.append(d)
+            while temp % d == 0:
+                temp //= d
+        d += 1
+    if temp > 1:
+        factors.append(temp)
+    
+    for g in range(2, m):
+        is_primitive = True
+        for p in factors:
+            if pow(g, phi // p, m) == 1:
+                is_primitive = False
+                break
+        if is_primitive:
+            return g
+    return None
+
+def _voltage_lift_search(base_edges, n_base, m, g, seed, n_attempts=50):
+    """Try multiple random voltage assignments on a base graph lift.
+    Returns (n, edges) if a valid girth-g graph is found, else None."""
+    rng = _random.Random(seed)
+    
+    for attempt in range(n_attempts):
+        voltages = {}
+        for u, v in base_edges:
+            vol = rng.randint(0, m - 1)
+            voltages[(u, v)] = vol
+            voltages[(v, u)] = (-vol) % m
+        
+        result = _build_lift(base_edges, n_base, m, voltages, g)
+        if result is None:
+            continue
+        n, adj_list, edges = result
+        if _verify_girth_array(adj_list, n, g):
+            return n, edges
+    
+    return None
+
+def _deterministic_voltage_lift(base_edges, n_base, m, g):
+    """Use deterministic voltage assignment based on primitive root powers."""
+    root = _find_primitive_root(m)
+    if root is None:
+        return None
+    
+    voltages = {}
+    for i, (u, v) in enumerate(base_edges):
+        voltages[(u, v)] = (root ** i) % m
+        voltages[(v, u)] = (-voltages[(u, v)]) % m
+    
+    result = _build_lift(base_edges, n_base, m, voltages, g)
+    if result is None:
+        return None
+    n, adj_list, edges = result
+    if _verify_girth_array(adj_list, n, g):
+        return n, edges
+    return None
+
+def _random_3reg(n, g, seed):
+    """Generate a random 3-regular graph and check girth."""
+    rng = _random.Random(seed)
+    stubs = []
+    for v in range(n):
+        for _ in range(3):
+            stubs.append(v)
+    rng.shuffle(stubs)
+    adj = [set() for _ in range(n)]
+    edges = []
+    valid = True
+    for i in range(0, n * 3, 2):
+        u, v = stubs[i], stubs[i + 1]
+        if u == v or v in adj[u]:
+            valid = False
+            break
+        adj[u].add(v)
+        adj[v].add(u)
+        edges.append((u, v))
+    if not valid:
+        return None
+    # Check connectivity
+    visited = set([0])
+    stack = [0]
+    while stack:
+        v = stack.pop()
+        for w in adj[v]:
+            if w not in visited:
+                visited.add(w)
+                stack.append(w)
+    if len(visited) != n:
+        return None
+    adj_list = [sorted(adj[i]) for i in range(n)]
+    if _verify_girth_array(adj_list, n, g):
+        return n, edges
+    return None
+
+def construct(k, g):
+    start_time = _time.time()
+    deadline = start_time + 115
+    
+    if k != 3:
+        # Use LUW for other values of k
+        q = k
+        n, edges = _luw_construct(q, g)
+        return n, edges
+    
+    # Moore bound for k=3, girth g
+    if g % 2 == 0:
+        moore = 2 * (2**(g//2) - 1)
+    else:
+        moore = 2 * (2**(g//2 - 1) - 1) + 2
+    
+    best_result = None
+    best_n = float('inf')
+    
+    # Get base graphs
+    base_graphs = _get_base_graphs()
+    
+    # Strategy 1: Voltage lifts on multiple base graphs
+    # For each base graph, try different lift sizes m
+    for base_edges, n_base in base_graphs:
+        if _time.time() > deadline - 20:
+            break
+        m_min = max(1, (moore + n_base - 1) // n_base)
+        m_max = m_min + 300
+        
+        for m in range(m_min, m_max):
+            if _time.time() > deadline - 15:
+                break
+            n_lift = n_base * m
+            if n_lift < moore:
+                continue
+            if n_lift >= best_n:
+                break
+            
+            # Try deterministic voltage first
+            result = _deterministic_voltage_lift(base_edges, n_base, m, g)
+            if result is not None:
+                n_r, edges_r = result
+                if n_r < best_n:
+                    best_n = n_r
+                    best_result = (n_r, edges_r)
+                break  # Found valid for this m, try next base graph or smaller m
+            
+            # Try random voltage assignments
+            result = _voltage_lift_search(base_edges, n_base, m, g, seed=m * 100000 + n_base, n_attempts=30)
+            if result is not None:
+                n_r, edges_r = result
+                if n_r < best_n:
+                    best_n = n_r
+                    best_result = (n_r, edges_r)
+                break  # Found valid for this m
+    
+    # Strategy 2: Try LUW construction as a strong baseline
+    if _time.time() < deadline - 20:
+        n_luw, edges_luw = _luw_construct(3, g)
+        if n_luw < best_n:
+            best_n = n_luw
+            best_result = (n_luw, edges_luw)
+    
+    # Strategy 3: Random 3-regular graphs near the Moore bound
+    if _time.time() < deadline - 15:
+        n_try = moore
+        if n_try % 2 != 0:
+            n_try += 1
+        while n_try < best_n and _time.time() < deadline - 10:
+            for attempt in range(20):
+                if _time.time() > deadline - 10:
+                    break
+                result = _random_3reg(n_try, g, seed=attempt * 104729 + n_try)
+                if result is not None:
+                    n_r, edges_r = result
+                    if n_r < best_n:
+                        best_n = n_r
+                        best_result = (n_r, edges_r)
+                    break
+            n_try += 32
+    
+    # Strategy 4: More extensive random search with smaller n
+    if _time.time() < deadline - 10 and best_result is not None:
+        # Try to find even smaller graphs
+        for n_try in range(moore, min(best_n, moore + 100), 2):
+            if _time.time() > deadline - 8:
+                break
+            for attempt in range(50):
+                if _time.time() > deadline - 5:
+                    break
+                result = _random_3reg(n_try, g, seed=attempt * 31 + n_try * 17)
+                if result is not None:
+                    n_r, edges_r = result
+                    if n_r < best_n:
+                        best_n = n_r
+                        best_result = (n_r, edges_r)
+                    break
+    
+    # Fallback: LUW construction
+    if best_result is None:
+        n_luw, edges_luw = _luw_construct(3, g)
+        best_result = (n_luw, edges_luw)
+    
+    return best_result
+# EVOLVE-BLOCK-END
