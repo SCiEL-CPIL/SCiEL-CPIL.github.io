@@ -22,32 +22,61 @@ def construct(v, k, t):
     for b_idx, indices in enumerate(block_t_indices):
         for idx in indices:
             t_subset_blocks[idx].append(b_idx)
+            
+    # Precompute degrees of t-subsets (number of blocks covering each)
+    t_subset_degrees = [len(lst) for lst in t_subset_blocks]
 
-    # 2. Phase 1: Greedy Packing (Approximate MWIS on Conflict Graph)
-    # Goal: Select a set of blocks (Core) such that no two blocks share t points.
-    # This maximizes the efficiency of the initial coverage by avoiding redundancy.
+    # 2. Phase 1: Weighted Greedy Independent Set (Packing)
+    # We want to select blocks that do not share any t-subset.
+    # Weight: Prefer blocks that cover "rare" t-subsets (low degree) to ensure hard parts are covered early.
     
     pool = set(range(num_k_subsets))
     core_blocks = []
-    uncovered_mask = [1] * num_t_subsets # 1 if uncovered
+    uncovered_mask = [1] * num_t_subsets
     
-    # Precompute list of t-subsets for each block for fast neighbor lookup
-    # block_t_indices already exists.
+    # Calculate initial "scarcity" weight for each block
+    # weight[b] = sum of 1/degree[t] for t in block
+    # This is expensive to compute for all 50k blocks initially? 
+    # 50k * C(7,4) = 50k * 35 = 1.75M operations. Acceptable.
     
+    block_weights = [0.0] * num_k_subsets
+    for b_idx, indices in enumerate(block_t_indices):
+        w = 0.0
+        for t_idx in indices:
+            deg = t_subset_degrees[t_idx]
+            if deg > 0:
+                w += 1.0 / deg
+        block_weights[b_idx] = w
+
     while pool:
-        # Select block from pool that covers the most currently uncovered t-subsets
         best_block = -1
-        max_cov = -1
+        max_score = -1.0
         
-        # Optimization: If pool is large, sampling might be faster, but 50k is manageable
-        # We iterate to find the best.
+        # To speed up, we might not scan the whole pool every time if it's huge, 
+        # but 50k is small enough.
         for b_idx in pool:
-            cov = 0
+            # Score = current uncovered coverage * scarcity factor
+            # If a block covers many uncovered items, it's good.
+            # If it covers rare items, it's good.
+            
+            # Quick check: if it covers 0 uncovered, skip?
+            # We need to calculate the score.
+            cov_uncovered = 0
+            scarcity_sum = 0.0
             for t_idx in block_t_indices[b_idx]:
                 if uncovered_mask[t_idx]:
-                    cov += 1
-            if cov > max_cov:
-                max_cov = cov
+                    cov_uncovered += 1
+                    scarcity_sum += 1.0 / t_subset_degrees[t_idx]
+            
+            if cov_uncovered == 0:
+                continue
+                
+            # Combine: Maximize covered count, tie-break by scarcity
+            # Or: Maximize (cov_uncovered * 100 + scarcity_sum)
+            score = cov_uncovered * 100.0 + scarcity_sum
+            
+            if score > max_score:
+                max_score = score
                 best_block = b_idx
                 
         if best_block == -1:
@@ -59,64 +88,40 @@ def construct(v, k, t):
         for t_idx in block_t_indices[best_block]:
             uncovered_mask[t_idx] = 0
             
-        # Remove best_block and its "conflicts" from pool
-        # Conflict: shares at least t points.
-        # This is equivalent to: C is in pool if C does NOT share any t-subset with best_block.
-        # So, we remove all C that share ANY t-subset with best_block.
+        # Remove best_block and its conflicts from pool
         neighbors_to_remove = set()
         for t_idx in block_t_indices[best_block]:
             neighbors_to_remove.update(t_subset_blocks[t_idx])
         
         pool.difference_update(neighbors_to_remove)
-        # Note: best_block is in neighbors_to_remove, so it gets removed too.
 
     # 3. Phase 2: Solve Remaining Set Cover
-    # The core covers some t-subsets. We need to cover the rest.
-    # Use standard Greedy Set Cover on the remaining uncovered t-subsets.
-    
-    # Re-initialize uncovered status for the full problem, but we know Core covers some.
-    # Actually, we can just continue the greedy process on the remaining uncovered.
-    
     active_blocks = set(core_blocks)
     cover_count = [0] * num_t_subsets
     
-    # Calculate cover counts for core blocks
     for b_idx in active_blocks:
         for t_idx in block_t_indices[b_idx]:
             cover_count[t_idx] += 1
             
-    # Determine which t-subsets are still uncovered
     still_uncovered = [i for i in range(num_t_subsets) if cover_count[i] == 0]
     
     if still_uncovered:
-        # Greedy Set Cover for the remainder
-        # We can use all blocks, or just those not in core?
-        # Using all blocks allows potentially better coverage of the remainder.
-        # But we must ensure we don't add duplicates if we are not careful.
-        # Since we are adding to active_blocks (a set), duplicates are handled.
-        
-        # Gain calculation for remaining blocks
-        # We want to maximize coverage of 'still_uncovered'
-        
-        # To speed up, we can restrict candidates to blocks that cover at least one 'still_uncovered'
-        # and are not already in active_blocks?
-        # Actually, a block in active_blocks might cover *more* still_uncovered?
-        # No, if it was in core, it was chosen greedily. But maybe a different combination is better?
-        # Standard greedy on the residual problem.
-        
         residual_uncovered = set(still_uncovered)
         
         while residual_uncovered:
             best_block = -1
             max_gain = 0
             
-            # Iterate over all blocks? Or just those not in active?
-            # If we pick a block already in active, it adds nothing new to active_blocks set.
-            # So we only need to consider blocks NOT in active_blocks.
+            # Standard Greedy: Pick block covering most residual uncovered
+            # We can restrict to blocks not in active_blocks to avoid duplicates
+            # But checking `not in active_blocks` for 50k blocks is O(N).
+            # We can just iterate all and check gain. If block is in active, gain is 0 for new items?
+            # No, if block is in active, it already covers its items. 
+            # So we only consider blocks NOT in active_blocks.
             
-            candidates = [b for b in range(num_k_subsets) if b not in active_blocks]
-            
-            for b_idx in candidates:
+            for b_idx in range(num_k_subsets):
+                if b_idx in active_blocks:
+                    continue
                 gain = 0
                 for t_idx in block_t_indices[b_idx]:
                     if t_idx in residual_uncovered:
@@ -126,7 +131,6 @@ def construct(v, k, t):
                     best_block = b_idx
                     
             if best_block == -1 or max_gain == 0:
-                # Should not happen if cover is possible
                 break
                 
             active_blocks.add(best_block)
@@ -135,7 +139,7 @@ def construct(v, k, t):
                     residual_uncovered.remove(t_idx)
                 cover_count[t_idx] += 1
 
-    # 4. Minimalization (as in current program)
+    # 4. Minimize
     def minimize(active_blocks_set, cover_counts):
         changed = True
         while changed:
@@ -159,10 +163,70 @@ def construct(v, k, t):
 
     active_blocks, cover_count = minimize(active_blocks, cover_count)
 
-    # 5. Local Search (Hill Climbing with Swaps)
+    # 5. Local Search (Enhanced)
     start_time = time.time()
     time_limit = 110.0
     
+    # Helper to try a move
+    def try_remove(b_idx):
+        nonlocal active_blocks, cover_count
+        if b_idx not in active_blocks:
+            return False
+        # Check if all t-subsets covered by b_idx have count > 1
+        for t_idx in block_t_indices[b_idx]:
+            if cover_count[t_idx] <= 1:
+                return False
+        # Remove
+        active_blocks.remove(b_idx)
+        for t_idx in block_t_indices[b_idx]:
+            cover_count[t_idx] -= 1
+        return True
+
+    def try_add(b_idx):
+        nonlocal active_blocks, cover_count
+        if b_idx in active_blocks:
+            return False
+        # Add
+        active_blocks.add(b_idx)
+        for t_idx in block_t_indices[b_idx]:
+            cover_count[t_idx] += 1
+        return True
+
+    def try_swap(old_idx, new_idx):
+        nonlocal active_blocks, cover_count
+        if old_idx not in active_blocks or new_idx in active_blocks:
+            return False
+        # Check validity: new_idx must cover all unique subsets of old_idx?
+        # No, we just swap and then minimize. But we should ensure we don't break coverage.
+        # A safe swap: new_idx covers all t-subsets that are *uniquely* covered by old_idx.
+        
+        # Find unique subsets of old_idx
+        unique_subsets = []
+        for t_idx in block_t_indices[old_idx]:
+            if cover_count[t_idx] == 1:
+                unique_subsets.append(t_idx)
+                
+        if not unique_subsets:
+            # Safe to swap with anything? 
+            # If no unique subsets, removing old_idx leaves all its subsets covered by others.
+            # So we can swap with any new_idx.
+            pass
+        else:
+            # Check if new_idx covers all unique_subsets
+            for t_idx in unique_subsets:
+                if t_idx not in block_t_indices[new_idx]:
+                    return False
+
+        # Perform Swap
+        active_blocks.remove(old_idx)
+        active_blocks.add(new_idx)
+        
+        for t_idx in block_t_indices[old_idx]:
+            cover_count[t_idx] -= 1
+        for t_idx in block_t_indices[new_idx]:
+            cover_count[t_idx] += 1
+        return True
+
     while time.time() - start_time < time_limit:
         improved = False
         current_blocks = list(active_blocks)
@@ -172,57 +236,76 @@ def construct(v, k, t):
             if B not in active_blocks:
                 continue
             
-            # Find t-subsets uniquely covered by B
-            uncovered_by_B = []
+            # Try Remove
+            if try_remove(B):
+                # Minimize after remove? It's already minimal regarding B.
+                # But other blocks might become redundant.
+                active_blocks, cover_count = minimize(active_blocks, cover_count)
+                improved = True
+                continue # B is gone, don't try other moves for B in this iteration?
+                # Actually, we re-shuffled, so B is removed from list.
+                # We can just continue to next B.
+            
+            # Try Swap
+            # Find candidates for swap
+            # Candidates must cover unique subsets of B
+            unique_subsets = []
             for t_idx in block_t_indices[B]:
                 if cover_count[t_idx] == 1:
-                    uncovered_by_B.append(t_idx)
+                    unique_subsets.append(t_idx)
             
-            if not uncovered_by_B:
-                continue
-
-            # Sort by number of covering blocks to speed up intersection
-            uncovered_by_B.sort(key=lambda x: len(t_subset_blocks[x]))
-            
-            candidates = None
-            for t_idx in uncovered_by_B:
-                blocks_list = t_subset_blocks[t_idx]
-                if candidates is None:
-                    candidates = set(blocks_list)
-                else:
-                    candidates.intersection_update(blocks_list)
+            if unique_subsets:
+                # Intersect candidate lists
+                candidates = None
+                for t_idx in unique_subsets:
+                    blocks_list = t_subset_blocks[t_idx]
+                    if candidates is None:
+                        candidates = set(blocks_list)
+                    else:
+                        candidates.intersection_update(blocks_list)
+                    if not candidates:
+                        break
                 
-                if not candidates:
-                    break
-            
-            if not candidates:
-                continue
-            
-            # Filter candidates
-            valid_candidates = []
-            for c in candidates:
-                if c != B and c not in active_blocks:
-                    valid_candidates.append(c)
-            
-            if not valid_candidates:
-                continue
-            
-            # Perform Swap
-            B_new = random.choice(valid_candidates)
-            
-            active_blocks.remove(B)
-            active_blocks.add(B_new)
-            
-            for t_idx in block_t_indices[B]:
-                cover_count[t_idx] -= 1
-            for t_idx in block_t_indices[B_new]:
-                cover_count[t_idx] += 1
-            
-            # Minimize after swap
-            active_blocks, cover_count = minimize(active_blocks, cover_count)
-            improved = True
-            
+                if candidates:
+                    # Filter out B and active blocks
+                    valid_candidates = [c for c in candidates if c != B and c not in active_blocks]
+                    if valid_candidates:
+                        # Pick one randomly
+                        B_new = random.choice(valid_candidates)
+                        if try_swap(B, B_new):
+                            active_blocks, cover_count = minimize(active_blocks, cover_count)
+                            improved = True
+            else:
+                # No unique subsets, B is "redundant" in terms of unique coverage.
+                # We can swap with ANY block not in active? 
+                # Or just try to remove? (Already tried remove, failed, so it's not redundant? 
+                # Wait, if unique_subsets is empty, remove should have succeeded?
+                # try_remove checks if cover_count[t] <= 1. If unique is empty, all cover_count > 1.
+                # So try_remove should have succeeded.
+                # So this case (unique empty but remove failed) shouldn't happen.
+                pass
+        
+        # Try Add
+        # Find a block that covers many uncovered? 
+        # But we should have no uncovered. 
+        # Maybe add a block and remove two? (2-for-1 swap)
+        # This is complex. Let's stick to Add if we detect uncovered?
+        # We assume cover is valid.
+        
         if not improved:
+            # Try a few random adds/removes to escape local minima?
+            # Or break?
+            # Let's try a random "perturbation": Add a random block, then minimize.
+            # If size decreases or stays same, keep it.
+            # Actually, minimize will remove redundant blocks.
+            # If we add a block, size increases by 1, then minimize might remove 2 others?
+            # This is a "2-move" local search.
+            
+            # Pick a random block not in active
+            # We need a list of inactive blocks.
+            # This is O(N). 
+            # Let's just break if no improvement to save time, 
+            # or do a few random swaps.
             break
 
     result = [list(all_k_subsets[b_idx]) for b_idx in active_blocks]
