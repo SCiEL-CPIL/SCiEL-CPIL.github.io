@@ -1,0 +1,201 @@
+"""
+Optimized uncertainty bound using vectorized analytic gradients and multi-start L-BFGS-B.
+"""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from scipy.optimize import minimize
+
+_START_TIME = time.time()
+_DEADLINE = _START_TIME + 195.0
+
+def _hermite_coeffs():
+    """
+    Precompute the polynomial coefficients of H_0, H_4, H_8, H_12.
+    Represented as vector p = [p0, p1, p2, p3, p4, p5, p6] for x^0, x^2, ..., x^12.
+    """
+    H = np.zeros((4, 7))
+    # H_0 = 1
+    H[0, 0] = 1.0
+    # H_4 = x^4 - 6x^2 + 3
+    H[1, 0] = 3.0; H[1, 1] = -6.0; H[1, 2] = 1.0
+    # H_8 = x^8 - 28x^6 + 210x^4 - 420x^2 + 105
+    H[2, 0] = 105.0; H[2, 1] = -420.0; H[2, 2] = 210.0; H[2, 3] = -28.0; H[2, 4] = 1.0
+    # H_12 = x^12 - 66x^10 + 1155x^8 - 6930x^6 + 13860x^4 - 7560x^2 + 945
+    H[3, 0] = 945.0; H[3, 1] = -7560.0; H[3, 2] = 13860.0; H[3, 3] = -6930.0
+    H[3, 4] = 1155.0; H[3, 5] = -66.0; H[3, 6] = 1.0
+    return H
+
+def _compute_moments():
+    """
+    Precompute I[n] = integral x^{2n} e^{-x^2} dx for n=0..12.
+    I[n] = (2n-1)!! * sqrt(pi) / 2^n
+    """
+    I = np.zeros(13)
+    sp = np.sqrt(np.pi)
+    I[0] = sp
+    for n in range(1, 13):
+        I[n] = I[n-1] * (2.0*n - 1.0) / (4.0 * n)
+    return I
+
+_H = _hermite_coeffs()
+_I = _compute_moments()
+_SIGN = np.array([1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0])
+
+# Precompute moment matrices for faster evaluation
+# M0[i, j] = I[i+j], M2[i, j] = I[1+i+j]
+M0 = np.zeros((7, 7))
+M2 = np.zeros((7, 7))
+for i in range(7):
+    for j in range(7):
+        M0[i, j] = _I[i+j]
+        M2[i, j] = _I[1+i+j]
+
+def _calc_bound_and_grad(params):
+    """
+    Compute the uncertainty bound A(f)*A(F) and its gradient.
+    params = [a0, a4, a8]
+    a12 is determined by P(0)=0 constraint: a0 + 3a4 + 105a8 + 945a12 = 0
+    """
+    a0, a4, a8 = params[0], params[1], params[2]
+    # Constraint: sum c_i H_i(0) = 0 => a0*1 + a4*3 + a8*105 + a12*945 = 0
+    a12 = -(a0 + 3.0*a4 + 105.0*a8) / 945.0
+    
+    coeffs = np.array([a0, a4, a8, a12])
+    p = coeffs @ _H  # shape (7,)
+    
+    # Moments for position space: m_k = int x^{2k} |P|^2 e^{-x^2} dx
+    # m0 = p^T M0 p
+    # m2 = p^T M2 p
+    m0 = p @ M0 @ p
+    m2 = p @ M2 @ p
+    
+    # Moments for frequency space
+    # q = p * (-1)^k
+    q = p * _SIGN
+    n0 = 2.0 * np.pi * (q @ M0 @ q)
+    n2 = 2.0 * np.pi * (q @ M2 @ q)
+    
+    if m0 <= 1e-30 or n0 <= 1e-30 or not np.isfinite(m0) or not np.isfinite(n0):
+        return 1e18, np.array([1e18, 1e18, 1e18])
+        
+    vf = m2 / m0
+    vF = n2 / n0
+    
+    if vf <= 0 or vF <= 0:
+        return 1e18, np.array([1e18, 1e18, 1e18])
+        
+    bound = np.sqrt(vf * vF)
+    
+    # Gradient calculation
+    # d(bound)/da_c = (vF * d(vf)/da_c + vf * d(vF)/da_c) / (2*bound)
+    # d(vf)/da_c = (dm2 * m0 - m2 * dm0) / m0^2
+    # dm0 = 2 * p^T M0 dp_c, where dp_c = H_c + da12_c H_3
+    # dm2 = 2 * p^T M2 dp_c
+    
+    # Derivatives of a12 w.r.t a0, a4, a8
+    da12 = np.array([-1.0/945.0, -3.0/945.0, -105.0/945.0])
+    
+    grad = np.zeros(3)
+    for c in range(3):
+        # dp = H[c] + da12[c]*H[3]
+        dp = _H[c, :] + da12[c] * _H[3, :]
+        
+        # dm0 = 2 * p^T M0 dp
+        # dm2 = 2 * p^T M2 dp
+        dm0 = 2.0 * (p @ M0 @ dp)
+        dm2 = 2.0 * (p @ M2 @ dp)
+        
+        dq = dp * _SIGN
+        # dn0 = 4*pi * q^T M0 dq
+        # dn2 = 4*pi * q^T M2 dq
+        dn0 = 4.0 * np.pi * (q @ M0 @ dq)
+        dn2 = 4.0 * np.pi * (q @ M2 @ dq)
+        
+        dvm = (dm2 * m0 - m2 * dm0) / (m0 * m0)
+        dvn = (dn2 * n0 - n2 * dn0) / (n0 * n0)
+        
+        grad[c] = (vF * dvm + vf * dvn) / (2.0 * bound)
+        
+    return bound, grad
+
+def _objective(params):
+    val, _ = _calc_bound_and_grad(params)
+    return val
+
+def _objective_grad(params):
+    val, grad = _calc_bound_and_grad(params)
+    return val, grad
+
+def construct():
+    """
+    1. Multi-start local optimization using L-BFGS-B.
+    2. Final high-precision polish.
+    """
+    # Seed point from previous best
+    seed_params = np.array([-1.13, 0.04, 0.000308642])
+    
+    # Generate a set of multi-start points around the seed
+    # The landscape is smooth, so local minima are likely close to the seed.
+    # We will use a grid of perturbations.
+    start_points = [seed_params.copy()]
+    
+    # Add perturbations
+    for dx in [-0.1, -0.01, 0.01, 0.1]:
+        for dy in [-0.01, 0.01]:
+            for dz in [-0.0001, 0.0001]:
+                p = seed_params.copy()
+                p[0] += dx
+                p[1] += dy
+                p[2] += dz
+                start_points.append(p)
+    
+    # Add some wider exploratory points
+    for dx in [-0.5, 0.5]:
+        for dy in [-0.1, 0.1]:
+            for dz in [-0.001, 0.001]:
+                p = seed_params.copy()
+                p[0] += dx
+                p[1] += dy
+                p[2] += dz
+                start_points.append(p)
+    
+    best_val = np.inf
+    best_params = seed_params
+    
+    # Run L-BFGS-B from each start point
+    for sp in start_points:
+        if time.time() > _DEADLINE - 5:
+            break
+        try:
+            res = minimize(
+                _objective_grad, 
+                sp, 
+                method='L-BFGS-B', 
+                jac=True, 
+                options={'maxiter': 1000, 'ftol': 1e-15, 'gtol': 1e-14}
+            )
+            if res.fun < best_val and np.isfinite(res.fun):
+                best_val = res.fun
+                best_params = res.x.copy()
+        except Exception:
+            pass
+    
+    # Final high-precision polish from the best point found
+    if time.time() < _DEADLINE - 2:
+        try:
+            res_final = minimize(
+                _objective_grad, 
+                best_params, 
+                method='L-BFGS-B', 
+                jac=True, 
+                options={'maxiter': 2000, 'ftol': 1e-16, 'gtol': 1e-15}
+            )
+            if res_final.fun < best_val and np.isfinite(res_final.fun):
+                best_val = res_final.fun
+                best_params = res_final.x.copy()
+        except Exception:
+            pass
+
+    return np.array(best_params)
+# EVOLVE-BLOCK-END
