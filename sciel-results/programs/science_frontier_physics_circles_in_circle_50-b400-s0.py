@@ -52,7 +52,6 @@ def _get_initial_hex_lattice(n):
 def _get_ring_initialization(n, num_rings=3):
     """Generate ring-based initialization."""
     centers = []
-    # Center point
     centers.append([0.0, 0.0])
     
     remaining = n - 1
@@ -116,7 +115,8 @@ def _objective_and_gradient(params, n, beta):
     i_idx, j_idx = np.triu_indices(n, k=1)
     pair_dists = dists[i_idx, j_idx]
     
-    vals = np.concatenate([pair_dists / 2.0, 1.0 - np.linalg.norm(centers, axis=1)])
+    norms = np.linalg.norm(centers, axis=1)
+    vals = np.concatenate([pair_dists / 2.0, 1.0 - norms])
     
     obj = -_soft_min(vals, beta)
     
@@ -129,6 +129,8 @@ def _objective_and_gradient(params, n, beta):
     pair_weights = weights[:n*(n-1)//2]
     for k in range(len(pair_weights)):
         w = pair_weights[k]
+        if w < 1e-10:
+            continue
         i, j = i_idx[k], j_idx[k]
         d = dists[i, j]
         if d > 1e-8:
@@ -137,9 +139,10 @@ def _objective_and_gradient(params, n, beta):
             grad[j] -= w * vec / 2.0
             
     bound_weights = weights[n*(n-1)//2:]
-    norms = np.linalg.norm(centers, axis=1)
     for i in range(n):
         w = bound_weights[i]
+        if w < 1e-10:
+            continue
         if norms[i] > 1e-8:
             grad[i] -= w * centers[i] / norms[i]
         
@@ -179,6 +182,54 @@ def _polish(centers, start_time):
     
     return current, best_score
 
+def _local_search(centers, start_time, max_iters=30, step_size=0.02):
+    """Simple local search with random perturbations."""
+    current = centers.copy()
+    current_score = _compute_score(current)
+    rng = np.random.default_rng(12345)
+    
+    for it in range(max_iters):
+        if time.time() - start_time > DEADLINE - 20:
+            break
+        
+        # Try random perturbation
+        noisy = current + rng.normal(0, step_size, current.shape)
+        
+        # Keep inside container
+        norms = np.linalg.norm(noisy, axis=1)
+        mask = norms > 0.95
+        if np.any(mask):
+            noisy[mask] *= 0.95 / norms[mask]
+        
+        # Optimize the perturbed solution
+        optimized = _optimize_from_start(noisy, beta=100.0, maxiter=40, gtol=1e-7)
+        if np.all(np.isfinite(optimized)):
+            r = _compute_score(optimized)
+            if r > current_score:
+                current_score = r
+                current = optimized.copy()
+    
+    return current, current_score
+
+def _final_high_precision_polish(centers, start_time):
+    """Final high-precision polish with very high beta and tight tolerances."""
+    current = centers.copy()
+    best_score = _compute_score(current)
+    
+    # Very high beta for near-exact min
+    for beta in [1000.0, 2000.0, 5000.0]:
+        if time.time() - start_time > DEADLINE - 5:
+            break
+        
+        polished = _optimize_from_start(current, beta, maxiter=100, gtol=1e-9)
+        if np.all(np.isfinite(polished)):
+            r = _compute_score(polished)
+            if r > best_score:
+                best_score = r
+                current = polished
+    
+    return current, best_score
+
 def construct():
     start_time = time.time()
     best_score = 0.0
@@ -191,11 +242,12 @@ def construct():
         _get_random_initialization(N, seed=42),
         _get_random_initialization(N, seed=123),
         _get_random_initialization(N, seed=999),
+        _get_random_initialization(N, seed=555),
     ]
     
     # First pass: optimize each initialization with moderate beta
     for init in initializations:
-        if time.time() - start_time > DEADLINE - 30:
+        if time.time() - start_time > DEADLINE - 40:
             break
         
         # Ensure all points are inside
@@ -213,32 +265,16 @@ def construct():
                 best_centers = optimized.copy()
     
     # Second pass: polish the best solution
-    if best_centers is not None and time.time() - start_time < DEADLINE - 20:
+    if best_centers is not None and time.time() - start_time < DEADLINE - 25:
         best_centers, best_score = _polish(best_centers, start_time)
     
-    # Third pass: try to improve with small perturbations of the best
-    if best_centers is not None and time.time() - start_time < DEADLINE - 10:
-        rng = np.random.default_rng(7)
-        for _ in range(5):
-            if time.time() - start_time > DEADLINE - 10:
-                break
-            
-            noisy = best_centers + rng.normal(0, 0.01, best_centers.shape)
-            norms = np.linalg.norm(noisy, axis=1)
-            mask = norms > 0.95
-            if np.any(mask):
-                noisy[mask] *= 0.95 / norms[mask]
-            
-            optimized = _optimize_from_start(noisy, beta=100.0, maxiter=40, gtol=1e-7)
-            if np.all(np.isfinite(optimized)):
-                r = _compute_score(optimized)
-                if r > best_score:
-                    best_score = r
-                    best_centers = optimized.copy()
-        
-        # Final polish
-        if time.time() - start_time < DEADLINE - 5:
-            best_centers, best_score = _polish(best_centers, start_time)
+    # Third pass: local search with perturbations
+    if best_centers is not None and time.time() - start_time < DEADLINE - 15:
+        best_centers, best_score = _local_search(best_centers, start_time, max_iters=20, step_size=0.015)
+    
+    # Fourth pass: final high-precision polish
+    if best_centers is not None and time.time() - start_time < DEADLINE - 5:
+        best_centers, best_score = _final_high_precision_polish(best_centers, start_time)
     
     if best_centers is None:
         return initializations[0]
