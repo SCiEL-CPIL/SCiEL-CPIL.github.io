@@ -1,0 +1,1 @@
+Σ_r U[i*m+j, r] · V[j'*p+k, r] · W[k*n+i, r] = δ_{j,j'}
