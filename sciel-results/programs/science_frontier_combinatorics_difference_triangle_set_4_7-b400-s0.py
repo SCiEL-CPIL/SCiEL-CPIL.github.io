@@ -58,7 +58,7 @@ def construct(n_rows, k):
                 diffs.add(row[j] - row[i])
         return diffs
 
-    def try_reduce_row(rows, row_idx, used_other, max_attempts=100):
+    def try_reduce_row(rows, row_idx, used_other, max_attempts=150):
         """Try to find a row at row_idx with smaller max entry (same k+1 size)."""
         current_row = rows[row_idx]
         current_max = max(current_row)
@@ -72,15 +72,15 @@ def construct(n_rows, k):
             current_row_diffs = set()
             success = True
             # Randomized greedy for this row to escape local minima in row construction
-            jitter = 0.1 if attempt > 10 else 0.0
+            jitter = 0.15 if attempt > 15 else 0.0
             while len(row) < k + 1:
                 found = False
                 # Look ahead a bit
-                for trial_x in range(x + 1, x + 50):
+                for trial_x in range(x + 1, x + 80):
                     new = {trial_x - a for a in row}
                     if not (new & used_other) and not (new & current_row_diffs):
                         # Apply jitter: sometimes skip a valid candidate to explore
-                        if jitter > 0 and random.random() < jitter and trial_x < 200:
+                        if jitter > 0 and random.random() < jitter and trial_x < 250:
                             continue
                         row.append(trial_x)
                         current_row_diffs |= new
@@ -104,7 +104,7 @@ def construct(n_rows, k):
         improved = True
         # Limit the number of full passes to avoid spending too much time here
         # if we are in an ILS loop
-        max_passes = 5 
+        max_passes = 6
         pass_count = 0
         while improved and time_left() > 5 and pass_count < max_passes:
             improved = False
@@ -117,7 +117,7 @@ def construct(n_rows, k):
                 for j in range(n_rows):
                     if j != i:
                         used_other |= row_diffs_set(rows[j])
-                new_row, new_max = try_reduce_row(rows, i, used_other, max_attempts=50)
+                new_row, new_max = try_reduce_row(rows, i, used_other, max_attempts=80)
                 if new_max < max(rows[i]):
                     old_scope = scope(rows)
                     rows[i] = new_row
@@ -145,18 +145,18 @@ def construct(n_rows, k):
             current_row_diffs = set()
             success = False
             # Try a few times to find a valid row, even if larger
-            for attempt in range(20):
+            for attempt in range(25):
                 row, x = [0], 0
                 current_row_diffs = set()
                 valid_row = True
                 while len(row) < k + 1:
                     found = False
                     # Wider search range for kicks
-                    for trial_x in range(x + 1, x + 100):
+                    for trial_x in range(x + 1, x + 120):
                         new = {trial_x - a for a in row}
                         if not (new & used_other) and not (new & current_row_diffs):
                             # High jitter: skip valid candidates often
-                            if random.random() < 0.4 and trial_x < 300:
+                            if random.random() < 0.45 and trial_x < 350:
                                 continue
                             row.append(trial_x)
                             current_row_diffs |= new
@@ -168,8 +168,6 @@ def construct(n_rows, k):
                     x = row[-1]
                 
                 if valid_row:
-                    # Check if this new row is valid with the rest (it should be by construction)
-                    # But we must ensure it doesn't conflict with itself (handled) and others (handled)
                     rows[idx] = row
                     success = True
                     break
