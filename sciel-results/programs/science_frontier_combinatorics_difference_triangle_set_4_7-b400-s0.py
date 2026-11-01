@@ -14,26 +14,23 @@ def construct(n_rows, k):
     d = k * (k + 1) // 2
     total_diffs = n_rows * d
 
-    # Simple counting bound
-    m_min = 0
-    while m_min * (m_min + 1) // 2 < total_diffs:
-        m_min += 1
-    lower_bound = m_min
-
     def get_scope(rows):
         return max(max(r) for r in rows)
 
-    def full_validate(rows):
-        """Return True if all positive differences across all rows are distinct."""
+    def full_validate_scope(rows):
+        """Return scope if valid, else None."""
         seen = set()
+        scope = 0
         for row in rows:
             for i in range(len(row)):
+                ri = row[i]
                 for j in range(i + 1, len(row)):
-                    diff = row[j] - row[i]
+                    diff = row[j] - ri
                     if diff in seen:
-                        return False
+                        return None
                     seen.add(diff)
-        return True
+            scope = max(scope, max(row))
+        return scope
 
     def greedy_init():
         used = set()
@@ -56,19 +53,84 @@ def construct(n_rows, k):
 
     rng = random.Random(42)
 
-    def full_validate_scope(rows):
-        """Return scope if valid, else None."""
-        seen = set()
-        scope = 0
-        for row in rows:
-            for i in range(len(row)):
-                for j in range(i + 1, len(row)):
-                    diff = row[j] - row[i]
-                    if diff in seen:
-                        return None
-                    seen.add(diff)
-            scope = max(scope, max(row))
-        return scope
+    def row_diffs_set(row):
+        s = set()
+        n = len(row)
+        for i in range(n):
+            ri = row[i]
+            for j in range(i + 1, n):
+                s.add(row[j] - ri)
+        return s
+
+    def targeted_descent(rows, budget):
+        """Try to reduce the scope by shrinking the largest mark in the row that has it.
+        Returns (improved_rows, new_scope) or (None, None) if no improvement found within budget."""
+        start = time.time()
+        cur = [r[:] for r in rows]
+        cur_scope = get_scope(cur)
+        improved = False
+
+        while time.time() - start < budget:
+            # Find the row(s) containing the current max
+            max_val = max(max(r) for r in cur)
+            max_rows = [r for r in range(n_rows) if max(cur[r]) == max_val]
+            r = rng.choice(max_rows)
+            row = cur[r]
+            # The last element is the max of this row
+            pos = len(row) - 1
+            old_val = row[pos]
+            lower = row[pos - 1] + 1
+
+            if old_val <= lower:
+                continue
+
+            # Try a set of candidate values: prefer values just above the lower bound
+            # to maximize the reduction, but also sample a few random ones
+            candidates = set()
+            # Sequential near the bottom (best reduction)
+            for v in range(lower, min(lower + 15, old_val)):
+                candidates.add(v)
+            # Some random samples in the middle
+            for _ in range(10):
+                candidates.add(rng.randint(lower, old_val - 1))
+
+            for new_val in sorted(candidates, key=lambda x: -x):  # try larger reductions first
+                if new_val >= old_val:
+                    continue
+                row[pos] = new_val
+                scope = full_validate_scope(cur)
+                if scope is not None:
+                    if scope < cur_scope:
+                        cur_scope = scope
+                        improved = True
+                        break
+                row[pos] = old_val
+
+            if not improved:
+                # Try reducing a non-last element in the max row
+                pos2 = rng.randint(1, len(row) - 2)
+                old2 = row[pos2]
+                lo2 = row[pos2 - 1] + 1
+                hi2 = row[pos2 + 1] - 1
+                if hi2 <= lo2:
+                    continue
+                for _ in range(5):
+                    nv = rng.randint(lo2, hi2)
+                    if nv == old2:
+                        continue
+                    row[pos2] = nv
+                    scope = full_validate_scope(cur)
+                    if scope is not None and scope < cur_scope:
+                        cur_scope = scope
+                        improved = True
+                        break
+                    row[pos2] = old2
+                if not improved:
+                    break
+
+        if improved:
+            return cur, cur_scope
+        return None, None
 
     # Simulated annealing with restarts
     max_restarts = 300
@@ -83,7 +145,7 @@ def construct(n_rows, k):
             cur = [r[:] for r in best_rows]
         else:
             cur = [r[:] for r in best_rows]
-            # Perturb
+            # Perturb: random row, random mark, random new value
             for _ in range(rng.randint(1, 3)):
                 ri = rng.randrange(n_rows)
                 pos = rng.randint(1, len(cur[ri]) - 1)
@@ -130,8 +192,19 @@ def construct(n_rows, k):
                 else:
                     cur[ri][pos] = old_val
             else:
+                # Invalid: reject
                 cur[ri][pos] = old_val
 
             T *= 0.99995
+
+        # After annealing, run a short targeted descent to try to squeeze scope further
+        if time.time() < deadline - 5.0:
+            desc_rows, desc_scope = targeted_descent(cur, budget=2.0)
+            if desc_rows is not None and desc_scope < best_scope:
+                best_scope = desc_scope
+                best_rows = desc_rows
+
+    if best_rows is None:
+        best_rows = greedy_init()
 
     return best_rows
