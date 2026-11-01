@@ -1,0 +1,1 @@
+I need to verify whether a rank-5 decomposition exists for 2×2 × 2×3 matrix multiplication, then use it to build a rank-20 solution for the full 2×2 × 2×12 problem. Let me construct and verify this computationally.
