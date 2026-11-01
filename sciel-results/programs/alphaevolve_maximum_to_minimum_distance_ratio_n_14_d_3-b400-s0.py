@@ -1,6 +1,7 @@
 import numpy as np
 import time
 from scipy.optimize import minimize
+from scipy.spatial.transform import Rotation
 
 N = 14
 D = 3
@@ -20,75 +21,91 @@ def raw_score(points):
     Calculate the actual score: (max_dist / min_dist)^2.
     """
     sq_dists = get_pairwise_sq_dists(points)
-    min_d = np.min(sq_dists)
-    if min_d < 1e-12:
+    if np.min(sq_dists) < 1e-12:
         return np.inf
-    return (np.max(sq_dists) / min_d)
+    return (np.max(sq_dists) / np.min(sq_dists))
 
-def normalize_points(points):
+def objective_log_ratio(x, tau=50.0):
     """
-    Center and normalize points to unit mean squared norm.
-    This removes translational and scale invariance.
-    """
-    points = points - np.mean(points, axis=0)
-    mean_norm_sq = np.mean(np.sum(points**2, axis=1))
-    if mean_norm_sq > 1e-12:
-        points = points / np.sqrt(mean_norm_sq)
-    return points
-
-def objective_smooth(x, tau=100.0):
-    """
-    Smooth approximation of the log ratio of max to min squared distance.
-    Uses Log-Sum-Exp for soft max and soft min.
+    Smooth approximation of log(max_sq_dist) - log(min_sq_dist).
+    Minimizing this minimizes the ratio of max to min distance.
     """
     points = x.reshape(N, D)
-    points = normalize_points(points)
     
+    # Center the points to remove translation invariance
+    points = points - np.mean(points, axis=0, keepdims=True)
+    
+    # Normalize to fix scale: make the mean squared distance = 1
     sq_dists = get_pairwise_sq_dists(points)
-    sq_dists = np.maximum(sq_dists, 1e-12)
+    mean_sq_dist = np.mean(sq_dists)
+    if mean_sq_dist < 1e-12:
+        return 1e10
+    points = points / np.sqrt(mean_sq_dist)
     
-    # Soft max
-    m_max = np.max(sq_dists)
-    exp_max = np.exp(tau * (sq_dists - m_max))
-    log_sum_exp_max = m_max + np.log(np.sum(exp_max)) / tau
+    # Recompute squared distances after normalization
+    sq_dists = get_pairwise_sq_dists(points)
+    sq_dists = np.maximum(sq_dists, 1e-15)
     
-    # Soft min
-    m_min = np.min(sq_dists)
-    exp_min = np.exp(-tau * (sq_dists - m_min))
-    log_sum_exp_min = m_min - np.log(np.sum(exp_min)) / tau
+    # Soft max of log(squared distances)
+    log_sq_dists = np.log(sq_dists)
+    m_max_log = np.max(log_sq_dists)
+    exp_max = np.exp(tau * (log_sq_dists - m_max_log))
+    soft_max_log = m_max_log + np.log(np.sum(exp_max)) / tau
     
-    # Minimize log(soft_max) - log(soft_min)
-    obj_val = np.log(log_sum_exp_max) - np.log(log_sum_exp_min)
+    # Soft min of log(squared distances)
+    m_min_log = np.min(log_sq_dists)
+    exp_min = np.exp(-tau * (log_sq_dists - m_min_log))
+    soft_min_log = m_min_log - np.log(np.sum(exp_min)) / tau
     
-    return obj_val
+    # Objective is the difference (log ratio)
+    obj = soft_max_log - soft_min_log
+    
+    return obj
 
-def objective_qcqp(x, t_min, t_max, lam=10.0):
+def objective_epigraph(x, tau=50.0):
     """
-    QCQP-style objective:
-    Minimize the ratio of max to min squared distance by penalizing violations
-    of lower bound t_min and upper bound t_max, while also directly minimizing
-    the ratio term to drive the bounds tighter.
+    Epigraph formulation: minimize t subject to constraints.
+    Uses smooth approximation of constraints.
+    x = [points_flat, t] where t is the log ratio.
     """
-    points = x.reshape(N, D)
-    points = normalize_points(points)
+    n_params = N * D
+    points = x[:n_params].reshape(N, D)
+    t = x[n_params]
     
+    # Center the points to remove translation invariance
+    points = points - np.mean(points, axis=0, keepdims=True)
+    
+    # Normalize to fix scale: make the mean squared distance = 1
     sq_dists = get_pairwise_sq_dists(points)
-    sq_dists = np.maximum(sq_dists, 1e-12)
+    mean_sq_dist = np.mean(sq_dists)
+    if mean_sq_dist < 1e-12:
+        return 1e10
+    points = points / np.sqrt(mean_sq_dist)
     
-    # Penalty for distances below t_min
-    viol_min = np.sum(np.maximum(t_min - sq_dists, 0)**2)
+    # Recompute squared distances after normalization
+    sq_dists = get_pairwise_sq_dists(points)
+    sq_dists = np.maximum(sq_dists, 1e-15)
+    log_sq_dists = np.log(sq_dists)
     
-    # Penalty for distances above t_max
-    viol_max = np.sum(np.maximum(sq_dists - t_max, 0)**2)
+    # Soft max of log(squared distances)
+    m_max_log = np.max(log_sq_dists)
+    exp_max = np.exp(tau * (log_sq_dists - m_max_log))
+    soft_max_log = m_max_log + np.log(np.sum(exp_max)) / tau
     
-    # Direct ratio term (smoothed)
-    ratio = np.max(sq_dists) / np.min(sq_dists)
+    # Soft min of log(squared distances)
+    m_min_log = np.min(log_sq_dists)
+    exp_min = np.exp(-tau * (log_sq_dists - m_min_log))
+    soft_min_log = m_min_log - np.log(np.sum(exp_min)) / tau
     
-    return ratio + lam * (viol_min + viol_max)
+    # Penalty if soft_max - soft_min > t
+    violation = soft_max_log - soft_min_log - t
+    penalty = np.maximum(0, violation) ** 2
+    
+    return t + 100.0 * penalty
 
 def construct():
     start_time = time.time()
-    timeout = 140.0 # Safety margin
+    timeout = 148.0  # Safety margin before 150s
     
     best_score = np.inf
     best_points = None
@@ -100,7 +117,10 @@ def construct():
         pts = np.asarray(pts)
         if pts.shape != (N, D):
             return
-        pts = normalize_points(pts)
+        # Check for duplicate points
+        sq_dists = get_pairwise_sq_dists(pts)
+        if np.min(sq_dists) < 1e-10:
+            return
         score = raw_score(pts)
         if score < best_score:
             best_score = score
@@ -108,16 +128,10 @@ def construct():
 
     rng = np.random.default_rng(42)
     
-    # Generate initial candidates
+    # Generate diverse initial candidates
     candidates = []
     
-    # 1. Random points on sphere
-    for _ in range(20):
-        pts = rng.normal(size=(N, D))
-        pts = pts / np.linalg.norm(pts, axis=1, keepdims=True)
-        candidates.append(pts.flatten())
-        
-    # 2. Icosahedron + 2 random points
+    # 1. Icosahedron + 2 points (various placements)
     phi = (1 + np.sqrt(5)) / 2
     ico = np.array([
         [0, 1, phi], [0, 1, -phi], [0, -1, phi], [0, -1, -phi],
@@ -126,136 +140,217 @@ def construct():
     ], dtype=float)
     ico = ico / np.linalg.norm(ico, axis=1, keepdims=True)
     
-    # Symmetric candidate: Ico + Poles
-    p_top = np.array([0, 0, 1.0])
-    p_bot = np.array([0, 0, -1.0])
-    pts_sym = np.vstack([ico, p_top.reshape(1, D), p_bot.reshape(1, D)])
-    candidates.append(pts_sym.flatten())
+    # Add 2 points at various symmetric positions
+    for i in range(8):
+        pts = ico.copy()
+        p1 = rng.normal(size=D)
+        p1 = p1 / np.linalg.norm(p1)
+        p2 = rng.normal(size=D)
+        p2 = p2 / np.linalg.norm(p2)
+        full_pts = np.vstack([pts, p1, p2])
+        # Apply random rotation
+        rot = Rotation.from_quat(rng.normal(size=4))
+        full_pts = rot.apply(full_pts)
+        candidates.append(full_pts.flatten())
+
+    # 2. Fibonacci sphere with 14 points
+    def fibonacci_sphere(n, rng):
+        points = []
+        golden_ratio = (1 + np.sqrt(5)) / 2
+        for i in range(n):
+            z = 1 - 2 * i / (n - 1)
+            radius = np.sqrt(1 - z**2)
+            theta = 2 * np.pi * i / golden_ratio
+            x = radius * np.cos(theta)
+            y = radius * np.sin(theta)
+            points.append([x, y, z])
+        pts = np.array(points)
+        rot = Rotation.from_quat(rng.normal(size=4))
+        pts = rot.apply(pts)
+        return pts
     
-    for _ in range(10):
-        p1 = rng.normal(size=D)
-        p2 = rng.normal(size=D)
-        p1 /= np.linalg.norm(p1)
-        p2 /= np.linalg.norm(p2)
-        pts = np.vstack([ico, p1.reshape(1, D), p2.reshape(1, D)])
+    for i in range(6):
+        pts = fibonacci_sphere(N, rng)
         candidates.append(pts.flatten())
 
-    # 3. Cuboctahedron vertices (12 points) + 2 random
-    perms = np.array([
-        [0, 1, 1], [0, 1, -1], [0, -1, 1], [0, -1, -1],
-        [1, 0, 1], [1, 0, -1], [-1, 0, 1], [-1, 0, -1],
-        [1, 1, 0], [1, -1, 0], [-1, 1, 0], [-1, -1, 0]
-    ])
-    cubo = perms / np.linalg.norm(perms, axis=1, keepdims=True)
-    for _ in range(10):
-        p1 = rng.normal(size=D)
-        p2 = rng.normal(size=D)
-        p1 /= np.linalg.norm(p1)
-        p2 /= np.linalg.norm(p2)
-        pts = np.vstack([cubo, p1.reshape(1, D), p2.reshape(1, D)])
+    # 3. Random spherical points
+    for i in range(6):
+        pts = rng.normal(size=(N, D))
+        pts = pts / np.linalg.norm(pts, axis=1, keepdims=True)
+        rot = Rotation.from_quat(rng.normal(size=4))
+        pts = rot.apply(pts)
         candidates.append(pts.flatten())
 
-    # Optimization Loop
+    # 4. Uniform random in cube
+    for i in range(4):
+        pts = rng.uniform(-1, 1, size=(N, D))
+        candidates.append(pts.flatten())
+
+    # 5. Try some structured configurations
+    # Two rings of 7 points each
+    for i in range(3):
+        ring1_angles = np.linspace(0, 2*np.pi, 7, endpoint=False)
+        ring2_angles = ring1_angles + np.pi/7
+        ring1 = np.column_stack([np.cos(ring1_angles), np.sin(ring1_angles), np.zeros(7)])
+        ring2 = np.column_stack([np.cos(ring2_angles), np.sin(ring2_angles), np.full(7, 0.5)])
+        pts = np.vstack([ring1, ring2])
+        rot = Rotation.from_quat(rng.normal(size=4))
+        pts = rot.apply(pts)
+        candidates.append(pts.flatten())
+
     n_restarts = len(candidates)
     
-    # Phase 1: Smooth Log-Ratio Annealing
-    taus = [1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0]
+    # Tau schedule: start low for smooth landscape, increase for precision
+    tau_schedule = [5.0, 15.0, 50.0, 150.0, 500.0, 1500.0]
     
-    # Phase 2: QCQP refinement parameters
-    qcqp_lams = [1.0, 5.0, 10.0, 50.0, 100.0]
-    
+    # Phase 1: Quick optimization with low tau on all candidates
     for i in range(n_restarts):
         if time.time() - start_time > timeout - 15:
             break
-            
-        x0 = candidates[i].copy()
-        x0 = x0.reshape(N, D)
-        x0 = normalize_points(x0)
-        x0 = x0.flatten()
-        
+        x0 = candidates[i]
         try:
-            current_x = x0
-            
-            # Phase 1: Standard smooth optimization
-            for tau in taus:
-                if time.time() - start_time > timeout - 15:
-                    break
-                
-                res = minimize(
-                    objective_smooth, 
-                    current_x, 
-                    method='L-BFGS-B', 
-                    args=(tau,),
-                    options={'maxiter': 100, 'ftol': 1e-12, 'gtol': 1e-8}
-                )
-                
-                if res.x is not None:
-                    current_x = res.x
-                    pts_current = current_x.reshape(N, D)
-                    update_best(pts_current)
-            
-            # Phase 2: QCQP-style refinement
-            if time.time() - start_time < timeout - 10:
-                pts_current = current_x.reshape(N, D)
-                pts_current = normalize_points(pts_current)
-                sq_dists = get_pairwise_sq_dists(pts_current)
-                
-                # Initialize bounds slightly wider than current min/max
-                t_min = np.min(sq_dists) * 0.99
-                t_max = np.max(sq_dists) * 1.01
-                
-                for lam in qcqp_lams:
-                    if time.time() - start_time > timeout - 10:
-                        break
-                    
-                    # Tighten bounds iteratively
-                    for _ in range(3):
-                        if time.time() - start_time > timeout - 10:
-                            break
-                        
-                        res = minimize(
-                            objective_qcqp, 
-                            current_x, 
-                            args=(t_min, t_max, lam),
-                            method='L-BFGS-B',
-                            options={'maxiter': 100, 'ftol': 1e-12, 'gtol': 1e-8}
-                        )
-                        
-                        if res.x is not None:
-                            current_x = res.x
-                            pts_current = current_x.reshape(N, D)
-                            pts_current = normalize_points(pts_current)
-                            sq_dists = get_pairwise_sq_dists(pts_current)
-                            
-                            # Update bounds to current min/max
-                            t_min = np.min(sq_dists)
-                            t_max = np.max(sq_dists)
-                            
-                            update_best(pts_current)
-
-        except Exception:
-            pass
-    
-    # Final high-precision polish pass on best point
-    if best_points is not None and time.time() - start_time < timeout - 5:
-        try:
-            x_polish = best_points.flatten()
-            # Use very high tau for precise max/min
             res = minimize(
-                objective_smooth, 
-                x_polish, 
+                objective_log_ratio, 
+                x0, 
                 method='L-BFGS-B', 
-                args=(10000.0,),
-                options={'maxiter': 500, 'ftol': 1e-14, 'gtol': 1e-10}
+                args=(tau_schedule[0],),
+                options={'maxiter': 80, 'ftol': 1e-10, 'gtol': 1e-8}
             )
             if res.x is not None:
-                pts_polish = res.x.reshape(N, D)
-                update_best(pts_polish)
+                pts = res.x.reshape(N, D)
+                update_best(pts)
+                candidates[i] = res.x
         except Exception:
             pass
 
+    # Phase 2: Progressive tau increase with more iterations
+    for tau_idx in range(1, len(tau_schedule)):
+        if time.time() - start_time > timeout - 10:
+            break
+        tau = tau_schedule[tau_idx]
+        max_iter = 100 + tau_idx * 40
+        for i in range(n_restarts):
+            if time.time() - start_time > timeout - 5:
+                break
+            x0 = candidates[i]
+            try:
+                res = minimize(
+                    objective_log_ratio, 
+                    x0, 
+                    method='L-BFGS-B', 
+                    args=(tau,),
+                    options={'maxiter': max_iter, 'ftol': 1e-12, 'gtol': 1e-10}
+                )
+                if res.x is not None:
+                    pts = res.x.reshape(N, D)
+                    update_best(pts)
+                    candidates[i] = res.x
+            except Exception:
+                pass
+
+    # Phase 3: High-precision polish on the best candidates
+    if time.time() - start_time < timeout - 8:
+        # Sort candidates by their current score
+        scored_candidates = []
+        for i in range(n_restarts):
+            pts = candidates[i].reshape(N, D)
+            score = raw_score(pts)
+            scored_candidates.append((score, i))
+        scored_candidates.sort()
+        
+        # Polish the top 8 candidates with very high tau
+        for score, i in scored_candidates[:8]:
+            if time.time() - start_time > timeout - 4:
+                break
+            x0 = candidates[i]
+            try:
+                res = minimize(
+                    objective_log_ratio, 
+                    x0, 
+                    method='L-BFGS-B', 
+                    args=(tau_schedule[-1],),
+                    options={'maxiter': 400, 'ftol': 1e-14, 'gtol': 1e-12}
+                )
+                if res.x is not None:
+                    pts = res.x.reshape(N, D)
+                    update_best(pts)
+                    candidates[i] = res.x
+            except Exception:
+                pass
+
+    # Phase 4: Final exact local search using SLSQP on true objective
+    if time.time() - start_time < timeout - 3:
+        # Get top candidates
+        scored_candidates = []
+        for i in range(n_restarts):
+            pts = candidates[i].reshape(N, D)
+            score = raw_score(pts)
+            scored_candidates.append((score, i))
+        scored_candidates.sort()
+        
+        def exact_objective(x):
+            pts = x.reshape(N, D)
+            sq_dists = get_pairwise_sq_dists(pts)
+            min_sq = np.min(sq_dists)
+            if min_sq < 1e-12:
+                return 1e10
+            return np.max(sq_dists) / min_sq
+        
+        for score, i in scored_candidates[:5]:
+            if time.time() - start_time > timeout - 2:
+                break
+            x0 = candidates[i]
+            try:
+                res = minimize(
+                    exact_objective, 
+                    x0, 
+                    method='SLSQP',
+                    options={'maxiter': 200, 'ftol': 1e-12}
+                )
+                if res.x is not None:
+                    pts = res.x.reshape(N, D)
+                    update_best(pts)
+            except Exception:
+                pass
+
+    # Phase 5: Additional random restarts if time remains
+    restart_count = 0
+    while time.time() - start_time < timeout - 3:
+        x0 = rng.uniform(-1, 1, size=(N * D))
+        try:
+            res = minimize(
+                objective_log_ratio, 
+                x0, 
+                method='L-BFGS-B', 
+                args=(tau_schedule[2],),
+                options={'maxiter': 100, 'ftol': 1e-10, 'gtol': 1e-8}
+            )
+            if res.x is not None:
+                pts = res.x.reshape(N, D)
+                update_best(pts)
+                
+                # If this is good, do a high-precision polish
+                if raw_score(pts) < best_score * 1.05 and time.time() - start_time < timeout - 2:
+                    try:
+                        res2 = minimize(
+                            objective_log_ratio, 
+                            res.x, 
+                            method='L-BFGS-B', 
+                            args=(tau_schedule[-1],),
+                            options={'maxiter': 200, 'ftol': 1e-14, 'gtol': 1e-12}
+                        )
+                        if res2.x is not None:
+                            pts2 = res2.x.reshape(N, D)
+                            update_best(pts2)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        restart_count += 1
+
     if best_points is None:
-        best_points = normalize_points(candidates[0].reshape(N, D))
+        # Fallback
+        best_points = candidates[0].reshape(N, D)
         best_score = raw_score(best_points)
 
     return best_points
