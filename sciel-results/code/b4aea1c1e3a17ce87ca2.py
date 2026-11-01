@@ -1,0 +1,3 @@
+        covered = set([idx])
+        ...
+        neighbors.append(covered)
