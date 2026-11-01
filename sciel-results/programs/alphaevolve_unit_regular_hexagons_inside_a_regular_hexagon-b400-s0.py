@@ -167,6 +167,46 @@ def construct():
     ]
     candidates.append(axial_20)
 
+    # Additional candidates
+    axial_21 = [
+        (0, 0), (1, 0), (2, 0), (3, 0),
+        (0, 1), (1, 1), (2, 1), (3, 1),
+        (1, 2), (2, 2), (3, 2)
+    ]
+    candidates.append(axial_21)
+
+    axial_22 = [
+        (0, 0), (1, 0), (2, 0),
+        (0, 1), (1, 1), (2, 1), (3, 1),
+        (0, 2), (1, 2), (2, 2),
+        (1, 3)
+    ]
+    candidates.append(axial_22)
+
+    axial_23 = [
+        (0, 0),
+        (1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1),
+        (2, 0), (-2, 0), (0, 2), (0, -2)
+    ]
+    candidates.append(axial_23)
+
+    axial_24 = [
+        (0, 0), (1, 0),
+        (0, 1), (1, 1),
+        (0, 2), (1, 2), (2, 2),
+        (0, 3), (1, 3),
+        (0, 4)
+    ]
+    candidates.append(axial_24)
+
+    axial_25 = [
+        (0, 0), (1, 0), (2, 0),
+        (0, 1), (1, 1),
+        (0, 2), (1, 2), (2, 2),
+        (0, 3), (1, 3), (2, 3)
+    ]
+    candidates.append(axial_25)
+
     def axial_to_cartesian(axial_list):
         pts = []
         for q, r in axial_list:
@@ -218,19 +258,22 @@ def construct():
             ang = beta + math.pi / 6.0 + k * math.pi / 3.0
             normals.append((math.cos(ang), math.sin(ang)))
         
-        projs = []
-        for nx, ny in normals:
-            for px, py in pts:
-                proj = (px - cx) * nx + (py - cy) * ny
-                projs.append(proj)
-                projs.append(-proj)
+        # Collect all projections: for each normal and each point, both +proj and -proj
+        projs = np.array([
+            ((px - cx) * nx + (py - cy) * ny)
+            for nx, ny in normals
+            for px, py in pts
+        ])
+        # We need max over all |proj|, so use both signs
+        all_projs = np.concatenate([projs, -projs])
         
-        projs = np.array(projs)
-        max_val = np.max(projs)
+        max_val = np.max(all_projs)
         if max_val > 100:
             return float('inf'), (cx, cy), float('inf')
         
-        log_sum = np.log(np.sum(np.exp((projs - max_val) / temperature))) + max_val / temperature
+        # Soft max via log-sum-exp
+        shifted = (all_projs - max_val) / temperature
+        log_sum = np.log(np.sum(np.exp(shifted))) + max_val / temperature
         D = temperature * log_sum
         S = (D + APOTHEM) / APOTHEM
         return S, (cx, cy), D
@@ -265,7 +308,7 @@ def construct():
         try:
             if time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN:
                 temperatures = [0.5, 0.2, 0.1, 0.05, 0.02]
-                start_betas = [0.0, math.pi/18, math.pi/12, math.pi/9, best_beta]
+                start_betas = [0.0, math.pi/36, math.pi/18, math.pi/12, math.pi/9, math.pi/6 - math.pi/36, best_beta]
                 
                 for temp in temperatures:
                     if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
@@ -282,7 +325,7 @@ def construct():
                         
                         init = [best_center[0], best_center[1], sb]
                         res = minimize(smooth_obj, init, method='Nelder-Mead',
-                                     options={'maxiter': 500, 'xatol': 1e-10, 'fatol': 1e-10})
+                                     options={'maxiter': 800, 'xatol': 1e-12, 'fatol': 1e-12})
                         
                         if res.fun < 1e10:
                             cx_r, cy_r, beta_r = res.x
@@ -299,8 +342,9 @@ def construct():
             if time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN:
                 def objective(params):
                     cx, cy, beta = params
-                    if beta < 0 or beta > math.pi / 6:
+                    if beta < -1e-6 or beta > math.pi / 6 + 1e-6:
                         return 1e10
+                    beta = ((beta % (math.pi/6)) + math.pi/6) % (math.pi/6)
                     normals = []
                     for k in range(6):
                         ang = beta + math.pi / 6.0 + k * math.pi / 3.0
@@ -310,18 +354,29 @@ def construct():
                     for nx, ny in normals:
                         for px, py in pts:
                             proj = (px - cx) * nx + (py - cy) * ny
-                            max_proj = max(max_proj, proj, -proj)
+                            max_proj = max(max_proj, abs(proj))
                     
                     S = (max_proj + APOTHEM) / APOTHEM
                     return S
                 
-                initial = [best_center[0], best_center[1], best_beta]
-                res = minimize(objective, initial, method='Nelder-Mead',
-                             options={'maxiter': 2000, 'xatol': 1e-15, 'fatol': 1e-15})
-                if res.fun < best_S:
-                    best_S = res.fun
-                    best_center = (res.x[0], res.x[1])
-                    best_beta = res.x[2]
+                # Multiple final polish attempts from different starting points
+                polish_starts = [
+                    [best_center[0], best_center[1], best_beta],
+                    [best_center[0], best_center[1], best_beta + 0.01],
+                    [best_center[0], best_center[1], best_beta - 0.01],
+                    [best_center[0] + 0.01, best_center[1], best_beta],
+                    [best_center[0], best_center[1] + 0.01, best_beta],
+                ]
+                
+                for init in polish_starts:
+                    if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
+                        break
+                    res = minimize(objective, init, method='Nelder-Mead',
+                                 options={'maxiter': 3000, 'xatol': 1e-14, 'fatol': 1e-14})
+                    if res.fun < best_S:
+                        best_S = res.fun
+                        best_center = (res.x[0], res.x[1])
+                        best_beta = ((res.x[2] % (math.pi/6)) + math.pi/6) % (math.pi/6)
         except Exception:
             pass
             
@@ -358,7 +413,8 @@ def construct():
     cx, cy = best_global_center
     angle_deg = math.degrees(best_global_beta)
     
-    SCALE = 1.0 + 1e-10
+    # Use a very small safety margin to ensure no overlap
+    SCALE = 1.0 + 1e-12
     pts_scaled = []
     for x, y in best_global_pts:
         sx = cx + (x - cx) * SCALE
