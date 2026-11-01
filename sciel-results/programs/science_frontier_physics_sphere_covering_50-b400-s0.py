@@ -1,179 +1,284 @@
-import numpy as np
-import scipy.spatial
-import time
-
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
 N = 50
 
-def _covering_radius(points):
-    """
-    Compute the covering radius of the given points on the unit sphere.
-    Returns the radius in radians and the index of the worst point (circumcenter).
-    """
-    # Convex hull of the points
-    try:
-        hull = scipy.spatial.ConvexHull(points)
-    except Exception:
-        # Fallback if hull fails (e.g., points are coplanar or degenerate)
-        # Calculate max distance to nearest point on a grid
-        grid = _generate_grid(100)
-        dists = np.array([np.min(np.arccos(np.clip(np.dot(grid, p), -1, 1))) for p in points])
-        return np.max(dists), -1
-
-    worst_radius = 0
-    worst_facet_idx = -1
-    worst_circumcenter = None
-
-    # Iterate over facets (triangles) of the convex hull
-    for simplex in hull.simplices:
-        a = points[simplex[0]]
-        b = points[simplex[1]]
-        c = points[simplex[2]]
-        
-        # Compute circumcenter of the spherical triangle
-        # Normal to the plane
-        n = np.cross(b - a, c - a)
-        norm_n = np.linalg.norm(n)
-        if norm_n < 1e-10:
-            continue
-        n = n / norm_n
-        
-        # The circumcenter is either n or -n.
-        # We choose the one that is "close" to the triangle (dot product > 0 with a)
-        if np.dot(n, a) < 0:
-            n = -n
-            
-        # Distance from circumcenter to vertices
-        r = np.arccos(np.clip(np.dot(n, a), -1, 1))
-        
-        if r > worst_radius:
-            worst_radius = r
-            worst_facet_idx = simplex[0] # Just an index, we need the simplex
-            # Store simplex indices
-            worst_simplex = simplex
-            worst_circumcenter = n
-
-    return worst_radius, worst_simplex, worst_circumcenter
-
-def _generate_grid(n_theta=50, n_phi=100):
-    """Generate a grid of points on the sphere for fallback evaluation."""
-    theta = np.linspace(0, np.pi, n_theta)
-    phi = np.linspace(0, 2 * np.pi, n_phi)
-    T, P = np.meshgrid(theta, phi, indexing='ij')
-    x = np.sin(T) * np.cos(P)
-    y = np.sin(T) * np.sin(P)
-    z = np.cos(T)
-    return np.column_stack([x.ravel(), y.ravel(), z.ravel()])
-
-def _local_search(points, max_steps=500, step_size=0.1):
-    """
-    Local search to minimize the covering radius.
-    Moves the vertices of the worst facet towards its circumcenter.
-    """
-    current_points = points.copy()
-    best_radius, _, _ = _covering_radius(current_points)
-    
-    for step in range(max_steps):
-        radius, simplex, circumcenter = _covering_radius(current_points)
-        
-        if radius < best_radius:
-            best_radius = radius
-            best_points = current_points.copy()
-            
-        # If radius is very small, we might be stuck or converged
-        if radius < 1e-6:
-            break
-            
-        # Get the 3 points of the worst facet
-        idx1, idx2, idx3 = simplex
-        
-        # Move these points towards the circumcenter
-        # We use a small step size to avoid overshooting
-        alpha = step_size
-        
-        p1 = current_points[idx1]
-        p2 = current_points[idx2]
-        p3 = current_points[idx3]
-        
-        # Move towards circumcenter
-        # new_p = normalize(p + alpha * (circumcenter - p))
-        # This is a gradient step on the distance to the circumcenter
-        
-        # To be more robust, we can move all 3 points
-        new_p1 = p1 + alpha * (circumcenter - p1)
-        new_p2 = p2 + alpha * (circumcenter - p2)
-        new_p3 = p3 + alpha * (circumcenter - p3)
-        
-        # Normalize
-        new_p1 = new_p1 / np.linalg.norm(new_p1)
-        new_p2 = new_p2 / np.linalg.norm(new_p2)
-        new_p3 = new_p3 / np.linalg.norm(new_p3)
-        
-        current_points[idx1] = new_p1
-        current_points[idx2] = new_p2
-        current_points[idx3] = new_p3
-        
-        # Occasionally, we might want to perturb other points to escape local minima
-        # But for now, this greedy approach is fast.
-        
-    return best_points, best_radius
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from scipy.spatial import ConvexHull
+from scipy.optimize import minimize
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 110.0 # 10s margin
+    deadline = start_time + 115.0  # Safety margin for 120s limit
     
-    best_points = None
-    best_radius = np.inf
+    # 1. Initialize with Fibonacci spiral
+    i = np.arange(N) + 0.5
+    z = 1.0 - 2.0 * i / N
+    phi = np.pi * (1.0 + np.sqrt(5.0)) * i
+    r = np.sqrt(1.0 - z * z)
+    x0 = np.column_stack([r * np.cos(phi), r * np.sin(phi), z]).flatten()
     
-    # Number of restarts
-    n_restarts = 20
+    def get_covering_radius_and_grads(x_flat):
+        """
+        Computes the covering radius and the gradient of the radius w.r.t the flattened coordinates.
+        The covering radius R is the maximum over all facets F of the convex hull of the distance 
+        from the circumcenter of F to the vertices of F (if the circumcenter is inside the spherical triangle).
+        If the circumcenter is outside, the max distance is at the midpoint of the longest edge.
+        
+        For simplicity and robustness in the optimizer, we approximate the gradient by 
+        considering only the active facets (those defining the max radius).
+        """
+        pts = x_flat.reshape(N, 3)
+        # Renormalize to ensure we are on the sphere
+        norms = np.linalg.norm(pts, axis=1, keepdims=True)
+        pts = pts / norms
+        
+        try:
+            hull = ConvexHull(pts)
+        except Exception:
+            # If hull fails, return a large penalty and zero gradient
+            return 1.0, np.zeros_like(x_flat)
+        
+        max_r = 0.0
+        active_facets = []
+        
+        # Precompute distances for all facets
+        facet_data = []
+        for simplex in hull.simplices:
+            i, j, k = simplex
+            p1, p2, p3 = pts[i], pts[j], pts[k]
+            
+            # Compute circumcenter of the planar triangle p1, p2, p3
+            u = p2 - p1
+            v = p3 - p1
+            uu = np.dot(u, u)
+            vv = np.dot(v, v)
+            uv = np.dot(u, v)
+            
+            det = uu * vv - uv * uv
+            if abs(det) < 1e-10:
+                continue
+                
+            a = (0.5 * uu * vv - 0.5 * uv * vv) / det
+            b = (0.5 * vv * uu - 0.5 * uu * uv) / det
+            
+            c_planar = p1 + a * u + b * v
+            c_norm = np.linalg.norm(c_planar)
+            if c_norm < 1e-10:
+                continue
+                
+            c_sph = c_planar / c_norm
+            
+            # Check if c_sph is inside the spherical triangle.
+            # A point is inside if it is on the same side of each edge as the opposite vertex.
+            # We use the dot product with the normal of the plane defined by the edge and the origin?
+            # Actually, for a spherical triangle, the circumcenter is inside if and only if 
+            # the triangle is "acute" in some sense? 
+            # A robust check: The circumcenter c is inside the cone generated by p1, p2, p3.
+            # This is equivalent to c being a positive linear combination of p1, p2, p3.
+            # Solve c = alpha*p1 + beta*p2 + gamma*p3. If alpha, beta, gamma > 0, it's inside.
+            # We can solve the 3x3 system [p1 p2 p3] * [alpha beta gamma]^T = c.
+            P = np.column_stack([p1, p2, p3])
+            try:
+                coeffs = np.linalg.solve(P, c_sph)
+                if np.all(coeffs > -1e-6): # Allow small numerical error
+                    is_inside = True
+                else:
+                    is_inside = False
+            except np.linalg.LinAlgError:
+                is_inside = False
+                
+            if is_inside:
+                d_c = np.arccos(np.clip(np.dot(c_sph, p1), -1.0, 1.0))
+                facet_data.append((simplex, c_sph, d_c, 'center'))
+            else:
+                # If outside, the max distance is at the midpoint of the longest edge
+                # We approximate this by checking the midpoints of the 3 edges
+                m12 = (p1 + p2) / np.linalg.norm(p1 + p2)
+                m23 = (p2 + p3) / np.linalg.norm(p2 + p3)
+                m31 = (p3 + p1) / np.linalg.norm(p3 + p1)
+                
+                d_m12 = np.arccos(np.clip(np.dot(m12, p1), -1.0, 1.0))
+                d_m23 = np.arccos(np.clip(np.dot(m23, p2), -1.0, 1.0))
+                d_m31 = np.arccos(np.clip(np.dot(m31, p3), -1.0, 1.0))
+                
+                max_d = max(d_m12, d_m23, d_m31)
+                if d_m12 == max_d:
+                    facet_data.append((simplex, m12, d_m12, 'edge12'))
+                elif d_m23 == max_d:
+                    facet_data.append((simplex, m23, d_m23, 'edge23'))
+                else:
+                    facet_data.append((simplex, m31, d_m31, 'edge31'))
+            
+            if facet_data[-1][2] > max_r:
+                max_r = facet_data[-1][2]
+        
+        if not facet_data:
+            return 1.0, np.zeros_like(x_flat)
+        
+        # Identify active facets (those contributing to the max radius)
+        # We use a tolerance to include facets close to the max
+        tol = 1e-4
+        for idx, (simplex, y, d, type) in enumerate(facet_data):
+            if d >= max_r - tol:
+                active_facets.append(idx)
+        
+        # Compute gradient
+        # The gradient of the max function is the average of the gradients of the active functions.
+        # f_i(x) = dist(y_i, p_nearest). 
+        # For a circumcenter y of facet (i,j,k), the distance is dist(y, p_i) (and p_j, p_k).
+        # The gradient of dist(y, p) w.r.t p is -y / sqrt(1 - (y.p)^2).
+        # Since we want to MINIMIZE the radius, we move p in the direction of -grad(f) = grad(dist)? 
+        # No, we want to reduce the radius. 
+        # f = max(dist). To reduce f, we should move points to increase the min distance? 
+        # Wait, the objective is to MINIMIZE the covering radius. 
+        # The covering radius is the MAX over y of min_i dist(y, p_i).
+        # So we want to make the "worst" y closer to some p_i.
+        # This means we should move p_i TOWARDS y.
+        # The gradient of dist(y, p) w.r.t p is -y / sqrt(...). 
+        # So -grad(dist) is y / sqrt(...). 
+        # Moving p in direction y increases the distance? No.
+        # Let's check: p = y. dist = 0. Move p slightly towards -y. dist increases.
+        # So grad(dist) points in direction that increases dist.
+        # We want to DECREASE the max dist. So we should move p in direction -grad(dist) = -(-y/...) = y/... ?
+        # Wait. If we move p towards y, dist decreases.
+        # Vector from p to y is y - p.
+        # Grad of dist(y,p) w.r.t p is -y / sqrt(1-(y.p)^2).
+        # Let's verify. f(p) = arccos(y.p). df/dp = -1/sqrt(1-(y.p)^2) * y.
+        # So the gradient points in direction -y (normalized by factor).
+        # If we move p in direction -grad, we move in direction y.
+        # Moving p towards y decreases the distance.
+        # So the gradient of the objective function (which we want to minimize) is the sum of gradients of active dists.
+        # grad(f) = sum_{active} -y / sqrt(1-(y.p_nearest)^2).
+        # We want to minimize f, so we use -grad(f) as the search direction in L-BFGS? 
+        # No, scipy.optimize.minimize expects the gradient of the function to be minimized.
+        # So we return grad(f).
+        
+        grads = np.zeros_like(x_flat)
+        
+        for idx in active_facets:
+            simplex, y, d, type = facet_data[idx]
+            
+            if type == 'center':
+                # The 3 vertices are equidistant. The gradient contribution from each vertex?
+                # The distance is determined by all 3. 
+                # Actually, if we move p1, the circumcenter y moves too. 
+                # This coupling is complex. 
+                # Approximation: Treat y as fixed. 
+                # Then d = dist(y, p1). 
+                # grad_p1(d) = -y / sqrt(1 - (y.p1)^2).
+                # Since d is the same for p1, p2, p3, and they are coupled, 
+                # a common heuristic is to distribute the gradient equally or sum them.
+                # Let's sum the gradients from the perspective of each vertex.
+                for idx_p in simplex:
+                    p = pts[idx_p]
+                    dot = np.dot(y, p)
+                    denom = np.sqrt(max(1e-10, 1.0 - dot*dot))
+                    # Gradient of dist w.r.t p is -y / denom
+                    # We want to minimize dist, so we add this to grads
+                    grads[idx_p*3 : idx_p*3+3] += -y / denom
+            else:
+                # Edge midpoint
+                if type == 'edge12':
+                    indices = [simplex[0], simplex[1]]
+                elif type == 'edge23':
+                    indices = [simplex[1], simplex[2]]
+                else:
+                    indices = [simplex[2], simplex[0]]
+                
+                for idx_p in indices:
+                    p = pts[idx_p]
+                    dot = np.dot(y, p)
+                    denom = np.sqrt(max(1e-10, 1.0 - dot*dot))
+                    grads[idx_p*3 : idx_p*3+3] += -y / denom
+        
+        # Average the gradients to stabilize
+        if len(active_facets) > 0:
+            grads /= len(active_facets)
+            
+        return max_r, grads
+
+    # Optimization
+    best_x = x0
+    best_val, _ = get_covering_radius_and_grads(best_x)
     
-    for i in range(n_restarts):
+    # Use L-BFGS-B
+    # We don't have a strict bound, but we can normalize after each step? 
+    # L-BFGS-B works on the flat vector. We can use a callback to renormalize? 
+    # No, the gradient calculation assumes unit vectors. 
+    # If the optimizer moves points off the sphere, the gradient is wrong.
+    # Solution: Use a transformation? Or just rely on the fact that the gradient 
+    # of the distance on the sphere is tangent to the sphere. 
+    # The gradient computed above is -y/sqrt(...). Is this tangent to the sphere at p?
+    # dot(p, -y/sqrt(...)) = -p.y/sqrt(...). This is NOT zero unless p.y = 0.
+    # So the gradient is not tangent. 
+    # To stay on the sphere, we should project the gradient onto the tangent space.
+    # grad_tangent = grad - (grad.p) p.
+    
+    def objective_with_grad(x_flat):
+        val, grad = get_covering_radius_and_grads(x_flat)
+        # Project gradient onto tangent space
+        pts = x_flat.reshape(N, 3)
+        norms = np.linalg.norm(pts, axis=1, keepdims=True)
+        pts_norm = pts / norms
+        
+        grad_reshaped = grad.reshape(N, 3)
+        # Project: g_t = g - (g.p) p
+        dots = np.sum(grad_reshaped * pts_norm, axis=1, keepdims=True)
+        grad_tangent = grad_reshaped - dots * pts_norm
+        
+        # Flatten back
+        grad_tangent_flat = grad_tangent.flatten()
+        
+        return val, grad_tangent_flat
+
+    # Run optimization
+    try:
+        res = minimize(
+            objective_with_grad, 
+            x0, 
+            method='L-BFGS-B', 
+            jac=True, 
+            options={'maxiter': 200, 'ftol': 1e-10, 'gtol': 1e-8}
+        )
+        if time.time() < deadline:
+            if res.fun < best_val:
+                best_val = res.fun
+                best_x = res.x
+    except Exception as e:
+        pass
+
+    # Final Polish with simple gradient descent on the sphere
+    # This ensures we are exactly on the sphere and handles any numerical drift
+    pts = best_x.reshape(N, 3)
+    pts = pts / np.linalg.norm(pts, axis=1, keepdims=True)
+    
+    step_size = 0.01
+    for it in range(100):
         if time.time() > deadline:
             break
             
-        # Initialize points
-        # Use Fibonacci sphere with random perturbation
-        rng = np.random.default_rng(seed=42 + i)
+        val, grad = get_covering_radius_and_grads(pts.flatten())
         
-        # Base Fibonacci
-        j = np.arange(N) + 0.5
-        z = 1.0 - 2.0 * j / N
-        phi = np.pi * (1.0 + np.sqrt(5.0)) * j
-        r = np.sqrt(1.0 - z * z)
-        base_points = np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
+        # Project gradient
+        grad_reshaped = grad.reshape(N, 3)
+        dots = np.sum(grad_reshaped * pts, axis=1, keepdims=True)
+        grad_tangent = grad_reshaped - dots * pts
         
-        # Add noise
-        noise = rng.normal(0, 0.1, size=(N, 3))
-        points = base_points + noise
-        points = points / np.linalg.norm(points, axis=1, keepdims=True)
+        new_pts = pts - step_size * grad_tangent
+        new_pts = new_pts / np.linalg.norm(new_pts, axis=1, keepdims=True)
         
-        # Run local search
-        pts, rad = _local_search(points, max_steps=200, step_size=0.05)
+        new_val, _ = get_covering_radius_and_grads(new_pts.flatten())
         
-        if rad < best_radius:
-            best_radius = rad
-            best_points = pts
-            
-        # If we found a very good solution, we can stop early?
-        # The best known is ~18.3 deg = 0.319 rad
-        if best_radius < 0.32:
-            # Continue to see if we can improve further, but we have a good candidate
-            pass
+        if new_val < val:
+            pts = new_pts
+            val = new_val
+            step_size *= 0.95
+        else:
+            step_size *= 0.8
+            if step_size < 1e-5:
+                break
 
-    # Final polish on the best point found
-    if best_points is not None:
-        # Run a finer local search
-        pts, rad = _local_search(best_points, max_steps=500, step_size=0.01)
-        if rad < best_radius:
-            best_radius = rad
-            best_points = pts
-
-    if best_points is None:
-        # Fallback to seed
-        i = np.arange(N) + 0.5
-        z = 1.0 - 2.0 * i / N
-        phi = np.pi * (1.0 + np.sqrt(5.0)) * i
-        r = np.sqrt(1.0 - z * z)
-        best_points = np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
-
-    return best_points
+    pts = pts / np.linalg.norm(pts, axis=1, keepdims=True)
+    return pts
+# EVOLVE-BLOCK-END
