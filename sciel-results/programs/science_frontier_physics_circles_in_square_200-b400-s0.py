@@ -111,31 +111,33 @@ def _local_optimize_smooth(c0, max_time=30.0):
     best_c = c0.copy()
     best_r = _compute_radius(c0)
     
-    # Anneal beta from low to high
-    betas = [20.0, 50.0, 100.0, 200.0, 500.0, 1000.0]
+    # Anneal beta from low to high with more gradual steps
+    betas = [15.0, 30.0, 60.0, 120.0, 250.0, 500.0, 1000.0, 2000.0]
     
     for beta in betas:
-        if time.time() > start_time + max_time - 2:
+        if time.time() > start_time + max_time - 3:
             break
         
         try:
             def obj(params):
                 return _smooth_objective(params, beta)
             
+            # Use more iterations for higher beta (sharper min)
+            maxiter = 80 if beta < 100 else 150
+            
             result = minimize(
                 obj,
                 best_c.flatten(),
                 method='L-BFGS-B',
                 bounds=[(-0.5 + 1e-12, 0.5 - 1e-12)] * (2 * N),
-                options={'maxiter': 100, 'ftol': 1e-12, 'gtol': 1e-9}
+                options={'maxiter': maxiter, 'ftol': 1e-14, 'gtol': 1e-10, 'maxls': 50}
             )
             
-            if result.fun < -best_r + 1e-10:
-                c_new = np.clip(result.x.reshape(-1, 2), -0.5 + 1e-12, 0.5 - 1e-12)
-                r_new = _compute_radius(c_new)
-                if r_new > best_r:
-                    best_c = c_new
-                    best_r = r_new
+            c_new = np.clip(result.x.reshape(-1, 2), -0.5 + 1e-12, 0.5 - 1e-12)
+            r_new = _compute_radius(c_new)
+            if r_new > best_r:
+                best_c = c_new
+                best_r = r_new
         except Exception:
             pass
     
@@ -166,16 +168,28 @@ def _get_active_pairs(c, r_target, margin=0.01):
 def _slsqp_polish(c0, r0, max_time=30.0):
     """
     High-precision polish using SLSQP with active constraints.
-    Iteratively increases r_target and solves for feasibility.
+    Uses vectorized constraint evaluation for speed.
     """
     start_time = time.time()
     best_c = c0.copy()
     best_r = r0
+    n = N
     
-    # We will try to increase the radius in small steps
-    # Step size starts small and can be adjusted
-    step = 1e-4
-    max_iter = 50
+    # Precompute pair indices for efficiency
+    def _get_pairs_vectorized(c, r_target, margin=0.005):
+        """Get active pairs using KDTree, vectorized output."""
+        tree = cKDTree(c)
+        dist_limit = 2 * r_target + margin
+        pairs = []
+        for i in range(n):
+            neighbors = tree.query_ball_point(c[i], dist_limit)
+            for j in neighbors:
+                if i < j:
+                    pairs.append((i, j))
+        return np.array(pairs, dtype=np.int32) if pairs else np.empty((0, 2), dtype=np.int32)
+    
+    step = 5e-5
+    max_iter = 80
     
     for _ in range(max_iter):
         if time.time() > start_time + max_time:
@@ -183,82 +197,97 @@ def _slsqp_polish(c0, r0, max_time=30.0):
         
         r_target = best_r + step
         
-        # Get active pairs for the current configuration and target radius
-        # We use a slightly larger margin to ensure we don't miss constraints
-        pairs = _get_active_pairs(best_c, r_target, margin=0.005)
+        # Get active pairs
+        pairs = _get_pairs_vectorized(best_c, r_target, margin=0.008)
+        npairs = len(pairs)
         
-        if not pairs:
-            # If no pairs are active, we are likely limited by the boundary
-            # We can just check boundary constraints
-            pass
-            
-        # Define constraints
-        # Boundary: 0.5 - |c_i| - r >= 0
-        # Pair: ||c_i - c_j|| - 2*r >= 0
-        
-        n = N
-        
+        # Vectorized constraint function
         def constraints_func(x):
             c = x.reshape(-1, 2)
-            # Boundary
-            bd = 0.5 - np.abs(c) - r_target
-            # Pairs
-            pdist_vals = np.zeros(len(pairs))
-            for idx, (i, j) in enumerate(pairs):
-                diff = c[i] - c[j]
-                pdist_vals[idx] = np.linalg.norm(diff) - 2 * r_target
-            return np.concatenate([bd.ravel(), pdist_vals])
+            # Boundary constraints: 0.5 - |c_ik| - r >= 0 for all i, k
+            bd = 0.5 - np.abs(c) - r_target  # shape (n, 2)
+            bd_flat = bd.ravel()  # shape (2*n,)
+            
+            if npairs == 0:
+                return bd_flat
+            
+            # Pair constraints: ||c_i - c_j|| - 2*r >= 0
+            ci = c[pairs[:, 0]]  # shape (npairs, 2)
+            cj = c[pairs[:, 1]]  # shape (npairs, 2)
+            diffs = ci - cj  # shape (npairs, 2)
+            dists = np.sqrt(np.sum(diffs**2, axis=1))  # shape (npairs,)
+            pd_vals = dists - 2 * r_target  # shape (npairs,)
+            
+            return np.concatenate([bd_flat, pd_vals])
         
+        # Vectorized Jacobian (sparse structure but returned dense for SLSQP)
         def jac_func(x):
             c = x.reshape(-1, 2)
-            jac_rows = []
+            total_constraints = 2 * n + npairs
+            jac = np.zeros((total_constraints, 2 * n))
             
-            # Boundary Jacobian
+            # Boundary Jacobian rows
+            # d(0.5 - |c_ik| - r)/dc_ik = -sign(c_ik)
+            signs = -np.sign(c)  # shape (n, 2)
+            # Map to dense Jacobian: row 2*i+k, col 2*i+k
             for i in range(n):
-                for k in range(2):
-                    row = np.zeros(2 * n)
-                    row[2 * i + k] = -np.sign(c[i, k])
-                    jac_rows.append(row)
+                jac[2*i, 2*i] = signs[i, 0]
+                jac[2*i+1, 2*i+1] = signs[i, 1]
             
-            # Pair Jacobian
-            for idx, (i, j) in enumerate(pairs):
-                diff = c[i] - c[j]
-                dist = np.linalg.norm(diff)
-                if dist < 1e-12:
-                    dist = 1e-12
-                row = np.zeros(2 * n)
-                row[2 * i:2 * i + 2] = diff / dist
-                row[2 * j:2 * j + 2] = -diff / dist
-                jac_rows.append(row)
+            if npairs == 0:
+                return jac
             
-            return np.array(jac_rows)
+            # Pair Jacobian rows
+            ci = c[pairs[:, 0]]
+            cj = c[pairs[:, 1]]
+            diffs = ci - cj  # shape (npairs, 2)
+            dists = np.sqrt(np.sum(diffs**2, axis=1))
+            dists_safe = np.where(dists < 1e-12, 1e-12, dists)
+            unit_vecs = diffs / dists_safe[:, np.newaxis]  # shape (npairs, 2)
+            
+            # For each pair p, row index = 2*n + p
+            # d(||c_i - c_j||)/dc_i = unit_vec, d(||c_i - c_j||)/dc_j = -unit_vec
+            row_indices = 2 * n + np.arange(npairs)
+            col_i = pairs[:, 0] * 2
+            col_j = pairs[:, 1] * 2
+            
+            # Use advanced indexing to fill in the Jacobian
+            # For each pair p:
+            # jac[row_indices[p], col_i[p]] = unit_vecs[p, 0]
+            # jac[row_indices[p], col_i[p]+1] = unit_vecs[p, 1]
+            # jac[row_indices[p], col_j[p]] = -unit_vecs[p, 0]
+            # jac[row_indices[p], col_j[p]+1] = -unit_vecs[p, 1]
+            
+            # Vectorized fill using np.add.at for potential duplicates (shouldn't be any)
+            np.add.at(jac, (row_indices, col_i), unit_vecs[:, 0])
+            np.add.at(jac, (row_indices, col_i + 1), unit_vecs[:, 1])
+            np.add.at(jac, (row_indices, col_j), -unit_vecs[:, 0])
+            np.add.at(jac, (row_indices, col_j + 1), -unit_vecs[:, 1])
+            
+            return jac
         
         try:
             result = minimize(
-                lambda x: 0.0, # Objective is constant, we just want feasibility
+                lambda x: 0.0,
                 best_c.flatten(),
                 method='SLSQP',
                 bounds=[(-0.5 + 1e-12, 0.5 - 1e-12)] * (2 * n),
                 constraints=[
                     {'type': 'ineq', 'fun': constraints_func, 'jac': jac_func}
                 ],
-                options={'maxiter': 100, 'ftol': 1e-12, 'disp': False}
+                options={'maxiter': 150, 'ftol': 1e-14, 'disp': False}
             )
             
             c_new = np.clip(result.x.reshape(-1, 2), -0.5 + 1e-12, 0.5 - 1e-12)
             r_new = _compute_radius(c_new)
             
-            if r_new > best_r:
+            if r_new > best_r + 1e-12:
                 best_c = c_new
                 best_r = r_new
-                # Increase step slightly if we made good progress
-                step *= 1.1
-                if step > 1e-3:
-                    step = 1e-3
+                step = min(step * 1.05, 2e-4)
             else:
-                # If we didn't improve, reduce step and try again or break
                 step *= 0.5
-                if step < 1e-6:
+                if step < 1e-7:
                     break
                     
         except Exception:
@@ -281,10 +310,10 @@ def construct():
         best_radius = r_hex
         best_c = c_hex.copy()
     
-    # 2. Primary optimization with sparse smooth objective
-    if time.time() < deadline - 40:
-        remaining = deadline - time.time() - 40
-        c_opt, r_opt = _local_optimize_smooth(c_hex, max_time=min(40.0, remaining))
+    # 2. Primary optimization with smooth objective
+    if time.time() < deadline - 50:
+        remaining = deadline - time.time() - 50
+        c_opt, r_opt = _local_optimize_smooth(c_hex, max_time=min(50.0, remaining))
         if r_opt > best_radius:
             best_radius = r_opt
             best_c = c_opt.copy()
@@ -293,13 +322,13 @@ def construct():
     np.random.seed(42)
     n_trials = 3
     for trial in range(n_trials):
-        if time.time() > deadline - 50:
+        if time.time() > deadline - 60:
             break
         
         # Perturb the best solution found so far
         if best_c is not None:
             # Smaller perturbation for later trials
-            noise_scale = 0.005 / (trial + 1)
+            noise_scale = 0.004 / (trial + 1)
             c_pert = best_c + np.random.normal(0, noise_scale, size=(N, 2))
             c_pert = np.clip(c_pert, -0.5 + 1e-12, 0.5 - 1e-12)
         else:
@@ -310,16 +339,17 @@ def construct():
             best_radius = r_pert
             best_c = c_pert.copy()
         
-        if time.time() < deadline - 45:
-            remaining = deadline - time.time() - 45
-            c_opt, r_opt = _local_optimize_smooth(c_pert, max_time=min(20.0, remaining))
+        if time.time() < deadline - 55:
+            remaining = deadline - time.time() - 55
+            c_opt, r_opt = _local_optimize_smooth(c_pert, max_time=min(15.0, remaining))
             if r_opt > best_radius:
                 best_radius = r_opt
                 best_c = c_opt.copy()
     
     # 4. Final high-precision polish on the best solution found
-    if best_c is not None and time.time() < deadline - 5:
-        remaining = max(5.0, deadline - time.time() - 5)
+    # Give polish a generous time budget
+    if best_c is not None and time.time() < deadline - 3:
+        remaining = max(10.0, deadline - time.time() - 3)
         c_final, r_final = _slsqp_polish(best_c, best_radius, max_time=remaining)
         if r_final > best_radius:
             best_radius = r_final

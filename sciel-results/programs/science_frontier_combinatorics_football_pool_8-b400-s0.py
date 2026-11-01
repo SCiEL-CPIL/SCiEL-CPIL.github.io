@@ -1,48 +1,35 @@
 import time
 import numpy as np
+import random
 
 def construct(q, n, radius):
     start_time = time.time()
-    deadline = start_time + 110.0
+    deadline = start_time + 115.0
     
     if q == 3 and n == 8 and radius == 1:
-        return _construct_ternary_8_1(deadline)
+        return _solve_ternary_8_1(deadline)
     
-    # Fallback for other cases (not expected in this specific task instance but good for robustness)
+    # Fallbacks
     import itertools
     if q == 3 and n >= 4:
-        # Direct sum with tetracode
         tetracode = [[a, b, (a + b) % 3, (a + 2 * b) % 3] for a in range(3) for b in range(3)]
         return [h + list(tail) for h in tetracode for tail in itertools.product(range(3), repeat=n - 4)]
-    
-    # Generic fallback
+        
     return [list(c) for c in itertools.product(range(q), repeat=n)]
 
-def _construct_ternary_8_1(deadline):
+def _solve_ternary_8_1(deadline):
     n = 8
     q = 3
-    total = q ** n  # 6561
+    N = q ** n # 6561
     
     # Precompute balls
-    # weights for positions
-    weights = np.array([3 ** (n - 1 - i) for i in range(n)], dtype=np.int32)
+    # balls[i] is a list of neighbors of i (including i)
+    weights = [3 ** (n - 1 - i) for i in range(n)]
+    balls = []
+    balls_matrix = np.zeros((N, 1 + 2 * n), dtype=np.int32)
     
-    balls = np.zeros((total, 1 + 2 * n), dtype=np.int32)
-    # balls[:, 0] is the word itself
-    # balls[:, 1 + 2*pos : 2 + 2*pos+1] are the neighbors?
-    # Actually, let's just fill it.
-    # For each word w, ball is [w] + [w + (d - w_d) * weight for pos in range(n) for d in range(3) if d != w_d]
-    
-    # Vectorized precomputation
-    words = np.arange(total, dtype=np.int32)
-    # Get digits
-    # This is a bit tricky to vectorize fully without loops, but 6561 is small.
-    # Let's use a loop for precomputation, it's fast enough once.
-    
-    for w in range(total):
-        balls[w, 0] = w
-        idx = 1
-        temp = w
+    for w in range(N):
+        neighbors = [w]
         for pos in range(n):
             weight = weights[pos]
             digit = (w // weight) % 3
@@ -50,126 +37,151 @@ def _construct_ternary_8_1(deadline):
                 if new_digit == digit:
                     continue
                 new_w = w + (new_digit - digit) * weight
-                balls[w, idx] = new_w
-                idx += 1
-    
-    best_size = total
+                neighbors.append(new_w)
+        balls.append(neighbors)
+        balls_matrix[w] = neighbors
+        
+    best_size = N
     best_set = None
     
-    while time.time() < deadline - 2.0:
-        # 1. Randomized Greedy Construction
-        cover_count = np.zeros(total, dtype=np.int32)
-        selected = []
-        uncovered_mask = np.ones(total, dtype=bool)
+    # Helper to convert index to list of digits
+    def idx_to_list(idx):
+        digits = []
+        temp = idx
+        for _ in range(n):
+            digits.append(temp % 3)
+            temp //= 3
+        return digits[::-1]
         
-        while np.any(uncovered_mask):
-            # Count how many uncovered words each candidate covers
-            # uncovered_mask[balls] shape (total, 17)
-            # sum along axis 1
-            counts = uncovered_mask[balls].sum(axis=1)
-            
-            # Find max count
-            max_count = np.max(counts)
-            
-            # If max_count is 0, we are stuck (should not happen if space is connected)
-            if max_count == 0:
+    # Main Loop
+    while time.time() < deadline - 10.0:
+        # 1. Greedy Construction
+        selected = []
+        cover_count = np.zeros(N, dtype=np.int32)
+        uncovered = np.ones(N, dtype=bool)
+        
+        while np.any(uncovered):
+            if time.time() > deadline - 10.0:
                 break
             
-            # Find all candidates with max count
-            candidates = np.where(counts == max_count)[0]
+            # Find word covering most uncovered
+            # Vectorized: sum uncovered mask over balls
+            gains = uncovered[balls_matrix].sum(axis=1)
             
-            # Pick one randomly
+            if np.max(gains) == 0:
+                break # Should not happen if logic correct
+                
+            # Random tie-breaking
+            max_gain = np.max(gains)
+            candidates = np.where(gains == max_gain)[0]
             best_idx = candidates[np.random.randint(len(candidates))]
             
             selected.append(best_idx)
             
-            # Update cover counts
-            cover_count[balls[best_idx]] += 1
+            # Update cover_count and uncovered
+            # Only update uncovered if count was 0
+            ball = balls[best_idx]
+            # We need to check which were 0
+            # cover_count[ball] += 1
+            # uncovered[ball] = False  <-- WRONG if count was already > 0? No, if count > 0, uncovered is already False.
+            # So setting to False is safe.
+            cover_count[ball] += 1
+            uncovered[ball] = False
             
-            # Update uncovered mask
-            # A word is uncovered if cover_count is 0
-            # We can just recompute uncovered_mask = (cover_count == 0)
-            # Or update it: for w in balls[best_idx], if cover_count[w] was 0, it is now 1, so uncovered.
-            # But cover_count[w] could be >1 if it was already covered.
-            # So: new_uncovered = (cover_count == 0) is safest.
-            uncovered_mask = (cover_count == 0)
+        if np.any(uncovered):
+            continue # Invalid
             
-            # Check time
-            if time.time() > deadline - 5.0:
-                break
-        
-        if not np.all(uncovered_mask == False):
-            # If we broke early due to time, this set might be invalid.
-            # We should only consider it if it's valid.
-            # But checking validity takes time.
-            # If we broke out of while loop normally, it is valid.
-            # Let's check if we completed the loop.
-            if np.any(uncovered_mask):
-                continue
-        
-        # 2. Pruning
-        # Convert selected to a set for fast lookup? Or just a list.
-        # We need to check if removing a codeword keeps the set valid.
-        # Condition: for all w in ball(c), cover_count[w] > 1.
-        
-        # We can iterate through selected and try to remove.
-        # To be efficient, we can do multiple passes.
-        
-        # Make a copy of selected to iterate over, as we modify it.
-        # Actually, we can just loop through indices.
-        
+        # 2. Prune
         changed = True
-        while changed and time.time() < deadline - 2.0:
+        while changed and time.time() < deadline - 5.0:
             changed = False
-            # Iterate backwards to allow removal without index shifting issues?
-            # Or just build a new list.
             new_selected = []
-            for c in selected:
-                # Check if c is removable
-                # min(cover_count[balls[c]]) > 1
+            # Check each codeword
+            # Vectorized check:
+            # For each c in selected, min(cover_count[balls[c]])
+            # If > 1, remove.
+            
+            # To do this efficiently in a loop (since selected changes size):
+            # We can do it in batches or one by one.
+            # One by one is O(K * BallSize). K~500, BallSize~17. ~8500 ops. Fast.
+            
+            i = 0
+            while i < len(selected):
+                c = selected[i]
                 if np.min(cover_count[balls[c]]) > 1:
-                    # Remove c
+                    # Remove
                     cover_count[balls[c]] -= 1
+                    selected.pop(i)
                     changed = True
-                    # Do not add to new_selected
                 else:
-                    new_selected.append(c)
-            selected = new_selected
+                    i += 1
             
-            # If we removed some, we might have made others removable?
-            # Yes, so we loop again.
+        # 3. Local Search (Swaps)
+        # Try to swap codewords to enable further pruning
+        # We will run many swap attempts
+        # Pre-allocate masks for speed?
+        mask_u = np.zeros(N, dtype=bool)
+        mask_v = np.zeros(N, dtype=bool)
+        
+        swap_attempts = 0
+        while time.time() < deadline - 5.0:
+            swap_attempts += 1
+            if not selected:
+                break
+                
+            # Pick random index
+            i = np.random.randint(len(selected))
+            u = selected[i]
             
-        # Update best
+            # Pick random replacement
+            v = np.random.randint(N)
+            if v == u:
+                continue
+                
+            # Check safety
+            # Risk = N[u] \ N[v]
+            mask_u.fill(False)
+            mask_u[balls[u]] = True
+            mask_v.fill(False)
+            mask_v[balls[v]] = True
+            
+            risk = mask_u & ~mask_v
+            
+            safe = True
+            if np.any(risk):
+                if np.min(cover_count[risk]) <= 1:
+                    safe = False
+            
+            if safe:
+                # Perform swap
+                cover_count[balls[u]] -= 1
+                cover_count[balls[v]] += 1
+                selected[i] = v
+                
+                # Try to prune
+                pruned = False
+                changed = True
+                while changed:
+                    changed = False
+                    new_selected = []
+                    for c in selected:
+                        if np.min(cover_count[balls[c]]) > 1:
+                            cover_count[balls[c]] -= 1
+                            changed = True
+                            pruned = True
+                        else:
+                            new_selected.append(c)
+                    selected = new_selected
+                
+                # If we pruned, we improved. If not, we are at same size but different state.
+                # We keep the state to explore further.
+                
         if len(selected) < best_size:
             best_size = len(selected)
             best_set = selected.copy()
-            
-            # If we found 486, we can stop early?
-            # The lower bound is 403, best known 486.
-            # It's unlikely to go below 486 quickly, but possible.
-            # Let's keep searching.
-            
-        if best_size <= 486:
-            # We found a very good solution.
-            # We can try a bit more to see if we can go lower, but 486 is the target.
-            # Let's run a few more iterations just in case.
-            pass
 
-    # Convert best_set to list of digit lists
     if best_set is None:
-        # Fallback: return all words (invalid for score but valid format)
-        return [list(np.base_repr(w, 3).zfill(n).ljust(n, '0')) for w in range(total)]
-        # Wait, base_repr might not handle leading zeros well or might be slow.
-        # Use the to_digits helper.
+        # Fallback
+        return [idx_to_list(w) for w in range(N)]
         
-    result = []
-    for w in best_set:
-        digits = []
-        temp = w
-        for _ in range(n):
-            digits.append(temp % 3)
-            temp //= 3
-        digits.reverse()
-        result.append(digits)
-        
-    return result
+    return [idx_to_list(w) for w in best_set]
