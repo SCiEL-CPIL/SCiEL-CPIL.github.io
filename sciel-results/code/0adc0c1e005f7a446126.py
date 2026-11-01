@@ -1,0 +1,523 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+N = 50
+
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from scipy.optimize import minimize
+
+_START_TIME = time.time()
+_DEADLINE = _START_TIME + 110.0
+
+
+def _score(positions):
+    """
+    Compute the valid packing radius.
+    Returns 0 if invalid.
+    """
+    n = len(positions)
+    if not np.all(np.isfinite(positions)):
+        return 0.0
+    
+    radii = np.hypot(positions[:, 0], positions[:, 1])
+    if np.any(radii > 1.0):
+        return 0.0
+        
+    min_boundary = 1.0 - np.max(radii)
+    if min_boundary < 0:
+        return 0.0
+        
+    if n < 2:
+        return min_boundary
+
+    diff = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff ** 2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    min_pair = np.min(dists) / 2.0
+    
+    return min(min_pair, min_boundary)
+
+
+def _soft_min(values, beta):
+    """Compute the soft minimum of an array of values."""
+    v = np.asarray(values, dtype=float)
+    m = np.min(v)
+    exp_terms = np.exp(-beta * (v - m))
+    return m - (1.0 / beta) * np.log(np.sum(exp_terms))
+
+
+def _objective_and_gradient(params, n, beta):
+    """
+    Objective to minimize: -soft_min(constraints)
+    params: (n, 2) array of centers
+    Returns (objective_value, gradient)
+    """
+    centers = params.reshape(n, 2)
+    
+    # Pairwise distances
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    diff = centers[i_idx, :] - centers[j_idx, :]
+    dists = np.sqrt(np.sum(diff ** 2, axis=1))
+    
+    # Boundary distances
+    norms = np.linalg.norm(centers, axis=1)
+    boundary_dists = 1.0 - norms
+    
+    # Combine all constraints
+    vals = np.concatenate([dists / 2.0, boundary_dists])
+    
+    obj = -_soft_min(vals, beta)
+    
+    # Compute gradient
+    m = np.min(vals)
+    exp_vals = np.exp(-beta * (vals - m))
+    S = np.sum(exp_vals)
+    weights = exp_vals / S
+    
+    grad = np.zeros_like(centers)
+    
+    # Pairwise part
+    pair_weights = weights[:len(i_idx)]
+    safe_dists = np.where(dists > 1e-10, dists, 1.0)
+    unit_vecs = diff / safe_dists[:, np.newaxis]
+    weighted_vecs = pair_weights[:, np.newaxis] * 0.5 * unit_vecs
+    
+    np.add.at(grad, i_idx, weighted_vecs)
+    np.add.at(grad, j_idx, -weighted_vecs)
+    
+    # Boundary part
+    bound_weights = weights[len(i_idx):]
+    safe_norms = np.where(norms > 1e-10, norms, 1.0)
+    grad -= bound_weights[:, np.newaxis] * centers / safe_norms[:, np.newaxis]
+    
+    return obj, -grad
+
+
+def _optimize_lbfgs(centers, beta, maxiter, gtol):
+    """
+    Optimize using L-BFGS-B.
+    """
+    try:
+        res = minimize(
+            _objective_and_gradient, 
+            centers.flatten(), 
+            args=(N, beta),
+            method='L-BFGS-B',
+            jac=True,
+            options={'maxiter': maxiter, 'gtol': gtol, 'disp': False}
+        )
+        return res.x.reshape(N, 2)
+    except Exception:
+        return centers
+
+
+def _get_hex_lattice(n, seed_offset=0):
+    """Generate a hexagonal lattice initialization."""
+    rng = np.random.default_rng(42 + seed_offset)
+    s_est = np.sqrt(2 * np.pi / (n * np.sqrt(3)))
+    
+    points = []
+    max_range = int(2.0 / s_est) + 3
+    for j in range(-max_range, max_range + 1):
+        for i in range(-max_range, max_range + 1):
+            x = i * s_est + (j % 2) * s_est / 2.0
+            y = j * s_est * np.sqrt(3) / 2.0
+            if np.hypot(x, y) <= 0.95:
+                points.append([x, y])
+                
+    if len(points) < n:
+        points = []
+        for _ in range(n * 10):
+            angle = rng.uniform(0, 2 * np.pi)
+            radius = rng.uniform(0, 0.9)
+            x = radius * np.cos(angle)
+            y = radius * np.sin(angle)
+            points.append([x, y])
+    
+    points = np.array(points)
+    
+    if len(points) < n:
+        while len(points) < n:
+            angle = rng.uniform(0, 2 * np.pi)
+            radius = rng.uniform(0, 0.9)
+            x = radius * np.cos(angle)
+            y = radius * np.sin(angle)
+            points = np.vstack([points, [[x, y]]])
+    
+    points = points + rng.normal(0, 0.01, points.shape)
+    
+    dists = np.linalg.norm(points, axis=1)
+    indices = np.argsort(dists)
+    return points[indices[:n]]
+
+
+def _get_ring_init(n, seed=42):
+    """
+    Generate a ring-based initialization matching known optimal structure.
+    The best known packing has rings: 1, 6, 12, 18, 13 = 50
+    """
+    rng = np.random.default_rng(seed)
+    
+    # Known optimal structure: 1 center + 4 rings
+    rings = [1, 6, 12, 18, 13]
+    while sum(rings) > n:
+        rings[-1] -= 1
+        if rings[-1] <= 0:
+            rings.pop()
+    while sum(rings) < n:
+        rings.append(1)
+    
+    points = []
+    # Optimal ring radii approximately: 0, 0.25, 0.5, 0.75, 0.97
+    ring_radii = [0.0, 0.25, 0.50, 0.75, 0.95]
+    
+    for ring_idx, count in enumerate(rings):
+        if count == 0:
+            continue
+        if ring_idx == 0:
+            points.append([0.0, 0.0])
+        else:
+            radius = ring_radii[min(ring_idx, len(ring_radii)-1)]
+            angle_offset = rng.uniform(0, 2 * np.pi)
+            for k in range(count):
+                angle = angle_offset + 2 * np.pi * k / count
+                x = radius * np.cos(angle)
+                y = radius * np.sin(angle)
+                r_jitter = rng.normal(0, 0.005)
+                x += r_jitter * np.cos(angle)
+                y += r_jitter * np.sin(angle)
+                points.append([x, y])
+    
+    points = np.array(points[:n])
+    
+    norms = np.linalg.norm(points, axis=1)
+    mask = norms > 0.95
+    if np.any(mask):
+        points[mask] *= (0.95 / norms[mask])[:, np.newaxis]
+    
+    return points
+
+
+def _get_random_init(n, seed):
+    """Generate random initialization."""
+    rng = np.random.default_rng(seed)
+    centers = []
+    for _ in range(n):
+        angle = rng.uniform(0, 2 * np.pi)
+        radius = rng.uniform(0, 0.85)
+        x = radius * np.cos(angle)
+        y = radius * np.sin(angle)
+        centers.append([x, y])
+    return np.array(centers)
+
+
+def _get_concentric_init(n, seed=11):
+    """Concentric rings with varying density."""
+    rng = np.random.default_rng(seed)
+    points = []
+    n_rings = int(np.sqrt(n)) + 1
+    remaining = n
+    ring_counts = []
+    for r in range(n_rings):
+        cap = min(remaining, max(1, int(2 * np.pi * (r + 0.5))))
+        ring_counts.append(cap)
+        remaining -= cap
+    while sum(ring_counts) < n:
+        ring_counts.append(1)
+        remaining += 1
+    while sum(ring_counts) > n:
+        ring_counts[-1] -= 1
+        if ring_counts[-1] <= 0:
+            ring_counts.pop()
+    
+    for ring_idx, count in enumerate(ring_counts):
+        if count == 0:
+            continue
+        if ring_idx == 0:
+            points.append([0.0, 0.0])
+        else:
+            radius = 0.15 + 0.8 * ring_idx / max(n_rings, 1)
+            radius = min(radius, 0.95)
+            offset = rng.uniform(0, 2 * np.pi)
+            for k in range(count):
+                angle = offset + 2 * np.pi * k / count
+                x = radius * np.cos(angle)
+                y = radius * np.sin(angle)
+                points.append([x, y])
+    
+    points = np.array(points[:n])
+    norms = np.linalg.norm(points, axis=1)
+    mask = norms > 0.95
+    if np.any(mask):
+        points[mask] *= (0.95 / norms[mask])[:, np.newaxis]
+    return points
+
+
+def _force_directed_relax(centers, start_time, max_steps=2000):
+    """
+    Force-directed relaxation to escape local minima.
+    Uses repulsive forces between circles and attractive force toward boundary.
+    """
+    current = centers.copy()
+    n = len(current)
+    dt = 0.001
+    best_score = _score(current)
+    best_positions = current.copy()
+    
+    for step in range(max_steps):
+        if time.time() - start_time > _DEADLINE - 15:
+            break
+        
+        forces = np.zeros_like(current)
+        
+        # Repulsive forces between all pairs
+        i_idx, j_idx = np.triu_indices(n, k=1)
+        diff = current[i_idx, :] - current[j_idx, :]
+        dists = np.sqrt(np.sum(diff ** 2, axis=1))
+        safe_dists = np.where(dists > 1e-8, dists, 1.0)
+        
+        # Strong repulsion when close
+        repulsion_strength = 1.0 / (safe_dists ** 2 + 1e-6)
+        unit_vecs = diff / safe_dists[:, np.newaxis]
+        weighted_forces = repulsion_strength[:, np.newaxis] * unit_vecs
+        
+        np.add.at(forces, i_idx, weighted_forces)
+        np.add.at(forces, j_idx, -weighted_forces)
+        
+        # Boundary constraint: push inward if too close to edge
+        norms = np.linalg.norm(current, axis=1)
+        boundary_force = np.where(norms > 0.9, (norms - 0.9) ** 2, 0.0)
+        safe_norms = np.where(norms > 1e-8, norms, 1.0)
+        forces -= boundary_force[:, np.newaxis] * current / safe_norms[:, np.newaxis]
+        
+        # Adaptive time step
+        max_force = np.max(np.linalg.norm(forces, axis=1))
+        dt = 0.001 / (1.0 + max_force * 10)
+        
+        current += dt * forces
+        
+        # Keep inside boundary
+        norms = np.linalg.norm(current, axis=1)
+        mask = norms > 0.99
+        if np.any(mask):
+            current[mask] *= (0.99 / norms[mask])[:, np.newaxis]
+        
+        score = _score(current)
+        if score > best_score:
+            best_score = score
+            best_positions = current.copy()
+        
+        # Dampen oscillations
+        if step % 100 == 0:
+            dt *= 0.9
+    
+    return best_positions, best_score
+
+
+def _polish(centers, start_time):
+    """
+    Progressively polish the solution with increasing beta,
+    with force-directed relaxation between phases.
+    """
+    current = centers.copy()
+    best_score = _score(current)
+    
+    betas = [50.0, 100.0, 200.0, 400.0, 800.0, 1500.0, 3000.0]
+    
+    for beta in betas:
+        if time.time() - start_time > _DEADLINE - 10:
+            break
+        
+        maxiter = 150
+        gtol = 1e-8
+        
+        polished = _optimize_lbfgs(current, beta, maxiter, gtol)
+        
+        if np.all(np.isfinite(polished)):
+            radii = np.hypot(polished[:, 0], polished[:, 1])
+            mask = radii > 1.0
+            if np.any(mask):
+                polished[mask] *= (0.999 / radii[mask])[:, None]
+            
+            r = _score(polished)
+            if r > best_score:
+                best_score = r
+                current = polished
+        
+        # Force-directed relaxation after each beta stage
+        if time.time() - start_time < _DEADLINE - 20:
+            relaxed, relaxed_score = _force_directed_relax(current, start_time, max_steps=500)
+            if relaxed_score > best_score:
+                best_score = relaxed_score
+                current = relaxed
+    
+    return current, best_score
+
+
+def _local_perturb_reoptimize(centers, start_time, n_restarts=3):
+    """
+    Try small perturbations to escape local minima.
+    """
+    current = centers.copy()
+    best_score = _score(current)
+    best_positions = current.copy()
+    rng = np.random.default_rng(999)
+    
+    for restart in range(n_restarts):
+        if time.time() - start_time > _DEADLINE - 10:
+            break
+        
+        # Add small random perturbation
+        perturbation = rng.normal(0, 0.02, centers.shape)
+        perturbed = current + perturbation
+        
+        # Keep inside boundary
+        norms = np.linalg.norm(perturbed, axis=1)
+        mask = norms > 0.95
+        if np.any(mask):
+            perturbed[mask] *= (0.95 / norms[mask])[:, np.newaxis]
+        
+        # Quick optimization from perturbed state
+        polished, score = _polish(perturbed, start_time)
+        
+        if score > best_score:
+            best_score = score
+            best_positions = polished
+            current = polished
+    
+    return best_positions, best_score
+
+
+def _high_beta_polish(centers, start_time):
+    """
+    Final high-precision polish with very high beta values,
+    including local perturbation attempts.
+    """
+    current = centers.copy()
+    best_score = _score(current)
+    
+    # Use very high beta for near-exact min
+    betas = [5000.0, 10000.0, 20000.0, 50000.0]
+    
+    for beta in betas:
+        if time.time() - start_time > _DEADLINE - 5:
+            break
+        
+        maxiter = 500
+        gtol = 1e-12
+        
+        polished = _optimize_lbfgs(current, beta, maxiter, gtol)
+        
+        if np.all(np.isfinite(polished)):
+            radii = np.hypot(polished[:, 0], polished[:, 1])
+            mask = radii > 1.0
+            if np.any(mask):
+                polished[mask] *= (0.9999 / radii[mask])[:, None]
+            
+            r = _score(polished)
+            if r > best_score:
+                best_score = r
+                current = polished
+    
+    # Try local perturbations to escape local minima
+    if time.time() - start_time < _DEADLINE - 3:
+        perturbed_best, perturbed_score = _local_perturb_reoptimize(current, start_time, n_restarts=2)
+        if perturbed_score > best_score:
+            best_score = perturbed_score
+            current = perturbed_best
+    
+    return current, best_score
+
+
+def construct():
+    """
+    Construct positions for N circles in the unit disk.
+    Returns an array of shape (N, 2).
+    """
+    start_time = time.time()
+    
+    # 1. Generate multiple diverse initializations
+    inits = []
+    
+    inits.append(_get_hex_lattice(N, seed_offset=0))
+    inits.append(_get_ring_init(N, seed=42))
+    inits.append(_get_ring_init(N, seed=123))
+    inits.append(_get_ring_init(N, seed=7))
+    inits.append(_get_ring_init(N, seed=2024))
+    inits.append(_get_concentric_init(N, seed=11))
+    
+    for seed in [1, 2, 3, 4, 5, 6, 7]:
+        inits.append(_get_random_init(N, seed))
+    
+    # 2. Optimize each initialization
+    best_pts = None
+    best_score = 0.0
+    
+    # Phase 1: Quick optimization on all inits
+    for init in inits:
+        if time.time() - start_time > _DEADLINE - 45:
+            break
+            
+        optimized, score = _polish(init, start_time)
+        
+        if score > best_score:
+            best_score = score
+            best_pts = optimized
+    
+    if best_pts is None:
+        best_pts = inits[0]
+        best_score = _score(best_pts)
+    
+    # Phase 2: Deep optimization on the best candidate
+    if time.time() - start_time < _DEADLINE - 25:
+        current = best_pts.copy()
+        
+        betas = [200.0, 500.0, 1000.0, 2000.0, 5000.0]
+        
+        for beta in betas:
+            if time.time() - start_time > _DEADLINE - 25:
+                break
+            
+            maxiter = 300
+            gtol = 1e-10
+            
+            optimized = _optimize_lbfgs(current, beta, maxiter, gtol)
+            
+            if np.all(np.isfinite(optimized)):
+                radii = np.hypot(optimized[:, 0], optimized[:, 1])
+                mask = radii > 1.0
+                if np.any(mask):
+                    optimized[mask] *= (0.999 / radii[mask])[:, None]
+                
+                score = _score(optimized)
+                if score > best_score:
+                    best_score = score
+                    best_pts = optimized
+                    current = optimized
+            
+            # Force-directed relaxation between deep optimization steps
+            if time.time() - start_time < _DEADLINE - 30:
+                relaxed, relaxed_score = _force_directed_relax(current, start_time, max_steps=300)
+                if relaxed_score > best_score:
+                    best_score = relaxed_score
+                    best_pts = relaxed
+                    current = relaxed
+    
+    # Phase 3: High-precision final polish
+    if time.time() - start_time < _DEADLINE - 5:
+        final_pts, final_score = _high_beta_polish(best_pts, start_time)
+        if final_score > best_score:
+            best_score = final_score
+            best_pts = final_pts
+    
+    # Final validation
+    radii = np.hypot(best_pts[:, 0], best_pts[:, 1])
+    max_allowed_radius = 1.0 - best_score - 1e-12
+    
+    mask = radii > max_allowed_radius
+    if np.any(mask):
+        best_pts[mask] *= (max_allowed_radius / radii[mask])[:, None]
+        
+    return best_pts
+
+# EVOLVE-BLOCK-END

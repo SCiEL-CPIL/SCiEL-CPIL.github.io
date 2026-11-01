@@ -8,9 +8,21 @@ N = 12
 # EVOLVE-BLOCK-START
 def construct():
     start_time = time.time()
-    deadline = start_time + 140.0  # Safety margin
-    
+    deadline = start_time + 140.0  # Safety margin before 150s limit
+
+    # Helper to check if a point is inside a hexagon of side L centered at origin (flat-top)
+    def point_in_hexagon(x, y, L):
+        # Flat top hexagon inequalities:
+        # |x| <= L
+        # |y| <= sqrt(3)/2 * L
+        # |sqrt(3)/2 * x + 1/2 * y| <= sqrt(3)/2 * L
+        if abs(x) > L: return False
+        if abs(y) > np.sqrt(3)/2 * L: return False
+        if abs(np.sqrt(3)/2 * x + 0.5 * y) > np.sqrt(3)/2 * L: return False
+        return True
+
     def hexagon_vertices(cx, cy, side, angle_deg):
+        """Returns vertices of a regular hexagon centered at (cx, cy) with given side length and rotation."""
         angle = np.radians(angle_deg)
         vertices = []
         for i in range(6):
@@ -21,7 +33,7 @@ def construct():
         return np.array(vertices)
 
     def hexagons_disjoint_fast(h1, h2):
-        """Fast check: distance based rejection, then SAT if close"""
+        """Fast check for disjointness using SAT (Separating Axis Theorem)."""
         dx = h1[0] - h2[0]
         dy = h1[1] - h2[1]
         dist_sq = dx*dx + dy*dy
@@ -60,7 +72,7 @@ def construct():
         return False
 
     def compute_min_side_fast(inner, center, angle):
-        """Vectorized computation of minimum outer side length"""
+        """Vectorized computation of minimum outer side length required to contain all inner hexagons."""
         sqrt3 = np.sqrt(3)
         max_extent = 0.0
         
@@ -84,14 +96,14 @@ def construct():
         return max_extent * 2.0 / sqrt3
 
     def objective(params):
-        """Objective: minimize outer side length"""
+        """Objective: minimize outer side length while ensuring disjointness."""
         # Unpack
         inner = []
         for i in range(N):
             inner.append((params[3*i], params[3*i+1], params[3*i+2]))
         
         center = (params[3*N], params[3*N+1])
-        angle = params[3*N+3]
+        angle = params[3*N+2]
         
         # Check disjointness
         for i in range(N):
@@ -105,7 +117,7 @@ def construct():
         return side
 
     def initial_guess():
-        params = np.zeros(3*N + 4)
+        params = np.zeros(3*N + 3)
         positions = []
         # Hexagonal packing for 12 hexagons: 1 center, 6 ring 1, 5 ring 2
         positions.append((0, 0, 0))
@@ -123,7 +135,7 @@ def construct():
         
         params[3*N] = 0.0
         params[3*N+1] = 0.0
-        params[3*N+3] = 0.0
+        params[3*N+2] = 0.0
         return params
 
     best_params = initial_guess()
@@ -144,10 +156,8 @@ def construct():
         new_params = current_params.copy()
         
         # Perturb one random parameter
-        idx = random.randint(0, 3*N + 3)
-        if idx == 3*N + 2: # Skip side placeholder
-            continue
-            
+        idx = random.randint(0, 3*N + 2)
+        
         # Adaptive step size
         current_step = step_size * (0.5 + 0.5 * T)
         new_params[idx] += random.gauss(0, current_step)
@@ -172,7 +182,7 @@ def construct():
         inner.append([float(best_params[3*i]), float(best_params[3*i+1]), float(best_params[3*i+2])])
     
     center = (float(best_params[3*N]), float(best_params[3*N+1]))
-    angle = float(best_params[3*N+3])
+    angle = float(best_params[3*N+2])
     side = compute_min_side_fast(inner, center, angle)
     
     # Final check: ensure validity (disjointness is already checked in objective, 
