@@ -1,0 +1,23 @@
+import numpy as np
+
+def construct():
+    n, m, p = 2, 2, 7
+    
+    # Schoolbook decomposition: rank = n*m*p = 28
+    rank = n * m * p
+    
+    # Build U, V, W as lists of lists with integer entries
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][col] = 1
+                V[j * p + k][col] = 1
+                W[k * n + i][col] = 1
+                col += 1
+    
+    return {"U": U, "V": V, "W": W}

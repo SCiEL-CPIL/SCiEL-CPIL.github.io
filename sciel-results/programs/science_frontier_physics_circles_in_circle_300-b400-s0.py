@@ -115,40 +115,59 @@ def _ring_init(n):
             add = min(diff, max(1, ring_counts[i]//3))
             ring_counts[i] += add
             diff -= add
-            if diff == 0:
+            if diff <= 0:
                 break
     elif diff < 0:
         # Remove from outer rings
         for i in range(len(ring_counts)-1, -1, -1):
-            rem = min(-diff, ring_counts[i]-1)
-            ring_counts[i] -= rem
-            diff += rem
-            if diff == 0:
+            remove = min(-diff, ring_counts[i]-1)
+            ring_counts[i] -= remove
+            diff += remove
+            if diff >= 0:
                 break
     
-    # Remove empty rings
-    ring_counts = [c for c in ring_counts if c > 0]
-    num_rings = len(ring_counts)
+    # Ensure we have exactly n points
+    while sum(ring_counts) > n:
+        for i in range(len(ring_counts)-1, -1, -1):
+            if ring_counts[i] > 1:
+                ring_counts[i] -= 1
+                break
+    while sum(ring_counts) < n:
+        ring_counts[-1] += 1
     
-    # Radius of each ring
-    # Total area ~ pi
-    # Ring k area ~ 2*pi*r_k*dr
-    # For hex packing, dr ~ s = 2r_circle
-    # r_k ~ k * s
-    s = np.sqrt(2.0 * np.pi / (n * np.sqrt(3.0)))
-    
+    # Place points
+    idx = 0
     for k, count in enumerate(ring_counts):
         if k == 0:
-            points.append([0.0, 0.0])
+            if count >= 1:
+                points.append([0.0, 0.0])
+                idx += 1
         else:
-            r_k = k * s * 0.95  # Slightly less than full hex spacing
-            angles = np.linspace(0, 2*np.pi, count, endpoint=False) + np.pi/count  # Offset
-            for angle in angles:
-                points.append([r_k * np.cos(angle), r_k * np.sin(angle)])
+            radius = k * np.sqrt(2.0 * np.pi / (n * np.sqrt(3.0)))
+            # Phase offset to stagger rings
+            phase = (k % 2) * np.pi / count
+            for m in range(count):
+                if idx >= n:
+                    break
+                angle = 2 * np.pi * m / count + phase
+                x = radius * np.cos(angle)
+                y = radius * np.sin(angle)
+                if x*x + y*y <= 1.0:
+                    points.append([x, y])
+                    idx += 1
     
-    points = np.array(points[:n])
+    points = np.array(points)
     
-    # Add small random perturbation to break symmetry
+    if len(points) < n:
+        # Fill remaining with random points
+        while len(points) < n:
+            x, y = np.random.uniform(-0.9, 0.9, 2)
+            if x*x + y*y <= 1.0:
+                points = np.vstack([points, [[x, y]]])
+    elif len(points) > n:
+        points = points[:n]
+    
+    # Add small random perturbation
     points += np.random.normal(0, 1e-4, points.shape)
     
     return points
@@ -157,67 +176,43 @@ def construct():
     start_time = time.time()
     deadline = start_time + 145.0  # 5s safety margin
     
-    # 1. Initialization - try multiple initializations and keep the best
-    np.random.seed(42)
+    # Try multiple initializations
+    inits = [_hex_lattice_init(N), _ring_init(N)]
     
-    inits = [
-        _hex_lattice_init(N),
-        _ring_init(N),
-    ]
+    best_points = None
+    best_score = -np.inf
     
-    # Also add a random initialization
-    random_points = np.random.rand(N, 2) * 2 - 1
-    norms = np.linalg.norm(random_points, axis=1)
-    mask = norms > 1.0
-    random_points[mask] = random_points[mask] / norms[mask, np.newaxis] * 0.95
-    inits.append(random_points)
-    
-    points = inits[0]
-    best_points = points.copy()
-    best_score = _compute_score(points)
-    
-    for init in inits[1:]:
-        score = _compute_score(init)
+    for init_points in inits:
+        if time.time() > deadline - 20:
+            break
+        
+        points = init_points
+        score = _compute_score(points)
+        
         if score > best_score:
+            best_points = points.copy()
             best_score = score
-            best_points = init
-            points = init
     
-    # 2. Optimization using L-BFGS-B with smooth soft-min objective
-    # Objective: minimize -soft_min(dists, boundary_dists)
-    # soft_min(z) = -1/beta * log(sum(exp(-beta * z)))
-    # Gradient: grad(soft_min) = sum(exp(-beta*z) * grad(z)) / sum(exp(-beta*z))
-    #           = sum(p_k * grad(z_k)) where p_k = exp(-beta*z_k) / sum(exp(-beta*z))
+    if best_points is None:
+        best_points = _hex_lattice_init(N)
+        best_score = _compute_score(best_points)
     
+    # Precompute upper triangle indices
+    iu = np.triu_indices(N, k=1)
+    n_pairs = len(iu[0])
+    
+    # Optimization using L-BFGS-B with smooth soft-min objective
     def objective_and_grad(x, beta):
         p = x.reshape(-1, 2)
         
-        # Calculate distances
-        diff = p[:, np.newaxis, :] - p[np.newaxis, :, :]
-        dists = np.sqrt(np.sum(diff**2, axis=-1))
-        np.fill_diagonal(dists, np.inf)
-        
-        # We want the radius r, so the "distance" for pairs is d/2.
-        # Let's define the "constraint distances" c_k.
-        # For pairs (i,j): c_{ij} = dists[i,j] / 2.0
-        # For boundary i: c_i = 1.0 - norms[i]
-        
-        # We want to maximize min(c_k).
-        # Minimize -min(c_k).
-        # Smooth approximation: -soft_min(c)
-        
-        # Flatten distances for vectorization
-        # Pair distances: upper triangle
-        iu = np.triu_indices(N, k=1)
-        pair_dists = dists[iu] / 2.0
+        # Calculate pair distances efficiently
+        i_idx, j_idx = iu
+        vecs = p[i_idx] - p[j_idx]
+        pair_dists = np.sqrt(np.sum(vecs**2, axis=1)) / 2.0
         
         # Boundary distances
         norms = np.linalg.norm(p, axis=1)
         bound_dists = 1.0 - norms
-        
-        # Combine all constraint distances
-        # Note: pair_dists has N*(N-1)/2 elements, bound_dists has N elements.
-        # We need to compute soft_min and its gradient.
         
         # To avoid overflow in exp, we use the log-sum-exp trick.
         # Let z = -beta * c.
@@ -225,10 +220,6 @@ def construct():
         
         z_pairs = -beta * pair_dists
         z_bounds = -beta * bound_dists
-        
-        # Concatenate for sum
-        # We can compute log_sum_exp separately or combined.
-        # Combined is easier for gradient weighting.
         
         # Max values for stability
         max_z_pair = np.max(z_pairs)
@@ -248,10 +239,6 @@ def construct():
         val = log_sum_exp / beta
         
         # Gradient
-        # grad(soft_min) = (1/sum_exp) * sum_k exp(-beta*c_k) * grad(c_k)
-        # grad(-soft_min) = -grad(soft_min)
-        # We want grad of objective = grad(-soft_min)
-        
         # Weights
         w_pairs = exp_pairs / sum_exp
         w_bounds = exp_bounds / sum_exp
@@ -259,85 +246,74 @@ def construct():
         grad = np.zeros_like(p)
         
         # Pair contributions
-        # c_{ij} = 0.5 * |p_i - p_j|
-        # grad_{p_i} c_{ij} = 0.5 * (p_i - p_j) / |p_i - p_j|
-        # grad_{p_j} c_{ij} = 0.5 * (p_j - p_i) / |p_i - p_j|
-        
-        # Vectorized pair gradient
-        # For each pair (i,j) with weight w_k:
-        # grad[p_i] += w_k * 0.5 * (p_i - p_j) / dists[i,j]
-        # grad[p_j] -= w_k * 0.5 * (p_j - p_i) / dists[i,j]
-        
-        # dists[i,j] = 2 * pair_dists[k]
-        # So 0.5 / dists[i,j] = 0.5 / (2 * pair_dists[k]) = 0.25 / pair_dists[k]
-        
-        # Let's compute the vector directions
-        # diff[i,j] = p_i - p_j
-        # We have iu indices.
-        i_idx, j_idx = iu
+        # d(pair_dist)/dp_i = (p_i - p_j) / (2 * dist)
+        # d(-beta * pair_dist)/dp_i = -beta * (p_i - p_j) / (2 * dist)
+        # soft_min gradient: sum(w_k * d(-beta*c_k)/dp) / beta = sum(w_k * d(-c_k)/dp)
+        # So: grad_pair_i = sum over j of w_ij * (p_j - p_i) / (2 * pair_dist_ij)
         
         # Avoid division by zero
         safe_pair_dists = np.where(pair_dists > 1e-12, pair_dists, 1.0)
         
-        # Coefficient for each pair
-        # w_k * 0.25 / pair_dists[k]
-        coeff = w_pairs * 0.25 / safe_pair_dists
-        
-        # Vector from j to i
-        vecs = p[i_idx] - p[j_idx]
+        # Coefficient for each pair: w / (2 * pair_dist)
+        coeff = w_pairs / (2.0 * safe_pair_dists)
         
         # Accumulate gradients
-        # grad[p_i] += coeff * vecs
-        # grad[p_j] -= coeff * vecs
-        
-        np.add.at(grad, i_idx, coeff[:, np.newaxis] * vecs)
-        np.add.at(grad, j_idx, -coeff[:, np.newaxis] * vecs)
+        # For point i: sum of coeff * (p_j - p_i) for all j > i
+        # For point j: sum of coeff * (p_i - p_j) for all i < j
+        np.add.at(grad, i_idx, -coeff[:, np.newaxis] * vecs)
+        np.add.at(grad, j_idx, coeff[:, np.newaxis] * vecs)
         
         # Boundary contributions
-        # c_i = 1 - |p_i|
-        # grad_{p_i} c_i = - p_i / |p_i|
-        
+        # d(-bound_dist)/dp = d(-1 + norm)/dp = p / norm
         safe_norms = np.where(norms > 1e-12, norms, 1.0)
-        bound_grad_vecs = -p / safe_norms[:, np.newaxis]
+        bound_grad_vecs = p / safe_norms[:, np.newaxis]
         
-        # grad[p_i] += w_bounds[i] * bound_grad_vecs[i]
         grad += w_bounds[:, np.newaxis] * bound_grad_vecs
         
-        # The objective is -soft_min, so gradient is -grad(soft_min)
-        # Wait, my derivation:
-        # f = -soft_min
-        # grad(f) = -grad(soft_min)
-        # grad(soft_min) = sum(w_k * grad(c_k))
-        # So grad(f) = -sum(w_k * grad(c_k))
-        
-        return val, -grad
+        return val, grad
 
     # Optimization loop with increasing beta
-    # Start with low beta (smooth), increase to high beta (sharp)
-    betas = [10.0, 50.0, 100.0, 500.0, 1000.0, 3000.0]
+    betas = [10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0, 10000.0]
     
-    current_points = points.copy()
+    current_points = best_points.copy()
     
     for beta in betas:
         if time.time() > deadline - 15:
             break
             
         try:
+            # Use a tighter tolerance for higher betas
+            if beta >= 1000:
+                maxiter = 500
+                gtol = 1e-11
+                ftol = 1e-14
+                maxls = 50
+            elif beta >= 100:
+                maxiter = 400
+                gtol = 1e-10
+                ftol = 1e-13
+                maxls = 40
+            else:
+                maxiter = 300
+                gtol = 1e-9
+                ftol = 1e-12
+                maxls = 30
+            
             res = minimize(
                 lambda x: objective_and_grad(x, beta)[0],
                 current_points.flatten(),
                 jac=lambda x: objective_and_grad(x, beta)[1],
                 method='L-BFGS-B',
                 options={
-                    'maxiter': 300,
-                    'gtol': 1e-9,
-                    'ftol': 1e-11,
-                    'maxls': 25,
+                    'maxiter': maxiter,
+                    'gtol': gtol,
+                    'ftol': ftol,
+                    'maxls': maxls,
                     'disp': False
                 }
             )
             
-            if time.time() > deadline - 8:
+            if time.time() > deadline - 5:
                 break
                 
             candidate = res.x.reshape(-1, 2)
@@ -348,53 +324,25 @@ def construct():
                 best_score = candidate_score
                 current_points = candidate
             else:
-                # If it didn't improve, keep current best for next beta
-                # But maybe the optimizer moved it to a worse local min.
-                # We should probably restart from best_points for next beta?
-                # Or just continue from current_points if it's close.
-                # Let's stick with best_points for stability.
                 current_points = best_points
                 
         except Exception:
             pass
 
     # Final polish with very high beta if time permits
-    if time.time() < deadline - 5:
+    if time.time() < deadline - 3:
         try:
+            final_beta = 50000.0
             res = minimize(
-                lambda x: objective_and_grad(x, 5000.0)[0],
+                lambda x: objective_and_grad(x, final_beta)[0],
                 best_points.flatten(),
-                jac=lambda x: objective_and_grad(x, beta)[1],
+                jac=lambda x: objective_and_grad(x, final_beta)[1],
                 method='L-BFGS-B',
                 options={
-                    'maxiter': 200,
-                    'gtol': 1e-11,
-                    'ftol': 1e-13,
-                    'maxls': 15,
-                    'disp': False
-                }
-            )
-            candidate = res.x.reshape(-1, 2)
-            candidate_score = _compute_score(candidate)
-            if candidate_score > best_score:
-                best_points = candidate
-                best_score = candidate_score
-        except Exception:
-            pass
-
-    # Second polish pass with even higher beta and tighter tolerance
-    if time.time() < deadline - 2:
-        try:
-            res = minimize(
-                lambda x: objective_and_grad(x, 10000.0)[0],
-                best_points.flatten(),
-                jac=lambda x: objective_and_grad(x, 10000.0)[1],
-                method='L-BFGS-B',
-                options={
-                    'maxiter': 150,
+                    'maxiter': 300,
                     'gtol': 1e-12,
-                    'ftol': 1e-14,
-                    'maxls': 20,
+                    'ftol': 1e-15,
+                    'maxls': 60,
                     'disp': False
                 }
             )
@@ -408,15 +356,9 @@ def construct():
 
     # Ensure points are inside
     norms = np.linalg.norm(best_points, axis=1)
-    max_allowed = 1.0 - best_score
-    # If any point is slightly outside due to numerical error, clip it
-    # But clipping might cause overlap. 
-    # The soft-min objective should keep them well inside.
-    # Just to be safe, if any norm > 1, scale back.
     outside = norms > 1.0
     if np.any(outside):
         best_points[outside] /= norms[outside, np.newaxis]
-        # Recalculate score
         best_score = _compute_score(best_points)
 
     return best_points

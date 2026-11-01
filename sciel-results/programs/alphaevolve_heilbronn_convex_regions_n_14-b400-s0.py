@@ -1,411 +1,319 @@
 import numpy as np
-import scipy.spatial
-import scipy.optimize
 import time
-from itertools import combinations
+from scipy.optimize import minimize, basinhopping, differential_evolution
+from scipy.spatial import ConvexHull
+import itertools
+import sys
 
 N = 14
 
-# Pre-compute triangle indices for speed
-def _get_triangle_indices(n):
-    indices = []
-    for i in range(n):
-        for j in range(i+1, n):
-            for k in range(j+1, n):
-                indices.append((i, j, k))
-    return np.array(indices, dtype=np.int32)
+# Precompute triangle indices
+_IDX = np.array([(i, j, k) for i in range(N) for j in range(i + 1, N) for k in range(j + 1, N)])
+_I, _J, _K = _IDX[:, 0], _IDX[:, 1], _IDX[:, 2]
 
-_TRI_INDICES = _get_triangle_indices(N)
-_I = _TRI_INDICES[:, 0]
-_J = _TRI_INDICES[:, 1]
-_K = _TRI_INDICES[:, 2]
-
-def _min_triangle_area(points):
-    pi = points[_I]
-    pj = points[_J]
-    pk = points[_K]
-    v1 = pj - pi
-    v2 = pk - pi
-    cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
-    return 0.5 * np.abs(cross).min()
-
-def _hull_area(points):
+def compute_score(points):
+    """Compute min triangle area / convex hull area, vectorized."""
+    n = len(points)
+    if n < 3:
+        return 0.0
     try:
-        hull = scipy.spatial.ConvexHull(points)
-        return hull.volume
+        hull = ConvexHull(points)
+        hull_area = hull.volume
+        if hull_area <= 1e-12:
+            return 0.0
     except Exception:
         return 0.0
-
-def _score(points):
-    try:
-        if len(points) < 3:
-            return 0.0
-        ha = _hull_area(points)
-        if ha < 1e-12:
-            return 0.0
-        mta = _min_triangle_area(points)
-        return mta / ha
-    except Exception:
-        return 0.0
-
-def _normalize(points):
-    try:
-        ha = _hull_area(points)
-        if ha < 1e-12:
-            return points
-        # Scale so that hull area = 1 (since score = min_area / hull_area,
-        # and both scale by s^2, the ratio is invariant under uniform scaling)
-        return points / np.sqrt(ha)
-    except Exception:
-        return points
-
-def _regular_polygon(n, radius=1.0, rotation=0.0):
-    angles = np.linspace(0, 2 * np.pi, n, endpoint=False) + rotation
-    return np.column_stack([radius * np.cos(angles), radius * np.sin(angles)])
-
-def _generate_two_ring_config(n1, n2, r1, r2, rot1, rot2):
-    pts1 = _regular_polygon(n1, r1, rot1)
-    pts2 = _regular_polygon(n2, r2, rot2)
-    return np.vstack([pts1, pts2])
-
-def _generate_three_ring_config(n1, n2, n3, r1, r2, r3, rot1, rot2, rot3):
-    pts1 = _regular_polygon(n1, r1, rot1)
-    pts2 = _regular_polygon(n2, r2, rot2)
-    pts3 = _regular_polygon(n3, r3, rot3)
-    return np.vstack([pts1, pts2, pts3])
-
-def _smooth_min_triangle_area(points, beta=100.0):
-    pi = points[_I]
-    pj = points[_J]
-    pk = points[_K]
-    v1 = pj - pi
-    v2 = pk - pi
+    
+    p_i = points[_I]
+    p_j = points[_J]
+    p_k = points[_K]
+    
+    v1 = p_j - p_i
+    v2 = p_k - p_i
     cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
     areas = 0.5 * np.abs(cross)
     
-    max_area = np.max(areas)
-    if max_area < 1e-15:
+    min_area = np.min(areas)
+    if min_area < 1e-12:
+        return 0.0
+    return min_area / hull_area
+
+def neg_score(x):
+    points = x.reshape((N, 2))
+    return -compute_score(points)
+
+def soft_min_score(x, tau):
+    """
+    Compute -soft_min(areas) / hull_area.
+    soft_min(A) = -tau * log(sum(exp(-A/tau)))
+    This is differentiable and approximates -min(A) as tau -> 0.
+    """
+    points = x.reshape((N, 2))
+    try:
+        hull = ConvexHull(points)
+        hull_area = hull.volume
+        if hull_area <= 1e-12:
+            return 0.0
+    except Exception:
         return 0.0
     
-    shifted = areas - max_area
-    exp_vals = np.exp(-beta * shifted)
-    log_sum = -beta * max_area + np.log(np.sum(exp_vals))
-    smooth_min = -log_sum / beta
-    return smooth_min
-
-def _neg_smooth_score_and_grad(points_flat, beta=100.0):
-    points = points_flat.reshape(-1, 2)
+    p_i = points[_I]
+    p_j = points[_J]
+    p_k = points[_K]
     
-    pi = points[_I]
-    pj = points[_J]
-    pk = points[_K]
-    v1 = pj - pi
-    v2 = pk - pi
+    v1 = p_j - p_i
+    v2 = p_k - p_i
     cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
     areas = 0.5 * np.abs(cross)
     
-    max_area = np.max(areas)
-    if max_area < 1e-15:
-        return 0.0, np.zeros_like(points_flat)
+    areas = np.maximum(areas, 1e-12)
+        
+    scaled = -areas / tau
+    max_scaled = np.max(scaled)
+    sum_exp = np.sum(np.exp(scaled - max_scaled))
+    soft_min_val = -tau * (max_scaled + np.log(sum_exp))
+    
+    return -soft_min_val / hull_area
 
-    shifted = areas - max_area
-    exp_vals = np.exp(-beta * shifted)
-    sum_exp = np.sum(exp_vals)
-    if sum_exp == 0:
-        return 0.0, np.zeros_like(points_flat)
-    weights = exp_vals / sum_exp
+def ring_configuration(params):
+    """
+    Generate points from ring parameters.
+    params: [r1, r2, r3, r4, theta_offset1, theta_offset2, theta_offset3, theta_offset4,
+             n1, n2, n3, n4] where n1+n2+n3+n4=14, r_i >= 0, theta offsets in [0, 2pi)
+    """
+    r1, r2, r3, r4, th1, th2, th3, th4, n1, n2, n3, n4 = params
+    n1 = int(round(n1))
+    n2 = int(round(n2))
+    n3 = int(round(n3))
+    n4 = int(round(n4))
     
-    log_sum = -beta * max_area + np.log(sum_exp)
-    smooth_min = -log_sum / beta
+    # Ensure we have exactly 14 points
+    while n1 + n2 + n3 + n4 > 14:
+        if n4 >= 1:
+            n4 -= 1
+        elif n3 >= 1:
+            n3 -= 1
+        elif n2 >= 1:
+            n2 -= 1
+        else:
+            n1 -= 1
+    while n1 + n2 + n3 + n4 < 14:
+        n4 += 1
     
-    ha = _hull_area(points)
-    if ha < 1e-12:
-        return 0.0, np.zeros_like(points_flat)
+    points = []
     
-    score = smooth_min / ha
+    # Ring 1 (outermost)
+    if n1 > 0:
+        angles = th1 + np.linspace(0, 2*np.pi, n1, endpoint=False)
+        points.append(np.column_stack((r1*np.cos(angles), r1*np.sin(angles))))
     
-    signs = np.sign(cross)
+    # Ring 2
+    if n2 > 0:
+        angles = th2 + np.linspace(0, 2*np.pi, n2, endpoint=False)
+        points.append(np.column_stack((r2*np.cos(angles), r2*np.sin(angles))))
     
-    d_cross_di_x = -(v1[:, 1] + v2[:, 1])
-    d_cross_di_y = (v1[:, 0] + v2[:, 0])
-    d_cross_dj_x = v2[:, 1]
-    d_cross_dj_y = -v2[:, 0]
-    d_cross_dk_x = -v1[:, 1]
-    d_cross_dk_y = v1[:, 0]
+    # Ring 3
+    if n3 > 0:
+        angles = th3 + np.linspace(0, 2*np.pi, n3, endpoint=False)
+        points.append(np.column_stack((r3*np.cos(angles), r3*np.sin(angles))))
     
-    w = weights * signs * 0.5
+    # Ring 4 (innermost)
+    if n4 > 0:
+        angles = th4 + np.linspace(0, 2*np.pi, n4, endpoint=False)
+        points.append(np.column_stack((r4*np.cos(angles), r4*np.sin(angles))))
     
-    grad_points = np.zeros_like(points)
+    if not points:
+        return np.zeros((N, 2))
     
-    dA_di = w[:, None] * np.column_stack([d_cross_di_x, d_cross_di_y])
-    dA_dj = w[:, None] * np.column_stack([d_cross_dj_x, d_cross_dj_y])
-    dA_dk = w[:, None] * np.column_stack([d_cross_dk_x, d_cross_dk_y])
+    result = np.vstack(points)
     
-    np.add.at(grad_points, _I, dA_di)
-    np.add.at(grad_points, _J, dA_dj)
-    np.add.at(grad_points, _K, dA_dk)
+    # Pad or trim to exactly N points if needed
+    if len(result) < N:
+        # Add points at center
+        extra = np.zeros((N - len(result), 2))
+        result = np.vstack([result, extra])
+    elif len(result) > N:
+        result = result[:N]
     
-    grad_score = grad_points / ha
-    
-    return -score, -grad_score.flatten()
+    return result
+
+def ring_score(params):
+    """Score for ring parameterization."""
+    try:
+        points = ring_configuration(params)
+        return compute_score(points)
+    except Exception:
+        return 0.0
+
+def neg_ring_score(params):
+    return -ring_score(params)
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 115.0  # 5s safety margin
+    deadline = 142.0  # Safety margin before 150s kill
     
-    best_score = 0.0
     best_points = None
-    rng = np.random.RandomState(42)
-
-    def _update_best(points):
-        nonlocal best_score, best_points
-        pts = _normalize(points)
-        sc = _score(pts)
-        if sc > best_score:
-            best_score = sc
-            best_points = pts.copy()
-        return sc
-
-    def _try_optimize_smooth(init_points, beta_start=50.0, beta_end=500.0, maxiter=2000):
-        if time.time() > deadline:
-            return
-        init_norm = _normalize(init_points)
-        x0 = init_norm.flatten()
+    best_score = -float('inf')
+    rng = np.random.default_rng(42)
+    
+    def try_update(points):
+        nonlocal best_points, best_score
+        s = compute_score(points)
+        if s > best_score:
+            best_score = s
+            best_points = points.copy()
+        return s
+    
+    # Phase 1: Differential Evolution on 4-ring parameters
+    # Parameters: [r1, r2, r3, r4, th1, th2, th3, th4, n1, n2, n3, n4]
+    bounds = [
+        (0.3, 1.5),  # r1 (outermost)
+        (0.1, 1.0),  # r2
+        (0.0, 0.7),  # r3
+        (0.0, 0.4),  # r4 (innermost)
+        (0, 2*np.pi),  # th1
+        (0, 2*np.pi),  # th2
+        (0, 2*np.pi),  # th3
+        (0, 2*np.pi),  # th4
+        (1, 14),  # n1
+        (1, 14),  # n2
+        (1, 14),  # n3
+        (1, 14),  # n4
+    ]
+    
+    # Try differential evolution with multiple restarts
+    for restart in range(4):
+        if time.time() - start_time > deadline - 35:
+            break
         
-        n_stages = 5
-        betas = np.linspace(beta_start, beta_end, n_stages)
+        try:
+            res = differential_evolution(
+                neg_ring_score,
+                bounds,
+                seed=rng.integers(0, 2**31),
+                maxiter=80,
+                tol=1e-6,
+                popsize=12,
+                mutation=(0.3, 1.2),
+                recombination=0.9,
+                polish=True,
+                init='latinhypercube'
+            )
+            
+            if res.success or res.fun < 0:
+                best_params = res.x
+                points = ring_configuration(best_params)
+                s = try_update(points)
+        except Exception:
+            pass
+    
+    # Phase 2: Multi-start L-BFGS-B on full 28D space from good ring configs
+    if best_points is not None and time.time() - start_time < deadline - 40:
+        # Generate diverse starting points
+        starts = [best_points]
         
-        x = x0.copy()
-        for beta in betas:
-            if time.time() > deadline - 5:
+        # Add jittered versions
+        for _ in range(6):
+            jittered = best_points + rng.normal(0, 0.08, (N, 2))
+            starts.append(jittered)
+        
+        # Add some structured starts
+        # Regular 14-gon
+        angles = np.linspace(0, 2*np.pi, N, endpoint=False)
+        starts.append(np.column_stack((np.cos(angles), np.sin(angles))))
+        
+        # Two rings 7+7
+        a_out = np.linspace(0, 2*np.pi, 7, endpoint=False)
+        a_in = a_out + np.pi/7
+        starts.append(np.vstack((
+            np.column_stack((np.cos(a_out), np.sin(a_out))),
+            np.column_stack((0.5*np.cos(a_in), 0.5*np.sin(a_in)))
+        )))
+        
+        # Three rings 5+5+4
+        a1 = np.linspace(0, 2*np.pi, 5, endpoint=False)
+        a2 = a1 + np.pi/5
+        a3 = np.linspace(0, 2*np.pi, 4, endpoint=False) + np.pi/4
+        starts.append(np.vstack((
+            np.column_stack((np.cos(a1), np.sin(a1))),
+            np.column_stack((0.6*np.cos(a2), 0.6*np.sin(a2))),
+            np.column_stack((0.25*np.cos(a3), 0.25*np.sin(a3)))
+        )))
+        
+        # Four rings 4+4+3+3
+        a1 = np.linspace(0, 2*np.pi, 4, endpoint=False)
+        a2 = a1 + np.pi/4
+        a3 = np.linspace(0, 2*np.pi, 3, endpoint=False) + np.pi/3
+        a4 = a3 + np.pi/3
+        starts.append(np.vstack((
+            np.column_stack((np.cos(a1), np.sin(a1))),
+            np.column_stack((0.65*np.cos(a2), 0.65*np.sin(a2))),
+            np.column_stack((0.35*np.cos(a3), 0.35*np.sin(a3))),
+            np.column_stack((0.1*np.cos(a4), 0.1*np.sin(a4)))
+        )))
+        
+        for start in starts:
+            if time.time() - start_time > deadline - 20:
                 break
             
-            def _obj_and_grad(x_flat, beta_val=beta):
-                return _neg_smooth_score_and_grad(x_flat, beta_val)
+            x0 = start.flatten()
             
-            try:
-                res = scipy.optimize.minimize(
-                    _obj_and_grad,
-                    x,
-                    jac=True,
-                    method='L-BFGS-B',
-                    options={'maxiter': maxiter // n_stages, 'gtol': 1e-8, 'ftol': 1e-12}
-                )
-                x = res.x
-                _update_best(x.reshape(-1, 2))
-            except Exception:
-                pass
-        
-        if time.time() < deadline - 3:
-            try:
-                def _obj_and_grad_high_beta(x_flat):
-                    return _neg_smooth_score_and_grad(x_flat, 1000.0)
-                
-                res = scipy.optimize.minimize(
-                    _obj_and_grad_high_beta,
-                    x,
-                    jac=True,
-                    method='L-BFGS-B',
-                    options={'maxiter': 500, 'gtol': 1e-10, 'ftol': 1e-14}
-                )
-                x = res.x
-                _update_best(x.reshape(-1, 2))
-                
-                if time.time() < deadline - 1:
-                    def _neg_exact_score(x_flat):
-                        return -_score(x_flat.reshape(-1, 2))
-                    
-                    res = scipy.optimize.minimize(
-                        _neg_exact_score,
-                        x,
-                        method='Nelder-Mead',
-                        options={'maxiter': 200, 'xatol': 1e-10, 'fatol': 1e-12, 'adaptive': True}
-                    )
-                    _update_best(res.x.reshape(-1, 2))
-            except Exception:
-                pass
-
-    # 1. Explore two-ring configurations extensively
-    splits = [(7, 7), (6, 8), (8, 6), (5, 9), (9, 5), (4, 10), (10, 4), (3, 11), (11, 3), (2, 12), (12, 2)]
-    
-    for n1, n2 in splits:
-        if time.time() > deadline:
-            break
-        
-        def _two_ring_score(params):
-            r_ratio = params[0]
-            rot1 = params[1]
-            rot2 = params[2]
+            # Annealing schedule for tau - tighter schedule
+            taus = [0.05, 0.02, 0.008, 0.003, 0.001]
             
-            r1 = 1.0
-            r2 = r_ratio * r1
-            
-            if r2 <= 0.01:
-                return -1e6
-                
-            pts = _generate_two_ring_config(n1, n2, r1, r2, rot1, rot2)
-            sc = _score(_normalize(pts))
-            return -sc
-
-        # More starting points with wider range
-        for r_init in [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
-            for rot_init in [0.0, np.pi/n1, np.pi/n2, 2*np.pi/n1, np.pi/(n1+n2)]:
-                if time.time() > deadline:
-                    continue
-                x0 = np.array([r_init, 0.0, rot_init])
-                try:
-                    res = scipy.optimize.minimize(
-                        _two_ring_score,
-                        x0,
-                        method='Nelder-Mead',
-                        options={'maxiter': 400, 'xatol': 1e-9, 'fatol': 1e-11}
-                    )
-                    r_ratio, rot1, rot2 = res.x
-                    pts = _generate_two_ring_config(n1, n2, 1.0, r_ratio, rot1, rot2)
-                    sc = _update_best(pts)
-                    
-                    if sc > best_score * 0.9 and time.time() < deadline - 12:
-                        _try_optimize_smooth(pts, maxiter=1200)
-                        
-                except Exception:
-                    pass
-
-    # 2. Explore three-ring configurations
-    three_ring_splits = [(5, 4, 5), (4, 5, 5), (5, 5, 4), (6, 4, 4), (4, 6, 4), (4, 4, 6), (7, 3, 4), (3, 7, 4), (5, 5, 4), (4, 4, 6)]
-    
-    for n1, n2, n3 in three_ring_splits:
-        if time.time() > deadline - 5:
-            break
-        
-        def _three_ring_score(params):
-            r2_ratio = params[0]
-            r3_ratio = params[1]
-            rot1 = params[2]
-            rot2 = params[3]
-            rot3 = params[4]
-            
-            r1 = 1.0
-            r2 = r2_ratio * r1
-            r3 = r3_ratio * r1
-            
-            if r2 <= 0.01 or r3 <= 0.01:
-                return -1e6
-                
-            pts = _generate_three_ring_config(n1, n2, n3, r1, r2, r3, rot1, rot2, rot3)
-            sc = _score(_normalize(pts))
-            return -sc
-
-        for r2_init in [0.3, 0.4, 0.5, 0.6]:
-            for r3_init in [0.15, 0.25, 0.35, 0.45]:
-                if time.time() > deadline - 5:
-                    continue
-                x0 = np.array([r2_init, r3_init, 0.0, np.pi/n2, np.pi/n3])
-                try:
-                    res = scipy.optimize.minimize(
-                        _three_ring_score,
-                        x0,
-                        method='Nelder-Mead',
-                        options={'maxiter': 250, 'xatol': 1e-9, 'fatol': 1e-11}
-                    )
-                    r2_ratio, r3_ratio, rot1, rot2, rot3 = res.x
-                    pts = _generate_three_ring_config(n1, n2, n3, 1.0, r2_ratio, r3_ratio, rot1, rot2, rot3)
-                    sc = _update_best(pts)
-                    
-                    if sc > best_score * 0.9 and time.time() < deadline - 12:
-                        _try_optimize_smooth(pts, maxiter=800)
-                        
-                except Exception:
-                    pass
-
-    # 3. Regular polygon and perturbations with varying noise levels
-    reg = _regular_polygon(N, 1.0)
-    _update_best(reg)
-    
-    noise_levels = [0.05, 0.1, 0.15, 0.2, 0.3]
-    for noise_scale in noise_levels:
-        if time.time() > deadline - 8:
-            break
-        for trial in range(3):
-            if time.time() > deadline - 8:
-                break
-            noise = rng.uniform(-noise_scale, noise_scale, (N, 2))
-            init = _regular_polygon(N, 1.0) + noise
-            _try_optimize_smooth(init, maxiter=1000)
-
-    # 4. Random restarts with diverse distributions
-    for i in range(8):
-        if time.time() > deadline - 8:
-            break
-        if i % 3 == 0:
-            r = np.sqrt(rng.uniform(0, 1, N))
-            theta = rng.uniform(0, 2 * np.pi, N)
-        elif i % 3 == 1:
-            # Points biased toward boundary
-            r = rng.uniform(0.5, 1.0, N)
-            theta = rng.uniform(0, 2 * np.pi, N)
-        else:
-            # Mix of inner and outer
-            r = np.concatenate([rng.uniform(0, 0.5, 5), rng.uniform(0.7, 1.0, 9)])
-            rng.shuffle(r)
-            theta = rng.uniform(0, 2 * np.pi, N)
-        init = np.column_stack([r * np.cos(theta), r * np.sin(theta)])
-        _try_optimize_smooth(init, maxiter=800)
-
-    # 5. Coordinate Descent Polish - more aggressive
-    if best_points is not None and time.time() < deadline - 5:
-        pts = best_points.copy()
-        for iteration in range(5):
-            if time.time() > deadline - 2:
-                break
-            for i in range(N):
-                if time.time() > deadline - 2:
+            current_x = x0
+            for tau in taus:
+                if time.time() - start_time > deadline - 12:
                     break
-                def _neg_score_one_point(params):
-                    new_pts = pts.copy()
-                    new_pts[i, 0] = params[0]
-                    new_pts[i, 1] = params[1]
-                    return -_score(new_pts)
                 
-                x0 = np.array([pts[i, 0], pts[i, 1]])
                 try:
-                    res = scipy.optimize.minimize(
-                        _neg_score_one_point,
-                        x0,
-                        method='Nelder-Mead',
-                        options={'maxiter': 80, 'xatol': 1e-10, 'fatol': 1e-12}
+                    res = minimize(
+                        soft_min_score,
+                        current_x,
+                        args=(tau,),
+                        method='L-BFGS-B',
+                        options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-8}
                     )
-                    pts[i, 0] = res.x[0]
-                    pts[i, 1] = res.x[1]
+                    current_x = res.x
+                    new_p = current_x.reshape((N, 2))
+                    try_update(new_p)
                 except Exception:
                     pass
-        _update_best(pts)
-        
-        # 6. Final high-precision polish with smooth objective at high beta
-        if time.time() < deadline - 3:
-            x0 = pts.flatten()
-            try:
-                def _obj_and_grad_final(x_flat):
-                    return _neg_smooth_score_and_grad(x_flat, 2000.0)
-                
-                res = scipy.optimize.minimize(
-                    _obj_and_grad_final,
-                    x0,
-                    jac=True,
-                    method='L-BFGS-B',
-                    options={'maxiter': 500, 'gtol': 1e-12, 'ftol': 1e-15}
-                )
-                _update_best(res.x.reshape(-1, 2))
-            except Exception:
-                pass
-
-    if best_points is None:
-        best_points = _normalize(_regular_polygon(N, 1.0))
-    else:
-        best_points = _normalize(best_points)
-        
-    # Final sanity check
-    final_score = _score(best_points)
-    if final_score < 1e-10:
-        best_points = _normalize(_regular_polygon(N, 1.0))
-        
+    
+    # Phase 3: Basin hopping from best
+    if best_points is not None and time.time() - start_time < deadline - 18:
+        x0 = best_points.flatten()
+        try:
+            res = basinhopping(
+                neg_score, x0,
+                method='Nelder-Mead',
+                options={'maxiter': 300, 'xatol': 1e-8, 'fatol': 1e-10},
+                minsteps=5, T=0.5, stepsize=0.25,
+                interval=5, disp=False
+            )
+            new_p = res.x.reshape((N, 2))
+            try_update(new_p)
+        except Exception:
+            pass
+    
+    # Phase 4: Powell refinement
+    if best_points is not None and time.time() - start_time < deadline - 10:
+        x0 = best_points.flatten()
+        try:
+            res = minimize(neg_score, x0, method='Powell',
+                          options={'maxiter': 500, 'xtol': 1e-10, 'ftol': 1e-12})
+            try_update(res.x.reshape((N, 2)))
+        except Exception:
+            pass
+    
+    # Phase 5: Final Nelder-Mead polish with tighter tolerances
+    if best_points is not None and time.time() - start_time < deadline - 5:
+        x0 = best_points.flatten()
+        try:
+            res = minimize(neg_score, x0, method='Nelder-Mead',
+                          options={'maxiter': 3000, 'xatol': 1e-10, 'fatol': 1e-12})
+            try_update(res.x.reshape((N, 2)))
+        except Exception:
+            pass
+    
     return best_points
