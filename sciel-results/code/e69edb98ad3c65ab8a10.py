@@ -1,0 +1,24 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+N = 14
+
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 110.0  # Safety margin for 120s limit
+    
+    # Generate vertices of a regular N-gon inscribed in the unit circle.
+    # This configuration maximizes the minimum distance between points on the boundary
+    # and provides a highly symmetric distribution, which typically maximizes
+    # the minimum triangle area for a fixed convex hull area.
+    angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
+    points = np.column_stack((np.cos(angles), np.sin(angles)))
+    
+    # Check time, though this is instantaneous
+    if time.time() > deadline:
+         return points
+
+    return points
+# EVOLVE-BLOCK-END
