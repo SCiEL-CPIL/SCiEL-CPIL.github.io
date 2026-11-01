@@ -1,0 +1,111 @@
+import time
+import numpy as np
+
+DIMENSIONS = [3, 3, 8]
+START = time.time()
+DEADLINE = 140.0  # Safety margin before 150s limit
+
+def _build_schoolbook():
+    n, m, p = DIMENSIONS
+    rank = n * m * p
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][col] = 1
+                V[j * p + k][col] = 1
+                W[k * n + i][col] = 1
+                col += 1
+    return {"U": U, "V": V, "W": W}
+
+def _validate_vectorized(U, V, W, n, m, p, tol=1e-6):
+    U = np.asarray(U, dtype=float)
+    V = np.asarray(V, dtype=float)
+    W = np.asarray(W, dtype=float)
+    r = U.shape[1]
+    
+    # We need to check if sum_c U[i*m+j, c] V[j*p+k, c] W[k*n+i, c] == 1
+    # for all i, j, k.
+    
+    # Reshape U to (n, m, r), V to (m, p, r), W to (p, n, r)
+    U_reshaped = U.reshape(n, m, r)
+    V_reshaped = V.reshape(m, p, r)
+    W_reshaped = W.reshape(p, n, r)
+    
+    # Compute the tensor product sum
+    # T[i, j, k] = sum_c U[i, j, c] * V[j, k, c] * W[k, i, c]
+    
+    # We can use einsum for this
+    # 'ijc,jkc,kic->ijk'
+    try:
+        T = np.einsum('ijc,jkc,kic->ijk', U_reshaped, V_reshaped, W_reshaped)
+    except Exception:
+        return False
+        
+    # Check if T is all ones
+    if not np.allclose(T, 1.0, atol=tol):
+        return False
+    return True
+
+def _try_rank(r, n, m, p, iters=2000, seed=0):
+    rng = np.random.default_rng(seed)
+    # Use small integers for sampling to increase chance of finding valid integer solutions
+    # Coefficients are likely small in optimal decompositions
+    for it in range(iters):
+        if time.time() > DEADLINE:
+            return None
+            
+        # Sample from {-1, 0, 1} or {-2, -1, 0, 1, 2}
+        # Let's try {-1, 0, 1} first
+        U = rng.integers(-1, 2, size=(n * m, r))
+        V = rng.integers(-1, 2, size=(m * p, r))
+        W = rng.integers(-1, 2, size=(p * n, r))
+        
+        # Optional: ensure not all zeros
+        if np.all(U == 0) or np.all(V == 0) or np.all(W == 0):
+            continue
+            
+        if _validate_vectorized(U, V, W, n, m, p):
+            def to_list(M):
+                return [[int(v) for v in row] for row in M]
+            return {"U": to_list(U), "V": to_list(V), "W": to_list(W)}
+    return None
+
+def construct():
+    n, m, p = DIMENSIONS
+    best = _build_schoolbook()
+    best_rank = n * m * p
+    
+    # Lower bound is max(n*m, m*p, n*p)
+    lower = max(n * m, m * p, n * p)
+    
+    seed_counter = 0
+    # We iterate from lower bound to best_rank - 1
+    # If we find a rank, we can break or continue to find a lower one?
+    # The loop goes upwards, so the first found is the lowest possible in this range.
+    # So we can break.
+    
+    for r in range(lower, best_rank):
+        if time.time() > DEADLINE:
+            break
+            
+        # Increase iterations for smaller ranks?
+        # Smaller ranks are harder to find, so more iterations might help.
+        iters = 1000 if r < 30 else 500
+        
+        res = _try_rank(r, n, m, p, iters=iters, seed=seed_counter)
+        seed_counter += 1
+        
+        if res is not None:
+            best = res
+            best_rank = r
+            break
+            
+    return best
+
+if __name__ == "__main__":
+    res = construct()
+    print("rank:", len(res["U"][0]))

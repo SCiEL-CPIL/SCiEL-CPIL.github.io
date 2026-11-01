@@ -1,0 +1,341 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+N = 50
+
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from scipy.spatial import ConvexHull
+from scipy.optimize import minimize
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 145.0
+
+    def fibonacci_sphere(n, offset=0.5):
+        i = np.arange(n) + offset
+        z = 1.0 - 2.0 * i / n
+        phi = np.pi * (1.0 + np.sqrt(5.0)) * i
+        r = np.sqrt(np.clip(1.0 - z * z, 0.0, 1.0))
+        pts = np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
+        return pts
+
+    def compute_facet_circumcenters(pts):
+        try:
+            hull = ConvexHull(pts)
+        except Exception:
+            return [(np.pi, np.array([0.0, 0.0, 1.0]), None)]
+
+        results = []
+        for simplex in hull.simplices:
+            v1 = pts[simplex[0]]
+            v2 = pts[simplex[1]]
+            v3 = pts[simplex[2]]
+
+            edge1 = v2 - v1
+            edge2 = v3 - v1
+            n = np.cross(edge1, edge2)
+            norm_n = np.linalg.norm(n)
+            if norm_n < 1e-12:
+                continue
+
+            c = n / norm_n
+            if np.dot(c, v1) < 0:
+                c = -c
+
+            d = np.linalg.norm(c - v1)
+            radius = 2.0 * np.arcsin(np.clip(d / 2.0, 0.0, 1.0))
+            results.append((radius, c, simplex))
+
+        if not results:
+            return [(np.pi, np.array([0.0, 0.0, 1.0]), None)]
+
+        return results
+
+    def compute_covering_radius(pts):
+        facets = compute_facet_circumcenters(pts)
+        max_radius = 0.0
+        worst_center = None
+        for radius, c, _ in facets:
+            if radius > max_radius:
+                max_radius = radius
+                worst_center = c
+        if worst_center is None:
+            return np.pi, np.array([0.0, 0.0, 1.0])
+        return max_radius, worst_center
+
+    def soft_max_radius_objective(flat_pts, beta=50.0):
+        pts = flat_pts.reshape(N, 3)
+        norms = np.linalg.norm(pts, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1.0
+        pts = pts / norms
+
+        facets = compute_facet_circumcenters(pts)
+        if not facets or len(facets) < 2:
+            return np.pi
+
+        radii = np.array([r for r, _, _ in facets])
+        max_r = np.max(radii)
+        if max_r > 0:
+            log_sum = max_r + np.log(np.sum(np.exp((radii - max_r) * beta)) / len(radii)) / beta
+        else:
+            log_sum = 0.0
+        return log_sum
+
+    def optimize_worst_facet(pts, step_size, iterations=50):
+        pts = pts.copy()
+        for _ in range(iterations):
+            if time.time() > deadline - 5:
+                break
+
+            radius, worst_center = compute_covering_radius(pts)
+
+            try:
+                hull = ConvexHull(pts)
+            except:
+                break
+
+            target_indices = None
+            for simplex in hull.simplices:
+                v1 = pts[simplex[0]]
+                v2 = pts[simplex[1]]
+                v3 = pts[simplex[2]]
+                edge1 = v2 - v1
+                edge2 = v3 - v1
+                n = np.cross(edge1, edge2)
+                norm_n = np.linalg.norm(n)
+                if norm_n < 1e-12:
+                    continue
+                c = n / norm_n
+                if np.dot(c, v1) < 0:
+                    c = -c
+                if np.dot(c, worst_center) > 0.9999:
+                    target_indices = simplex
+                    break
+
+            if target_indices is None:
+                break
+
+            for idx in target_indices:
+                v = pts[idx]
+                dir_vec = worst_center - v
+                norm_dir = np.linalg.norm(dir_vec)
+                if norm_dir > 1e-10:
+                    dir_vec /= norm_dir
+                    pts[idx] = v + step_size * dir_vec
+                    pts[idx] /= np.linalg.norm(pts[idx])
+
+        return pts
+
+    def lloyd_iteration(pts, iterations=30):
+        """
+        Lloyd iteration: for each facet, move its vertices toward the facet's
+        circumcenter to reduce the covering radius.
+        """
+        pts = pts.copy()
+        for _ in range(iterations):
+            if time.time() > deadline - 5:
+                break
+
+            facets = compute_facet_circumcenters(pts)
+            if not facets:
+                break
+
+            # Compute target displacement for each point
+            displacement = np.zeros((N, 3))
+            count = np.zeros(N)
+            for radius, center, simplex in facets:
+                if simplex is None:
+                    continue
+                # Weight by radius to prioritize larger facets
+                weight = radius / max(f[0] for f in facets)
+                for idx in simplex:
+                    displacement[idx] += weight * (center - pts[idx])
+                    count[idx] += 1
+
+            # Apply averaged displacement
+            for i in range(N):
+                if count[i] > 0:
+                    disp = displacement[i] / count[i]
+                    pts[i] = pts[i] + 0.1 * disp
+                    pts[i] /= np.linalg.norm(pts[i])
+
+        return pts
+
+    def repulsion_relax(pts, iterations=50, strength=0.01):
+        """
+        Relax points using pairwise repulsion to spread them more uniformly.
+        """
+        pts = pts.copy()
+        for _ in range(iterations):
+            if time.time() > deadline - 5:
+                break
+
+            forces = np.zeros((N, 3))
+            for i in range(N):
+                for j in range(i + 1, N):
+                    d = np.arccos(np.clip(np.dot(pts[i], pts[j]), -1.0, 1.0))
+                    if d < 1e-6:
+                        continue
+                    force_mag = strength / (d * d)
+                    dir_vec = pts[i] - pts[j]
+                    norm_dir = np.linalg.norm(dir_vec)
+                    if norm_dir > 1e-10:
+                        dir_vec /= norm_dir
+                        forces[i] += force_mag * dir_vec
+                        forces[j] -= force_mag * dir_vec
+
+            for i in range(N):
+                new_v = pts[i] + 0.05 * forces[i]
+                new_norm = np.linalg.norm(new_v)
+                if new_norm > 1e-10:
+                    pts[i] = new_v / new_norm
+
+        return pts
+
+    # Phase 1: Initial Fibonacci spiral
+    best = fibonacci_sphere(N, 0.5)
+    best_radius = compute_covering_radius(best)[0]
+
+    # Phase 2: Pre-processing with Lloyd and repulsion
+    current = best.copy()
+    if time.time() < deadline - 20:
+        current = lloyd_iteration(current, iterations=30)
+        radius, _ = compute_covering_radius(current)
+        if radius < best_radius:
+            best_radius = radius
+            best = current.copy()
+
+    if time.time() < deadline - 20:
+        current = repulsion_relax(best.copy(), iterations=50)
+        radius, _ = compute_covering_radius(current)
+        if radius < best_radius:
+            best_radius = radius
+            best = current.copy()
+
+    # Phase 3: L-BFGS-B optimization on soft-max surrogate
+    if time.time() < deadline - 25:
+        flat_initial = best.flatten()
+        try:
+            result = minimize(
+                soft_max_radius_objective,
+                flat_initial,
+                method='L-BFGS-B',
+                options={'maxiter': 300, 'ftol': 1e-10, 'gtol': 1e-8}
+            )
+            if result.success:
+                current = result.x.reshape(N, 3)
+                radius, _ = compute_covering_radius(current)
+                if radius < best_radius:
+                    best_radius = radius
+                    best = current.copy()
+        except:
+            pass
+
+    # Phase 4: Worst-facet optimization
+    if time.time() < deadline - 15:
+        for step in [0.05, 0.02, 0.01]:
+            if time.time() > deadline - 15:
+                break
+            current = optimize_worst_facet(best.copy(), step, iterations=50)
+            radius, _ = compute_covering_radius(current)
+            if radius < best_radius:
+                best_radius = radius
+                best = current.copy()
+
+    # Phase 5: Random restarts with perturbations
+    if time.time() < deadline - 20:
+        for restart in range(12):
+            if time.time() > deadline - 20:
+                break
+
+            perturbed = best.copy()
+            noise_scale = 0.04 / (restart + 1)
+            for i in range(N):
+                rand_vec = np.random.randn(3)
+                rand_vec /= np.linalg.norm(rand_vec)
+                perturbed[i] = perturbed[i] + noise_scale * rand_vec
+                perturbed[i] /= np.linalg.norm(perturbed[i])
+
+            # Apply Lloyd then L-BFGS
+            if time.time() < deadline - 20:
+                perturbed = lloyd_iteration(perturbed, iterations=20)
+
+            if time.time() < deadline - 20:
+                flat_pert = perturbed.flatten()
+                try:
+                    result = minimize(
+                        soft_max_radius_objective,
+                        flat_pert,
+                        method='L-BFGS-B',
+                        options={'maxiter': 100, 'ftol': 1e-9, 'gtol': 1e-7}
+                    )
+                    if result.success:
+                        perturbed = result.x.reshape(N, 3)
+                except:
+                    pass
+
+            if time.time() < deadline - 20:
+                perturbed = optimize_worst_facet(perturbed, 0.01, iterations=30)
+
+            radius, _ = compute_covering_radius(perturbed)
+            if radius < best_radius:
+                best_radius = radius
+                best = perturbed.copy()
+
+    # Phase 6: Final fine-tuning
+    if time.time() < deadline - 5:
+        final = best.copy()
+        for _ in range(100):
+            if time.time() > deadline - 5:
+                break
+            radius, worst_center = compute_covering_radius(final)
+
+            try:
+                hull = ConvexHull(final)
+            except:
+                break
+
+            target_indices = None
+            for simplex in hull.simplices:
+                v1 = final[simplex[0]]
+                v2 = final[simplex[1]]
+                v3 = final[simplex[2]]
+                edge1 = v2 - v1
+                edge2 = v3 - v1
+                n = np.cross(edge1, edge2)
+                norm_n = np.linalg.norm(n)
+                if norm_n < 1e-12:
+                    continue
+                c = n / norm_n
+                if np.dot(c, v1) < 0:
+                    c = -c
+                if np.dot(c, worst_center) > 0.9999:
+                    target_indices = simplex
+                    break
+
+            if target_indices is None:
+                break
+
+            for idx in target_indices:
+                v = final[idx]
+                dir_vec = worst_center - v
+                norm_dir = np.linalg.norm(dir_vec)
+                if norm_dir > 1e-10:
+                    dir_vec /= norm_dir
+                    final[idx] = v + 0.002 * dir_vec
+                    final[idx] /= np.linalg.norm(final[idx])
+
+        radius, _ = compute_covering_radius(final)
+        if radius < best_radius:
+            best = final
+
+    # Final normalization and validation
+    best = best / np.linalg.norm(best, axis=1, keepdims=True)
+
+    norms = np.linalg.norm(best, axis=1)
+    valid = (norms > 1e-10) & np.all(np.isfinite(best), axis=1)
+    if not np.all(valid):
+        best = fibonacci_sphere(N)
+
+    return best
+# EVOLVE-BLOCK-END
