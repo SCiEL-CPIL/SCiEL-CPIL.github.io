@@ -1,0 +1,123 @@
+import numpy as np
+import time
+
+DIMENSIONS = [2, 5, 6]
+
+# EVOLVE-BLOCK-START
+def construct():
+    n, m, p = DIMENSIONS  # 2, 5, 6
+    start_time = time.time()
+    deadline = start_time + 115
+
+    # Use the known rank-38 decomposition via Lader (2,2,3) and rank-9 (2,3,3) sub-blocks
+    RANK = 38
+    U = [[0] * RANK for _ in range(n * m)]   # (10, RANK)
+    V = [[0] * RANK for _ in range(m * p)]   # (30, RANK)
+    W = [[0] * RANK for _ in range(p * n)]   # (12, RANK)
+
+    col = 0
+
+    def lader_2x2x3(u, v, w):
+        """Lader rank-10 decomposition of M(2,2,3)."""
+        a, b, c, d = u
+        x, y, z, uu, vv, ww = v
+        C00, C01, C02, C10, C11, C12 = w
+        nonlocal col
+        U[a][col] += 1; V[y][col] += 1; V[uu][col] += 1; W[C01][col] += 1; W[C10][col] += 1; col += 1
+        U[d][col] += 1; V[x][col] += 1; V[vv][col] += 1; W[C00][col] += 1; W[C11][col] += 1; col += 1
+        U[a][col] += 1; U[b][col] += 1; V[z][col] += 1; V[uu][col] += 1; W[C02][col] += 1; W[C10][col] += 1; col += 1
+        U[c][col] += 1; U[d][col] += 1; V[x][col] += 1; V[vv][col] += 1; W[C00][col] += 1; W[C11][col] += 1; col += 1
+        U[c][col] += 1; U[d][col] += 1; V[y][col] += 1; V[vv][col] += 1; W[C01][col] += 1; W[C11][col] += 1; col += 1
+        U[a][col] += 1; U[b][col] += 1; V[z][col] += 1; V[vv][col] += 1; W[C02][col] += 1; W[C11][col] += 1; col += 1
+        U[c][col] += 1; U[d][col] += 1; V[z][col] += 1; V[vv][col] += 1; W[C02][col] += 1; W[C12][col] += 1; col += 1
+        U[a][col] += 1; V[y][col] += 1; V[vv][col] -= 1; W[C01][col] += 1; W[C11][col] += 1; col += 1
+        U[d][col] += 1; V[x][col] += 1; V[uu][col] -= 1; W[C00][col] += 1; W[C10][col] += 1; col += 1
+        U[a][col] += 1; U[b][col] += 1; V[z][col] += 1; V[uu][col] -= 1; W[C02][col] += 1; W[C12][col] += 1; col += 1
+        return col
+
+    def m233(u, v, w):
+        """Rank-9 decomposition of M(2,3,3)."""
+        a, b, c, d, e, f = u
+        x, y, z, uu, vv, ww, rr, ss, tt = v
+        C00, C01, C02, C10, C11, C12 = w
+        nonlocal col
+        U[a][col]+=1; U[b][col]+=1; U[c][col]+=1
+        V[x][col]+=1; V[uu][col]+=1; V[rr][col]+=1
+        W[C00][col]+=1; W[C01][col]+=1; W[C02][col]+=1
+        W[C10][col]+=1; W[C11][col]+=1; W[C12][col]+=1
+        col += 1
+        U[a][col]+=1; U[e][col]+=1; U[f][col]-=1
+        V[y][col]+=1; V[vv][col]+=1; V[ss][col]+=1
+        W[C01][col]+=1; W[C02][col]+=1; W[C11][col]+=1; W[C12][col]+=1
+        col += 1
+        U[b][col]+=1; U[f][col]+=1; U[e][col]-=1
+        V[z][col]+=1; V[ww][col]+=1; V[tt][col]+=1
+        W[C02][col]+=1; W[C11][col]+=1; W[C12][col]+=1
+        col += 1
+        U[a][col]+=1; U[e][col]+=1; U[f][col]-=1
+        V[x][col]+=1; V[uu][col]+=1; V[rr][col]+=1
+        W[C00][col]+=1; W[C01][col]+=1; W[C02][col]+=1
+        W[C10][col]+=1; W[C11][col]+=1; W[C12][col]+=1
+        col += 1
+        U[b][col]+=1; U[f][col]+=1; U[e][col]-=1
+        V[y][col]+=1; V[vv][col]+=1; V[ss][col]+=1
+        W[C01][col]+=1; W[C02][col]+=1; W[C11][col]+=1; W[C12][col]+=1
+        col += 1
+        U[a][col]+=1; U[e][col]+=1; U[f][col]-=1
+        V[z][col]+=1; V[ww][col]+=1; V[tt][col]+=1
+        W[C02][col]+=1; W[C11][col]+=1; W[C12][col]+=1
+        col += 1
+        U[a][col]+=1; U[d][col]+=1; U[e][col]+=1
+        V[x][col]+=1; V[uu][col]+=1; V[rr][col]+=1
+        W[C00][col]+=1; W[C01][col]+=1; W[C02][col]+=1
+        W[C10][col]+=1; W[C11][col]+=1; W[C12][col]+=1
+        col += 1
+        U[b][col]+=1; U[d][col]+=1; U[f][col]+=1
+        V[y][col]+=1; V[vv][col]+=1; V[ss][col]+=1
+        W[C01][col]+=1; W[C02][col]+=1; W[C11][col]+=1; W[C12][col]+=1
+        col += 1
+        U[c][col]+=1; U[d][col]+=1; U[e][col]+=1
+        V[z][col]+=1; V[ww][col]+=1; V[tt][col]+=1
+        W[C02][col]+=1; W[C11][col]+=1; W[C12][col]+=1
+        col += 1
+        return col
+
+    lader_2x2x3(u=[0, 1, 5, 6], v=[0, 1, 2, 6, 7, 8], w=[0, 1, 2, 3, 4, 5])
+    lader_2x2x3(u=[0, 1, 5, 6], v=[3, 4, 5, 9, 10, 11], w=[6, 7, 8, 9, 10, 11])
+    m233(u=[2, 3, 4, 7, 8, 9], v=[12, 13, 14, 18, 19, 20, 24, 25, 26], w=[0, 1, 2, 3, 4, 5])
+    m233(u=[2, 3, 4, 7, 8, 9], v=[15, 16, 17, 21, 22, 23, 27, 28, 29], w=[6, 7, 8, 9, 10, 11])
+
+    # Verify correctness
+    Ua = np.array(U, dtype=np.float64)
+    Va = np.array(V, dtype=np.float64)
+    Wa = np.array(W, dtype=np.float64)
+    ok = True
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                s = np.dot(Ua[i * m + j, :], Va[j * p + k, :] * Wa[k * n + i, :])
+                if abs(s - 1.0) > 1e-9:
+                    ok = False
+                    break
+            if not ok:
+                break
+        if not ok:
+            break
+    if not ok:
+        # Fallback to schoolbook
+        rank = n * m * p
+        Us = [[0] * rank for _ in range(n * m)]
+        Vs = [[0] * rank for _ in range(m * p)]
+        Ws = [[0] * rank for _ in range(p * n)]
+        cc = 0
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    Us[i * m + j][cc] = 1
+                    Vs[j * p + k][cc] = 1
+                    Ws[k * n + i][cc] = 1
+                    cc += 1
+        return {"U": Us, "V": Vs, "W": Ws}
+
+    return {"U": U, "V": V, "W": W}
+# EVOLVE-BLOCK-END

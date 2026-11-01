@@ -1,0 +1,355 @@
+import numpy as np
+import time
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
+from scipy.spatial import cKDTree
+
+N = 100
+_DEADLINE = None
+
+def _get_deadline():
+    global _DEADLINE
+    if _DEADLINE is None:
+        _DEADLINE = time.time() + 145.0
+    return _DEADLINE
+
+def _time_left():
+    return _get_deadline() - time.time()
+
+def _compute_radius(centers):
+    """
+    Compute the largest common radius for the given centers.
+    Centers are in [-0.5, 0.5]^3.
+    """
+    # Distance to walls
+    dists_to_walls = 0.5 - np.abs(centers)
+    min_wall_dist = np.min(dists_to_walls)
+    
+    # Pairwise distances
+    dists = cdist(centers, centers, metric='euclidean')
+    np.fill_diagonal(dists, np.inf)
+    min_pair_dist = np.min(dists)
+    
+    return min(min_wall_dist, min_pair_dist / 2.0)
+
+def _soft_min_objective(centers_flat, beta, iu):
+    """
+    Objective function for L-BFGS-B.
+    Minimizes the soft-min approximation of the radius.
+    """
+    centers = centers_flat.reshape(-1, 3)
+    
+    # 1. Wall distances
+    dists_to_walls = 0.5 - np.abs(centers)
+    wall_vals = dists_to_walls.flatten()
+    
+    # 2. Pairwise distances / 2
+    dists = cdist(centers, centers, metric='euclidean')
+    pair_vals = dists / 2.0
+    pair_vals_unique = pair_vals[iu]
+    
+    all_vals = np.concatenate([wall_vals, pair_vals_unique])
+    
+    # Calculate LSE: 1/beta * ln(sum(exp(-beta * x)))
+    # This approximates min(x)
+    neg_beta_x = -beta * all_vals
+    max_val = np.max(neg_beta_x)
+    sum_exp = np.sum(np.exp(neg_beta_x - max_val))
+    obj = (max_val + np.log(sum_exp)) / beta
+    
+    return obj
+
+def _build_grid_init(nx, ny, nz, noise_scale=0.0, seed=42):
+    """Build a grid initialization."""
+    if nx == 1: xs = np.array([0.0])
+    else: xs = np.linspace(-0.5, 0.5, nx)
+    
+    if ny == 1: ys = np.array([0.0])
+    else: ys = np.linspace(-0.5, 0.5, ny)
+    
+    if nz == 1: zs = np.array([0.0])
+    else: zs = np.linspace(-0.5, 0.5, nz)
+    
+    X, Y, Z = np.meshgrid(xs, ys, zs, indexing='ij')
+    centers = np.column_stack((X.ravel(), Y.ravel(), Z.ravel()))
+    
+    if len(centers) != N:
+        # Pad or truncate to get exactly N points
+        if len(centers) < N:
+            rng = np.random.default_rng(seed)
+            extra = rng.uniform(-0.45, 0.45, (N - len(centers), 3))
+            centers = np.vstack([centers, extra])
+        else:
+            centers = centers[:N]
+
+    if noise_scale > 0:
+        rng = np.random.default_rng(seed)
+        centers += rng.normal(0, noise_scale, centers.shape)
+    
+    centers = np.clip(centers, -0.499, 0.499)
+    return centers
+
+def _build_bcc_init():
+    """
+    Build a BCC (body-centered cubic) lattice initialization.
+    """
+    nx, ny, nz = 5, 5, 2
+    points = []
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                cx = -0.5 + (i + 0.5) * (1.0 / nx)
+                cy = -0.5 + (j + 0.5) * (1.0 / ny)
+                cz = -0.5 + (k + 0.5) * (1.0 / nz)
+                points.append([cx, cy, cz])
+                points.append([cx + 0.5/nx, cy + 0.5/ny, cz + 0.5/nz])
+    
+    centers = np.array(points[:N])
+    
+    rng = np.random.default_rng(42)
+    centers += rng.normal(0, 0.005, centers.shape)
+    centers = np.clip(centers, -0.499, 0.499)
+    
+    return centers
+
+def _build_sobol_init(seed=42):
+    """
+    Generate N points using a Sobol sequence.
+    """
+    from scipy.stats import qmc
+    sobol = qmc.Sobol(d=3, scramble=True, seed=seed)
+    points = sobol.random(N)
+    centers = points - 0.5
+    
+    rng = np.random.default_rng(seed)
+    centers += rng.normal(0, 0.005, centers.shape)
+    centers = np.clip(centers, -0.499, 0.499)
+    
+    return centers
+
+def _simulated_annealing(centers, deadline, iu):
+    """
+    Simulated Annealing to escape local minima.
+    Uses exact radius calculation for evaluation.
+    """
+    centers = centers.copy()
+    best_centers = centers.copy()
+    best_r = _compute_radius(best_centers)
+    current_r = best_r
+    
+    # SA Parameters
+    T_start = 0.05
+    T_end = 0.0001
+    alpha = 0.95  # Cooling rate
+    T = T_start
+    
+    rng = np.random.default_rng(42)
+    
+    while _time_left() > 2.0 and T > T_end:
+        # Generate a neighbor
+        # Perturb a random subset of points or all points with small noise
+        # We perturb all points with a step size proportional to T
+        step_size = T * 0.1
+        noise = rng.normal(0, step_size, centers.shape)
+        new_centers = centers + noise
+        new_centers = np.clip(new_centers, -0.4999, 0.4999)
+        
+        new_r = _compute_radius(new_centers)
+        
+        # Acceptance probability
+        if new_r >= current_r:
+            accept = True
+        else:
+            delta = current_r - new_r
+            # Boltzmann factor: exp(-delta / T)
+            # If T is small, this is very small
+            p = np.exp(-delta / T)
+            accept = rng.random() < p
+            
+        if accept:
+            centers = new_centers
+            current_r = new_r
+            if current_r > best_r + 1e-12:
+                best_r = current_r
+                best_centers = centers.copy()
+        
+        T *= alpha
+        
+    return best_centers, best_r
+
+def _polish_high_beta(centers, deadline, iu):
+    """
+    Final high-precision polish using L-BFGS-B with very high beta.
+    """
+    best_centers = centers.copy()
+    best_r = _compute_radius(best_centers)
+    
+    # Use a very high beta for near-exact min approximation
+    beta = 2000.0
+    
+    x0 = best_centers.flatten()
+    
+    try:
+        res = minimize(
+            _soft_min_objective,
+            x0,
+            args=(beta, iu),
+            method='L-BFGS-B',
+            bounds=[(-0.4999, 0.4999)] * (N * 3),
+            options={'maxiter': 500, 'ftol': 1e-15, 'gtol': 1e-10, 'maxls': 20}
+        )
+        
+        new_centers = res.x.reshape(-1, 3)
+        new_centers = np.clip(new_centers, -0.4999, 0.4999)
+        
+        r = _compute_radius(new_centers)
+        if r > best_r:
+            best_r = r
+            best_centers = new_centers
+            
+    except Exception:
+        pass
+        
+    return best_centers, best_r
+
+def _optimize_from_initial(centers, deadline, iu, time_budget=20.0):
+    """
+    Run optimization from initial centers.
+    """
+    best_centers = centers.copy()
+    best_radius = _compute_radius(best_centers)
+    
+    start_t = time.time()
+    
+    # Phase 1: Soft-min optimization (Medium Beta)
+    # This finds a good local minimum
+    beta_start = 50.0
+    beta_end = 500.0
+    n_beta_steps = 3
+    
+    for step in range(n_beta_steps):
+        if _time_left() < 5.0 or (time.time() - start_t) > time_budget - 5.0:
+            break
+            
+        beta = beta_start * (beta_end / beta_start) ** (step / (n_beta_steps - 1))
+        
+        x0 = best_centers.flatten()
+        
+        try:
+            max_iter = 100
+            res = minimize(
+                _soft_min_objective,
+                x0,
+                args=(beta, iu),
+                method='L-BFGS-B',
+                bounds=[(-0.4999, 0.4999)] * (N * 3),
+                options={'maxiter': max_iter, 'ftol': 1e-12, 'gtol': 1e-8, 'maxls': 15}
+            )
+            
+            new_centers = res.x.reshape(-1, 3)
+            new_centers = np.clip(new_centers, -0.4999, 0.4999)
+            
+            r = _compute_radius(new_centers)
+            if r > best_radius:
+                best_radius = r
+                best_centers = new_centers
+                
+        except Exception:
+            pass
+            
+    # Phase 2: Simulated Annealing to escape local minima
+    # SA is good for jumping out of flat regions or shallow minima
+    if _time_left() > 10.0 and (time.time() - start_t) < time_budget - 5.0:
+        sa_deadline = min(deadline, start_t + time_budget - 5.0)
+        sa_centers, sa_radius = _simulated_annealing(best_centers, sa_deadline, iu)
+        if sa_radius > best_radius:
+            best_radius = sa_radius
+            best_centers = sa_centers
+            
+    # Phase 3: High-Precision Polish
+    # Refine the best found so far with a very hard soft-min
+    if _time_left() > 3.0:
+        polish_centers, polish_radius = _polish_high_beta(best_centers, deadline, iu)
+        if polish_radius > best_radius:
+            best_radius = polish_radius
+            best_centers = polish_centers
+            
+    return best_centers, best_radius
+
+def construct():
+    global _DEADLINE
+    _DEADLINE = time.time() + 145.0
+    
+    iu = np.triu_indices(N, k=1)
+    
+    best_centers = None
+    best_radius = 0.0
+    
+    def try_init(centers, time_budget=15.0):
+        nonlocal best_centers, best_radius
+        r_init = _compute_radius(centers)
+        if r_init > best_radius:
+            best_radius = r_init
+            best_centers = centers.copy()
+        
+        if _time_left() > time_budget + 2.0:
+            opt_centers, opt_radius = _optimize_from_initial(centers, _DEADLINE, iu, time_budget)
+            if opt_radius > best_radius:
+                best_radius = opt_radius
+                best_centers = opt_centers
+        else:
+            # Fallback: Quick polish if little time left
+            if _time_left() > 3.0:
+                polish_centers, polish_radius = _polish_high_beta(centers, _DEADLINE, iu)
+                if polish_radius > best_radius:
+                    best_radius = polish_radius
+                    best_centers = polish_centers
+
+    # Initializations
+    # 1. BCC Lattice
+    if _time_left() > 30.0:
+        centers = _build_bcc_init()
+        try_init(centers, time_budget=25.0)
+        
+    # 2. Grids
+    grid_configs = [
+        (5, 5, 4),
+        (4, 5, 5),
+    ]
+    
+    for nx, ny, nz in grid_configs:
+        if _time_left() < 25.0:
+            break
+        centers = _build_grid_init(nx, ny, nz, 0.0, seed=nx*100+ny*10+nz)
+        try_init(centers, time_budget=20.0)
+        
+    # 3. Sobol
+    if _time_left() > 20.0:
+        centers = _build_sobol_init()
+        try_init(centers, time_budget=15.0)
+        
+    # 4. Random (with SA it might find something unique)
+    if _time_left() > 15.0:
+        rng = np.random.default_rng(123)
+        centers = rng.uniform(-0.45, 0.45, (N, 3))
+        try_init(centers, time_budget=10.0)
+        
+    # Final Global Polish
+    if best_centers is not None and _time_left() > 5.0:
+        # Run SA again on the best found to see if we can jump further
+        sa_centers, sa_radius = _simulated_annealing(best_centers, _DEADLINE, iu)
+        if sa_radius > best_radius:
+            best_radius = sa_radius
+            best_centers = sa_centers
+            
+        # And finally, high-beta polish
+        if _time_left() > 2.0:
+            polish_centers, polish_radius = _polish_high_beta(best_centers, _DEADLINE, iu)
+            if polish_radius > best_radius:
+                best_radius = polish_radius
+                best_centers = polish_centers
+
+    if best_centers is None:
+        best_centers = _build_grid_init(5, 5, 4, 0.0)
+        
+    return best_centers

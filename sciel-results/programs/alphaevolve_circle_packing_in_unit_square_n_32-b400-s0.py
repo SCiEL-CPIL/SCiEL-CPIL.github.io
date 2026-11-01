@@ -1,28 +1,25 @@
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, differential_evolution
 from scipy.spatial import Delaunay
 import time
 
 N = 32
-TIME_LIMIT = 135.0  # evaluator kills at 150s; keep margin
+TIME_LIMIT = 135.0
 
 def _elapsed(start):
     return time.time() - start
 
 def _is_valid(x, y, r, eps=1e-7):
-    # bounds
     if np.any(x < -eps) or np.any(x > 1.0 + eps):
         return False
     if np.any(y < -eps) or np.any(y > 1.0 + eps):
         return False
     if np.any(r < -eps):
         return False
-    # circle in square
     if np.any(x < r - eps) or np.any(x > 1.0 - r + eps):
         return False
     if np.any(y < r - eps) or np.any(y > 1.0 - r + eps):
         return False
-    # pairwise disjoint interiors
     for i in range(N):
         for j in range(i + 1, N):
             dx = x[i] - x[j]
@@ -44,7 +41,6 @@ def _objective(params, start):
     r = np.maximum(r, 0.0)
     obj = -np.sum(r)
 
-    # Vectorized overlap penalty
     dx = x[:, None] - x[None, :]
     dy = y[:, None] - y[None, :]
     dist = np.sqrt(dx*dx + dy*dy + 1e-14)
@@ -54,7 +50,6 @@ def _objective(params, start):
     mask = np.triu(np.ones((N, N), dtype=bool), k=1)
     overlap_pen = np.sum(smooth_max[mask])
 
-    # Boundary penalties
     dneg_x = r - x
     dpos_x = x - (1.0 - r)
     dneg_y = r - y
@@ -67,7 +62,6 @@ def _objective(params, start):
     return obj + mu * (overlap_pen + bound_pen)
 
 def _objective_tight(params, start):
-    """Tighter penalty objective for final polishing."""
     if _elapsed(start) > TIME_LIMIT:
         return 1e10
     x = params[:N]
@@ -76,7 +70,6 @@ def _objective_tight(params, start):
     r = np.maximum(r, 0.0)
     obj = -np.sum(r)
 
-    # Vectorized overlap penalty with tighter smoothing
     dx = x[:, None] - x[None, :]
     dy = y[:, None] - y[None, :]
     dist = np.sqrt(dx*dx + dy*dy + 1e-14)
@@ -86,7 +79,6 @@ def _objective_tight(params, start):
     mask = np.triu(np.ones((N, N), dtype=bool), k=1)
     overlap_pen = np.sum(smooth_max[mask])
 
-    # Boundary penalties with tighter smoothing
     dneg_x = r - x
     dpos_x = x - (1.0 - r)
     dneg_y = r - y
@@ -95,245 +87,108 @@ def _objective_tight(params, start):
         return 0.5 * (v + np.sqrt(v*v + 1e-12))
     bound_pen = np.sum(sm(dneg_x)) + np.sum(sm(dpos_x)) + np.sum(sm(dneg_y)) + np.sum(sm(dpos_y))
 
-    mu = 200.0
+    mu = 100.0
     return obj + mu * (overlap_pen + bound_pen)
 
+def _objective_logsumexp(params, start, beta=20.0):
+    """Log-sum-exp based smooth surrogate for the constraint violation."""
+    if _elapsed(start) > TIME_LIMIT:
+        return 1e10
+    x = params[:N]
+    y = params[N:2*N]
+    r = params[2*N:3*N]
+    r = np.maximum(r, 0.0)
+    obj = -np.sum(r)
+
+    # Pairwise constraints: r_i + r_j - d_ij should be <= 0
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    dist = np.sqrt(dx*dx + dy*dy + 1e-14)
+    min_dist = r[:, None] + r[None, :]
+    violations = min_dist - dist  # positive means violation
+    mask = np.triu(np.ones((N, N), dtype=bool), k=1)
+    v_pairs = violations[mask]
+    # Log-sum-exp of positive violations
+    v_max = np.max(v_pairs)
+    if v_max > 0:
+        lse = v_max + np.log(np.sum(np.exp(beta * (v_pairs - v_max)))) / beta
+    else:
+        lse = 0.0
+
+    # Boundary constraints
+    bviol = np.maximum(0, r - x) + np.maximum(0, x - (1.0 - r)) + \
+            np.maximum(0, r - y) + np.maximum(0, y - (1.0 - r))
+    b_max = np.max(bviol)
+    if b_max > 0:
+        lse_b = b_max + np.log(np.sum(np.exp(beta * (bviol - b_max)))) / beta
+    else:
+        lse_b = 0.0
+
+    mu = 200.0
+    return obj + mu * (lse + lse_b)
+
 def _push_apart(x, y, r, iters=500):
-    """Move centers to resolve overlaps; never shrink radii. Keep in bounds."""
     x = x.copy()
     y = y.copy()
     for _ in range(iters):
-        moved = False
-        # Vectorized check for overlaps
         dx = x[:, None] - x[None, :]
         dy = y[:, None] - y[None, :]
         dist = np.sqrt(dx*dx + dy*dy + 1e-14)
         need = r[:, None] + r[None, :]
-        overlaps = dist < need
+        overlaps = (dist < need) & (np.abs(np.triu(np.ones((N, N), dtype=bool), k=1).astype(float)) > 0)
         
         if not np.any(overlaps):
             break
-            
+        
+        disp_x = np.zeros(N)
+        disp_y = np.zeros(N)
+        
         for i in range(N):
             for j in range(i + 1, N):
                 if not overlaps[i, j]:
                     continue
-                dx = x[i] - x[j]
-                dy = y[i] - y[j]
-                d = np.hypot(dx, dy)
+                dx_ij = x[i] - x[j]
+                dy_ij = y[i] - y[j]
+                d = np.hypot(dx_ij, dy_ij)
                 need_ij = r[i] + r[j]
                 if d < need_ij:
                     if d < 1e-12:
                         ang = (i * 0.7 + j * 1.3) % (2*np.pi)
                         ux, uy = np.cos(ang), np.sin(ang)
                     else:
-                        ux, uy = dx / d, dy / d
+                        ux, uy = dx_ij / d, dy_ij / d
                     gap = need_ij - d
-                    # Move each half the gap along the separating axis
                     step = 0.5 * gap
-                    x[i] += step * ux
-                    y[i] += step * uy
-                    x[j] -= step * ux
-                    y[j] -= step * uy
-                    moved = True
-        # Clamp back into square (respecting radius)
+                    disp_x[i] += step * ux
+                    disp_y[i] += step * uy
+                    disp_x[j] -= step * ux
+                    disp_y[j] -= step * uy
+        
+        x += disp_x
+        y += disp_y
         x = np.clip(x, r, 1.0 - r)
         y = np.clip(y, r, 1.0 - r)
-        if not moved:
-            break
     return x, y
 
-def _physics_optimize(x, y, r, start, max_iter=2000):
-    """
-    Physics-based optimization using repulsive particle model.
-    Uses smooth 1/d^2 repulsion between circles and boundary attraction.
-    Optimizes positions and radii simultaneously with gradient descent.
-    """
-    x = x.copy().astype(float)
-    y = y.copy().astype(float)
-    r = r.copy().astype(float)
-    
-    # Softness parameter for the repulsive potential
-    soft = 1e-6
-    
-    def compute_forces(x, y, r):
-        """Compute forces on all particles."""
-        fx = np.zeros(N)
-        fy = np.zeros(N)
-        fr = np.zeros(N)
-        
-        # Pairwise repulsive forces: F ~ 1/d^2 in direction away from neighbor
-        # We use a smooth version: F = (r_i + r_j - d)^2 / d^2 * direction
-        # This gives strong repulsion when overlapping, weak when far
-        for i in range(N):
-            for j in range(i + 1, N):
-                dx = x[i] - x[j]
-                dy = y[i] - y[j]
-                d = np.hypot(dx, dy) + soft
-                ux = dx / d
-                uy = dy / d
-                
-                # Repulsive force magnitude: quadratic in overlap, scaled by 1/d
-                overlap = r[i] + r[j] - d
-                if overlap > 0:
-                    # Strong repulsion when overlapping
-                    F = 50.0 * overlap / d
-                else:
-                    # Weak attractive force to encourage packing
-                    F = -0.5 * (1.0 / (d * d))
-                
-                fx[i] += F * ux
-                fy[i] += F * uy
-                fx[j] -= F * ux
-                fy[j] -= F * uy
-                
-                # Force on radius: encourage larger radii when not overlapping
-                # Penalize when overlapping
-                if overlap > 0:
-                    fr[i] -= 10.0
-                    fr[j] -= 10.0
-                else:
-                    # Small positive force to grow radii
-                    fr[i] += 0.1 / (d + 1.0)
-                    fr[j] += 0.1 / (d + 1.0)
-        
-        # Boundary forces: push circles away from walls
-        for i in range(N):
-            # Left wall
-            dist_left = x[i] - r[i]
-            if dist_left < 0.05:
-                fx[i] += 20.0 * (0.05 - dist_left)
-                fr[i] -= 5.0 * (0.05 - dist_left)
-            # Right wall
-            dist_right = (1.0 - x[i]) - r[i]
-            if dist_right < 0.05:
-                fx[i] -= 20.0 * (0.05 - dist_right)
-                fr[i] -= 5.0 * (0.05 - dist_right)
-            # Bottom wall
-            dist_bottom = y[i] - r[i]
-            if dist_bottom < 0.05:
-                fy[i] += 20.0 * (0.05 - dist_bottom)
-                fr[i] -= 5.0 * (0.05 - dist_bottom)
-            # Top wall
-            dist_top = (1.0 - y[i]) - r[i]
-            if dist_top < 0.05:
-                fy[i] -= 20.0 * (0.05 - dist_top)
-                fr[i] -= 5.0 * (0.05 - dist_top)
-        
-        return fx, fy, fr
-    
-    # Gradient descent with adaptive step size
-    step_size = 0.01
-    best_score = _sum_r(r)
-    best_state = (x.copy(), y.copy(), r.copy())
-    patience = 0
-    
-    for it in range(max_iter):
-        if _elapsed(start) > TIME_LIMIT - 5:
-            break
-        
-        fx, fy, fr = compute_forces(x, y, r)
-        
-        # Update positions
-        x += step_size * fx
-        y += step_size * fy
-        r += step_size * fr
-        
-        # Clamp to valid range
-        r = np.maximum(r, 1e-4)
-        r = np.minimum(r, 0.45)
-        x = np.clip(x, r, 1.0 - r)
-        y = np.clip(y, r, 1.0 - r)
-        
-        # Check if we improved
-        score = _sum_r(r)
-        if score > best_score + 1e-8:
-            best_score = score
-            best_state = (x.copy(), y.copy(), r.copy())
-            patience = 0
-        else:
-            patience += 1
-        
-        # Adaptive step size
-        if patience > 50:
-            step_size *= 0.95
-            patience = 0
-            if step_size < 1e-6:
-                break
-        elif patience > 20:
-            step_size *= 0.98
-    
-    # Return best state found
-    bx, by, br = best_state
-    bx, by, br = _make_valid(bx, by, br)
-    return bx, by, br
-
-def _tight_polish(x, y, r, start, max_iter=3000):
-    """
-    High-precision polish using tight penalty objective.
-    Uses L-BFGS-B with bounds for better convergence.
-    """
-    p0 = np.concatenate([x, y, r])
-    
-    # Define bounds for L-BFGS-B
-    # x[i] in [r[i], 1-r[i]], but since r varies, use loose bounds
-    # We'll handle tight constraints via penalty
-    bounds = []
-    for i in range(N):
-        bounds.append((0.001, 0.999))  # x
-    for i in range(N):
-        bounds.append((0.001, 0.999))  # y
-    for i in range(N):
-        bounds.append((0.001, 0.45))   # r
-    
-    best = (x.copy(), y.copy(), r.copy())
-    best_score = _sum_r(r)
-    
-    try:
-        res = minimize(
-            _objective_tight, p0, args=(start,),
-            method='L-BFGS-B',
-            bounds=bounds,
-            options={'maxiter': max_iter, 'ftol': 1e-14, 'gtol': 1e-8, 'maxls': 50}
-        )
-        vx, vy, vr = _make_valid(res.x[:N], res.x[N:2*N], res.x[2*N:3*N])
-        if _is_valid(vx, vy, vr):
-            s = _sum_r(vr)
-            if s > best_score:
-                best_score = s
-                best = (vx, vy, vr)
-    except Exception:
-        pass
-    
-    return best
-
 def _make_valid(x, y, r):
-    """Guarantee validity: push apart, then shrink any residual overlap/bounds."""
     x = x.copy()
     y = y.copy()
     r = r.copy()
     
-    # Iteratively push apart and clamp
     for _ in range(50):
         x, y = _push_apart(x, y, r, iters=200)
         x = np.clip(x, r, 1.0 - r)
         y = np.clip(y, r, 1.0 - r)
-        
-        # Check if valid
-        valid = _is_valid(x, y, r)
-        if valid:
+        if _is_valid(x, y, r):
             break
     
     if not _is_valid(x, y, r):
-        # Aggressive shrinking to ensure validity
         for _ in range(500):
-            # Fix bounds first
             for i in range(N):
                 mr = min(x[i], 1.0 - x[i], y[i], 1.0 - y[i])
                 if r[i] > mr * 0.999:
                     r[i] = max(0.0, mr * 0.998)
             
-            # Fix overlaps
             dx = x[:, None] - x[None, :]
             dy = y[:, None] - y[None, :]
             dist = np.sqrt(dx*dx + dy*dy + 1e-14)
@@ -343,7 +198,6 @@ def _make_valid(x, y, r):
             if not np.any(overlaps):
                 break
             
-            # Shrink the most overlapping pair
             idx = np.where(overlaps)
             i, j = idx[0][0], idx[1][0]
             if j < i:
@@ -354,7 +208,6 @@ def _make_valid(x, y, r):
     return x, y, r
 
 def _hex_init():
-    # Hexagonal packing for 32 circles, then scale to fit square
     pts = []
     rowh = np.sqrt(3.0)/2.0
     r = 0
@@ -375,7 +228,6 @@ def _hex_init():
     scale = 0.85 / span
     x = (pts[:,0] - xmin) * scale + 0.075
     y = (pts[:,1] - ymin) * scale + 0.075
-    # radius = half min neighbor distance, capped by boundary
     r = np.zeros(N)
     for i in range(N):
         mn = 1e9
@@ -408,15 +260,83 @@ def _random_init(seed):
     r = np.minimum(r, np.minimum(np.minimum(x, 1-x), np.minimum(y, 1-y)))
     return x, y, r
 
+def _voronoi_init():
+    rng = np.random.RandomState(42)
+    x = rng.uniform(0.1, 0.9, N)
+    y = rng.uniform(0.1, 0.9, N)
+    try:
+        dists = np.sqrt((x[:,None]-x[None,:])**2 + (y[:,None]-y[None,:])**2)
+        np.fill_diagonal(dists, np.inf)
+        r = 0.45 * np.min(dists, axis=1)
+        r = np.minimum(r, np.minimum(np.minimum(x, 1-x), np.minimum(y, 1-y)))
+    except Exception:
+        r = np.full(N, 0.05)
+    return x, y, r
+
+def _lbfgsb_optimize(x, y, r, start, max_iter=3000):
+    """L-BFGS-B with log-sum-exp smooth surrogate."""
+    if _elapsed(start) > TIME_LIMIT - 10:
+        return x, y, r
+    
+    best = (x.copy(), y.copy(), r.copy())
+    best_score = _sum_r(r)
+    
+    p0 = np.concatenate([x, y, r])
+    
+    # Bounds for L-BFGS-B
+    bounds = []
+    for i in range(N):
+        bounds.append((0.0, 1.0))  # x
+    for i in range(N):
+        bounds.append((0.0, 1.0))  # y
+    for i in range(N):
+        bounds.append((0.001, 0.45))  # r
+    
+    try:
+        res = minimize(
+            _objective_logsumexp, p0, args=(start,),
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': max_iter, 'ftol': 1e-15, 'gtol': 1e-8, 'maxfun': 10000}
+        )
+        vx, vy, vr = _make_valid(res.x[:N], res.x[N:2*N], res.x[2*N:3*N])
+        if _is_valid(vx, vy, vr):
+            s = _sum_r(vr)
+            if s > best_score:
+                best = (vx, vy, vr)
+                best_score = s
+    except Exception:
+        pass
+    
+    return best
+
 def _optimize(x, y, r, start):
     params = np.concatenate([x, y, r])
     best = (x, y, r)
     best_score = _sum_r(r)
     
-    # Physics-based optimization first
+    # L-BFGS-B with log-sum-exp (gradient-based, smooth)
+    if _elapsed(start) < TIME_LIMIT - 15:
+        try:
+            vx, vy, vr = _lbfgsb_optimize(x, y, r, start, max_iter=2000)
+            if _is_valid(vx, vy, vr):
+                s = _sum_r(vr)
+                if s > best_score:
+                    best_score = s
+                    best = (vx, vy, vr)
+        except Exception:
+            pass
+    
+    # Powell with standard objective
     if _elapsed(start) < TIME_LIMIT - 10:
         try:
-            vx, vy, vr = _physics_optimize(x, y, r, start, max_iter=1000)
+            p0 = np.concatenate([best[0], best[1], best[2]])
+            res = minimize(
+                _objective, p0, args=(start,),
+                method='Powell',
+                options={'maxiter': 2000, 'ftol': 1e-12}
+            )
+            vx, vy, vr = _make_valid(res.x[:N], res.x[N:2*N], res.x[2*N:3*N])
             if _is_valid(vx, vy, vr):
                 s = _sum_r(vr)
                 if s > best_score:
@@ -428,8 +348,9 @@ def _optimize(x, y, r, start):
     # Nelder-Mead
     if _elapsed(start) < TIME_LIMIT - 5:
         try:
+            p0 = np.concatenate([best[0], best[1], best[2]])
             res = minimize(
-                _objective, params, args=(start,),
+                _objective, p0, args=(start,),
                 method='Nelder-Mead',
                 options={'maxiter': 2000, 'xatol': 1e-7, 'fatol': 1e-9, 'adaptive': True}
             )
@@ -442,14 +363,14 @@ def _optimize(x, y, r, start):
         except Exception:
             pass
     
-    # Powell polish on best
+    # Powell with tight objective
     if _elapsed(start) < TIME_LIMIT - 3:
         try:
             p0 = np.concatenate([best[0], best[1], best[2]])
             res = minimize(
-                _objective, p0, args=(start,),
+                _objective_tight, p0, args=(start,),
                 method='Powell',
-                options={'maxiter': 1500, 'ftol': 1e-10}
+                options={'maxiter': 2000, 'ftol': 1e-14}
             )
             vx, vy, vr = _make_valid(res.x[:N], res.x[N:2*N], res.x[2*N:3*N])
             if _is_valid(vx, vy, vr):
@@ -459,66 +380,200 @@ def _optimize(x, y, r, start):
                     best = (vx, vy, vr)
         except Exception:
             pass
-            
-    # Tight L-BFGS-B polish
-    if _elapsed(start) < TIME_LIMIT - 2:
-        try:
-            vx, vy, vr = _tight_polish(best[0], best[1], best[2], start, max_iter=2000)
-            if _is_valid(vx, vy, vr):
-                s = _sum_r(vr)
-                if s > best_score:
-                    best_score = s
-                    best = (vx, vy, vr)
-        except Exception:
-            pass
-            
+    
     return best
 
-def _final_polish(x, y, r, start):
-    """High-precision final polish using multiple optimization methods."""
+def _tight_polish(x, y, r, start):
     best = (x, y, r)
     best_score = _sum_r(r)
     
-    # Multiple Powell passes with different tolerances
-    for ftol in [1e-10, 1e-12, 1e-14]:
-        if _elapsed(start) > TIME_LIMIT - 2:
-            break
+    # L-BFGS-B with very tight log-sum-exp
+    if _elapsed(start) < TIME_LIMIT - 5:
         try:
             p0 = np.concatenate([best[0], best[1], best[2]])
+            bounds = []
+            for i in range(N):
+                bounds.append((0.0, 1.0))
+            for i in range(N):
+                bounds.append((0.0, 1.0))
+            for i in range(N):
+                bounds.append((0.001, 0.45))
             res = minimize(
-                _objective, p0, args=(start,),
-                method='Powell',
-                options={'maxiter': 2000, 'ftol': ftol}
+                _objective_logsumexp, p0, args=(start, 50.0),
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={'maxiter': 5000, 'ftol': 1e-18, 'gtol': 1e-10, 'maxfun': 20000}
             )
             vx, vy, vr = _make_valid(res.x[:N], res.x[N:2*N], res.x[2*N:3*N])
             if _is_valid(vx, vy, vr):
                 s = _sum_r(vr)
                 if s > best_score:
-                    best_score = s
                     best = (vx, vy, vr)
+                    best_score = s
         except Exception:
             pass
     
-    # Tight L-BFGS-B polish
-    if _elapsed(start) < TIME_LIMIT - 2:
+    # Powell with tight objective
+    if _elapsed(start) < TIME_LIMIT - 3:
         try:
-            vx, vy, vr = _tight_polish(best[0], best[1], best[2], start, max_iter=3000)
+            p0 = np.concatenate([best[0], best[1], best[2]])
+            res = minimize(
+                _objective_tight, p0, args=(start,),
+                method='Powell',
+                options={'maxiter': 3000, 'ftol': 1e-15}
+            )
+            vx, vy, vr = _make_valid(res.x[:N], res.x[N:2*N], res.x[2*N:3*N])
             if _is_valid(vx, vy, vr):
                 s = _sum_r(vr)
                 if s > best_score:
-                    best_score = s
                     best = (vx, vy, vr)
+                    best_score = s
         except Exception:
             pass
     
-    # Local perturbation search
+    # Nelder-Mead with tight objective
+    if _elapsed(start) < TIME_LIMIT - 2:
+        try:
+            p0 = np.concatenate([best[0], best[1], best[2]])
+            res = minimize(
+                _objective_tight, p0, args=(start,),
+                method='Nelder-Mead',
+                options={'maxiter': 5000, 'xatol': 1e-13, 'fatol': 1e-15, 'adaptive': True}
+            )
+            vx, vy, vr = _make_valid(res.x[:N], res.x[N:2*N], res.x[2*N:3*N])
+            if _is_valid(vx, vy, vr):
+                s = _sum_r(vr)
+                if s > best_score:
+                    best = (vx, vy, vr)
+                    best_score = s
+        except Exception:
+            pass
+    
+    # Fine-grained local perturbation
     if _elapsed(start) < TIME_LIMIT - 1:
-        rng = np.random.RandomState(123)
-        for _ in range(50):
+        rng = np.random.RandomState(42)
+        for trial in range(80):
             if _elapsed(start) > TIME_LIMIT - 1:
                 break
-            # Small random perturbation
-            scale = 0.01 * (1 - _ / 50.0)
+            scale = 0.003 * (1.0 - trial / 80.0)
+            px = best[0] + rng.normal(0, scale, N)
+            py = best[1] + rng.normal(0, scale, N)
+            pr = best[2] + rng.normal(0, scale * 0.3, N)
+            pr = np.maximum(pr, 1e-4)
+            
+            vx, vy, vr = _make_valid(px, py, pr)
+            if _is_valid(vx, vy, vr):
+                s = _sum_r(vr)
+                if s > best_score:
+                    best = (vx, vy, vr)
+                    best_score = s
+    
+    return best
+
+def _grow_radii(x, y, r, start, max_rounds=50):
+    x = x.copy()
+    y = y.copy()
+    r = r.copy()
+    
+    for _ in range(max_rounds):
+        if _elapsed(start) > TIME_LIMIT - 2:
+            break
+        
+        improved = False
+        for i in range(N):
+            slack_boundary = min(x[i] - r[i], 1.0 - x[i] - r[i],
+                                  y[i] - r[i], 1.0 - y[i] - r[i])
+            
+            max_dr_pair = 1e9
+            for j in range(N):
+                if i == j:
+                    continue
+                d = np.hypot(x[i] - x[j], y[i] - y[j])
+                slack = d - r[i] - r[j]
+                if slack < max_dr_pair:
+                    max_dr_pair = slack
+            
+            max_dr = min(slack_boundary, max_dr_pair)
+            if max_dr > 1e-10:
+                r[i] += max_dr * 0.99
+                improved = True
+        
+        if not improved:
+            break
+        
+        x, y = _push_apart(x, y, r, iters=100)
+        x = np.clip(x, r, 1.0 - r)
+        y = np.clip(y, r, 1.0 - r)
+        
+        if not _is_valid(x, y, r):
+            r = np.minimum(r, 0.99 * r)
+            x, y = _push_apart(x, y, r, iters=100)
+            x = np.clip(x, r, 1.0 - r)
+            y = np.clip(y, r, 1.0 - r)
+    
+    return x, y, r
+
+def _final_polish(x, y, r, start):
+    best = (x, y, r)
+    best_score = _sum_r(r)
+    
+    # L-BFGS-B with high beta log-sum-exp
+    if _elapsed(start) < TIME_LIMIT - 10:
+        try:
+            p0 = np.concatenate([best[0], best[1], best[2]])
+            bounds = []
+            for i in range(N):
+                bounds.append((0.0, 1.0))
+            for i in range(N):
+                bounds.append((0.0, 1.0))
+            for i in range(N):
+                bounds.append((0.001, 0.45))
+            res = minimize(
+                _objective_logsumexp, p0, args=(start, 100.0),
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={'maxiter': 5000, 'ftol': 1e-18, 'gtol': 1e-10, 'maxfun': 20000}
+            )
+            vx, vy, vr = _make_valid(res.x[:N], res.x[N:2*N], res.x[2*N:3*N])
+            if _is_valid(vx, vy, vr):
+                s = _sum_r(vr)
+                if s > best_score:
+                    best = (vx, vy, vr)
+                    best_score = s
+        except Exception:
+            pass
+    
+    # Tight polish
+    if _elapsed(start) < TIME_LIMIT - 5:
+        try:
+            res = _tight_polish(*best, start)
+            if _is_valid(*res):
+                s = _sum_r(res[2])
+                if s > best_score:
+                    best = res
+                    best_score = s
+        except Exception:
+            pass
+    
+    # Grow radii
+    if _elapsed(start) < TIME_LIMIT - 3:
+        try:
+            vx, vy, vr = _grow_radii(*best, start, max_rounds=30)
+            if _is_valid(vx, vy, vr):
+                s = _sum_r(vr)
+                if s > best_score:
+                    best = (vx, vy, vr)
+                    best_score = s
+        except Exception:
+            pass
+    
+    # Local perturbation
+    if _elapsed(start) < TIME_LIMIT - 2:
+        rng = np.random.RandomState(123)
+        for _ in range(40):
+            if _elapsed(start) > TIME_LIMIT - 2:
+                break
+            scale = 0.008 * (1 - _ / 40.0)
             px = best[0] + rng.normal(0, scale, N)
             py = best[1] + rng.normal(0, scale, N)
             pr = best[2] + rng.normal(0, scale * 0.5, N)
@@ -528,44 +583,15 @@ def _final_polish(x, y, r, start):
             if _is_valid(vx, vy, vr):
                 s = _sum_r(vr)
                 if s > best_score:
-                    best_score = s
                     best = (vx, vy, vr)
+                    best_score = s
     
     return best
 
-def _voronoi_init():
-    """
-    Generate a packing based on Voronoi cells of a random point set,
-    then optimize the centers/radii.
-    """
-    rng = np.random.RandomState(42)
-    # Generate points in a grid-like random pattern
-    x = rng.uniform(0.1, 0.9, N)
-    y = rng.uniform(0.1, 0.9, N)
-    
-    # Compute Voronoi diagram to find inradii
-    try:
-        tri = Delaunay(np.column_stack((x, y)))
-        # For each point, find its Voronoi cell inradius
-        # This is complex, so we approximate by distance to nearest neighbors
-        r = np.zeros(N)
-        for i in range(N):
-            # Distance to nearest neighbors
-            dists = np.sqrt((x[i]-x)**2 + (y[i]-y)**2)
-            dists[i] = np.inf
-            # Take the 3 nearest neighbors to get a robust radius estimate
-            nearest = np.argsort(dists)[:3]
-            min_dist = np.min(dists[nearest])
-            r[i] = 0.45 * min_dist
-            # Cap by boundary
-            r[i] = min(r[i], x[i], 1-x[i], y[i], 1-y[i])
-    except Exception:
-        r = np.full(N, 0.05)
-        
-    return x, y, r
-
 def construct():
     start = time.time()
+    
+    # Generate diverse initializations
     inits = []
     inits.append(_hex_init())
     inits.append(_rect_init(6, 6))
@@ -584,9 +610,10 @@ def construct():
     if not _is_valid(*best):
         best = _make_valid(*best)
         best_score = _sum_r(best[2])
-
+    
+    # Optimize each initialization
     for k, (x, y, r) in enumerate(inits):
-        if _elapsed(start) > TIME_LIMIT - 15:
+        if _elapsed(start) > TIME_LIMIT - 20:
             break
         res = _optimize(x, y, r, start)
         if _is_valid(*res):
@@ -594,28 +621,29 @@ def construct():
             if s > best_score:
                 best_score = s
                 best = res
-
+    
     # Final high-precision polish
-    if _elapsed(start) < TIME_LIMIT - 5:
+    if _elapsed(start) < TIME_LIMIT - 8:
         res = _final_polish(*best, start)
         if _is_valid(*res):
             s = _sum_r(res[2])
             if s > best_score:
                 best = res
-
-    # Additional tight polish if time permits
-    if _elapsed(start) < TIME_LIMIT - 3:
+                best_score = s
+    
+    # One more round of radius growth
+    if _elapsed(start) < TIME_LIMIT - 2:
         try:
-            vx, vy, vr = _tight_polish(best[0], best[1], best[2], start, max_iter=5000)
+            vx, vy, vr = _grow_radii(*best, start, max_rounds=20)
             if _is_valid(vx, vy, vr):
                 s = _sum_r(vr)
                 if s > best_score:
                     best = (vx, vy, vr)
+                    best_score = s
         except Exception:
             pass
-
+    
     x, y, r = best
-    # ensure final validity
     x, y, r = _make_valid(x, y, r)
     result = np.column_stack((x, y, r))
     return result

@@ -176,20 +176,21 @@ def _simulated_annealing(centers, rng, time_budget):
     """
     Simulated annealing to optimize the minimum radius directly.
     Uses vectorized radius computation (no per-step KDTree build).
+    Optimized move size and acceptance criteria.
     """
     start_time = time.time()
     current = centers.copy()
     best = current.copy()
     best_r = _compute_radius(current)
     
-    T_start = 0.02
-    T_end = 0.0001
-    n_steps = 30000
+    T_start = 0.015
+    T_end = 0.00005
+    # Dynamic step count based on budget
+    # Estimate ~0.0005s per step. 
+    est_steps = int(time_budget / 0.0005)
+    n_steps = max(10000, min(50000, est_steps))
     cooling = (T_end / T_start) ** (1.0 / max(n_steps, 1))
     T = T_start
-    
-    # Precompute for vectorized radius
-    diff = np.zeros((N, N, 2))
     
     for step in range(n_steps):
         if time.time() - start_time > time_budget:
@@ -209,10 +210,15 @@ def _simulated_annealing(centers, rng, time_budget):
         
         # Move generation
         i = rng.integers(0, N)
-        move_size = 0.005 + 0.01 * T / T_start
+        # Scale move size with temperature, but cap it
+        move_size = 0.002 + 0.008 * (T / T_start)
         direction = rng.normal(size=2)
-        direction /= np.linalg.norm(direction)
-        
+        norm = np.linalg.norm(direction)
+        if norm > 1e-12:
+            direction /= norm
+        else:
+            direction = np.array([1.0, 0.0])
+            
         trial = current.copy()
         trial[i] += direction * move_size
         trial = np.clip(trial, -0.5, 0.5)
@@ -226,8 +232,13 @@ def _simulated_annealing(centers, rng, time_budget):
                 best_r = trial_r
                 best = trial.copy()
         else:
-            if rng.random() < np.exp(delta_r / max(T, 1e-10)):
-                current = trial
+            # Acceptance probability
+            # Use log-space for stability
+            log_prob = delta_r / max(T, 1e-12)
+            if log_prob > -50: # Avoid underflow
+                if rng.random() < np.exp(log_prob):
+                    current = trial
+            # If log_prob <= -50, exp is ~0, reject
         
         T *= cooling
     
@@ -248,11 +259,12 @@ def _lbfgs_feasibility_polish(x0, r_target, beta, time_budget):
         return f, g
     
     try:
+        # Tighter tolerances for better precision
         result = opt.minimize(
             obj_and_grad, x0, jac=True, method='L-BFGS-B',
             bounds=[(-0.5, 0.5)] * (2 * N),
-            options={'maxiter': 1000, 'ftol': 1e-15, 'gtol': 1e-12,
-                     'maxfun': 5000, 'disp': False}
+            options={'maxiter': 2000, 'ftol': 1e-18, 'gtol': 1e-14,
+                     'maxfun': 10000, 'disp': False}
         )
         polished = result.x.reshape(-1, 2)
         polished = np.clip(polished, -0.5, 0.5)
@@ -263,7 +275,7 @@ def _lbfgs_feasibility_polish(x0, r_target, beta, time_budget):
 def _refine_radius(centers, time_budget):
     """
     Binary search for the maximum feasible radius using L-BFGS polishing.
-    Increased iterations and tighter tolerance.
+    Adaptive time allocation: spend more time when close to the limit.
     """
     start_time = time.time()
     best = centers.copy()
@@ -273,24 +285,34 @@ def _refine_radius(centers, time_budget):
     lo = best_r
     hi = min(0.08, best_r * 1.05)
     
-    search_steps = 12
+    search_steps = 15
     for i in range(search_steps):
         if time.time() - start_time > time_budget:
             break
             
         mid = (lo + hi) / 2
-        beta = 200.0
+        # Increase beta as we get closer to the limit to sharpen the constraint
+        # Start with 200, increase to 1000 in later steps
+        beta = 200.0 + 50.0 * i
         x0 = best.flatten()
         
         remaining = time_budget - (time.time() - start_time)
-        if remaining < 5:
+        if remaining < 3:
             break
-        lbfgs_budget = min(12.0, remaining * 0.85)
         
+        # Allocate more time in the first few steps to establish feasibility
+        # and less time later as we converge
+        if i < 3:
+            lbfgs_budget = min(15.0, remaining * 0.6)
+        else:
+            lbfgs_budget = min(10.0, remaining * 0.7)
+            
         trial = _lbfgs_feasibility_polish(x0, mid, beta, lbfgs_budget)
         trial_r = _compute_radius(trial)
         
-        if trial_r >= mid - 1e-7:
+        # Tolerance for feasibility check
+        tol = 1e-6
+        if trial_r >= mid - tol:
             lo = mid
             best = trial
             best_r = trial_r
@@ -303,13 +325,15 @@ def _high_precision_polish(centers, time_budget):
     """
     Final high-precision polish using increasing beta.
     Includes a "push" phase targeting slightly above current best.
+    Optimized to use remaining time efficiently.
     """
     start_time = time.time()
     best = centers.copy()
     best_r = _compute_radius(best)
     
     # Progressive sharpening of the violation objective
-    betas = [500, 1000, 2000, 4000]
+    # Higher betas allow resolving tighter constraints
+    betas = [500, 1000, 2000, 5000]
     
     for beta in betas:
         if time.time() - start_time > time_budget:
@@ -319,9 +343,12 @@ def _high_precision_polish(centers, time_budget):
         x0 = best.flatten()
         
         remaining = time_budget - (time.time() - start_time)
-        if remaining < 5:
+        if remaining < 3:
             break
-        lbfgs_budget = min(12.0, remaining * 0.85)
+        
+        # Use a larger portion of remaining time for high-beta steps
+        # as they are crucial for final precision
+        lbfgs_budget = min(15.0, remaining * 0.8)
         
         trial = _lbfgs_feasibility_polish(x0, r_target, beta, lbfgs_budget)
         trial_r = _compute_radius(trial)
@@ -331,18 +358,22 @@ def _high_precision_polish(centers, time_budget):
             best = trial
             
     # Push phase: try to target slightly above best_r
-    if time.time() - start_time < time_budget - 10:
-        for push_frac in [1.002, 1.005, 1.01]:
+    # This attempts to find a slightly larger feasible radius
+    if time.time() - start_time < time_budget - 8:
+        # Try a few small pushes
+        for push_frac in [1.001, 1.003, 1.006, 1.01]:
             if time.time() - start_time > time_budget - 5:
                 break
             r_push = best_r * push_frac
             if r_push > 0.08:
                 break
             remaining = time_budget - (time.time() - start_time)
-            if remaining < 5:
+            if remaining < 4:
                 break
-            lbfgs_budget = min(12.0, remaining * 0.85)
-            trial = _lbfgs_feasibility_polish(best.flatten(), r_push, 1000.0, lbfgs_budget)
+            
+            # Use high beta for pushing
+            lbfgs_budget = min(10.0, remaining * 0.7)
+            trial = _lbfgs_feasibility_polish(best.flatten(), r_push, 2000.0, lbfgs_budget)
             trial_r = _compute_radius(trial)
             if trial_r > best_r:
                 best_r = trial_r
@@ -362,6 +393,11 @@ def construct():
         _hex_init(),
     ]
     
+    # Add a random initialization to explore different basins
+    rng_init = np.random.default_rng(123)
+    random_init = rng_init.uniform(-0.45, 0.45, (N, 2))
+    inits.append(random_init)
+    
     best_centers = None
     best_radius = 0
     
@@ -376,21 +412,27 @@ def construct():
         best_radius = _compute_radius(best_centers)
         
     # 2. Simulated Annealing (Global Search)
-    # Vectorized radius makes SA ~3x faster, so we can use more of the budget
-    sa_budget = min(45.0, (deadline - time.time()) * 0.35)
+    # Run SA on the best initialization. 
+    # We could run it on multiple, but time is tight. 
+    # The vectorized SA is fast, so we can afford a decent budget.
+    sa_budget = min(50.0, (deadline - time.time()) * 0.4)
     if sa_budget > 5:
         best_centers, best_radius = _simulated_annealing(best_centers, rng, sa_budget)
         
     # 3. Feasibility-Driven Radius Refinement (Coarse to Fine)
-    if time.time() < deadline - 35:
+    # Allocate significant time here as it establishes the radius
+    if time.time() < deadline - 40:
+        time_left = deadline - time.time() - 10
         best_centers, best_radius = _refine_radius(
-            best_centers, time_budget=min(45.0, deadline - time.time() - 15)
+            best_centers, time_budget=min(50.0, time_left)
         )
         
     # 4. High Precision Polish (Final Tightening + Push)
-    if time.time() < deadline - 10:
+    # Use remaining time for final polish
+    if time.time() < deadline - 5:
+        time_left = deadline - time.time() - 2
         best_centers, best_radius = _high_precision_polish(
-            best_centers, time_budget=min(25.0, deadline - time.time() - 5)
+            best_centers, time_budget=min(30.0, time_left)
         )
         
     # Final Validation
