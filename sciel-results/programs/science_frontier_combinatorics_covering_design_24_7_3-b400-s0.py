@@ -1,363 +1,221 @@
-"""Portfolio search for covering design C(24,7,3)."""
 import itertools
 import random
 import time
-import sys
 
-# EVOLVE-BLOCK-START
-import numpy as np
-
-def _greedy_covering(v, k, t, rng, time_limit, mode='basic', diversity_bonus=0.0):
-    """
-    Greedy covering with various scoring modes.
-    mode='basic': pure gain
-    mode='pair': gain + diversity bonus based on pair rarity
-    mode='adaptive': gain with adaptive weight on diversity
-    """
-    deadline = time.time() + time_limit
-    
-    # All t-sets
-    all_tsets = list(itertools.combinations(range(v), t))
-    uncovered = set(all_tsets)
-    blocks = []
-    
-    # Precompute t-sets containing each (t-1)-subset
-    # For each (t-1)-tuple S, list of t-sets that contain S
-    tset_by_tm1 = {}
-    for ts in all_tsets:
-        for i in range(t):
-            tm1 = ts[:i] + ts[i+1:]
-            if tm1 not in tset_by_tm1:
-                tset_by_tm1[tm1] = []
-            tset_by_tm1[tm1].append(ts)
-    
-    # For each pair (i,j), track how many blocks contain both
-    pair_block_count = {}
-    
-    def compute_gain(x, block, uncovered):
-        """Number of uncovered t-sets that contain x and (t-1) elements of block."""
-        cnt = 0
-        for S in itertools.combinations(block, t-1):
-            if x not in S:
-                tset = tuple(sorted(S + (x,)))
-                if tset in uncovered:
-                    cnt += 1
-        return cnt
-    
-    def compute_diversity_bonus(x, block, pair_block_count):
-        """Bonus based on how rare the pairs (x, y) are for y in block."""
-        bonus = 0.0
-        for y in block:
-            p = (min(x, y), max(x, y))
-            cnt = pair_block_count.get(p, 0)
-            bonus += 1.0 / (1.0 + cnt)
-        return bonus
-    
-    while uncovered and time.time() < deadline:
-        # Start with a random uncovered t-set
-        # For diversity, sometimes pick the one with most uncovered t-sets
-        first_uncovered = min(uncovered)
-        block = list(first_uncovered)
-        
-        while len(block) < k:
-            candidates = [x for x in range(v) if x not in block]
-            if not candidates:
-                break
-            
-            best_x = None
-            best_score = -1
-            
-            for x in candidates:
-                gain = compute_gain(x, block, uncovered)
-                
-                if mode == 'basic':
-                    score = gain
-                elif mode == 'pair':
-                    bonus = compute_diversity_bonus(x, block, pair_block_count)
-                    score = gain + diversity_bonus * bonus
-                elif mode == 'adaptive':
-                    bonus = compute_diversity_bonus(x, block, pair_block_count)
-                    # Adaptive: weight diversity more when gain is low
-                    adaptive_w = max(0.1, 1.0 - gain / max(1, len(uncovered)))
-                    score = gain + adaptive_w * bonus
-                else:
-                    score = gain
-                
-                # Add small random tie-breaker
-                score += rng.random() * 0.01
-                
-                if score > best_score:
-                    best_score = score
-                    best_x = x
-            
-            if best_x is None:
-                break
-            block.append(best_x)
-        
-        if len(block) < k:
-            break
-        
-        block.sort()
-        blocks.append(tuple(block))
-        
-        # Update pair counts
-        for p in itertools.combinations(block, 2):
-            pair_block_count[p] = pair_block_count.get(p, 0) + 1
-        
-        # Remove covered t-sets
-        covered = set(itertools.combinations(block, t))
-        uncovered -= covered
-    
-    return [list(b) for b in blocks]
-
-def _local_search(blocks, v, k, t, rng, time_limit):
-    """
-    Local search: try to improve by removing redundant blocks and swapping.
-    """
-    deadline = time.time() + time_limit
-    blocks = [list(b) for b in blocks]
-    
-    # Precompute all t-sets
-    all_tsets = list(itertools.combinations(range(v), t))
-    tset_to_blocks = {ts: [] for ts in all_tsets}
-    
-    def build_indices(blocks):
-        tset_to_blocks = {ts: [] for ts in all_tsets}
-        for i, b in enumerate(blocks):
-            bset = set(b)
-            for ts in itertools.combinations(b, t):
-                tset_to_blocks[ts].append(i)
-        return tset_to_blocks
-    
-    tset_to_blocks = build_indices(blocks)
-    
-    def is_valid_covering(blocks, v, k, t):
-        """Check if every t-subset is covered by at least one block."""
-        for ts in itertools.combinations(range(v), t):
-            if len(tset_to_blocks.get(ts, [])) == 0:
-                return False
-        return True
-    
-    def find_redundant(blocks, tset_to_blocks):
-        """Find blocks that are redundant (removing them doesn't uncover any t-set)."""
-        redundant = []
-        for i in range(len(blocks)):
-            # Check if any t-set is covered ONLY by block i
-            only_covered = False
-            b = blocks[i]
-            for ts in itertools.combinations(b, t):
-                covering = tset_to_blocks[ts]
-                if covering == [i]:
-                    only_covered = True
-                    break
-            if not only_covered:
-                redundant.append(i)
-        return redundant
-    
-    def try_remove_redundant(blocks, tset_to_blocks):
-        """Try to remove redundant blocks. Returns (new_blocks, new_tset_to_blocks, removed)."""
-        removed = 0
-        changed = True
-        while changed and time.time() < deadline:
-            changed = False
-            redundant = find_redundant(blocks, tset_to_blocks)
-            if redundant:
-                # Remove the first redundant block
-                idx = redundant[0]
-                b = blocks[idx]
-                # Remove from tset_to_blocks
-                for ts in itertools.combinations(b, t):
-                    if idx in tset_to_blocks[ts]:
-                        tset_to_blocks[ts].remove(idx)
-                # Remove block
-                blocks.pop(idx)
-                # Reindex
-                for i in range(len(blocks)):
-                    for ts in itertools.combinations(blocks[i], t):
-                        # This is inefficient, but let's rebuild
-                        pass
-                # Rebuild indices
-                tset_to_blocks = build_indices(blocks)
-                removed += 1
-                changed = True
-        return blocks, tset_to_blocks, removed
-    
-    def try_swap(blocks, tset_to_blocks, rng):
-        """Try to swap a block with a better one. Returns (new_blocks, new_tset_to_blocks, improved)."""
-        n = len(blocks)
-        if n == 0:
-            return blocks, tset_to_blocks, False
-        
-        # Pick a random block to potentially swap
-        idx = rng.randint(0, n - 1)
-        old_block = blocks[idx]
-        old_set = set(old_block)
-        
-        # Find t-sets that are ONLY covered by this block
-        critical_tsets = []
-        for ts in itertools.combinations(old_block, t):
-            covering = tset_to_blocks[ts]
-            if covering == [idx]:
-                critical_tsets.append(ts)
-        
-        if not critical_tsets:
-            # This block is redundant, remove it
-            # Remove from tset_to_blocks
-            for ts in itertools.combinations(old_block, t):
-                if idx in tset_to_blocks[ts]:
-                    tset_to_blocks[ts].remove(idx)
-            blocks.pop(idx)
-            tset_to_blocks = build_indices(blocks)
-            return blocks, tset_to_blocks, True
-        
-        # Try to find a replacement that covers all critical_tsets
-        # Sample some random blocks
-        best_new_block = None
-        best_extra = -1
-        
-        for _ in range(20):
-            if time.time() >= deadline:
-                break
-            cand = sorted(rng.sample(range(v), k))
-            cand_set = set(cand)
-            
-            # Check if cand covers all critical_tsets
-            covers_all = True
-            for ts in critical_tsets:
-                if not set(ts).issubset(cand_set):
-                    covers_all = False
-                    break
-            if not covers_all:
-                continue
-            
-            # Count how many additional t-sets this block covers
-            extra = 0
-            for ts in itertools.combinations(cand, t):
-                covering = tset_to_blocks.get(ts, [])
-                # Count how many blocks cover ts, excluding the old one
-                covering_without_old = [i for i in covering if i != idx]
-                if len(covering_without_old) == 0:
-                    extra += 1
-            
-            if extra > best_extra:
-                best_extra = extra
-                best_new_block = cand
-        
-        if best_new_block is not None and best_extra > 0:
-            # Perform swap
-            # Remove old block from indices
-            for ts in itertools.combinations(old_block, t):
-                if idx in tset_to_blocks[ts]:
-                    tset_to_blocks[ts].remove(idx)
-            # Add new block
-            blocks[idx] = best_new_block
-            for ts in itertools.combinations(best_new_block, t):
-                tset_to_blocks.setdefault(ts, []).append(idx)
-            # Rebuild to clean up indices
-            tset_to_blocks = build_indices(blocks)
-            return blocks, tset_to_blocks, True
-        
-        return blocks, tset_to_blocks, False
-    
-    # Main loop
-    while time.time() < deadline:
-        # Phase 1: Remove redundant blocks
-        blocks, tset_to_blocks, removed = try_remove_redundant(blocks, tset_to_blocks)
-        
-        # Phase 2: Try swaps
-        blocks, tset_to_blocks, improved = try_swap(blocks, tset_to_blocks, rng)
-        
-        if not improved and removed == 0:
-            # Try a few more random swaps before giving up
-            for _ in range(5):
-                if time.time() >= deadline:
-                    break
-                blocks, tset_to_blocks, improved = try_swap(blocks, tset_to_blocks, rng)
-                if improved:
-                    break
-            if not improved:
-                break
-    
-    return blocks
-
-def _is_valid_covering(blocks, v, k, t):
-    """Check if the covering is valid."""
-    # Build a set of all covered t-sets
-    covered = set()
-    for b in blocks:
-        bset = set(b)
-        for ts in itertools.combinations(b, t):
-            if set(ts).issubset(bset):
-                covered.add(tuple(ts))
-    
-    # Check all t-sets are covered
-    for ts in itertools.combinations(range(v), t):
-        if tuple(ts) not in covered:
-            return False
-    return True
+# Precompute blocks and their triple sets for v=24, k=7, t=3
+# This is specific to the task parameters, but the function takes v, k, t.
+# We should make it generic enough or assume the evaluator uses 24, 7, 3.
+# The prompt says "evaluator passes this task's parameters v, k and t".
+# So we must handle v, k, t dynamically.
 
 def construct(v, k, t):
-    start_time = time.time()
-    # Reserve 15s safety margin for the 150s kill
-    total_budget = 135.0
+    # For v=24, k=7, t=3, total blocks is ~346k.
+    # Total triples is ~2024.
     
+    # If parameters are too large, this precomputation might be too slow.
+    # But 24 is small.
+    
+    # To be safe and fast, we use a lazy generation or precomputation if size allows.
+    # Given the 120s limit, precomputing 346k blocks is fast (<0.1s).
+    
+    all_blocks = list(itertools.combinations(range(v), k))
+    # Map block to index for fast lookup?
+    # We need to know which triples a block covers.
+    
+    # Represent triples as tuples of sorted points.
+    all_triples = list(itertools.combinations(range(v), t))
+    triple_to_idx = {triple: i for i, triple in enumerate(all_triples)}
+    
+    # Precompute for each block, the list of triple indices it covers
+    block_triples = []
+    for b in all_blocks:
+        ts = [triple_to_idx[tr] for tr in itertools.combinations(b, t)]
+        block_triples.append(ts)
+        
+    # Greedy with restarts
     best_blocks = None
     best_len = float('inf')
     
-    # Run multiple greedy variants with different modes and seeds
-    modes = ['basic', 'pair', 'adaptive']
-    diversity_values = [0.3, 0.5, 0.8]
-    num_runs = 3
+    # Number of restarts depends on time budget
+    start_time = time.time()
+    max_time = 110 # Leave 10s buffer
     
-    # Allocate time
-    greedy_time = total_budget * 0.50
-    ls_time = total_budget * 0.40
-    margin = total_budget * 0.10
+    # We will run greedy multiple times with random tie-breaking
+    # We need to efficiently find the block with max gain.
     
-    total_greedy_configs = len(modes) * len(diversity_values) * num_runs
-    per_greedy_time = greedy_time / total_greedy_configs
+    # Data structures for greedy:
+    # uncovered: boolean array of size num_triples
+    # gain[block_idx]: number of uncovered triples covered by this block
     
-    config_idx = 0
-    for mode in modes:
-        for div in diversity_values:
-            for run in range(num_runs):
-                config_idx += 1
-                if time.time() - start_time > total_budget - ls_time - margin:
-                    break
+    num_triples = len(all_triples)
+    num_blocks = len(all_blocks)
+    
+    # To make it faster, we can sort blocks by some heuristic?
+    # No, gain changes dynamically.
+    
+    # Efficient Gain Calculation:
+    # When we add a block, we mark its triples as covered.
+    # We need to update the gain of all other blocks that share triples with the added block.
+    # This is expensive if done naively.
+    
+    # Alternative: 
+    # For each uncovered triple, find the blocks that cover it.
+    # The "gain" of a block is the number of uncovered triples it covers.
+    # We can maintain a list of uncovered triples.
+    # For each step, we want to find the block maximizing gain.
+    # We can iterate through uncovered triples and accumulate counts for blocks?
+    # That is O(|Uncovered| * AvgBlocksPerTriple).
+    # AvgBlocksPerTriple = C(v-t, k-t) = C(21, 4) = 5985.
+    # |Uncovered| starts at 2024.
+    # 2024 * 5985 ~ 12 million operations per step.
+    # Number of steps ~ 76.
+    # 76 * 12M = 912M operations. Too slow in Python.
+    
+    # We need a better greedy.
+    # Standard Greedy:
+    # 1. Calculate gain for ALL blocks.
+    # 2. Pick max.
+    # 3. Update gains.
+    # Updating gains:
+    # When block B is added, for every triple T in B:
+    #   For every block B' that covers T:
+    #     If T was the only uncovered triple in B' (or just decrement count):
+    #        gain[B'] -= 1
+    
+    # We need: For each triple T, the list of blocks covering T.
+    # triple_to_blocks = defaultdict(list)
+    # for i, ts in enumerate(block_triples):
+    #     for t_idx in ts:
+    #         triple_to_blocks[t_idx].append(i)
+        
+    # This structure is:
+    # 2024 triples * ~6000 blocks/triple = 12M entries.
+    # Memory is okay (~100MB).
+    # Speed:
+    # Step 1: Init gains.
+    #   For each block, gain = len(block_triples[i]) = 35.
+    #   Actually, gain = number of *uncovered* triples. Initially all uncovered, so gain = 35 for all.
+    #   Wait, if all gains are equal, we pick randomly or first.
+    #   This is bad. We need to pick a block that is "good".
+    #   In the first step, all blocks are symmetric.
+    
+    # Let's refine the gain update.
+    # uncovered = [True] * num_triples
+    # gains = [0] * num_blocks
+    # for i in range(num_blocks):
+    #     gains[i] = len(block_triples[i]) # 35
+    
+    # But this is static. We need dynamic.
+    # 
+    # Algorithm:
+    # 1. Init `uncovered` as set of all triple indices.
+    # 2. Init `gains` array.
+    #    For each block, gain is number of triples in `uncovered` it covers.
+    #    Initially 35.
+    # 3. Loop:
+    #    a. Find block `b` with max `gains[b]`.
+    #       If tie, pick random among maxes.
+    #    b. Add `b` to solution.
+    #    c. For each triple `t` in `block_triples[b]`:
+    #       If `t` is in `uncovered`:
+    #          Remove `t` from `uncovered`.
+    #          For each block `b_prime` in `triple_to_blocks[t]`:
+    #             gains[b_prime] -= 1
+    #    d. If `uncovered` is empty, break.
+    
+    # Complexity:
+    # Finding max: O(num_blocks) = 346k.
+    # Updating:
+    #   Each block added covers 35 triples.
+    #   Each triple is in ~6000 blocks.
+    #   So for one block added, we update 35 * 6000 = 210,000 gains.
+    #   Total steps ~ 76.
+    #   Total updates: 76 * 210,000 = 16M updates.
+    #   Total max-finds: 76 * 346,000 = 26M comparisons.
+    #   Total ops ~ 42M.
+    #   Python can do ~10-50M simple ops/sec.
+    #   This might take 1-5 seconds per run.
+    #   We can do ~10-50 restarts in 120s.
+    
+    # This is a viable plan.
+    
+    # Precomputation
+    triple_to_blocks = [[] for _ in range(num_triples)]
+    for i, ts in enumerate(block_triples):
+        for t_idx in ts:
+            triple_to_blocks[t_idx].append(i)
+            
+    # Greedy Function
+    def greedy_run(random_seed):
+        random.seed(random_seed)
+        uncovered = set(range(num_triples))
+        gains = [len(ts) for ts in block_triples] # Initial gain is 35
+        blocks_used = []
+        
+        # Optimization: If a block's gain becomes 0, it's useless.
+        # We can maintain a list of "active" blocks?
+        # Or just scan all 346k each time. 346k * 76 is fine.
+        
+        while uncovered:
+            # Find max gain
+            max_gain = -1
+            candidates = []
+            for i in range(num_blocks):
+                if gains[i] > max_gain:
+                    max_gain = gains[i]
+                    candidates = [i]
+                elif gains[i] == max_gain:
+                    candidates.append(i)
+            
+            if max_gain == 0:
+                # Should not happen if problem is solvable, but break to avoid infinite loop
+                break
                 
-                rng = random.Random(42 + config_idx * 137)
-                blocks = _greedy_covering(v, k, t, rng, per_greedy_time, mode=mode, diversity_bonus=div)
-                
-                if len(blocks) < best_len:
-                    best_len = len(blocks)
-                    best_blocks = blocks
+            # Random tie-breaking
+            b = random.choice(candidates)
+            blocks_used.append(b)
+            
+            # Update
+            for t_idx in block_triples[b]:
+                if t_idx in uncovered:
+                    uncovered.remove(t_idx)
+                    # Update gains for all blocks covering this triple
+                    for b_prime in triple_to_blocks[t_idx]:
+                        gains[b_prime] -= 1
+                        
+        return blocks_used
+
+    # Run multiple restarts
+    # Estimate time for one run.
+    # Let's try 5 runs first to calibrate, then use remaining time.
     
-    # If no good result, do a simple greedy
-    if best_blocks is None or best_len > 80:
-        rng = random.Random(0)
-        blocks = _greedy_covering(v, k, t, rng, 10.0, mode='basic')
-        if len(blocks) < best_len:
-            best_len = len(blocks)
-            best_blocks = blocks
+    # To be safe, let's run 10-20 restarts.
+    # We'll track the best (smallest) list.
     
-    if best_blocks is None:
-        # Fallback
-        blocks = _greedy_covering(v, k, t, random.Random(1), 5.0, mode='basic')
-        best_blocks = blocks
-        best_len = len(blocks)
+    # Note: `blocks_used` is a list of indices. We need to convert to actual blocks.
     
-    # Phase 2: Local search refinement
-    remaining = total_budget - (time.time() - start_time) - margin
-    if remaining > 5.0 and best_blocks is not None:
-        rng = random.Random(12345)
-        refined = _local_search(best_blocks, v, k, t, rng, remaining)
-        if len(refined) < best_len:
-            best_blocks = refined
-            best_len = len(refined)
+    # Let's do a quick timing check in the code? No, just run a fixed number.
+    # 20 restarts * 3s/run = 60s. Safe.
     
-    # Final safety check
-    if time.time() - start_time > total_budget - 5.0:
-        return best_blocks
+    best_solution = None
+    best_size = float('inf')
     
-    return best_blocks
-# EVOLVE-BLOCK-END
+    # Use different seeds
+    for i in range(20):
+        sol_idx = greedy_run(i)
+        if len(sol_idx) < best_size:
+            best_size = len(sol_idx)
+            best_solution = sol_idx
+        # Optional: Check time
+        if time.time() - start_time > 100:
+            break
+            
+    if best_solution is None:
+        # Fallback to simple greedy if something went wrong
+        # Just return first run
+        sol_idx = greedy_run(0)
+        best_solution = sol_idx
+        
+    # Convert indices to blocks
+    result = [list(all_blocks[i]) for i in best_solution]
+    return result
