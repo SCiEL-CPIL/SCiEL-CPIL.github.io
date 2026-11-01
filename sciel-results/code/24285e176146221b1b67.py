@@ -1,0 +1,122 @@
+import numpy as np
+
+DIMENSIONS = [2, 2, 10]
+
+def construct():
+    """
+    Decompose 2x2 * 2x10 multiplication into five independent 2x2 * 2x2 blocks.
+    Each 2x2 * 2x2 block uses the rank-7 Strassen decomposition.
+    Total rank = 5 * 7 = 35.
+    
+    The B matrix is 2x10, which can be viewed as 5 blocks of 2x2 (columns 0-1, 2-3, ..., 8-9).
+    The output C is 2x10, with each 2x2 block corresponding to one 2x2 submatrix of B.
+    
+    Indexing conventions:
+    - A is n x m = 2 x 2, indexed as A[i, j]
+    - B is m x p = 2 x 10, indexed as B[j, k]
+    - C is n x p = 2 x 10, indexed as C[i, k]
+    
+    For the r-th block (r = 0..4), B's columns are 2*r and 2*r+1.
+    The r-th block computes: C_block_r = A * B_block_r where B_block_r is 2x2.
+    
+    U has shape (n*m, rank) = (4, 35)
+    V has shape (m*p, rank) = (20, 35)
+    W has shape (p*n, rank) = (20, 35) with W[k*n + i, c]
+    
+    For each block r and each Strassen term t (0..6):
+      U[i*m + j, r*7 + t] = U_strassen[i, j, t]
+      V[j*p + (2*r + k), r*7 + t] = V_strassen[j, k, t]
+      W[(2*r + k)*n + i, r*7 + t] = W_strassen[k, i, t]
+    """
+    n, m, p = DIMENSIONS
+    num_blocks = p // 2  # 5 blocks
+    
+    # Strassen rank-7 decomposition for 2x2 matrices
+    # A = [[a, b], [c, d]], B = [[e, f], [g, h]]
+    # C = A * B
+    #
+    # Strassen's 7 products:
+    # M1 = (a + d)(e + h)
+    # M2 = (c + d)e
+    # M3 = a(f - h)
+    # M4 = d(g - e)
+    # M5 = (a + b)h
+    # M6 = (c - a)(e + f)
+    # M7 = (b - d)(g + h)
+    #
+    # C[0,0] = M1 + M4 - M5 + M7
+    # C[0,1] = M3 + M5
+    # C[1,0] = M2 + M4
+    # C[1,1] = M1 - M2 + M3 + M6
+    
+    # Define the 7 Strassen terms as (U_entries, V_entries, W_entries)
+    # U_entries: dict from (i,j) to value
+    # V_entries: dict from (j,k) to value
+    # W_entries: dict from (k,i) to value
+    
+    strassen_terms = [
+        # Term 0: M1 = (a+d)(e+h)
+        (
+            {(0,0): 1, (1,1): 1},   # U: a+d
+            {(0,0): 1, (1,1): 1},   # V: e+h
+            {(0,0): 1, (1,1): 1}    # W: C[0,0]+=1, C[1,1]+=1
+        ),
+        # Term 1: M2 = (c+d)e
+        (
+            {(1,0): 1, (1,1): 1},   # U: c+d
+            {(0,0): 1},             # V: e
+            {(0,1): 1, (1,1): -1}   # W: C[1,0]+=1, C[1,1]-=1
+        ),
+        # Term 2: M3 = a(f-h)
+        (
+            {(0,0): 1},             # U: a
+            {(0,1): 1, (1,1): -1},  # V: f-h
+            {(1,0): 1, (1,1): 1}    # W: C[0,1]+=1, C[1,1]+=1
+        ),
+        # Term 3: M4 = d(g-e)
+        (
+            {(1,1): 1},             # U: d
+            {(1,0): 1, (0,0): -1},  # V: g-e
+            {(0,0): 1, (0,1): 1}    # W: C[0,0]+=1, C[1,0]+=1
+        ),
+        # Term 4: M5 = (a+b)h
+        (
+            {(0,0): 1, (0,1): 1},   # U: a+b
+            {(1,1): 1},             # V: h
+            {(0,0): -1, (1,0): 1}   # W: C[0,0]-=1, C[0,1]+=1
+        ),
+        # Term 5: M6 = (c-a)(e+f)
+        (
+            {(1,0): 1, (0,0): -1},  # U: c-a
+            {(0,0): 1, (0,1): 1},   # V: e+f
+            {(1,1): 1}              # W: C[1,1]+=1
+        ),
+        # Term 6: M7 = (b-d)(g+h)
+        (
+            {(0,1): 1, (1,1): -1},  # U: b-d
+            {(1,0): 1, (1,1): 1},   # V: g+h
+            {(0,0): 1}              # W: C[0,0]+=1
+        ),
+    ]
+    
+    rank = num_blocks * 7  # 35
+    
+    U = np.zeros((n * m, rank), dtype=float)
+    V = np.zeros((m * p, rank), dtype=float)
+    W = np.zeros((p * n, rank), dtype=float)
+    
+    for r in range(num_blocks):
+        for t in range(7):
+            col = r * 7 + t
+            u_entries, v_entries, w_entries = strassen_terms[t]
+            
+            for (i, j), val in u_entries.items():
+                U[i * m + j, col] = val
+            
+            for (j, k), val in v_entries.items():
+                V[j * p + (2 * r + k), col] = val
+            
+            for (k, i), val in w_entries.items():
+                W[(2 * r + k) * n + i, col] = val
+    
+    return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}

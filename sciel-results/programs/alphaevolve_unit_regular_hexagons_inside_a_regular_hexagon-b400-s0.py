@@ -207,6 +207,31 @@ def construct():
     ]
     candidates.append(axial_25)
 
+    # Additional promising configurations
+    axial_26 = [
+        (0, 0), (1, 0), (2, 0), (3, 0),
+        (1, 1), (2, 1), (3, 1),
+        (0, 2), (1, 2), (2, 2), (3, 2),
+        (1, 3), (2, 3)
+    ]
+    candidates.append(axial_26)
+
+    axial_27 = [
+        (0, 0),
+        (1, 0), (0, 1), (-1, 1), (-1, 0), (0, -1), (1, -1),
+        (2, 0), (-2, 0), (0, 2), (1, -2)
+    ]
+    candidates.append(axial_27)
+
+    axial_28 = [
+        (0, 0), (1, 0),
+        (0, 1), (1, 1), (2, 1),
+        (0, 2), (1, 2),
+        (0, 3), (1, 3), (2, 3),
+        (1, 4), (2, 4)
+    ]
+    candidates.append(axial_28)
+
     def axial_to_cartesian(axial_list):
         pts = []
         for q, r in axial_list:
@@ -253,26 +278,29 @@ def construct():
             return float('inf'), None, None
 
     def smooth_calc_S(pts, beta, cx, cy, temperature=0.1):
-        normals = []
-        for k in range(6):
-            ang = beta + math.pi / 6.0 + k * math.pi / 3.0
-            normals.append((math.cos(ang), math.sin(ang)))
-        
-        # Collect all projections: for each normal and each point, both +proj and -proj
-        projs = np.array([
-            ((px - cx) * nx + (py - cy) * ny)
-            for nx, ny in normals
-            for px, py in pts
+        normals = np.array([
+            (math.cos(beta + math.pi / 6.0 + k * math.pi / 3.0),
+             math.sin(beta + math.pi / 6.0 + k * math.pi / 3.0))
+            for k in range(6)
         ])
-        # We need max over all |proj|, so use both signs
-        all_projs = np.concatenate([projs, -projs])
+        
+        # Compute all projections efficiently using matrix operations
+        # For each point and each normal, compute projection
+        pts_centered = pts - np.array([cx, cy])
+        # Shape: (n_points, 6)
+        projs = pts_centered @ normals.T
+        
+        # We need max over all |proj|
+        all_projs = np.concatenate([projs.ravel(), (-projs).ravel()])
         
         max_val = np.max(all_projs)
         if max_val > 100:
             return float('inf'), (cx, cy), float('inf')
         
-        # Soft max via log-sum-exp
+        # Soft max via log-sum-exp for numerical stability
         shifted = (all_projs - max_val) / temperature
+        # Clip to avoid overflow in exp
+        shifted = np.clip(shifted, -50, 50)
         log_sum = np.log(np.sum(np.exp(shifted))) + max_val / temperature
         D = temperature * log_sum
         S = (D + APOTHEM) / APOTHEM
@@ -286,6 +314,7 @@ def construct():
         if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
             return float('inf'), 0.0, None
         
+        # Coarse grid search over beta
         for i in range(37):
             beta = i * (math.pi / 6) / 36
             S, center, D = calc_S_for_beta(pts, beta)
@@ -294,10 +323,11 @@ def construct():
                 best_beta = beta
                 best_center = center
         
+        # Refine beta with bounded scalar optimization
         try:
             if time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN:
                 res = minimize_scalar(lambda b: calc_S_for_beta(pts, b)[0], bounds=(0, math.pi / 6), method='bounded',
-                                     options={'maxiter': 200, 'xatol': 1e-10})
+                                     options={'maxiter': 300, 'xatol': 1e-12})
                 if res.fun < best_S:
                     best_S = res.fun
                     best_beta = res.x
@@ -305,10 +335,11 @@ def construct():
         except Exception:
             pass
         
+        # Smooth surrogate optimization with adaptive temperature
         try:
             if time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN:
-                temperatures = [0.5, 0.2, 0.1, 0.05, 0.02]
-                start_betas = [0.0, math.pi/36, math.pi/18, math.pi/12, math.pi/9, math.pi/6 - math.pi/36, best_beta]
+                temperatures = [0.3, 0.1, 0.05, 0.02, 0.01]
+                start_betas = [best_beta, best_beta + 0.05, best_beta - 0.05, 0.0, math.pi/12, math.pi/6]
                 
                 for temp in temperatures:
                     if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
@@ -325,7 +356,7 @@ def construct():
                         
                         init = [best_center[0], best_center[1], sb]
                         res = minimize(smooth_obj, init, method='Nelder-Mead',
-                                     options={'maxiter': 800, 'xatol': 1e-12, 'fatol': 1e-12})
+                                     options={'maxiter': 500, 'xatol': 1e-10, 'fatol': 1e-10})
                         
                         if res.fun < 1e10:
                             cx_r, cy_r, beta_r = res.x
@@ -338,41 +369,42 @@ def construct():
         except Exception:
             pass
         
+        # Final high-precision polish using exact objective
         try:
             if time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN:
                 def objective(params):
                     cx, cy, beta = params
-                    if beta < -1e-6 or beta > math.pi / 6 + 1e-6:
-                        return 1e10
                     beta = ((beta % (math.pi/6)) + math.pi/6) % (math.pi/6)
                     normals = []
                     for k in range(6):
                         ang = beta + math.pi / 6.0 + k * math.pi / 3.0
                         normals.append((math.cos(ang), math.sin(ang)))
                     
-                    max_proj = 0
+                    max_proj = 0.0
                     for nx, ny in normals:
                         for px, py in pts:
-                            proj = (px - cx) * nx + (py - cy) * ny
-                            max_proj = max(max_proj, abs(proj))
+                            proj = abs((px - cx) * nx + (py - cy) * ny)
+                            if proj > max_proj:
+                                max_proj = proj
                     
                     S = (max_proj + APOTHEM) / APOTHEM
                     return S
                 
-                # Multiple final polish attempts from different starting points
                 polish_starts = [
                     [best_center[0], best_center[1], best_beta],
-                    [best_center[0], best_center[1], best_beta + 0.01],
-                    [best_center[0], best_center[1], best_beta - 0.01],
-                    [best_center[0] + 0.01, best_center[1], best_beta],
-                    [best_center[0], best_center[1] + 0.01, best_beta],
+                    [best_center[0], best_center[1], best_beta + 0.02],
+                    [best_center[0], best_center[1], best_beta - 0.02],
+                    [best_center[0] + 0.02, best_center[1], best_beta],
+                    [best_center[0], best_center[1] + 0.02, best_beta],
+                    [best_center[0] - 0.02, best_center[1], best_beta],
+                    [best_center[0], best_center[1] - 0.02, best_beta],
                 ]
                 
                 for init in polish_starts:
                     if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
                         break
                     res = minimize(objective, init, method='Nelder-Mead',
-                                 options={'maxiter': 3000, 'xatol': 1e-14, 'fatol': 1e-14})
+                                 options={'maxiter': 5000, 'xatol': 1e-13, 'fatol': 1e-13})
                     if res.fun < best_S:
                         best_S = res.fun
                         best_center = (res.x[0], res.x[1])
