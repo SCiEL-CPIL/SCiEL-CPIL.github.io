@@ -7,7 +7,6 @@ def construct(v, k, t):
     start_time = time.time()
     deadline = start_time + 145.0  # Safety margin for 150s limit
 
-    # Helper function for combinations count
     def C(n, r):
         if r > n or r < 0:
             return 0
@@ -19,21 +18,15 @@ def construct(v, k, t):
             result = result * (n - i + 1) // i
         return result
 
-    # 1. Precomputation
-    # Generate all t-subsets and map them to indices
+    # Precomputation
     all_t_subsets = list(itertools.combinations(range(v), t))
     num_t_subsets = len(all_t_subsets)
     
-    # Generate all possible k-blocks
     all_k_blocks = list(itertools.combinations(range(v), k))
     num_k_blocks = len(all_k_blocks)
     
-    # Map t-subset to index
     ts_index_map = {ts: i for i, ts in enumerate(all_t_subsets)}
     
-    # Build incidence structures:
-    # block_to_ts[j]: list of indices of t-subsets contained in block j
-    # ts_to_blocks[i]: list of indices of blocks containing t-subset i
     block_to_ts = []
     ts_to_blocks = [[] for _ in range(num_t_subsets)]
     
@@ -45,23 +38,16 @@ def construct(v, k, t):
             ts_to_blocks[idx].append(j)
         block_to_ts.append(ts_list)
 
-    # Precompute block indices as numpy arrays for fast operations
-    block_ts_arrays = []
-    for j in range(num_k_blocks):
-        block_ts_arrays.append(np.array(block_to_ts[j], dtype=np.int32))
-        
-    # Precompute ts_to_blocks as numpy arrays for fast vectorized updates
-    ts_to_blocks_arrays = []
-    for i in range(num_t_subsets):
-        ts_to_blocks_arrays.append(np.array(ts_to_blocks[i], dtype=np.int32))
-
-    # Precompute tuple-to-index map for fast block lookup
+    # Convert to numpy arrays for fast operations
+    block_to_ts_np = [np.array(lst, dtype=np.int32) for lst in block_to_ts]
+    ts_to_blocks_np = [np.array(lst, dtype=np.int32) for lst in ts_to_blocks]
+    
     block_tuple_to_idx = {tuple(b): i for i, b in enumerate(all_k_blocks)}
     
     def get_block_idx(block):
         return block_tuple_to_idx.get(tuple(block), -1)
 
-    def run_greedy(seed):
+    def run_greedy(seed, explore_prob=0.0):
         random.seed(seed)
         gain = np.full(num_k_blocks, C(k, t), dtype=np.int32)
         is_uncovered = np.full(num_t_subsets, True, dtype=bool)
@@ -72,50 +58,46 @@ def construct(v, k, t):
             if time.time() > deadline - 5.0:
                 return None
             
-            max_gain = np.max(gain)
+            max_gain = int(np.max(gain))
             if max_gain <= 0:
                 break
                 
-            # Find candidates with max gain
             candidates = np.where((gain == max_gain) & (~is_selected))[0]
             if len(candidates) == 0:
                 break
                 
-            # Randomly pick one
-            b_idx = candidates[random.randint(0, len(candidates) - 1)]
+            if explore_prob > 0 and random.random() < explore_prob:
+                # Explore: pick from blocks with gain >= max_gain - 3
+                explore_cands = np.where((gain >= max_gain - 3) & (~is_selected))[0]
+                if len(explore_cands) > 0:
+                    b_idx = int(explore_cands[random.randint(0, len(explore_cands) - 1)])
+                else:
+                    b_idx = int(candidates[random.randint(0, len(candidates) - 1)])
+            else:
+                b_idx = int(candidates[random.randint(0, len(candidates) - 1)])
             
             sol.append(list(all_k_blocks[b_idx]))
             is_selected[b_idx] = True
-            gain[b_idx] = -1 # Mark as selected to avoid re-selection
+            gain[b_idx] = -1
             
             # Identify newly covered t-subsets
-            newly_covered_ts = []
-            for ts_idx in block_to_ts[b_idx]:
-                if is_uncovered[ts_idx]:
-                    is_uncovered[ts_idx] = False
-                    newly_covered_ts.append(ts_idx)
+            bts = block_to_ts_np[b_idx]
+            newly_covered_mask = is_uncovered[bts]
+            newly_covered = bts[newly_covered_mask]
             
-            if not newly_covered_ts:
+            if len(newly_covered) == 0:
                 continue
                 
-            # Vectorized gain update
-            # We need to decrement gain for all blocks that contain any of the newly_covered_ts
-            # and are not selected.
-            # Collect all block indices that contain any of these t-subsets
-            # Using a list to accumulate, then bincount is efficient
+            is_uncovered[newly_covered] = False
+            
+            # Vectorized gain update using bincount
             blocks_to_decrement = []
-            for ts_idx in newly_covered_ts:
+            for ts_idx in newly_covered:
                 blocks_to_decrement.extend(ts_to_blocks[ts_idx])
                 
             if blocks_to_decrement:
-                # Count how many times each block appears in the list
-                # This effectively subtracts the number of newly covered t-subsets in that block
                 counts = np.bincount(blocks_to_decrement, minlength=num_k_blocks)
-                # Only update unselected blocks
-                # We can just subtract counts, selected blocks have gain=-1 and we don't care if they go lower
                 gain -= counts
-                # Ensure selected blocks stay at -1 (or lower, doesn't matter as long as they are not max)
-                # But to be safe, reset selected gains to a very low number
                 gain[is_selected] = -1000
 
         return sol
@@ -123,34 +105,31 @@ def construct(v, k, t):
     # Initial deterministic greedy
     best_solution = run_greedy(0)
     if best_solution is None:
-        # Fallback if greedy timed out or failed
         best_solution = [list(all_k_blocks[0])]
     best_len = len(best_solution)
     
-    # Run randomized greedy multiple times to find a better starting point
-    num_runs = 200 # Increased runs due to faster greedy
+    # Run multiple randomized greedy with varying exploration
+    num_runs = 150
     for i in range(1, num_runs):
-        if time.time() > deadline - 10.0:
+        if time.time() > deadline - 15.0:
             break
-            
-        sol = run_greedy(i)
+        
+        # Vary exploration probability
+        explore = 0.0 if i < 50 else (0.1 if i < 100 else 0.2)
+        sol = run_greedy(i, explore_prob=explore)
         if sol is not None and len(sol) < best_len:
             best_len = len(sol)
             best_solution = sol
-            
-    # Local Search: Remove redundant blocks
+
     def optimize_redundancy(blocks):
-        # Build cover_count using precomputed block_to_ts
         cover_count = np.zeros(num_t_subsets, dtype=np.int32)
         
-        # Map solution blocks to their precomputed ts indices
         block_ts_indices = []
         for b in blocks:
             idx = get_block_idx(b)
             if idx >= 0:
                 block_ts_indices.append(block_to_ts[idx])
             else:
-                # Fallback: compute on the fly
                 ts_list = []
                 for ts in itertools.combinations(b, t):
                     ts_list.append(ts_index_map[ts])
@@ -164,7 +143,7 @@ def construct(v, k, t):
         while changed:
             changed = False
             for i in range(len(blocks)):
-                if time.time() > deadline - 2.0:
+                if time.time() > deadline - 3.0:
                     return blocks
                 
                 redundant = True
@@ -186,7 +165,6 @@ def construct(v, k, t):
     def local_search_swap(blocks):
         cover_count = np.zeros(num_t_subsets, dtype=np.int32)
         
-        # Map solution blocks to their precomputed ts indices
         block_ts_indices = []
         for b in blocks:
             idx = get_block_idx(b)
@@ -202,7 +180,6 @@ def construct(v, k, t):
             for ts_idx in ts_list:
                 cover_count[ts_idx] += 1
                 
-        # Build set of block indices currently in solution for O(1) lookup
         sol_block_indices = set()
         for b in blocks:
             idx = get_block_idx(b)
@@ -211,7 +188,7 @@ def construct(v, k, t):
                 
         improved = False
         for i in range(len(blocks)):
-            if time.time() > deadline - 2.0:
+            if time.time() > deadline - 3.0:
                 return blocks, improved
             
             unique_ts = []
@@ -232,7 +209,6 @@ def construct(v, k, t):
             if not candidates:
                 continue
             
-            # Filter out blocks already in solution
             valid_candidates = [c for c in candidates if c not in sol_block_indices]
             if not valid_candidates:
                 continue
@@ -247,7 +223,6 @@ def construct(v, k, t):
             sol_block_indices.discard(old_block_idx)
             sol_block_indices.add(new_block_idx)
             
-            # Update cover counts using precomputed arrays
             for ts_idx in block_ts_indices[i]:
                 cover_count[ts_idx] -= 1
             for ts_idx in block_to_ts[new_block_idx]:
@@ -264,7 +239,6 @@ def construct(v, k, t):
             
         cover_count = np.zeros(num_t_subsets, dtype=np.int32)
         
-        # Map solution blocks to their precomputed ts indices
         block_ts_indices = []
         for b in blocks:
             idx = get_block_idx(b)
@@ -289,16 +263,13 @@ def construct(v, k, t):
         improved = False
         n = len(blocks)
         
-        # Try pairs of blocks to remove; see if we can find two replacement blocks
-        # that allow the solution to shrink or maintain validity while enabling further reductions
         for i in range(n):
-            if time.time() > deadline - 2.0:
+            if time.time() > deadline - 3.0:
                 return blocks, improved
             for j in range(i + 1, n):
-                if time.time() > deadline - 2.0:
+                if time.time() > deadline - 3.0:
                     return blocks, improved
                     
-                # Collect unique t-subsets for blocks[i] and blocks[j]
                 unique_ts_i = []
                 for ts_idx in block_ts_indices[i]:
                     if cover_count[ts_idx] == 1:
@@ -312,15 +283,11 @@ def construct(v, k, t):
                 if not unique_ts_i and not unique_ts_j:
                     continue
                     
-                # We need to find two blocks B', B'' not in solution such that:
-                # - B' covers all unique_ts_i (or they're covered by B' and B'' together)
-                # - B'' covers all unique_ts_j
-                # Simpler: find one block that covers ALL unique t-subsets of both i and j
                 all_unique = unique_ts_i + unique_ts_j
                 if not all_unique:
                     continue
                     
-                # Try to find a single block covering all unique ts from both
+                # Try single block covering all unique ts
                 candidates = set(ts_to_blocks[all_unique[0]])
                 for ts_idx in all_unique[1:]:
                     candidates.intersection_update(ts_to_blocks[ts_idx])
@@ -333,12 +300,6 @@ def construct(v, k, t):
                         new_block_idx = random.choice(valid)
                         new_block = list(all_k_blocks[new_block_idx])
                         
-                        # Remove both blocks, add one new block
-                        # This reduces size by 1!
-                        old_i = blocks[i]
-                        old_j = blocks[j]
-                        
-                        # Update cover counts using precomputed arrays
                         for ts_idx in block_ts_indices[i]:
                             cover_count[ts_idx] -= 1
                         for ts_idx in block_ts_indices[j]:
@@ -346,8 +307,8 @@ def construct(v, k, t):
                         for ts_idx in block_to_ts[new_block_idx]:
                             cover_count[ts_idx] += 1
                         
-                        sol_block_indices.discard(get_block_idx(old_i))
-                        sol_block_indices.discard(get_block_idx(old_j))
+                        sol_block_indices.discard(get_block_idx(blocks[i]))
+                        sol_block_indices.discard(get_block_idx(blocks[j]))
                         sol_block_indices.add(new_block_idx)
                         
                         blocks.pop(j)
@@ -357,8 +318,7 @@ def construct(v, k, t):
                         improved = True
                         break
                         
-                # If single block doesn't work, try two separate blocks
-                # Block for i's unique ts
+                # Try two separate blocks
                 if unique_ts_i:
                     cand_i = set(ts_to_blocks[unique_ts_i[0]])
                     for ts_idx in unique_ts_i[1:]:
@@ -386,10 +346,6 @@ def construct(v, k, t):
                     new_i = list(all_k_blocks[new_i_idx])
                     new_j = list(all_k_blocks[new_j_idx])
                     
-                    old_i = blocks[i]
-                    old_j = blocks[j]
-                    
-                    # Update cover counts using precomputed arrays
                     for ts_idx in block_ts_indices[i]:
                         cover_count[ts_idx] -= 1
                     for ts_idx in block_ts_indices[j]:
@@ -399,8 +355,8 @@ def construct(v, k, t):
                     for ts_idx in block_to_ts[new_j_idx]:
                         cover_count[ts_idx] += 1
                         
-                    sol_block_indices.discard(get_block_idx(old_i))
-                    sol_block_indices.discard(get_block_idx(old_j))
+                    sol_block_indices.discard(get_block_idx(blocks[i]))
+                    sol_block_indices.discard(get_block_idx(blocks[j]))
                     sol_block_indices.add(new_i_idx)
                     sol_block_indices.add(new_j_idx)
                     
@@ -415,8 +371,8 @@ def construct(v, k, t):
                 
         return blocks, improved
 
-    # Run local search for a few iterations
-    for _ in range(50):
+    # Local search iterations
+    for _ in range(100):
         if time.time() > deadline - 5.0:
             break
         best_solution, improved = local_search_swap(best_solution)
@@ -425,7 +381,6 @@ def construct(v, k, t):
             if len(best_solution) < best_len:
                 best_len = len(best_solution)
         else:
-            # Try 2-exchange
             best_solution, improved2 = local_search_2exchange(best_solution)
             if improved2:
                 best_solution = optimize_redundancy(best_solution)

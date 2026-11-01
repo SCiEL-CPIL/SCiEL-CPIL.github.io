@@ -1,279 +1,436 @@
 import time
 import random
+import math
+
+_START = None
 
 def construct(n_rows, k):
-    # n_rows=4, k=7 (8 numbers)
-    # We want to minimize M (max entry)
-    
-    start_time = time.time()
-    # Safety margin for the 120s limit. Let's aim for 115s of work.
-    deadline = start_time + 115.0
+    global _START
+    if _START is None:
+        _START = time.time()
+    deadline = _START + 132.0  # safety margin before 150s kill
 
-    def time_left():
-        return deadline - time.time()
+    d = k * (k + 1) // 2  # differences per row
+    max_diff = 200  # upper bound on any difference we care about
 
-    def row_diffs_list(row):
-        """All positive differences in a row (as a list)."""
-        diffs = []
-        for i in range(len(row)):
-            for j in range(i + 1, len(row)):
-                diffs.append(row[j] - row[i])
-        return diffs
+    def get_scope(rows):
+        return max(max(r) for r in rows)
+
+    def full_validate(rows):
+        """Return scope if valid, else None."""
+        seen = set()
+        scope = 0
+        for row in rows:
+            for i in range(len(row)):
+                ri = row[i]
+                for j in range(i + 1, len(row)):
+                    diff = row[j] - ri
+                    if diff in seen:
+                        return None
+                    seen.add(diff)
+            scope = max(scope, max(row))
+        return scope
 
     def row_diffs_set(row):
-        """All positive differences in a row (as a set)."""
-        diffs = set()
-        for i in range(len(row)):
-            for j in range(i + 1, len(row)):
-                diffs.add(row[j] - row[i])
-        return diffs
+        s = set()
+        n = len(row)
+        for i in range(n):
+            ri = row[i]
+            for j in range(i + 1, n):
+                s.add(row[j] - ri)
+        return s
 
-    def is_valid(rows):
-        seen = set()
-        for row in rows:
-            for d in row_diffs_list(row):
-                if d in seen:
-                    return False
-                seen.add(d)
-        return True
-
-    def scope(rows):
-        return max(max(row) for row in rows)
-
-    # ---------- Greedy baseline (fast, deterministic) ----------
-    def greedy():
+    def greedy_init():
+        """Greedy construction with smarter skip: try multiple candidates per step."""
         used = set()
         rows = []
         for _ in range(n_rows):
-            row, x = [0], 0
-            row_diffs = set()
+            row = [0]
+            x = 0
             while len(row) < k + 1:
-                x += 1
-                new = {x - a for a in row}
-                if not (new & used) and not (new & row_diffs):
-                    row.append(x)
-                    row_diffs |= new
-                    used |= new
+                found = False
+                for trial in range(x + 1, x + 50):
+                    new = {trial - a for a in row}
+                    if not new & used:
+                        row.append(trial)
+                        used |= new
+                        x = trial
+                        found = True
+                        break
+                if not found:
+                    # Fallback: just keep incrementing
+                    while True:
+                        x += 1
+                        new = {x - a for a in row}
+                        if not new & used:
+                            row.append(x)
+                            used |= new
+                            break
             rows.append(row)
         return rows
 
-    best_rows = greedy()
-    best_scope = scope(best_rows)
+    rows = greedy_init()
+    best_rows = [r[:] for r in rows]
+    best_scope = get_scope(rows)
 
-    # ---------- Per-row local optimization (refinement machinery) ----------
-    def try_reduce_row(rows, row_idx, used_other, max_attempts=150):
-        """Try to find a row at row_idx with smaller max entry (same k+1 size)."""
-        current_row = rows[row_idx]
-        current_max = max(current_row)
-        best_row = list(current_row)
-        best_max = current_max
+    rng = random.Random(12345)
 
-        for attempt in range(max_attempts):
-            if time_left() < 2:
-                break
-            row, x = [0], 0
-            current_row_diffs = set()
-            success = True
-            # Randomized greedy for this row to escape local minima in row construction
-            # Jitter increases with attempts to explore more
-            jitter = 0.15 if attempt > 15 else 0.0
-            while len(row) < k + 1:
-                found = False
-                # Collect all valid candidates in the window
-                candidates = []
-                for trial_x in range(x + 1, x + 80):
-                    new = {trial_x - a for a in row}
-                    if not (new & used_other) and not (new & current_row_diffs):
-                        # Score: prefer smaller values, but also consider future flexibility
-                        # A value that creates differences close to existing used_other diffs
-                        # might be more restrictive in the future
-                        score = trial_x
-                        # Add a small penalty if this value would create diffs that are
-                        # close to boundaries of used_other (heuristic for flexibility)
-                        candidates.append((score, trial_x, new))
-                
-                if not candidates:
-                    success = False
+    def rebuild_row(used_other, jitter=0.0, max_val=None, local_rng=None):
+        """Rebuild a single row given differences already used by other rows.
+        Returns the row list or None if failed."""
+        if local_rng is None:
+            local_rng = rng
+        row = [0]
+        row_diffs = set()
+        x = 0
+        search_end = max_val if max_val is not None else (best_scope + 30)
+        while len(row) < k + 1:
+            found = False
+            for trial_x in range(x + 1, search_end + 1):
+                new = {trial_x - a for a in row}
+                if not (new & used_other) and not (new & row_diffs):
+                    if jitter > 0 and local_rng.random() < jitter and trial_x < 300:
+                        continue
+                    row.append(trial_x)
+                    row_diffs |= new
+                    found = True
                     break
-                
-                # Sort by score (which is just the value here, so smallest first)
-                candidates.sort(key=lambda c: c[0])
-                
-                # Apply jitter: sometimes skip the best candidate to explore
-                chosen_idx = 0
-                if jitter > 0 and len(candidates) > 1:
-                    # With probability jitter, pick a random candidate from top 5
-                    if random.random() < jitter:
-                        top_n = min(5, len(candidates))
-                        chosen_idx = random.randint(0, top_n - 1)
-                    else:
-                        chosen_idx = 0
-                
-                _, chosen_x, chosen_new = candidates[chosen_idx]
-                row.append(chosen_x)
-                current_row_diffs |= chosen_new
-                found = True
-                x = row[-1]
-            if success and max(row) < best_max:
-                # Verify the whole set is valid with this new row
-                test_rows = [list(r) for r in rows]
-                test_rows[row_idx] = row
-                if is_valid(test_rows):
-                    best_row = list(row)
-                    best_max = max(row)
-        return best_row, best_max
+            if not found:
+                return None
+            x = row[-1]
+        return row
 
-    def local_polish(rows):
-        """Reduce scope by locally re-optimizing each row (ordered by scope)."""
+    def local_polish(rows, max_passes=8):
+        """Reduce scope by locally re-optimizing each row, bottleneck-prioritized."""
         rows = [list(r) for r in rows]
         improved = True
-        # Limit the number of full passes to avoid spending too much time here
-        # if we are in an ILS loop
-        max_passes = 6
         pass_count = 0
-        while improved and time_left() > 5 and pass_count < max_passes:
+        while improved and time.time() < deadline - 12 and pass_count < max_passes:
             improved = False
             pass_count += 1
-            # Sort indices by descending max entry to target the largest rows first
+            # Bottleneck-prioritized order: largest rows first
             order = sorted(range(n_rows), key=lambda i: -max(rows[i]))
             for i in order:
-                if time_left() < 5:
+                if time.time() > deadline - 12:
                     break
                 used_other = set()
                 for j in range(n_rows):
                     if j != i:
                         used_other |= row_diffs_set(rows[j])
-                new_row, new_max = try_reduce_row(rows, i, used_other, max_attempts=80)
-                if new_max < max(rows[i]):
-                    old_scope = scope(rows)
-                    rows[i] = new_row
-                    new_scope = scope(rows)
-                    if new_scope < old_scope:
-                        improved = True
+                best_row = list(rows[i])
+                best_max = max(rows[i])
+                # More attempts with varied jitter for better exploration
+                for attempt in range(40):
+                    if attempt < 15:
+                        jitter = 0.0
+                    elif attempt < 25:
+                        jitter = 0.05 + 0.02 * (attempt - 15)
+                    else:
+                        jitter = 0.25 + 0.03 * (attempt - 25)
+                    new_row = rebuild_row(used_other, jitter=jitter, max_val=best_max - 1)
+                    if new_row is not None and max(new_row) < best_max:
+                        best_row = new_row
+                        best_max = max(new_row)
+                if max(best_row) < max(rows[i]):
+                    rows[i] = best_row
+                    improved = True
         return rows
 
-    def kick(rows):
-        """Perturb the solution to escape local minima."""
+    def kick(rows, num_kicks=1):
+        """Perturb by rebuilding random rows with high jitter."""
         rows = [list(r) for r in rows]
-        # Strategy: Rebuild 1 or 2 random rows with high randomness
-        num_kicks = random.choice([1, 2])
-        indices = random.sample(range(n_rows), num_kicks)
-        
+        indices = rng.sample(range(n_rows), min(num_kicks, n_rows))
         for idx in indices:
-            # Calculate used diffs from other rows
             used_other = set()
             for j in range(n_rows):
                 if j != idx:
                     used_other |= row_diffs_set(rows[j])
-            
-            # Rebuild the row with high jitter
             success = False
-            # Try a few times to find a valid row, even if larger
-            for attempt in range(25):
-                row, x = [0], 0
-                current_row_diffs = set()
-                valid_row = True
-                while len(row) < k + 1:
-                    found = False
-                    # Collect candidates and use conflict-aware selection
-                    candidates = []
-                    for trial_x in range(x + 1, x + 120):
-                        new = {trial_x - a for a in row}
-                        if not (new & used_other) and not (new & current_row_diffs):
-                            # For kicks, we want more diversity
-                            # Score: bias toward smaller but with more randomness
-                            score = trial_x + random.random() * 20
-                            candidates.append((score, trial_x, new))
-                    
-                    if not candidates:
-                        valid_row = False
-                        break
-                    
-                    # Sort by score
-                    candidates.sort(key=lambda c: c[0])
-                    
-                    # High jitter: pick from top 10 with randomness
-                    if len(candidates) > 1 and random.random() < 0.45:
-                        top_n = min(10, len(candidates))
-                        chosen_idx = random.randint(0, top_n - 1)
-                    else:
-                        chosen_idx = 0
-                    
-                    _, chosen_x, chosen_new = candidates[chosen_idx]
-                    row.append(chosen_x)
-                    current_row_diffs |= chosen_new
-                    found = True
-                    x = row[-1]
-                
-                if valid_row:
-                    rows[idx] = row
+            for attempt in range(20):
+                jitter = 0.3 + 0.1 * attempt
+                new_row = rebuild_row(used_other, jitter=jitter, max_val=best_scope + 30)
+                if new_row is not None:
+                    rows[idx] = new_row
                     success = True
                     break
-            
             if not success:
-                # If we failed to rebuild, keep the original row
-                # This might make the solution invalid temporarily, but local_polish will fix it
-                # Or we revert to a greedy row
-                greedy_row, x = [0], 0
-                row_diffs = set()
-                while len(greedy_row) < k + 1:
-                    x += 1
-                    new = {x - a for a in greedy_row}
-                    if not (new & used_other) and not (new & row_diffs):
-                        greedy_row.append(x)
-                        row_diffs |= new
-                rows[idx] = greedy_row
-
+                new_row = rebuild_row(used_other, jitter=0.0, max_val=best_scope + 40)
+                if new_row is not None:
+                    rows[idx] = new_row
         return rows
 
-    # Initial polish
-    if time_left() > 10:
-        polished = local_polish(best_rows)
-        if scope(polished) < best_scope:
-            best_rows = polished
-            best_scope = scope(polished)
+    def targeted_descent(rows, budget=3.0):
+        """Try to reduce scope by shrinking the largest entry in max rows."""
+        start = time.time()
+        cur = [r[:] for r in rows]
+        cur_scope = get_scope(cur)
+        improved = False
 
-    # Iterated Local Search
-    # We use a loop that alternates between Local Search and Kicks
-    # This is structurally different from a single long SA run.
-    while time_left() > 20:
-        # 1. Local Search
-        polished = local_polish(best_rows)
-        if scope(polished) < best_scope:
-            best_rows = polished
-            best_scope = scope(polished)
-        
-        # 2. Kick
-        if time_left() < 15:
-            break
-            
-        kicked_rows = kick(best_rows)
-        
-        # 3. Local Search on kicked rows
-        polished_kicked = local_polish(kicked_rows)
-        
-        if scope(polished_kicked) < best_scope:
-            best_rows = polished_kicked
-            best_scope = scope(polished_kicked)
-        elif time_left() > 30:
-            # Additional refinement: try multiple kicks and pick the best
-            best_kicked = polished_kicked
-            for extra_kick in range(3):
-                if time_left() < 15:
+        while time.time() - start < budget:
+            max_val = max(max(r) for r in cur)
+            max_rows = [r for r in range(n_rows) if max(cur[r]) == max_val]
+            r = rng.choice(max_rows)
+            row = cur[r]
+            pos = len(row) - 1
+            old_val = row[pos]
+            lower = row[pos - 1] + 1
+
+            if old_val <= lower:
+                # Try interior positions
+                pos2 = rng.randint(1, len(row) - 2)
+                old2 = row[pos2]
+                lo2 = row[pos2 - 1] + 1
+                hi2 = row[pos2 + 1] - 1
+                if hi2 <= lo2:
+                    continue
+                for _ in range(15):
+                    nv = rng.randint(lo2, hi2)
+                    if nv == old2:
+                        continue
+                    row[pos2] = nv
+                    scope = full_validate(cur)
+                    if scope is not None and scope < cur_scope:
+                        cur_scope = scope
+                        improved = True
+                        break
+                    row[pos2] = old2
+                if not improved:
                     break
-                kicked2 = kick(best_rows)
-                polished2 = local_polish(kicked2)
-                if scope(polished2) < scope(best_kicked):
-                    best_kicked = polished2
-            if scope(best_kicked) < best_scope:
-                best_rows = best_kicked
-                best_scope = scope(best_kicked)
+                continue
 
-    # Final high-precision polish pass with tighter parameters
-    if time_left() > 8:
-        final_polish = local_polish(best_rows)
-        if scope(final_polish) < best_scope:
-            best_rows = final_polish
-            best_scope = scope(final_polish)
+            # Try all values from lower to old_val-1 (descending for early exit)
+            for new_val in range(old_val - 1, lower - 1, -1):
+                row[pos] = new_val
+                scope = full_validate(cur)
+                if scope is not None:
+                    if scope < cur_scope:
+                        cur_scope = scope
+                        improved = True
+                        break
+                    else:
+                        # Scope didn't improve but might be same; try next lower
+                        continue
+                row[pos] = old_val
+                break
+
+            if not improved:
+                break
+
+        if improved:
+            return cur, cur_scope
+        return None, None
+
+    def exact_local_polish(rows, budget=4.0):
+        """Exact local solve: for each position in each row, try all valid lower values."""
+        start = time.time()
+        cur = [r[:] for r in rows]
+        cur_scope = get_scope(cur)
+        best_cur = [r[:] for r in cur]
+        best_sc = cur_scope
+        improved = True
+
+        while improved and time.time() - start < budget:
+            improved = False
+            for ri in range(n_rows):
+                if time.time() - start > budget:
+                    break
+                row = cur[ri]
+                for pos in range(len(row) - 1, 0, -1):  # from end to start
+                    if time.time() - start > budget:
+                        break
+                    old_val = row[pos]
+                    lo = row[pos - 1] + 1
+                    hi = row[pos + 1] - 1 if pos < len(row) - 1 else cur_scope + 10
+                    if hi <= lo:
+                        continue
+                    # Try all values from old_val-1 down to lo
+                    for new_val in range(old_val - 1, lo - 1, -1):
+                        row[pos] = new_val
+                        scope = full_validate(cur)
+                        if scope is not None:
+                            if scope < best_sc:
+                                best_sc = scope
+                                best_cur = [r[:] for r in cur]
+                            improved = True
+                            break
+                        else:
+                            row[pos] = old_val
+                            break
+                    if improved:
+                        break
+                if improved:
+                    cur = [r[:] for r in best_cur]
+                    cur_scope = best_sc
+
+        return best_cur, best_sc
+
+    def molecule_anneal(rows, cur_scope, budget=5.0):
+        """Metropolis with proper revert on invalid moves."""
+        start = time.time()
+        cur = [r[:] for r in rows]
+        cur_sc = cur_scope
+        best_local = [r[:] for r in rows]
+        best_local_sc = cur_scope
+        T = 0.6
+
+        while time.time() - start < budget:
+            ri = rng.randrange(n_rows)
+            row_snapshot = cur[ri][:]
+            row = cur[ri]
+
+            if rng.random() < 0.5 and len(row) > 2:
+                pos = rng.randint(1, len(row) - 2)
+                old_val = row[pos]
+                lo = row[pos - 1] + 1
+                hi = row[pos + 1] - 1
+                if hi <= lo:
+                    continue
+                new_val = rng.randint(lo, hi)
+                if new_val == old_val:
+                    continue
+                row[pos] = new_val
+            else:
+                delta = rng.randint(-3, 3)
+                if delta == 0:
+                    continue
+                shifted = [v + delta for v in row]
+                if min(shifted) < 0:
+                    continue
+                anchor = min(shifted)
+                new_row = [v - anchor for v in shifted]
+                if new_row[0] != 0 or any(new_row[i] >= new_row[i + 1] for i in range(len(new_row) - 1)):
+                    continue
+                row[:] = new_row
+
+            new_scope = full_validate(cur)
+            if new_scope is not None:
+                if new_scope < best_local_sc:
+                    best_local_sc = new_scope
+                    best_local = [r[:] for r in cur]
+                delta_sc = new_scope - cur_sc
+                if delta_sc <= 0 or rng.random() < (2.718281828 ** (-delta_sc / max(T, 0.01))):
+                    cur_sc = new_scope
+                else:
+                    cur[ri] = row_snapshot
+            else:
+                cur[ri] = row_snapshot
+
+            T *= 0.9998
+
+        return best_local, best_local_sc
+
+    # Phase 1: ILS with row reconstruction + local polish
+    max_il_iter = 300
+    for it in range(max_il_iter):
+        if time.time() > deadline - 22:
+            break
+
+        if it == 0:
+            cur = [r[:] for r in best_rows]
+        else:
+            cur = [r[:] for r in best_rows]
+            if rng.random() < 0.7:
+                cur = kick(cur, num_kicks=rng.choice([1, 1, 2]))
+            else:
+                i = rng.randrange(n_rows)
+                j = rng.randrange(n_rows)
+                if i != j:
+                    cur[i], cur[j] = cur[j], cur[i]
+
+        cur_scope = full_validate(cur)
+        if cur_scope is None:
+            continue
+
+        if cur_scope < best_scope:
+            best_scope = cur_scope
+            best_rows = [r[:] for r in cur]
+
+        # Local polish (bottleneck-prioritized)
+        if time.time() < deadline - 16:
+            polished = local_polish(cur)
+            ps = full_validate(polished)
+            if ps is not None and ps < best_scope:
+                best_scope = ps
+                best_rows = [r[:] for r in polished]
+                cur = [r[:] for r in polished]
+
+        # Targeted descent
+        if time.time() < deadline - 12:
+            desc_rows, desc_scope = targeted_descent(cur, budget=1.5)
+            if desc_rows is not None and desc_scope < best_scope:
+                best_scope = desc_scope
+                best_rows = desc_rows
+                cur = [r[:] for r in desc_rows]
+
+    # Phase 2: Fine-grained annealing
+    if time.time() < deadline - 10:
+        start = time.time()
+        cur = [r[:] for r in best_rows]
+        cur_sc = best_scope
+        best_local = [r[:] for r in best_rows]
+        best_local_sc = best_scope
+        T = 0.8
+        while time.time() - start < 6.0:
+            ri = rng.randrange(n_rows)
+            pos = rng.randint(1, len(cur[ri]) - 1)
+            old_val = cur[ri][pos]
+            lo = cur[ri][pos - 1] + 1
+            hi = cur[ri][pos + 1] - 1 if pos < len(cur[ri]) - 1 else best_scope + 25
+            if hi <= lo:
+                continue
+            new_val = rng.randint(lo, hi)
+            if new_val == old_val:
+                continue
+            cur[ri][pos] = new_val
+            new_scope = full_validate(cur)
+            if new_scope is not None:
+                if new_scope < best_local_sc:
+                    best_local_sc = new_scope
+                    best_local = [r[:] for r in cur]
+                delta = new_scope - cur_sc
+                if delta <= 0 or rng.random() < (2.718281828 ** (-delta / max(T, 0.01))):
+                    cur_sc = new_scope
+                else:
+                    cur[ri][pos] = old_val
+            else:
+                cur[ri][pos] = old_val
+            T *= 0.9998
+        if best_local_sc < best_scope:
+            best_scope = best_local_sc
+            best_rows = best_local
+
+    # Phase 3: Exact local polish (try all lower values for each position)
+    if time.time() < deadline - 6:
+        polished, ps = exact_local_polish(best_rows, budget=3.0)
+        if ps < best_scope:
+            best_scope = ps
+            best_rows = polished
+
+    # Phase 4: Final local polish pass
+    if time.time() < deadline - 4:
+        polished = local_polish(best_rows, max_passes=6)
+        ps = full_validate(polished)
+        if ps is not None and ps < best_scope:
+            best_scope = ps
+            best_rows = polished
+
+    # Phase 5: Final targeted descent
+    if time.time() < deadline - 2:
+        desc_rows, desc_scope = targeted_descent(best_rows, budget=1.5)
+        if desc_rows is not None and desc_scope < best_scope:
+            best_scope = desc_scope
+            best_rows = desc_rows
+
+    # Phase 6: Final exact local polish with remaining time
+    if time.time() < deadline - 0.5:
+        remaining = deadline - time.time() - 0.5
+        if remaining > 1.0:
+            polished, ps = exact_local_polish(best_rows, budget=remaining)
+            if ps < best_scope:
+                best_scope = ps
+                best_rows = polished
+
+    if best_rows is None:
+        best_rows = greedy_init()
 
     return best_rows

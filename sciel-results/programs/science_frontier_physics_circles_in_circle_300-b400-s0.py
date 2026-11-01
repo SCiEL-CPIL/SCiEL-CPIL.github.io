@@ -273,21 +273,21 @@ def construct():
         return val, grad
 
     # Optimization loop with increasing beta - extended schedule
-    betas = [10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0]
+    betas = [10.0, 50.0, 200.0, 1000.0, 5000.0, 20000.0, 100000.0]
     
     current_points = best_points.copy()
     
     for beta in betas:
-        if time.time() > deadline - 10:
+        if time.time() > deadline - 15:
             break
             
         try:
             # Use a tighter tolerance for higher betas
-            if beta >= 5000:
-                maxiter = 400
-                gtol = 1e-12
-                ftol = 1e-15
-                maxls = 60
+            if beta >= 20000:
+                maxiter = 500
+                gtol = 1e-13
+                ftol = 1e-16
+                maxls = 80
             elif beta >= 1000:
                 maxiter = 500
                 gtol = 1e-11
@@ -337,7 +337,7 @@ def construct():
     # Final polish with very high beta if time permits
     if time.time() < deadline - 2:
         try:
-            final_beta = 100000.0
+            final_beta = 500000.0
             res = minimize(
                 lambda x: objective_and_grad(x, final_beta)[0],
                 best_points.flatten(),
@@ -345,9 +345,9 @@ def construct():
                 method='L-BFGS-B',
                 options={
                     'maxiter': 500,
-                    'gtol': 1e-13,
+                    'gtol': 1e-14,
                     'ftol': 1e-16,
-                    'maxls': 80,
+                    'maxls': 100,
                     'disp': False
                 }
             )

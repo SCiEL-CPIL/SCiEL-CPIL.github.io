@@ -1,319 +1,277 @@
 import numpy as np
-import time
-from scipy.optimize import minimize, basinhopping, differential_evolution
+from scipy.optimize import minimize
 from scipy.spatial import ConvexHull
 import itertools
-import sys
+import time
 
 N = 14
 
-# Precompute triangle indices
-_IDX = np.array([(i, j, k) for i in range(N) for j in range(i + 1, N) for k in range(j + 1, N)])
-_I, _J, _K = _IDX[:, 0], _IDX[:, 1], _IDX[:, 2]
-
-def compute_score(points):
-    """Compute min triangle area / convex hull area, vectorized."""
-    n = len(points)
-    if n < 3:
-        return 0.0
-    try:
-        hull = ConvexHull(points)
-        hull_area = hull.volume
-        if hull_area <= 1e-12:
-            return 0.0
-    except Exception:
-        return 0.0
-    
-    p_i = points[_I]
-    p_j = points[_J]
-    p_k = points[_K]
-    
-    v1 = p_j - p_i
-    v2 = p_k - p_i
-    cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
-    areas = 0.5 * np.abs(cross)
-    
-    min_area = np.min(areas)
-    if min_area < 1e-12:
-        return 0.0
-    return min_area / hull_area
-
-def neg_score(x):
-    points = x.reshape((N, 2))
-    return -compute_score(points)
-
-def soft_min_score(x, tau):
-    """
-    Compute -soft_min(areas) / hull_area.
-    soft_min(A) = -tau * log(sum(exp(-A/tau)))
-    This is differentiable and approximates -min(A) as tau -> 0.
-    """
-    points = x.reshape((N, 2))
-    try:
-        hull = ConvexHull(points)
-        hull_area = hull.volume
-        if hull_area <= 1e-12:
-            return 0.0
-    except Exception:
-        return 0.0
-    
-    p_i = points[_I]
-    p_j = points[_J]
-    p_k = points[_K]
-    
-    v1 = p_j - p_i
-    v2 = p_k - p_i
-    cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
-    areas = 0.5 * np.abs(cross)
-    
-    areas = np.maximum(areas, 1e-12)
-        
-    scaled = -areas / tau
-    max_scaled = np.max(scaled)
-    sum_exp = np.sum(np.exp(scaled - max_scaled))
-    soft_min_val = -tau * (max_scaled + np.log(sum_exp))
-    
-    return -soft_min_val / hull_area
-
-def ring_configuration(params):
-    """
-    Generate points from ring parameters.
-    params: [r1, r2, r3, r4, theta_offset1, theta_offset2, theta_offset3, theta_offset4,
-             n1, n2, n3, n4] where n1+n2+n3+n4=14, r_i >= 0, theta offsets in [0, 2pi)
-    """
-    r1, r2, r3, r4, th1, th2, th3, th4, n1, n2, n3, n4 = params
-    n1 = int(round(n1))
-    n2 = int(round(n2))
-    n3 = int(round(n3))
-    n4 = int(round(n4))
-    
-    # Ensure we have exactly 14 points
-    while n1 + n2 + n3 + n4 > 14:
-        if n4 >= 1:
-            n4 -= 1
-        elif n3 >= 1:
-            n3 -= 1
-        elif n2 >= 1:
-            n2 -= 1
-        else:
-            n1 -= 1
-    while n1 + n2 + n3 + n4 < 14:
-        n4 += 1
-    
-    points = []
-    
-    # Ring 1 (outermost)
-    if n1 > 0:
-        angles = th1 + np.linspace(0, 2*np.pi, n1, endpoint=False)
-        points.append(np.column_stack((r1*np.cos(angles), r1*np.sin(angles))))
-    
-    # Ring 2
-    if n2 > 0:
-        angles = th2 + np.linspace(0, 2*np.pi, n2, endpoint=False)
-        points.append(np.column_stack((r2*np.cos(angles), r2*np.sin(angles))))
-    
-    # Ring 3
-    if n3 > 0:
-        angles = th3 + np.linspace(0, 2*np.pi, n3, endpoint=False)
-        points.append(np.column_stack((r3*np.cos(angles), r3*np.sin(angles))))
-    
-    # Ring 4 (innermost)
-    if n4 > 0:
-        angles = th4 + np.linspace(0, 2*np.pi, n4, endpoint=False)
-        points.append(np.column_stack((r4*np.cos(angles), r4*np.sin(angles))))
-    
-    if not points:
-        return np.zeros((N, 2))
-    
-    result = np.vstack(points)
-    
-    # Pad or trim to exactly N points if needed
-    if len(result) < N:
-        # Add points at center
-        extra = np.zeros((N - len(result), 2))
-        result = np.vstack([result, extra])
-    elif len(result) > N:
-        result = result[:N]
-    
-    return result
-
-def ring_score(params):
-    """Score for ring parameterization."""
-    try:
-        points = ring_configuration(params)
-        return compute_score(points)
-    except Exception:
-        return 0.0
-
-def neg_ring_score(params):
-    return -ring_score(params)
-
 def construct():
+    """
+    Maximize minimum triangle area / convex hull area for 14 points.
+    Uses multi-scale optimization with log-sum-exp smoothing and direct refinement.
+    """
+    triples = list(itertools.combinations(range(N), 3))
+    n_triples = len(triples)
+    
+    # Precompute triangle indices
+    tri_i = np.array([t[0] for t in triples])
+    tri_j = np.array([t[1] for t in triples])
+    tri_k = np.array([t[2] for t in triples])
+    
+    def get_points(x):
+        pts = np.zeros((N, 2))
+        pts[0] = [0.0, 0.0]
+        pts[1] = [1.0, 0.0]
+        for i in range(N - 2):
+            pts[i + 2, 0] = x[2 * i]
+            pts[i + 2, 1] = x[2 * i + 1]
+        return pts
+    
+    def compute_areas_vectorized(pts):
+        pi = pts[tri_i]
+        pj = pts[tri_j]
+        pk = pts[tri_k]
+        v1 = pj - pi
+        v2 = pk - pi
+        dets = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+        areas = 0.5 * np.abs(dets)
+        return areas
+    
+    def compute_hull_area(pts):
+        try:
+            hull = ConvexHull(pts)
+            return hull.volume
+        except Exception:
+            return 1.0
+    
+    def objective_smooth(x, beta):
+        pts = get_points(x)
+        areas = compute_areas_vectorized(pts)
+        
+        a_min = np.min(areas)
+        if a_min < 1e-15:
+            return 1.0
+        
+        # Log-sum-exp for smooth minimum
+        a_ref = np.min(areas)
+        exp_terms = np.exp(-beta * (areas - a_ref))
+        log_sum = -beta * a_ref + np.log(np.sum(exp_terms))
+        smooth_min = -log_sum / beta
+        
+        hull_area = compute_hull_area(pts)
+        if hull_area < 1e-10:
+            return 1.0
+        
+        return -(smooth_min / hull_area)
+    
+    def objective_raw(x):
+        pts = get_points(x)
+        areas = compute_areas_vectorized(pts)
+        min_area = np.min(areas)
+        hull_area = compute_hull_area(pts)
+        if hull_area < 1e-10:
+            return 1.0
+        return -(min_area / hull_area)
+    
+    def initial_reg_polygon(n_points, center=(0.5, 0.5), radius=0.5, angle_offset=0.0):
+        angles = np.linspace(0, 2 * np.pi, n_points, endpoint=False) + angle_offset
+        pts = np.zeros((n_points, 2))
+        for i in range(n_points):
+            pts[i, 0] = center[0] + radius * np.cos(angles[i])
+            pts[i, 1] = center[1] + radius * np.sin(angles[i])
+        return pts
+    
+    def pts_to_x(pts):
+        x = np.zeros(2 * (N - 2))
+        for i in range(N - 2):
+            x[2 * i] = pts[i + 2, 0]
+            x[2 * i + 1] = pts[i + 2, 1]
+        return x
+    
+    def score_config(pts):
+        """Compute the score for a point configuration"""
+        areas = compute_areas_vectorized(pts)
+        min_area = np.min(areas)
+        hull_area = compute_hull_area(pts)
+        if hull_area < 1e-10:
+            return 0.0
+        return min_area / hull_area
+    
     start_time = time.time()
-    deadline = 142.0  # Safety margin before 150s kill
+    time_limit = 115.0
     
-    best_points = None
-    best_score = -float('inf')
-    rng = np.random.default_rng(42)
+    best_score = -np.inf
+    best_x = None
     
-    def try_update(points):
-        nonlocal best_points, best_score
-        s = compute_score(points)
-        if s > best_score:
-            best_score = s
-            best_points = points.copy()
-        return s
+    dim = 2 * (N - 2)
     
-    # Phase 1: Differential Evolution on 4-ring parameters
-    # Parameters: [r1, r2, r3, r4, th1, th2, th3, th4, n1, n2, n3, n4]
-    bounds = [
-        (0.3, 1.5),  # r1 (outermost)
-        (0.1, 1.0),  # r2
-        (0.0, 0.7),  # r3
-        (0.0, 0.4),  # r4 (innermost)
-        (0, 2*np.pi),  # th1
-        (0, 2*np.pi),  # th2
-        (0, 2*np.pi),  # th3
-        (0, 2*np.pi),  # th4
-        (1, 14),  # n1
-        (1, 14),  # n2
-        (1, 14),  # n3
-        (1, 14),  # n4
-    ]
+    # Generate diverse initial configurations
+    def generate_initials():
+        initials = []
+        
+        # Regular polygon with various parameters
+        for radius in [0.35, 0.4, 0.45, 0.5, 0.55, 0.6]:
+            for angle_offset in [0.0, np.pi/14, np.pi/7, 2*np.pi/14, 3*np.pi/14]:
+                pts = initial_reg_polygon(N, center=(0.5, 0.5), radius=radius, angle_offset=angle_offset)
+                pts[0] = [0.0, 0.0]
+                pts[1] = [1.0, 0.0]
+                initials.append(pts_to_x(pts))
+        
+        # Elliptical distributions
+        for rx in [0.35, 0.45, 0.55, 0.65]:
+            for ry in [0.25, 0.35, 0.45, 0.55]:
+                angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
+                pts = np.zeros((N, 2))
+                for i in range(N):
+                    pts[i, 0] = 0.5 + rx * np.cos(angles[i])
+                    pts[i, 1] = 0.5 + ry * np.sin(angles[i])
+                pts[0] = [0.0, 0.0]
+                pts[1] = [1.0, 0.0]
+                initials.append(pts_to_x(pts))
+        
+        # Random perturbations of regular polygon
+        base_pts = initial_reg_polygon(N, center=(0.5, 0.5), radius=0.5)
+        for sigma in [0.05, 0.1, 0.15]:
+            for _ in range(3):
+                perturbed = base_pts.copy()
+                perturbed += np.random.normal(0, sigma, size=(N, 2))
+                perturbed[0] = [0.0, 0.0]
+                perturbed[1] = [1.0, 0.0]
+                initials.append(pts_to_x(perturbed))
+        
+        return initials
     
-    # Try differential evolution with multiple restarts
-    for restart in range(4):
-        if time.time() - start_time > deadline - 35:
+    # Phase 1: Coarse optimization with multiple betas
+    betas_coarse = [30.0, 60.0, 120.0, 250.0, 500.0]
+    initials = generate_initials()
+    
+    for beta in betas_coarse:
+        if time.time() - start_time > time_limit - 25.0:
             break
         
-        try:
-            res = differential_evolution(
-                neg_ring_score,
-                bounds,
-                seed=rng.integers(0, 2**31),
-                maxiter=80,
-                tol=1e-6,
-                popsize=12,
-                mutation=(0.3, 1.2),
-                recombination=0.9,
-                polish=True,
-                init='latinhypercube'
-            )
-            
-            if res.success or res.fun < 0:
-                best_params = res.x
-                points = ring_configuration(best_params)
-                s = try_update(points)
-        except Exception:
-            pass
-    
-    # Phase 2: Multi-start L-BFGS-B on full 28D space from good ring configs
-    if best_points is not None and time.time() - start_time < deadline - 40:
-        # Generate diverse starting points
-        starts = [best_points]
-        
-        # Add jittered versions
-        for _ in range(6):
-            jittered = best_points + rng.normal(0, 0.08, (N, 2))
-            starts.append(jittered)
-        
-        # Add some structured starts
-        # Regular 14-gon
-        angles = np.linspace(0, 2*np.pi, N, endpoint=False)
-        starts.append(np.column_stack((np.cos(angles), np.sin(angles))))
-        
-        # Two rings 7+7
-        a_out = np.linspace(0, 2*np.pi, 7, endpoint=False)
-        a_in = a_out + np.pi/7
-        starts.append(np.vstack((
-            np.column_stack((np.cos(a_out), np.sin(a_out))),
-            np.column_stack((0.5*np.cos(a_in), 0.5*np.sin(a_in)))
-        )))
-        
-        # Three rings 5+5+4
-        a1 = np.linspace(0, 2*np.pi, 5, endpoint=False)
-        a2 = a1 + np.pi/5
-        a3 = np.linspace(0, 2*np.pi, 4, endpoint=False) + np.pi/4
-        starts.append(np.vstack((
-            np.column_stack((np.cos(a1), np.sin(a1))),
-            np.column_stack((0.6*np.cos(a2), 0.6*np.sin(a2))),
-            np.column_stack((0.25*np.cos(a3), 0.25*np.sin(a3)))
-        )))
-        
-        # Four rings 4+4+3+3
-        a1 = np.linspace(0, 2*np.pi, 4, endpoint=False)
-        a2 = a1 + np.pi/4
-        a3 = np.linspace(0, 2*np.pi, 3, endpoint=False) + np.pi/3
-        a4 = a3 + np.pi/3
-        starts.append(np.vstack((
-            np.column_stack((np.cos(a1), np.sin(a1))),
-            np.column_stack((0.65*np.cos(a2), 0.65*np.sin(a2))),
-            np.column_stack((0.35*np.cos(a3), 0.35*np.sin(a3))),
-            np.column_stack((0.1*np.cos(a4), 0.1*np.sin(a4)))
-        )))
-        
-        for start in starts:
-            if time.time() - start_time > deadline - 20:
+        for x0 in initials:
+            if time.time() - start_time > time_limit - 25.0:
                 break
             
-            x0 = start.flatten()
+            try:
+                res = minimize(
+                    objective_smooth,
+                    x0,
+                    args=(beta,),
+                    method='L-BFGS-B',
+                    bounds=[(-1.5, 1.5)] * dim,
+                    options={'maxiter': 300, 'ftol': 1e-10, 'gtol': 1e-6, 'maxfun': 3000}
+                )
+                
+                if res.fun < -best_score:
+                    best_x = res.x.copy()
+                    best_score = -res.fun
+            except Exception:
+                pass
+        
+        # Update initials with best solution
+        if best_x is not None:
+            new_initials = [best_x.copy()]
+            for sigma in [0.05, 0.1, 0.15, 0.2]:
+                for _ in range(2):
+                    jitter = np.random.normal(0, sigma, size=dim)
+                    new_initials.append(best_x + jitter)
+            new_initials.extend(initials[:3])
+            initials = new_initials
+    
+    # Phase 2: Fine optimization
+    betas_fine = [1000.0, 2000.0, 4000.0, 8000.0, 15000.0]
+    
+    if best_x is not None:
+        for beta in betas_fine:
+            if time.time() - start_time > time_limit - 15.0:
+                break
             
-            # Annealing schedule for tau - tighter schedule
-            taus = [0.05, 0.02, 0.008, 0.003, 0.001]
+            candidates = [best_x.copy()]
+            for sigma in [0.02, 0.05, 0.1]:
+                for _ in range(4):
+                    jitter = np.random.normal(0, sigma, size=dim)
+                    candidates.append(best_x + jitter)
             
-            current_x = x0
-            for tau in taus:
-                if time.time() - start_time > deadline - 12:
+            for x0 in candidates:
+                if time.time() - start_time > time_limit - 15.0:
                     break
                 
                 try:
                     res = minimize(
-                        soft_min_score,
-                        current_x,
-                        args=(tau,),
+                        objective_smooth,
+                        x0,
+                        args=(beta,),
                         method='L-BFGS-B',
-                        options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-8}
+                        bounds=[(-1.5, 1.5)] * dim,
+                        options={'maxiter': 500, 'ftol': 1e-12, 'gtol': 1e-8, 'maxfun': 5000}
                     )
-                    current_x = res.x
-                    new_p = current_x.reshape((N, 2))
-                    try_update(new_p)
+                    
+                    if res.fun < -best_score:
+                        best_x = res.x.copy()
+                        best_score = -res.fun
                 except Exception:
                     pass
     
-    # Phase 3: Basin hopping from best
-    if best_points is not None and time.time() - start_time < deadline - 18:
-        x0 = best_points.flatten()
+    # Phase 3: Ultra-fine with very high beta
+    if time.time() - start_time < time_limit - 8.0 and best_x is not None:
+        for beta_final in [30000.0, 50000.0, 100000.0]:
+            if time.time() - start_time > time_limit - 5.0:
+                break
+            
+            try:
+                res_final = minimize(
+                    objective_smooth,
+                    best_x,
+                    args=(beta_final,),
+                    method='L-BFGS-B',
+                    bounds=[(-1.5, 1.5)] * dim,
+                    options={'maxiter': 1000, 'ftol': 1e-14, 'gtol': 1e-10, 'maxfun': 10000}
+                )
+                
+                if res_final.fun < -best_score:
+                    best_x = res_final.x.copy()
+                    best_score = -res_final.fun
+            except Exception:
+                pass
+    
+    # Phase 4: Direct Nelder-Mead refinement
+    if time.time() - start_time < time_limit - 3.0 and best_x is not None:
         try:
-            res = basinhopping(
-                neg_score, x0,
+            res_nm = minimize(
+                objective_raw,
+                best_x,
                 method='Nelder-Mead',
-                options={'maxiter': 300, 'xatol': 1e-8, 'fatol': 1e-10},
-                minsteps=5, T=0.5, stepsize=0.25,
-                interval=5, disp=False
+                options={'maxiter': 3000, 'xatol': 1e-10, 'fatol': 1e-12, 'adaptive': True}
             )
-            new_p = res.x.reshape((N, 2))
-            try_update(new_p)
+            if res_nm.fun < -best_score:
+                best_x = res_nm.x.copy()
+                best_score = -res_nm.fun
         except Exception:
             pass
     
-    # Phase 4: Powell refinement
-    if best_points is not None and time.time() - start_time < deadline - 10:
-        x0 = best_points.flatten()
-        try:
-            res = minimize(neg_score, x0, method='Powell',
-                          options={'maxiter': 500, 'xtol': 1e-10, 'ftol': 1e-12})
-            try_update(res.x.reshape((N, 2)))
-        except Exception:
-            pass
+    # Phase 5: Final local search with small steps
+    if time.time() - start_time < time_limit - 1.0 and best_x is not None:
+        for _ in range(50):
+            if time.time() - start_time > time_limit - 0.5:
+                break
+            for sigma in [0.005, 0.01, 0.02]:
+                jitter = np.random.normal(0, sigma, size=dim)
+                candidate = best_x + jitter
+                try:
+                    s = -objective_raw(candidate)
+                    if s > best_score:
+                        best_x = candidate
+                        best_score = s
+                except Exception:
+                    pass
     
-    # Phase 5: Final Nelder-Mead polish with tighter tolerances
-    if best_points is not None and time.time() - start_time < deadline - 5:
-        x0 = best_points.flatten()
-        try:
-            res = minimize(neg_score, x0, method='Nelder-Mead',
-                          options={'maxiter': 3000, 'xatol': 1e-10, 'fatol': 1e-12})
-            try_update(res.x.reshape((N, 2)))
-        except Exception:
-            pass
+    # Fallback
+    if best_x is None:
+        pts = initial_reg_polygon(N, center=(0.5, 0.5), radius=0.5)
+        pts[0] = [0.0, 0.0]
+        pts[1] = [1.0, 0.0]
+        best_x = pts_to_x(pts)
     
-    return best_points
+    return get_points(best_x)

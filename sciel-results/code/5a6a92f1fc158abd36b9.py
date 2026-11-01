@@ -1,0 +1,316 @@
+"""Program for covering the sphere with 130 equal caps using penalty-based optimization."""
+import numpy as np
+import time
+from scipy.spatial import ConvexHull
+from scipy.optimize import minimize
+
+N = 130
+
+# Pre-compute grids for evaluation
+def _make_fib_grid(n):
+    i = np.arange(n) + 0.5
+    z = 1.0 - 2.0 * i / n
+    phi = np.pi * (1.0 + np.sqrt(5.0)) * i
+    r = np.sqrt(1.0 - z * z)
+    return np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
+
+GRID_COARSE = _make_fib_grid(2000)
+GRID_MEDIUM = _make_fib_grid(5000)
+GRID_FINE = _make_fib_grid(8000)
+
+# EVOLVE-BLOCK-START
+def construct():
+    start_time = time.time()
+    deadline = start_time + 145.0  # Leave 5s margin for safety
+
+    def fibonacci_spiral(n):
+        i = np.arange(n) + 0.5
+        z = 1.0 - 2.0 * i / n
+        phi = np.pi * (1.0 + np.sqrt(5.0)) * i
+        r = np.sqrt(1.0 - z * z)
+        return np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
+
+    def compute_covering_radius_exact(pts):
+        """Compute covering radius exactly as max circumradius over convex hull faces."""
+        try:
+            hull = ConvexHull(pts)
+            faces = hull.simplices
+            a = pts[faces[:, 0]]
+            b = pts[faces[:, 1]]
+            c = pts[faces[:, 2]]
+            
+            ab = np.cross(a, b)
+            bc = np.cross(b, c)
+            ca = np.cross(c, a)
+            c_dir = ab + bc + ca
+            norms = np.linalg.norm(c_dir, axis=1)
+            
+            radii = np.zeros(len(faces))
+            valid = norms > 1e-10
+            
+            if np.any(valid):
+                c_dir_valid = c_dir[valid] / norms[valid, np.newaxis]
+                cos_r = np.clip(np.sum(c_dir_valid * a[valid], axis=1), -1.0, 1.0)
+                r = np.arccos(cos_r)
+                r[r > np.pi / 2] = np.pi - r[r > np.pi / 2]
+                radii[valid] = r
+            
+            if np.any(~valid):
+                a_deg = a[~valid]
+                b_deg = b[~valid]
+                c_deg = c[~valid]
+                d_ab = np.arccos(np.clip(np.sum(a_deg * b_deg, axis=1), -1, 1))
+                d_bc = np.arccos(np.clip(np.sum(b_deg * c_deg, axis=1), -1, 1))
+                d_ca = np.arccos(np.clip(np.sum(c_deg * a_deg, axis=1), -1, 1))
+                radii[~valid] = np.maximum(np.maximum(d_ab, d_bc), d_ca)
+            
+            return float(np.max(radii))
+        except Exception:
+            # Fallback: dense grid-based estimate
+            dot = np.dot(GRID_FINE, pts.T)
+            dot = np.clip(dot, -1.0, 1.0)
+            ang_dists = np.arccos(dot)
+            min_dists = np.min(ang_dists, axis=1)
+            return float(np.max(min_dists))
+
+    def penalty_objective_and_grad(x_flat, target_min_dist, penalty_weight):
+        """
+        Objective: maximize sum of squared pairwise distances (uniformity)
+        with a penalty for pairwise distances below target_min_dist.
+        
+        We minimize the negative of the sum of squared distances plus the penalty.
+        
+        x_flat: flattened (N,3) array of points.
+        Returns (value, gradient).
+        """
+        pts = x_flat.reshape(N, 3)
+        norms = np.linalg.norm(pts, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1e-10
+        pts_norm = pts / norms
+
+        # Compute pairwise dot products
+        dot = np.dot(pts_norm, pts_norm.T)  # N x N
+        dot = np.clip(dot, -1.0, 1.0)
+        np.fill_diagonal(dot, 1.0)
+        
+        # Squared chordal distances: d_ij^2 = 2 - 2 * dot_ij
+        dist_sq = 2.0 - 2.0 * dot
+        np.fill_diagonal(dist_sq, 0.0)
+        
+        # Sum of squared distances (uniformity term)
+        sum_dist_sq = np.sum(dist_sq)
+        
+        # Penalty term: for each pair, if dist_sq < target_min_dist^2, add penalty
+        target_sq = target_min_dist ** 2
+        violations = np.maximum(0.0, target_sq - dist_sq)
+        penalty = penalty_weight * np.sum(violations)
+        
+        # Objective: minimize -sum_dist_sq + penalty
+        val = -sum_dist_sq + penalty
+        
+        # Gradient
+        # d(sum_dist_sq)/d(pts_norm) = d(2 - 2*dot)/d(pts_norm) = -2 * d(dot)/d(pts_norm)
+        # d(dot_ij)/d(pts_norm_i) = pts_norm_j, d(dot_ij)/d(pts_norm_j) = pts_norm_i
+        # So d(sum_dist_sq)/d(pts_norm_i) = -2 * sum_{j != i} pts_norm_j
+        # = -2 * (sum_j pts_norm_j - pts_norm_i)
+        
+        sum_pts = np.sum(pts_norm, axis=0)  # sum over all points
+        grad_uniformity = -2.0 * (sum_pts[None, :] - pts_norm)  # N x 3
+        
+        # Penalty gradient: d(penalty)/d(pts_norm_i)
+        # For each pair (i,j) with violation, d(violation_ij)/d(pts_norm_i) = -d(dist_sq_ij)/d(pts_norm_i)
+        # d(dist_sq_ij)/d(pts_norm_i) = -2 * pts_norm_j
+        # So d(violation_ij)/d(pts_norm_i) = 2 * pts_norm_j (if violated)
+        
+        # Create violation mask
+        viol_mask = violations > 0.0  # N x N
+        # Gradient contribution from penalty for point i:
+        # sum_j [2 * penalty_weight * pts_norm_j * viol_mask[i,j]]
+        # = 2 * penalty_weight * (viol_mask @ pts_norm)
+        
+        grad_penalty = 2.0 * penalty_weight * (viol_mask @ pts_norm)
+        
+        # Total gradient
+        grad_pts_norm = grad_uniformity + grad_penalty
+        
+        # Chain rule: project gradient to tangent space and account for normalization
+        grad = np.zeros_like(x_flat)
+        for i in range(N):
+            p = pts_norm[i]
+            n = norms[i, 0]
+            # Project to tangent space: remove component along p
+            grad_i = (grad_pts_norm[i] - np.dot(grad_pts_norm[i], p) * p) / n
+            grad[i*3:(i+1)*3] = grad_i
+        
+        return float(val), grad
+
+    def optimize_penalty(points, target_min_dist, penalty_weight, maxiter=200):
+        """Optimize using L-BFGS-B with penalty objective."""
+        
+        def objective(x):
+            val, _ = penalty_objective_and_grad(x, target_min_dist, penalty_weight)
+            return val
+        
+        def gradient(x):
+            _, g = penalty_objective_and_grad(x, target_min_dist, penalty_weight)
+            return g
+        
+        # Normalize initial points
+        norms = np.linalg.norm(points, axis=1, keepdims=True)
+        norms[norms < 1e-10] = 1e-10
+        x0 = (points / norms).flatten()
+        
+        result = minimize(
+            objective, x0, jac=gradient,
+            method='L-BFGS-B',
+            options={'maxiter': maxiter, 'maxfun': 500, 'ftol': 1e-12, 'gtol': 1e-10}
+        )
+        
+        x_opt = result.x.reshape(N, 3)
+        x_opt /= np.linalg.norm(x_opt, axis=1, keepdims=True)
+        
+        return x_opt, result.fun
+
+    def repulsion_energy_grad(pts, exponent=4.0):
+        """Compute repulsion energy and gradient for uniform distribution."""
+        dot = np.dot(pts, pts.T)
+        dot = np.clip(dot, -1.0, 1.0)
+        np.fill_diagonal(dot, 1.0)
+        dist_sq = 2.0 - 2.0 * dot
+        dist_sq[dist_sq < 1e-10] = 1e-10
+        
+        w = 1.0 / (dist_sq ** exponent)
+        np.fill_diagonal(w, 0.0)
+        
+        w_grad = exponent * (dist_sq ** (-exponent/2 - 1))
+        np.fill_diagonal(w_grad, 0.0)
+        
+        grad = w_grad @ pts
+        
+        return float(np.sum(w)), grad
+
+    def gradient_descent_repulsion(pts, exponent, alpha_init, decay, max_iter):
+        """Optimize points by gradient descent on repulsion energy."""
+        alpha = alpha_init
+        for _ in range(max_iter):
+            if time.time() > deadline - 5.0:
+                break
+            
+            energy, grad = repulsion_energy_grad(pts, exponent)
+            grad_norm = np.linalg.norm(grad)
+            if grad_norm > 1e-10:
+                grad = grad / grad_norm
+            
+            pts = pts + alpha * grad
+            norms = np.linalg.norm(pts, axis=1, keepdims=True)
+            pts = pts / norms
+            
+            alpha *= decay
+        
+        return pts
+
+    best_points = None
+    best_rad = np.inf
+
+    # Phase 1: Multiple starts with repulsion + penalty optimization
+    n_restarts = 4
+    
+    for restart in range(n_restarts):
+        if time.time() > deadline - 60.0:
+            break
+        
+        if restart == 0:
+            points = fibonacci_spiral(N).astype(np.float64)
+        elif restart == 1:
+            rng = np.random.RandomState(42 + restart)
+            points = rng.randn(N, 3)
+            points /= np.linalg.norm(points, axis=1, keepdims=True)
+        elif restart == 2:
+            points = fibonacci_spiral(N).astype(np.float64)
+            rng = np.random.RandomState(100 + restart)
+            points = points + 0.3 * rng.randn(N, 3)
+            points /= np.linalg.norm(points, axis=1, keepdims=True)
+        else:
+            if best_points is not None:
+                rng = np.random.RandomState(300 + restart)
+                points = best_points + 0.08 * rng.randn(N, 3)
+                points /= np.linalg.norm(points, axis=1, keepdims=True)
+            else:
+                points = fibonacci_spiral(N).astype(np.float64)
+
+        # Optimize with repulsion to get a good starting configuration
+        points = gradient_descent_repulsion(points, 4.0, 0.05, 0.98, 150)
+        
+        # Penalty-based optimization with increasing target and penalty
+        time_left = deadline - time.time() - 15.0
+        if time_left > 15.0:
+            # Start with a conservative target and increase it
+            # The covering radius is ~11.3 degrees = 0.197 rad
+            # So the minimum pairwise distance should be at least ~2 * 11.3 = 22.6 degrees = 0.395 rad
+            # But we want to push it higher
+            target_init = 0.35  # ~20 degrees
+            penalty_init = 100.0
+            
+            for t_iter in range(5):
+                if time.time() > deadline - 10.0:
+                    break
+                
+                target = target_init + 0.01 * t_iter
+                penalty_w = penalty_init * (1.5 ** t_iter)
+                
+                points, _ = optimize_penalty(points, target, penalty_w, maxiter=150)
+            
+            # Final polish with higher target
+            if time.time() < deadline - 8.0:
+                points, _ = optimize_penalty(points, 0.40, 1000.0, maxiter=100)
+        
+        # Evaluate exact covering radius
+        rad = compute_covering_radius_exact(points)
+        
+        if rad < best_rad:
+            best_rad = rad
+            best_points = points.copy()
+
+    # Phase 2: Local refinement with penalty method
+    if best_points is not None and time.time() < deadline - 30.0:
+        for trial in range(3):
+            if time.time() > deadline - 15.0:
+                break
+            rng = np.random.RandomState(500 + trial)
+            candidate = best_points + 0.03 * rng.randn(N, 3)
+            candidate /= np.linalg.norm(candidate, axis=1, keepdims=True)
+            
+            time_left = deadline - time.time() - 10.0
+            if time_left > 8.0:
+                # Use a high target and penalty to refine
+                candidate, _ = optimize_penalty(candidate, 0.40, 2000.0, maxiter=150)
+            
+            rad = compute_covering_radius_exact(candidate)
+            if rad < best_rad:
+                best_rad = rad
+                best_points = candidate.copy()
+
+    # Phase 3: Final high-precision polish
+    if best_points is not None and time.time() < deadline - 15.0:
+        final = best_points.copy()
+        time_left = deadline - time.time() - 5.0
+        if time_left > 5.0:
+            # Very high penalty to enforce large minimum distance
+            final, _ = optimize_penalty(final, 0.42, 5000.0, maxiter=100)
+            
+            # Second polish with even higher target
+            if time.time() < deadline - 5.0:
+                final, _ = optimize_penalty(final, 0.43, 10000.0, maxiter=50)
+            
+            rad_final = compute_covering_radius_exact(final)
+            if rad_final < best_rad:
+                best_rad = rad_final
+                best_points = final
+
+    # Phase 4: Final check and return
+    if best_points is None:
+        best_points = fibonacci_spiral(N).astype(np.float64)
+
+    return best_points
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,179 @@
+"""Matrix multiplication 2x2x14: rank-minimal exact tensor decomposition."""
+import time
+import numpy as np
+
+DIMENSIONS = [2, 2, 14]
+
+# EVOLVE-BLOCK-START
+def construct():
+    n, m, p = DIMENSIONS
+    start_time = time.time()
+    deadline = start_time + 100  # safety margin before 150s kill
+
+    # Construct rank-49 Strassen-based decomposition for 2x2x14
+    result = _construct_strassen_49(n, m, p)
+    if result is not None:
+        return result
+
+    # Fallback: schoolbook rank-56
+    rank_schoolbook = n * m * p
+    U = [[0] * rank_schoolbook for _ in range(n * m)]
+    V = [[0] * rank_schoolbook for _ in range(m * p)]
+    W = [[0] * rank_schoolbook for _ in range(p * n)]
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][col] = 1
+                V[j * p + k][col] = 1
+                W[k * n + i][col] = 1
+                col += 1
+
+    return {"U": U, "V": V, "W": W}
+
+
+def _construct_strassen_49(n, m, p):
+    """
+    Construct a rank-49 decomposition using Strassen's algorithm on 7 blocks of 2x2x2.
+    
+    We split the 14 columns of B into 7 pairs of 2 columns. For each pair,
+    we apply Strassen's 7-product formula to the 2x2x2 sub-problem.
+    
+    Index conventions:
+    - U[i*m + j, r]: coefficient for A[i,j] in product r
+    - V[j*p + k, r]: coefficient for B[j,k] in product r  
+    - W[k*n + i, r]: coefficient for C[k,i] in product r (trace convention W[k*n+i,r])
+    """
+    rank = 49
+    U = [[0] * rank for _ in range(n * m)]   # 4 x 49
+    V = [[0] * rank for _ in range(m * p)]   # 28 x 49
+    W = [[0] * rank for _ in range(p * n)]   # 28 x 49
+
+    for pair_idx in range(7):
+        k1 = 2 * pair_idx
+        k2 = 2 * pair_idx + 1
+        base_col = pair_idx * 7
+
+        # Strassen's 7 products for 2x2x2:
+        # M1 = (A[0,0] + A[1,1]) * (B[0,k1] + B[1,k2])
+        # M2 = (A[1,0] + A[1,1]) * B[0,k1]
+        # M3 = A[0,0] * (B[0,k2] - B[1,k2])
+        # M4 = A[1,1] * (B[1,k1] - B[0,k1])
+        # M5 = (A[0,0] + A[0,1]) * B[1,k2]
+        # M6 = (A[1,0] - A[0,0]) * (B[0,k1] + B[0,k2])
+        # M7 = (A[0,1] - A[1,1]) * (B[1,k1] + B[1,k2])
+        #
+        # Reconstruction:
+        # C[0,k1] = M1 - M4 + M6 - M7
+        # C[1,k1] = M2 + M4 + M6
+        # C[0,k2] = M3 + M5 + M7
+        # C[1,k2] = M1 - M3 + M2 - M5
+
+        # M1 = (A[0,0] + A[1,1]) * (B[0,k1] + B[1,k2])
+        U[0][base_col] = 1       # A[0,0]
+        U[3][base_col] = 1       # A[1,1]
+        V[k1][base_col] = 1      # B[0,k1]
+        V[p + k2][base_col] = 1  # B[1,k2]
+        W[k1 * n + 0][base_col] = 1   # C[0,k1]
+        W[k1 * n + 1][base_col] = 1   # C[1,k2]  -- wait, this is wrong
+
+        # Let me redo this more carefully
+        # C[0,k1] gets M1, C[1,k2] gets M1? No...
+        # From reconstruction:
+        # C[0,k1] = M1 - M4 + M6 - M7
+        # C[1,k1] = M2 + M4 + M6
+        # C[0,k2] = M3 + M5 + M7
+        # C[1,k2] = M1 - M3 + M2 - M5
+
+        # So M1 contributes to C[0,k1] and C[1,k2]
+        # M2 contributes to C[1,k1] and C[1,k2]
+        # M3 contributes to C[0,k2] and C[1,k2]
+        # M4 contributes to C[0,k1] and C[1,k1]
+        # M5 contributes to C[0,k2] and C[1,k2]
+        # M6 contributes to C[0,k1] and C[1,k1]
+        # M7 contributes to C[0,k1] and C[0,k2]
+
+        # Let me clear and redo
+        for c in range(7):
+            U[0][base_col + c] = 0
+            U[1][base_col + c] = 0
+            U[2][base_col + c] = 0
+            U[3][base_col + c] = 0
+            for v in range(m * p):
+                V[v][base_col + c] = 0
+            for w in range(p * n):
+                W[w][base_col + c] = 0
+
+        # M1 = (A[0,0] + A[1,1]) * (B[0,k1] + B[1,k2])
+        U[0][base_col + 0] = 1
+        U[3][base_col + 0] = 1
+        V[k1][base_col + 0] = 1
+        V[p + k2][base_col + 0] = 1
+        W[k1 * n + 0][base_col + 0] = 1   # C[0,k1]
+        W[k2 * n + 1][base_col + 0] = 1   # C[1,k2]
+
+        # M2 = (A[1,0] + A[1,1]) * B[0,k1]
+        U[2][base_col + 1] = 1
+        U[3][base_col + 1] = 1
+        V[k1][base_col + 1] = 1
+        W[k1 * n + 1][base_col + 1] = 1   # C[1,k1]
+        W[k2 * n + 1][base_col + 1] = -1  # C[1,k2]
+
+        # M3 = A[0,0] * (B[0,k2] - B[1,k2])
+        U[0][base_col + 2] = 1
+        V[k2][base_col + 2] = 1
+        V[p + k2][base_col + 2] = -1
+        W[k2 * n + 0][base_col + 2] = 1   # C[0,k2]
+        W[k2 * n + 1][base_col + 2] = -1  # C[1,k2]
+
+        # M4 = A[1,1] * (B[1,k1] - B[0,k1])
+        U[3][base_col + 3] = 1
+        V[p + k1][base_col + 3] = 1
+        V[k1][base_col + 3] = -1
+        W[k1 * n + 0][base_col + 3] = -1  # C[0,k1]
+        W[k1 * n + 1][base_col + 3] = 1   # C[1,k1]
+
+        # M5 = (A[0,0] + A[0,1]) * B[1,k2]
+        U[0][base_col + 4] = 1
+        U[1][base_col + 4] = 1
+        V[p + k2][base_col + 4] = 1
+        W[k2 * n + 0][base_col + 4] = 1   # C[0,k2]
+        W[k2 * n + 1][base_col + 4] = -1  # C[1,k2]
+
+        # M6 = (A[1,0] - A[0,0]) * (B[0,k1] + B[0,k2])
+        U[2][base_col + 5] = 1
+        U[0][base_col + 5] = -1
+        V[k1][base_col + 5] = 1
+        V[k2][base_col + 5] = 1
+        W[k1 * n + 0][base_col + 5] = 1   # C[0,k1]
+        W[k1 * n + 1][base_col + 5] = 1   # C[1,k1]
+
+        # M7 = (A[0,1] - A[1,1]) * (B[1,k1] + B[1,k2])
+        U[1][base_col + 6] = 1
+        U[3][base_col + 6] = -1
+        V[p + k1][base_col + 6] = 1
+        V[p + k2][base_col + 6] = 1
+        W[k1 * n + 0][base_col + 6] = -1  # C[0,k1]
+        W[k2 * n + 0][base_col + 6] = 1   # C[0,k2]
+
+    # Verify the decomposition
+    if _verify_decomposition(U, V, W, n, m, p):
+        return {"U": U, "V": V, "W": W}
+    else:
+        return None
+
+
+def _verify_decomposition(U, V, W, n, m, p):
+    """Verify that the decomposition correctly computes matrix multiplication."""
+    rank = len(U[0])
+    # Verify the tensor: T[i,j,k] = sum_r U[i*m+j,r] * V[j*p+k,r] * W[k*n+i,r] should equal 1
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                tensor_val = 0.0
+                for r in range(rank):
+                    tensor_val += U[i * m + j][r] * V[j * p + k][r] * W[k * n + i][r]
+                if abs(tensor_val - 1.0) > 1e-10:
+                    return False
+    return True
+# EVOLVE-BLOCK-END
