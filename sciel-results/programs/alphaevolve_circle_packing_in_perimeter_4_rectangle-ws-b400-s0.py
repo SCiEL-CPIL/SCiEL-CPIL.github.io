@@ -1,4 +1,4 @@
-"""Circle packing in perimeter-4 rectangle: SLSQP + Constraint Polish + LSE Refine."""
+"""Circle packing in perimeter-4 rectangle: SLSQP + Constraint Polish + LSE Refine + ADMM."""
 import numpy as np
 import time
 from scipy.optimize import minimize
@@ -205,15 +205,33 @@ def construct():
                     best_result = refined
 
         # 4. Smooth LSE epigraph refinement (smooth surrogate for non-convex dist constraints)
-        if best_result is not None and time.time() < deadline - 8:
-            lse = _lse_refine(best_result, deadline - (time.time() - start_time) - 4)
+        if best_result is not None and time.time() < deadline - 10:
+            lse = _lse_refine(best_result, deadline - (time.time() - start_time) - 5)
             if lse is not None:
                 valid, val = check_validity(lse)
                 if valid and val > best_value:
                     best_value = val
                     best_result = lse
 
-        # 5. Second constraint refinement pass (exploit gains from LSE / polish)
+        # 5. Contact-graph optimization: exploit active constraint structure
+        if best_result is not None and time.time() < deadline - 10:
+            cg = _contact_graph_optimize(best_result, deadline - (time.time() - start_time) - 6)
+            if cg is not None:
+                valid, val = check_validity(cg)
+                if valid and val > best_value:
+                    best_value = val
+                    best_result = cg
+
+        # 6. ADMM refinement: decoupled subproblem solving for better global convergence
+        if best_result is not None and time.time() < deadline - 8:
+            admm = _admm_refine(best_result, deadline - (time.time() - start_time) - 4)
+            if admm is not None:
+                valid, val = check_validity(admm)
+                if valid and val > best_value:
+                    best_value = val
+                    best_result = admm
+
+        # 7. Second constraint refinement pass (exploit gains from LSE / ADMM / CG)
         if best_result is not None and time.time() < deadline - 5:
             refined2 = _constraint_refine(best_result, deadline - (time.time() - start_time) - 2)
             if refined2 is not None:
@@ -222,7 +240,7 @@ def construct():
                     best_value = val
                     best_result = refined2
 
-        # 6. Final high-precision polish
+        # 8. Final high-precision polish
         if best_result is not None and time.time() < deadline - 2:
             polished2 = _polish_result(best_result, deadline - (time.time() - start_time))
             if polished2 is not None:
@@ -422,15 +440,55 @@ def _polish_result(z, time_budget):
         if time.time() > time_budget:
             break
         lo, hi = 1.0, 1.05
-        for _ in range(15):
+        for _ in range(20):
             mid = (lo + hi) / 2.0
             if _is_valid(x, y, r * mid, w, h):
                 lo = mid
             else:
                 hi = mid
-        if lo > 1.0 + 1e-9:
+        if lo > 1.0 + 1e-12:
             r = r * lo
         else:
+            break
+
+    # Per-circle greedy expansion: try to grow each circle individually
+    for _ in range(50):
+        if time.time() > time_budget:
+            break
+        improved = False
+        for i in range(n):
+            if time.time() > time_budget:
+                break
+            # Max radius for circle i given current positions
+            r_wall = min(x[i], w - x[i], y[i], h - y[i])
+            r_max = r_wall
+            for j in range(n):
+                if i == j:
+                    continue
+                dx = x[i] - x[j]
+                dy = y[i] - y[j]
+                d = np.sqrt(dx * dx + dy * dy)
+                r_allowed = d - r[j]
+                if r_allowed < r_max:
+                    r_max = r_allowed
+            r_max = max(0.0, r_max)
+
+            if r_max > r[i] + 1e-7:
+                lo2 = r[i]
+                hi2 = r_max
+                for _ in range(20):
+                    mid2 = (lo2 + hi2) / 2.0
+                    r_test = r.copy()
+                    r_test[i] = mid2
+                    if _is_valid(x, y, r_test, w, h):
+                        lo2 = mid2
+                    else:
+                        hi2 = mid2
+                if lo2 > r[i] + 1e-8:
+                    r[i] = lo2
+                    improved = True
+
+        if not improved:
             break
 
     # Reconstruct z
@@ -746,13 +804,27 @@ def _lse_refine(z, time_budget):
             np.maximum(y + r - h, 0.0),
         ])
 
-        # Log-sum-exp smooth penalty (temperature beta)
-        beta = 200.0
+        # Adaptive log-sum-exp smooth penalty
+        # Use higher beta when violations are small (near-converged), lower when large
+        max_viol = float(np.max(np.concatenate([viol, wall_viol])))
+        if max_viol < 1e-4:
+            beta = 500.0
+            weight = 100.0
+        elif max_viol < 1e-3:
+            beta = 300.0
+            weight = 80.0
+        elif max_viol < 1e-2:
+            beta = 200.0
+            weight = 50.0
+        else:
+            beta = 100.0
+            weight = 30.0
+
         all_viol = np.concatenate([viol, wall_viol])
         m = np.max(all_viol)
         lse = m + np.log(np.sum(np.exp(beta * (all_viol - m)))) / beta
 
-        return -np.sum(r) + 50.0 * lse
+        return -np.sum(r) + weight * lse
 
     bounds = []
     for i in range(n):
@@ -785,6 +857,448 @@ def _lse_refine(z, time_budget):
         return None
     except Exception:
         return None
+
+
+def _admm_refine(z, time_budget):
+    """
+    ADMM refinement: Alternating Direction Method of Multipliers.
+    Decouples circle-circle non-overlap constraints from wall constraints and radius maximization.
+    Uses augmented Lagrangian with dual updates for better convergence.
+    """
+    z = z.copy().astype(float)
+    n = N
+    x = z[0::3][:n].copy()
+    y = z[1::3][:n].copy()
+    r = z[2::3][:n].copy()
+    w = z[-1]
+    h = 2.0 - w
+
+    # ADMM parameters
+    rho = 10.0  # Penalty parameter
+    max_iter = int(min(300, time_budget * 50))
+
+    # Dual variables for pairwise constraints
+    iu = np.triu_indices(n, k=1)
+    n_pairs = len(iu[0])
+    dual_pair = np.zeros(n_pairs)
+
+    # Dual variables for wall constraints
+    dual_left = np.zeros(n)
+    dual_right = np.zeros(n)
+    dual_bottom = np.zeros(n)
+    dual_top = np.zeros(n)
+
+    def solve_x_subproblem(x_curr, y_curr, r_curr, w_curr, h_curr, dual_p, dual_l, dual_r, dual_b, dual_t, rho_curr):
+        """Solve x-update: minimize -sum(r) + augmented Lagrangian for x."""
+        x_new = x_curr.copy()
+        for _ in range(50):  # Inner iterations for x
+            if time.time() > time_budget:
+                break
+
+            grad_x = np.zeros(n)
+
+            # Wall augmented Lagrangian
+            for i in range(n):
+                # Left wall: x_i - r_i >= 0
+                viol_l = max(0, r_curr[i] - x_new[i])
+                grad_x[i] += rho_curr * viol_l - dual_l[i]
+
+                # Right wall: w - x_i - r_i >= 0
+                viol_r = max(0, x_new[i] + r_curr[i] - w_curr)
+                grad_x[i] -= rho_curr * viol_r + dual_r[i]
+
+            # Pairwise augmented Lagrangian
+            for idx in range(n_pairs):
+                i_idx = iu[0][idx]
+                j_idx = iu[1][idx]
+                dx = x_new[i_idx] - x_new[j_idx]
+                dy = y_curr[i_idx] - y_curr[j_idx]
+                d_sq = dx * dx + dy * dy
+                d = np.sqrt(max(d_sq, 1e-12))
+                r_sum = r_curr[i_idx] + r_curr[j_idx]
+                viol = max(0, r_sum - d)
+
+                if viol > 0:
+                    # Gradient of augmented Lagrangian w.r.t. x
+                    ux = dx / d
+                    uy = dy / d
+                    force = rho_curr * viol - dual_p[idx]
+                    grad_x[i_idx] += ux * force
+                    grad_x[j_idx] -= ux * force
+
+            # Gradient descent step
+            step = 0.01 / (1 + np.max(np.abs(grad_x)) * 10)
+            x_new -= step * grad_x
+
+            # Clamp to walls
+            for i in range(n):
+                x_new[i] = np.clip(x_new[i], r_curr[i], w_curr - r_curr[i])
+
+        return x_new
+
+    def solve_y_subproblem(x_curr, y_curr, r_curr, w_curr, h_curr, dual_p, dual_l, dual_r, dual_b, dual_t, rho_curr):
+        """Solve y-update: minimize -sum(r) + augmented Lagrangian for y."""
+        y_new = y_curr.copy()
+        for _ in range(50):  # Inner iterations for y
+            if time.time() > time_budget:
+                break
+
+            grad_y = np.zeros(n)
+
+            # Wall augmented Lagrangian
+            for i in range(n):
+                # Bottom wall: y_i - r_i >= 0
+                viol_b = max(0, r_curr[i] - y_new[i])
+                grad_y[i] += rho_curr * viol_b - dual_b[i]
+
+                # Top wall: h - y_i - r_i >= 0
+                viol_t = max(0, y_new[i] + r_curr[i] - h_curr)
+                grad_y[i] -= rho_curr * viol_t + dual_t[i]
+
+            # Pairwise augmented Lagrangian
+            for idx in range(n_pairs):
+                i_idx = iu[0][idx]
+                j_idx = iu[1][idx]
+                dx = x_curr[i_idx] - x_curr[j_idx]
+                dy = y_new[i_idx] - y_new[j_idx]
+                d_sq = dx * dx + dy * dy
+                d = np.sqrt(max(d_sq, 1e-12))
+                r_sum = r_curr[i_idx] + r_curr[j_idx]
+                viol = max(0, r_sum - d)
+
+                if viol > 0:
+                    ux = dx / d
+                    uy = dy / d
+                    force = rho_curr * viol - dual_p[idx]
+                    grad_y[i_idx] += uy * force
+                    grad_y[j_idx] -= uy * force
+
+            # Gradient descent step
+            step = 0.01 / (1 + np.max(np.abs(grad_y)) * 10)
+            y_new -= step * grad_y
+
+            # Clamp to walls
+            for i in range(n):
+                y_new[i] = np.clip(y_new[i], r_curr[i], h_curr - r_curr[i])
+
+        return y_new
+
+    def solve_r_subproblem(x_curr, y_curr, r_curr, w_curr, h_curr, dual_p, dual_l, dual_r, dual_b, dual_t, rho_curr):
+        """Solve r-update: maximize sum(r) subject to constraints."""
+        r_new = r_curr.copy()
+        for _ in range(50):  # Inner iterations for r
+            if time.time() > time_budget:
+                break
+
+            grad_r = np.zeros(n)
+
+            # Wall augmented Lagrangian
+            for i in range(n):
+                viol_l = max(0, r_new[i] - x_curr[i])
+                grad_r[i] -= rho_curr * viol_l + dual_l[i]
+
+                viol_r = max(0, x_curr[i] + r_new[i] - w_curr)
+                grad_r[i] -= rho_curr * viol_r + dual_r[i]
+
+                viol_b = max(0, r_new[i] - y_curr[i])
+                grad_r[i] -= rho_curr * viol_b + dual_b[i]
+
+                viol_t = max(0, y_curr[i] + r_new[i] - h_curr)
+                grad_r[i] -= rho_curr * viol_t + dual_t[i]
+
+            # Pairwise augmented Lagrangian
+            for idx in range(n_pairs):
+                i_idx = iu[0][idx]
+                j_idx = iu[1][idx]
+                dx = x_curr[i_idx] - x_curr[j_idx]
+                dy = y_curr[i_idx] - y_curr[j_idx]
+                d_sq = dx * dx + dy * dy
+                d = np.sqrt(max(d_sq, 1e-12))
+                r_sum = r_new[i_idx] + r_new[j_idx]
+                viol = max(0, r_sum - d)
+
+                if viol > 0:
+                    force = rho_curr * viol - dual_p[idx]
+                    grad_r[i_idx] -= force
+                    grad_r[j_idx] -= force
+
+            # Gradient ascent step (maximize sum(r))
+            step = 0.01 / (1 + np.max(np.abs(grad_r)) * 10)
+            r_new += step * grad_r
+
+            # Clamp to positive
+            r_new = np.maximum(r_new, 0.01)
+
+        return r_new
+
+    # ADMM iterations
+    for it in range(max_iter):
+        if time.time() > time_budget:
+            break
+
+        # X update
+        x_new = solve_x_subproblem(x, y, r, w, h, dual_pair, dual_left, dual_right, dual_bottom, dual_top, rho)
+
+        # Y update
+        y_new = solve_y_subproblem(x_new, y, r, w, h, dual_pair, dual_left, dual_right, dual_bottom, dual_top, rho)
+
+        # R update
+        r_new = solve_r_subproblem(x_new, y_new, r, w, h, dual_pair, dual_left, dual_right, dual_bottom, dual_top, rho)
+
+        # Dual updates
+        for idx in range(n_pairs):
+            i_idx = iu[0][idx]
+            j_idx = iu[1][idx]
+            dx = x_new[i_idx] - x_new[j_idx]
+            dy = y_new[i_idx] - y_new[j_idx]
+            d_sq = dx * dx + dy * dy
+            d = np.sqrt(max(d_sq, 1e-12))
+            r_sum = r_new[i_idx] + r_new[j_idx]
+            viol = max(0, r_sum - d)
+            dual_pair[idx] += rho * viol
+
+        for i in range(n):
+            dual_left[i] += rho * max(0, r_new[i] - x_new[i])
+            dual_right[i] += rho * max(0, x_new[i] + r_new[i] - w)
+            dual_bottom[i] += rho * max(0, r_new[i] - y_new[i])
+            dual_top[i] += rho * max(0, y_new[i] + r_new[i] - h)
+
+        # Update variables
+        x = x_new
+        y = y_new
+        r = r_new
+
+        # Adaptive rho
+        if it % 50 == 49:
+            rho *= 1.1
+
+    # Check validity and repair if needed
+    if not _is_valid(x, y, r, w, h):
+        for factor in [0.999, 0.998, 0.997, 0.995, 0.99]:
+            r_trial = r * factor
+            if _is_valid(x, y, r_trial, w, h):
+                r = r_trial
+                break
+
+    if _is_valid(x, y, r, w, h):
+        z_new = np.empty(3 * N + 1)
+        z_new[0::3][:n] = x
+        z_new[1::3][:n] = y
+        z_new[2::3][:n] = r
+        z_new[-1] = w
+        return z_new
+    return None
+
+
+def _contact_graph_optimize(z, time_budget):
+    """
+    Contact-graph based local optimization: identify the set of active constraints
+    (circles touching each other or walls), then solve a smaller optimization problem
+    where only the active constraints are enforced as equalities. This is a
+    differentiable approach that avoids the non-convexity of the full distance
+    constraints by working on the contact structure.
+    """
+    z = z.copy().astype(float)
+    n = N
+    x = z[0::3][:n].copy()
+    y = z[1::3][:n].copy()
+    r = z[2::3][:n].copy()
+    w = z[-1]
+    h = 2.0 - w
+
+    def get_active_constraints(x_curr, y_curr, r_curr, tol=1e-6):
+        """Identify active constraints: pairwise contacts and wall contacts."""
+        active_pairs = []
+        active_walls = []  # list of (circle_idx, wall_type)
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                dx = x_curr[i] - x_curr[j]
+                dy = y_curr[i] - y_curr[j]
+                d = np.sqrt(dx * dx + dy * dy)
+                if abs(d - (r_curr[i] + r_curr[j])) < tol:
+                    active_pairs.append((i, j))
+
+            if abs(x_curr[i] - r_curr[i]) < tol:
+                active_walls.append((i, 'left'))
+            if abs(x_curr[i] + r_curr[i] - w) < tol:
+                active_walls.append((i, 'right'))
+            if abs(y_curr[i] - r_curr[i]) < tol:
+                active_walls.append((i, 'bottom'))
+            if abs(y_curr[i] + r_curr[i] - h) < tol:
+                active_walls.append((i, 'top'))
+
+        return active_pairs, active_walls
+
+    def objective_cg(zv):
+        """Objective: minimize -sum(r) with smooth penalty for inactive constraint violations."""
+        xv = zv[0::3][:n]
+        yv = zv[1::3][:n]
+        rv = zv[2::3][:n]
+        wv = zv[-1]
+        hv = 2.0 - wv
+
+        if wv < 0.2 or hv < 0.2 or np.any(rv < 0):
+            return 1e6
+
+        obj = -np.sum(rv)
+
+        # Smooth penalty for pairwise overlaps
+        dx = xv[:, None] - xv[None, :]
+        dy = yv[:, None] - yv[None, :]
+        d_sq = dx * dx + dy * dy
+        r_sum = rv[:, None] + rv[None, :]
+
+        iu = np.triu_indices(n, k=1)
+        d_sq_pairs = d_sq[iu]
+        r_sum_pairs = r_sum[iu]
+        d_pairs = np.sqrt(np.maximum(d_sq_pairs, 1e-12))
+        overlap = np.maximum(r_sum_pairs - d_pairs, 0.0)
+        obj += 100.0 * np.sum(overlap * overlap)
+
+        # Wall penalties
+        obj += 100.0 * (
+            np.sum(np.maximum(rv - xv, 0.0) ** 2) +
+            np.sum(np.maximum(xv + rv - wv, 0.0) ** 2) +
+            np.sum(np.maximum(rv - yv, 0.0) ** 2) +
+            np.sum(np.maximum(yv + rv - hv, 0.0) ** 2)
+        )
+
+        return obj
+
+    def constraints_cg(zv):
+        """Active constraints as smooth equalities (squared to keep inequality form)."""
+        xv = zv[0::3][:n]
+        yv = zv[1::3][:n]
+        rv = zv[2::3][:n]
+        wv = zv[-1]
+        hv = 2.0 - wv
+
+        active_pairs, active_walls = get_active_constraints(xv, yv, rv)
+
+        # Pairwise: dist >= r_i + r_j  =>  dist^2 - (r_i+r_j)^2 >= 0
+        # Use smooth version: (dist - (r_i+r_j)) >= 0
+        pair_constraints = []
+        for (i, j) in active_pairs:
+            dx = xv[i] - xv[j]
+            dy = yv[i] - yv[j]
+            d = np.sqrt(max(dx * dx + dy * dy, 1e-12))
+            pair_constraints.append(d - (rv[i] + rv[j]))
+
+        # Wall constraints
+        wall_constraints = []
+        for (i, wall) in active_walls:
+            if wall == 'left':
+                wall_constraints.append(xv[i] - rv[i])
+            elif wall == 'right':
+                wall_constraints.append(wv - xv[i] - rv[i])
+            elif wall == 'bottom':
+                wall_constraints.append(yv[i] - rv[i])
+            else:
+                wall_constraints.append(hv - yv[i] - rv[i])
+
+        return np.array(pair_constraints + wall_constraints) if (pair_constraints or wall_constraints) else np.array([1.0])
+
+    # Iterative contact-graph refinement
+    best_val = float(np.sum(r))
+    best_x, best_y, best_r = x.copy(), y.copy(), r.copy()
+
+    for outer_iter in range(20):
+        if time.time() > time_budget:
+            break
+
+        # Get current active constraints
+        active_pairs, active_walls = get_active_constraints(x, y, r, tol=1e-5)
+
+        if len(active_pairs) + len(active_walls) < 3:
+            # Not enough contacts to form a rigid structure; use full constraint set
+            break
+
+        # Build SLSQP problem with active constraints
+        def obj_func(zv):
+            return objective_cg(zv)
+
+        cons_list = []
+        for (i, j) in active_pairs:
+            def make_pair_con(i=i, j=j):
+                def con(zv):
+                    xv = zv[0::3][:n]
+                    yv = zv[1::3][:n]
+                    rv = zv[2::3][:n]
+                    dx = xv[i] - xv[j]
+                    dy = yv[i] - yv[j]
+                    d = np.sqrt(max(dx * dx + dy * dy, 1e-12))
+                    return d - (rv[i] + rv[j])
+                return con
+            cons_list.append({'type': 'ineq', 'fun': make_pair_con()})
+
+        for (i, wall) in active_walls:
+            def make_wall_con(i=i, wall=wall):
+                def con(zv):
+                    xv = zv[0::3][:n]
+                    yv = zv[1::3][:n]
+                    rv = zv[2::3][:n]
+                    wv = zv[-1]
+                    hv = 2.0 - wv
+                    if wall == 'left':
+                        return xv[i] - rv[i]
+                    elif wall == 'right':
+                        return wv - xv[i] - rv[i]
+                    elif wall == 'bottom':
+                        return yv[i] - rv[i]
+                    else:
+                        return hv - yv[i] - rv[i]
+                return con
+            cons_list.append({'type': 'ineq', 'fun': make_wall_con()})
+
+        bounds = []
+        for i in range(n):
+            bounds.extend([(0, 2), (0, 2), (0.001, 1.0)])
+        bounds.append((0.3, 1.7))
+
+        maxiter = int(min(500, time_budget * 100))
+        try:
+            res = minimize(obj_func, z, method='SLSQP',
+                           bounds=bounds,
+                           constraints=cons_list if cons_list else [],
+                           options={'maxiter': maxiter, 'ftol': 1e-12, 'maxls': 100})
+
+            z_opt = res.x
+            x_new = z_opt[0::3][:n].copy()
+            y_new = z_opt[1::3][:n].copy()
+            r_new = z_opt[2::3][:n].copy()
+            w_new = z_opt[-1]
+            h_new = 2.0 - w_new
+
+            if _is_valid(x_new, y_new, r_new, w_new, h_new):
+                val = float(np.sum(r_new))
+                if val > best_val:
+                    best_val = val
+                    best_x, best_y, best_r = x_new, y_new, r_new
+                    x, y, r, w, h = x_new, y_new, r_new, w_new, h_new
+            else:
+                # Try slight shrink
+                for factor in [0.999, 0.998, 0.997]:
+                    r_trial = r_new * factor
+                    if _is_valid(x_new, y_new, r_trial, w_new, h_new):
+                        val = float(np.sum(r_trial))
+                        if val > best_val:
+                            best_val = val
+                            best_x, best_y, best_r = x_new, y_new, r_trial
+                            x, y, r, w, h = x_new, y_new, r_trial, w_new, h_new
+                        break
+
+        except Exception:
+            continue
+
+    if best_val > float(np.sum(z[2::3][:n])):
+        z_new = np.empty(3 * N + 1)
+        z_new[0::3][:n] = best_x
+        z_new[1::3][:n] = best_y
+        z_new[2::3][:n] = best_r
+        z_new[-1] = w
+        return z_new
+    return None
 
 
 def _is_valid_move(x, y, r, w, h, i, new_x, new_y):
