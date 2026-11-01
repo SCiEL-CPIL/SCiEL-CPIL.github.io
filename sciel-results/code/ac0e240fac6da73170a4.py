@@ -1,0 +1,316 @@
+"""Lennard-Jones 55-atom global minimum: Mackay icosahedron seed + aggressive L-BFGS relaxation."""
+import numpy as np
+import time
+from scipy.optimize import minimize
+
+N = 55
+
+# EVOLVE-BLOCK-START
+def _lj_energy(pos):
+    """Compute total LJ energy for a set of positions (vectorized)."""
+    n = pos.shape[0]
+    diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
+    r2 = np.sum(diff ** 2, axis=2)
+    np.fill_diagonal(r2, np.inf)
+    r6 = r2 ** 3
+    e = 4.0 * (1.0 / (r6 * r6) - 1.0 / r6)
+    return np.sum(e) / 2.0
+
+def _lj_energy_grad(pos):
+    """Compute total LJ energy and gradient (vectorized, numerically stable)."""
+    n = pos.shape[0]
+    diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
+    r2 = np.sum(diff ** 2, axis=2)
+    np.fill_diagonal(r2, 1.0)
+    
+    r6 = r2 * r2 * r2
+    r12 = r6 * r6
+    
+    e_pair = 4.0 * (1.0 / r12 - 1.0 / r6)
+    np.fill_diagonal(e_pair, 0.0)
+    energy = np.sum(e_pair) / 2.0
+    
+    with np.errstate(divide='ignore', invalid='ignore'):
+        factor = 4.0 * (-12.0 / (r2 ** 7) + 6.0 / (r2 ** 4))
+    np.fill_diagonal(factor, 0.0)
+    
+    sum_factor = np.sum(factor, axis=1, keepdims=True)
+    sum_factor_pos = np.sum(factor[:, :, np.newaxis] * pos[np.newaxis, :, :], axis=1)
+    grad = pos * sum_factor - sum_factor_pos
+    
+    return energy, grad
+
+def _get_icosahedral_directions():
+    """Return the 55 unit directions for a Mackay icosahedron (center + 12 + 30 + 12)."""
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    verts = np.array([
+        [0, 1, phi], [0, -1, phi], [0, 1, -phi], [0, -1, -phi],
+        [1, phi, 0], [-1, phi, 0], [1, -phi, 0], [-1, -phi, 0],
+        [phi, 0, 1], [-phi, 0, 1], [phi, 0, -1], [-phi, 0, -1]
+    ], dtype=float)
+    
+    norms = np.linalg.norm(verts, axis=1, keepdims=True)
+    verts_unit = verts / norms
+    
+    # Find edges of the icosahedron (12 vertices, 30 edges)
+    dists = np.zeros((12, 12))
+    for i in range(12):
+        for j in range(12):
+            dists[i, j] = np.linalg.norm(verts_unit[i] - verts_unit[j])
+    
+    min_dist = np.min(dists[dists > 1e-6])
+    edges = []
+    for i in range(12):
+        for j in range(i + 1, 12):
+            if abs(dists[i, j] - min_dist) < 1e-6:
+                edges.append((i, j))
+    
+    # Edge midpoints (30 atoms)
+    edge_mids = []
+    for i, j in edges:
+        mid = (verts_unit[i] + verts_unit[j]) / 2.0
+        norm = np.linalg.norm(mid)
+        if norm > 1e-6:
+            edge_mids.append(mid / norm)
+    edge_mids = np.array(edge_mids)
+    
+    center = np.array([[0.0, 0.0, 0.0]])
+    all_dirs = np.vstack([center, verts_unit, edge_mids, verts_unit])
+    return all_dirs  # shape (55, 3)
+
+def _make_mackay_icosahedron(r1=1.05, r2=1.75, r3=1.95):
+    """Construct a two-shell Mackay icosahedron for 55 atoms.
+    1 center + 12 first shell + 30 edge-midpoints + 12 vertex-like = 55
+    """
+    dirs = _get_icosahedral_directions()
+    radii = np.concatenate([
+        [0.0],  # center
+        np.full(12, r1),
+        np.full(30, r2),
+        np.full(12, r3)
+    ])
+    return dirs * radii[:, np.newaxis]
+
+def _relax_lbfgs(pos, deadline=None, maxiter=500, gtol=1e-10):
+    """Relax using L-BFGS-B with deadline guard."""
+    start_time = time.time()
+    best_energy = _lj_energy(pos)
+    best_pos = pos.copy()
+    
+    def obj_and_grad(x):
+        pos_flat = x.reshape(-1, 3)
+        e, g = _lj_energy_grad(pos_flat)
+        return e, g.flatten()
+    
+    x0 = pos.flatten()
+    
+    try:
+        result = minimize(
+            obj_and_grad, x0, jac=True, method='L-BFGS-B',
+            options={'maxiter': maxiter, 'gtol': gtol, 'maxls': 100, 'ftol': 1e-14}
+        )
+        if result.fun < best_energy:
+            best_energy = result.fun
+            best_pos = result.x.reshape(-1, 3)
+    except Exception:
+        pass
+    
+    if deadline is not None and time.time() > deadline - 5.0:
+        return best_pos, best_energy
+    
+    return best_pos, best_energy
+
+def _radial_to_cartesian(radii, dirs):
+    """Convert 55 radial coordinates to Cartesian positions."""
+    return dirs * radii[:, np.newaxis]
+
+def _radial_energy_grad(radii, dirs):
+    """Compute LJ energy and gradient w.r.t. radial coordinates."""
+    pos = _radial_to_cartesian(radii, dirs)
+    e, g_cart = _lj_energy_grad(pos)
+    
+    # Chain rule: dE/dr_i = g_cart_i · dir_i
+    g_radial = np.sum(g_cart * dirs, axis=1)
+    return e, g_radial
+
+def _optimize_radial_manifold(dirs, deadline, initial_radii=None):
+    """Optimize over 55 radial coordinates (low-dim manifold)."""
+    if initial_radii is None:
+        initial_radii = np.array([0.0] + [1.05]*12 + [1.75]*30 + [1.95]*12)
+    
+    best_energy = np.inf
+    best_radii = initial_radii.copy()
+    
+    def obj_and_grad(x):
+        e, g = _radial_energy_grad(x, dirs)
+        return e, g
+    
+    x0 = initial_radii.copy()
+    
+    # Multi-stage radial optimization
+    stages = [
+        {'maxiter': 1000, 'gtol': 1e-8, 'ftol': 1e-12},
+        {'maxiter': 3000, 'gtol': 1e-10, 'ftol': 1e-14},
+        {'maxiter': 5000, 'gtol': 1e-12, 'ftol': 1e-16},
+    ]
+    
+    for stage_opts in stages:
+        if deadline is not None and time.time() > deadline - 20.0:
+            break
+        try:
+            result = minimize(
+                obj_and_grad, x0, jac=True, method='L-BFGS-B',
+                options=stage_opts
+            )
+            if result.fun < best_energy:
+                best_energy = result.fun
+                best_radii = result.x.copy()
+                x0 = result.x
+        except Exception:
+            pass
+    
+    return best_radii, best_energy
+
+def _polish(pos, deadline=None):
+    """High-precision polish pass with progressively tighter tolerances."""
+    start_time = time.time()
+    best_energy = _lj_energy(pos)
+    best_pos = pos.copy()
+    
+    def obj_and_grad(x):
+        pos_flat = x.reshape(-1, 3)
+        e, g = _lj_energy_grad(pos_flat)
+        return e, g.flatten()
+    
+    x0 = pos.flatten()
+    
+    # Multi-stage polish: progressively tighter
+    stages = [
+        {'maxiter': 2000, 'gtol': 1e-12, 'maxls': 300, 'ftol': 1e-16},
+        {'maxiter': 5000, 'gtol': 1e-14, 'maxls': 500, 'ftol': 1e-16},
+        {'maxiter': 10000, 'gtol': 1e-16, 'maxls': 1000, 'ftol': 1e-18},
+        {'maxiter': 20000, 'gtol': 1e-18, 'maxls': 2000, 'ftol': 1e-20},
+    ]
+    
+    for stage_opts in stages:
+        if deadline is not None and time.time() > deadline - 3.0:
+            break
+        try:
+            result = minimize(
+                obj_and_grad, x0, jac=True, method='L-BFGS-B',
+                options=stage_opts
+            )
+            if result.fun < best_energy:
+                best_energy = result.fun
+                best_pos = result.x.reshape(-1, 3)
+                x0 = result.x
+        except Exception:
+            pass
+    
+    return best_pos, best_energy
+
+def construct():
+    """
+    Construct 55-atom LJ cluster near global minimum.
+    Strategy: 
+    1. Optimize over low-dim radial manifold (55 DOF) for Mackay geometry
+    2. Use best radial solution as seed for full Cartesian relaxation
+    3. Try multiple radius initializations, keep best
+    4. Final high-precision polish
+    """
+    start_time = time.time()
+    deadline = start_time + 145.0  # Safety margin before 150s limit
+    
+    dirs = _get_icosahedral_directions()
+    
+    # Phase 1: Radial manifold optimization with different initializations
+    radius_inits = [
+        np.array([0.0] + [1.05]*12 + [1.75]*30 + [1.95]*12),
+        np.array([0.0] + [1.04]*12 + [1.76]*30 + [1.98]*12),
+        np.array([0.0] + [1.00]*12 + [1.70]*30 + [1.90]*12),
+        np.array([0.0] + [1.10]*12 + [1.80]*30 + [2.00]*12),
+    ]
+    
+    best_pos = None
+    best_energy = np.inf
+    
+    # Try radial optimization for each initialization
+    for r_init in radius_inits:
+        if time.time() > deadline - 40.0:
+            break
+        
+        try:
+            radii_opt, e_radial = _optimize_radial_manifold(dirs, deadline, r_init)
+            pos_from_radial = _radial_to_cartesian(radii_opt, dirs)
+            
+            # Quick Cartesian relaxation from radial result
+            pos_relaxed, e_relaxed = _relax_lbfgs(
+                pos_from_radial, deadline=deadline, maxiter=200, gtol=1e-8
+            )
+            
+            if e_relaxed < best_energy:
+                best_energy = e_relaxed
+                best_pos = pos_relaxed.copy()
+        except Exception:
+            continue
+    
+    # Phase 2: Try traditional radius combos if time permits
+    if time.time() < deadline - 30.0:
+        radius_combos = [
+            (1.04, 1.76, 1.98),
+            (1.05, 1.75, 1.95),
+            (1.02, 1.74, 1.96),
+        ]
+        
+        for r1, r2, r3 in radius_combos:
+            if time.time() > deadline - 25.0:
+                break
+            
+            try:
+                pos = _make_mackay_icosahedron(r1, r2, r3)
+                pos_relaxed, e_relaxed = _relax_lbfgs(
+                    pos, deadline=deadline, maxiter=200, gtol=1e-8
+                )
+                
+                if e_relaxed < best_energy:
+                    best_energy = e_relaxed
+                    best_pos = pos_relaxed.copy()
+            except Exception:
+                continue
+    
+    # If no valid candidate found, use default
+    if best_pos is None:
+        best_pos = _make_mackay_icosahedron(1.05, 1.75, 1.95)
+        best_energy = _lj_energy(best_pos)
+    
+    # Verify minimum distance constraint
+    diff = best_pos[:, np.newaxis, :] - best_pos[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff ** 2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    min_dist_found = np.min(dists)
+    
+    if min_dist_found < 0.5:
+        scale = 0.5 / min_dist_found * 1.01
+        best_pos = best_pos * scale
+        best_pos, best_energy = _relax_lbfgs(
+            best_pos, deadline=deadline, maxiter=200, gtol=1e-10
+        )
+    
+    # Final high-precision polish
+    pos_final, e_final = _polish(best_pos, deadline=deadline)
+    
+    # Final constraint check
+    diff = pos_final[:, np.newaxis, :] - pos_final[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff ** 2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    min_dist_final = np.min(dists)
+    
+    if min_dist_final < 0.5:
+        scale = 0.5 / min_dist_final * 1.001
+        pos_final = pos_final * scale
+        pos_final, e_final = _relax_lbfgs(
+            pos_final, deadline=deadline, maxiter=100, gtol=1e-10
+        )
+    
+    return pos_final
+# EVOLVE-BLOCK-END
