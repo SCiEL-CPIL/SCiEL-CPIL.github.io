@@ -238,15 +238,6 @@ def construct():
                     best_value = val
                     best_result = polished2
 
-        # 5. High-precision final polish with tighter tolerances
-        if best_result is not None and time.time() < deadline - 2:
-            final_polished = _high_precision_polish(best_result, deadline - (time.time() - start_time))
-            if final_polished is not None:
-                valid, val = check_validity(final_polished)
-                if valid and val > best_value:
-                    best_value = val
-                    best_result = final_polished
-
     if best_result is None:
         # Fallback: simple grid in unit square
         side = int(np.ceil(np.sqrt(N)))
@@ -465,7 +456,7 @@ def _expansion_relaxation_polish(z, time_budget):
     for rnd in range(max_rounds):
         if time.time() > time_budget:
             break
-        
+
         improved = False
         for i in range(n):
             # 1. Try to expand radius i to max possible using binary search
@@ -481,7 +472,7 @@ def _expansion_relaxation_polish(z, time_budget):
                 if r_allowed < r_max:
                     r_max = r_allowed
             r_max = max(0.0, r_max)
-            
+
             if r_max > r[i] + 1e-6:
                 # Binary search for the true max valid radius
                 lo = r[i]
@@ -496,7 +487,7 @@ def _expansion_relaxation_polish(z, time_budget):
                 if new_r > r[i] + 1e-7:
                     r[i] = new_r
                     improved = True
-            
+
             # 2. If expansion is limited, try to shift circle i to create space
             min_dist = float('inf')
             blocker = None
@@ -504,7 +495,7 @@ def _expansion_relaxation_polish(z, time_budget):
             d_right = w - x[i] - r[i]
             d_bottom = y[i] - r[i]
             d_top = h - y[i] - r[i]
-            
+
             if d_left < min_dist:
                 min_dist = d_left
                 blocker = 'left'
@@ -517,7 +508,7 @@ def _expansion_relaxation_polish(z, time_budget):
             if d_top < min_dist:
                 min_dist = d_top
                 blocker = 'top'
-            
+
             for j in range(n):
                 if i == j:
                     continue
@@ -528,7 +519,7 @@ def _expansion_relaxation_polish(z, time_budget):
                 if gap < min_dist:
                     min_dist = gap
                     blocker = j
-            
+
             # If touching a constraint, try multi-step moves away
             if min_dist < 0.02:
                 move_x = 0.0
@@ -549,7 +540,7 @@ def _expansion_relaxation_polish(z, time_budget):
                     if d > 1e-6:
                         move_x = dx / d
                         move_y = dy / d
-                
+
                 # Try multiple step sizes, from larger to smaller
                 for step in [0.05, 0.03, 0.02, 0.01, 0.005, 0.002]:
                     new_x = x[i] + move_x * step
@@ -598,19 +589,22 @@ def _expansion_relaxation_polish(z, time_budget):
         return z_new
     return None
 
+
 def _max_radius_for_circle(x, y, r, w, h, i):
     """Calculate maximum possible radius for circle i given other positions."""
     r_wall = min(x[i], w - x[i], y[i], h - y[i])
     r_max = r_wall
     for j in range(N):
-        if i == j: continue
+        if i == j:
+            continue
         dx = x[i] - x[j]
         dy = y[i] - y[j]
-        d = np.sqrt(dx*dx + dy*dy)
+        d = np.sqrt(dx * dx + dy * dy)
         r_allowed = d - r[j]
         if r_allowed < r_max:
             r_max = r_allowed
     return max(0.0, r_max)
+
 
 def _is_valid_move(x, y, r, w, h, i, new_x, new_y):
     """Check if moving circle i to new_x, new_y is valid."""
@@ -619,15 +613,16 @@ def _is_valid_move(x, y, r, w, h, i, new_x, new_y):
         return False
     if new_y < r[i] or new_y > h - r[i]:
         return False
-    
+
     # Neighbor check
     for j in range(N):
-        if i == j: continue
+        if i == j:
+            continue
         dx = new_x - x[j]
         dy = new_y - y[j]
-        d2 = dx*dx + dy*dy
+        d2 = dx * dx + dy * dy
         r_sum = r[i] + r[j]
-        if d2 < r_sum*r_sum - 1e-9:
+        if d2 < r_sum * r_sum - 1e-9:
             return False
     return True
 
@@ -688,7 +683,7 @@ def _constraint_refine(z, time_budget):
         y = z_opt[1::3][:n]
         r = z_opt[2::3][:n]
         w = z_opt[-1]
-        h = 2.0 - w
+        h = z_opt[-1] if False else 2.0 - z_opt[-1]
 
         if _is_valid(x, y, r, w, h):
             return z_opt
@@ -712,131 +707,3 @@ def _is_valid(cx, cy, r, W, H, tol=1e-8):
             if dx * dx + dy * dy < (r[i] + r[j]) ** 2 - tol:
                 return False
     return True
-
-
-def _high_precision_polish(z, time_budget):
-    """
-    High-precision polish: iterative radius growth with position adjustment.
-    Uses tighter tolerances and more iterations for final squeeze.
-    """
-    z = z.copy().astype(float)
-    n = N
-    x = z[0::3][:n].copy()
-    y = z[1::3][:n].copy()
-    r = z[2::3][:n].copy()
-    w = z[-1]
-    h = 2.0 - w
-
-    # Phase 1: Fine-tune positions with very small steps
-    dt = 0.0002
-    max_iter = int(min(5000, time_budget * 200))
-    
-    for it in range(max_iter):
-        if time.time() > time_budget:
-            break
-        
-        fx = np.zeros(n)
-        fy = np.zeros(n)
-        
-        # Wall repulsion
-        left_viol = np.maximum(r - x, 0.0)
-        right_viol = np.maximum(x + r - w, 0.0)
-        bottom_viol = np.maximum(r - y, 0.0)
-        top_viol = np.maximum(y + r - h, 0.0)
-        fx -= left_viol * 50
-        fx += right_viol * 50
-        fy -= bottom_viol * 50
-        fy += top_viol * 50
-        
-        # Pairwise repulsion
-        dx = x[:, None] - x[None, :]
-        dy = y[:, None] - y[None, :]
-        d_sq = dx * dx + dy * dy
-        r_sum = r[:, None] + r[None, :]
-        
-        iu = np.triu_indices(n, k=1)
-        d_sq_pairs = d_sq[iu]
-        r_sum_pairs = r_sum[iu]
-        
-        d_pairs = np.sqrt(np.maximum(d_sq_pairs, 1e-12))
-        overlap = np.maximum(r_sum_pairs - d_pairs, 0.0)
-        
-        if np.max(overlap) > 1e-12:
-            f_pairs = overlap * 25.0
-            dx_pairs = dx[iu]
-            dy_pairs = dy[iu]
-            ux = dx_pairs / d_pairs
-            uy = dy_pairs / d_pairs
-            
-            for idx in range(len(iu[0])):
-                i_idx = iu[0][idx]
-                j_idx = iu[1][idx]
-                fx[i_idx] += ux[idx] * f_pairs[idx]
-                fy[i_idx] += uy[idx] * f_pairs[idx]
-                fx[j_idx] -= ux[idx] * f_pairs[idx]
-                fy[j_idx] -= uy[idx] * f_pairs[idx]
-        
-        x += dt * fx
-        y += dt * fy
-        x = np.clip(x, r, w - r)
-        y = np.clip(y, r, h - r)
-    
-    # Phase 2: Greedy radius expansion with binary search
-    # Try to expand each circle as much as possible
-    for _ in range(50):
-        if time.time() > time_budget:
-            break
-        
-        improved = False
-        for i in range(n):
-            # Calculate max possible radius
-            r_wall = min(x[i], w - x[i], y[i], h - y[i])
-            r_max = r_wall
-            for j in range(n):
-                if i == j:
-                    continue
-                dx = x[i] - x[j]
-                dy = y[i] - y[j]
-                d = np.sqrt(dx * dx + dy * dy)
-                r_allowed = d - r[j]
-                if r_allowed < r_max:
-                    r_max = r_allowed
-            r_max = max(0.0, r_max)
-            
-            if r_max > r[i] + 1e-9:
-                # Binary search for max valid radius
-                lo = r[i]
-                hi = r_max
-                for _ in range(30):
-                    mid = (lo + hi) / 2.0
-                    r_test = r.copy()
-                    r_test[i] = mid
-                    if _is_valid(x, y, r_test, w, h, tol=1e-10):
-                        lo = mid
-                    else:
-                        hi = mid
-                if lo > r[i] + 1e-10:
-                    r[i] = lo
-                    improved = True
-        
-        if not improved:
-            break
-    
-    # Phase 3: Uniform expansion with very fine steps
-    for _ in range(200):
-        if time.time() > time_budget:
-            break
-        r_trial = r * 1.0001
-        if _is_valid(x, y, r_trial, w, h, tol=1e-10):
-            r = r_trial
-        else:
-            break
-    
-    if _is_valid(x, y, r, w, h, tol=1e-10):
-        z_new = np.empty(3 * N + 1)
-        z_new[0::3][:n] = x
-        z_new[1::3][:n] = y
-        z_new[2::3][:n] = r
-        z_new[-1] = w
-        return z_new
-    return None

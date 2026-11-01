@@ -1,251 +1,256 @@
-"""
-Vectorized Facet-Based Covering Optimization.
-
-Strategy:
-1. Compute the convex hull of the points.
-2. Vectorize the calculation of the circumradius for every facet (triangle) of the hull.
-3. Identify the facet with the largest circumradius (the bottleneck for the covering radius).
-4. Compute the pole (normal) of that facet.
-5. Move the three vertices of that facet towards the pole to reduce the circumradius.
-6. Repeat until time limit.
-
-This avoids the expensive Python loop over facets and repeated small matrix solves found in the seed program,
-allowing for significantly more optimization steps within the time budget.
-"""
-import time
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
 import numpy as np
+import time
 from scipy.spatial import ConvexHull
 
 N = 130
-_EPS = 1e-12
 
-def _initial_fib():
-    """Generate initial points using Fibonacci spiral."""
-    i = np.arange(N) + 0.5
-    z = 1.0 - 2.0 * i / N
-    phi = np.pi * (1.0 + np.sqrt(5.0)) * i
-    r = np.sqrt(np.clip(1.0 - z * z, 0.0, None))
-    return np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
-
-def _vectorized_circumradii_and_poles(pts, hull):
-    """
-    Compute circumradii and poles for all hull facets in a vectorized manner.
-    Returns:
-        radii: array of shape (M,) with circumradius (radians) for each facet.
-        poles: array of shape (M, 3) with normalized pole vectors for each facet.
-        faces: array of shape (M, 3) with vertex indices for each facet.
-    """
-    faces = hull.simplices
-    M = len(faces)
+# EVOLVE-BLOCK-START
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140.0  # Leave 10s margin for safety
     
-    # Get coordinates of vertices for each facet
-    # faces: (M, 3) indices
-    A = pts[faces[:, 0]]  # (M, 3)
-    B = pts[faces[:, 1]]  # (M, 3)
-    C = pts[faces[:, 2]]  # (M, 3)
+    def fibonacci_spiral(n):
+        i = np.arange(n) + 0.5
+        z = 1.0 - 2.0 * i / n
+        phi = np.pi * (1.0 + np.sqrt(5.0)) * i
+        r = np.sqrt(1.0 - z * z)
+        return np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
     
-    # Vectors for the triangle edges
-    AB = B - A
-    AC = C - A
-    BC = C - B
-    
-    # Side lengths (Euclidean chord lengths)
-    len_AB = np.linalg.norm(AB, axis=1)
-    len_AC = np.linalg.norm(AC, axis=1)
-    len_BC = np.linalg.norm(BC, axis=1)
-    
-    # Area of triangle: 0.5 * || AB x AC ||
-    cross = np.cross(AB, AC)
-    area = 0.5 * np.linalg.norm(cross, axis=1)
-    
-    # Circumradius R = (a*b*c) / (4*Area)
-    # a, b, c are side lengths
-    prod_sides = len_AB * len_AC * len_BC
-    denom = 4.0 * area
-    
-    # Handle degenerate facets (area ~ 0)
-    valid = denom > _EPS
-    radii = np.full(M, np.inf)
-    radii[valid] = prod_sides[valid] / denom[valid]
-    
-    # Convert Euclidean circumradius to angular circumradius
-    # For a unit sphere, the chord length c = 2 * sin(theta/2)
-    # The circumradius of the triangle in 3D space is R_3d.
-    # The angular radius theta is the distance from the pole to the vertices.
-    # The pole P is the normal to the facet. The distance from P to A is the angular radius.
-    # Actually, the "circumradius" in the context of covering is the angular distance.
-    # The pole P is the unit normal to the facet.
-    # The angular radius is arccos(P @ A).
-    # Let's compute the poles first.
-    
-    # Normal vector for each facet
-    normals = cross
-    norms = np.linalg.norm(normals, axis=1, keepdims=True)
-    # Ensure normals point outward (away from origin)
-    # The centroid of the facet is (A+B+C)/3. If normal @ centroid > 0, it's outward.
-    centroids = (A + B + C) / 3.0
-    signs = np.sum(normals * centroids, axis=1, keepdims=True)
-    normals = normals * np.sign(signs)
-    normals = normals / (norms + _EPS)
-    
-    # Angular circumradius: distance from pole to any vertex (e.g., A)
-    # cos(theta) = P @ A
-    cos_theta = np.sum(normals * A, axis=1)
-    # Clip to avoid numerical issues in arccos
-    cos_theta = np.clip(cos_theta, -1.0, 1.0)
-    ang_radii = np.arccos(cos_theta)
-    
-    # Only valid facets have finite radii
-    ang_radii[~valid] = np.inf
-    
-    return ang_radii, normals, faces
-
-def _improve_vectorized(pts, deadline, rng, max_iters=5000, step0=0.05, decay=0.9999):
-    """
-    Optimize the configuration by moving vertices of the worst facet towards its pole.
-    """
-    pts = np.array(pts, dtype=float)
-    best = pts.copy()
-    
-    # Initial hull and radius
-    try:
-        hull = ConvexHull(pts)
-        radii, poles, faces = _vectorized_circumradii_and_poles(pts, hull)
-        best_r = np.max(radii)
-    except Exception:
-        return best, np.pi
-
-    if not np.isfinite(best_r):
-        best_r = np.pi
-
-    step = step0
-    for _ in range(max_iters):
-        if time.time() > deadline:
-            break
-        
-        # Recompute hull and radii
+    def compute_covering_radius(pts):
+        """Compute covering radius as max circumradius over convex hull faces (vectorized)."""
         try:
             hull = ConvexHull(pts)
-            radii, poles, faces = _vectorized_circumradii_and_poles(pts, hull)
-            curr_r = np.max(radii)
+            faces = hull.simplices  # shape (F, 3)
+            a = pts[faces[:, 0]]
+            b = pts[faces[:, 1]]
+            c = pts[faces[:, 2]]
+            
+            ab = np.cross(a, b)
+            bc = np.cross(b, c)
+            ca = np.cross(c, a)
+            c_dir = ab + bc + ca
+            norms = np.linalg.norm(c_dir, axis=1)
+            
+            radii = np.zeros(len(faces))
+            valid = norms > 1e-10
+            
+            if np.any(valid):
+                c_dir_valid = c_dir[valid] / norms[valid, np.newaxis]
+                cos_r = np.clip(np.sum(c_dir_valid * a[valid], axis=1), -1.0, 1.0)
+                r = np.arccos(cos_r)
+                r[r > np.pi / 2] = np.pi - r[r > np.pi / 2]
+                radii[valid] = r
+            
+            if np.any(~valid):
+                a_deg = a[~valid]
+                b_deg = b[~valid]
+                c_deg = c[~valid]
+                d_ab = np.arccos(np.clip(np.sum(a_deg * b_deg, axis=1), -1, 1))
+                d_bc = np.arccos(np.clip(np.sum(b_deg * c_deg, axis=1), -1, 1))
+                d_ca = np.arccos(np.clip(np.sum(c_deg * a_deg, axis=1), -1, 1))
+                radii[~valid] = np.maximum(np.maximum(d_ab, d_bc), d_ca)
+            
+            return float(np.max(radii))
         except Exception:
-            # If hull fails, we might be in a degenerate state. Break or jitter.
-            break
-            
-        if not np.isfinite(curr_r):
-            break
-            
-        if curr_r < best_r:
-            best_r = curr_r
-            best = pts.copy()
-            
-        # Find the worst facet
-        worst_idx = np.argmax(radii)
-        if not np.isfinite(radii[worst_idx]):
-            break
-            
-        # Get the vertices and pole of the worst facet
-        v_indices = faces[worst_idx]
-        pole = poles[worst_idx]
-        
-        # Move the three vertices towards the pole
-        # We use a gradient-like step. The direction to reduce the radius is towards the pole.
-        # However, moving vertices directly might break the hull or create new worse facets.
-        # A standard technique is to move the vertices a small fraction of the way to the pole.
-        
-        cand = pts.copy()
-        for v in v_indices:
-            # Move point v towards pole
-            # Normalize the step direction
-            dir_vec = pole - pts[v]
-            dir_norm = np.linalg.norm(dir_vec)
-            if dir_norm > _EPS:
-                dir_vec /= dir_norm
-            else:
-                dir_vec = 0.0
-            
-            cand[v] = pts[v] + step * dir_vec
-            # Renormalize to sphere
-            cand[v] /= (np.linalg.norm(cand[v]) + _EPS)
-        
-        # Check if this move improved the radius
-        # We don't want to recompute the full hull if it's likely to be worse, but we need to know.
-        # For simplicity and robustness, we compute the new hull.
-        # Optimization: We can skip the hull computation if we are confident, but it's safer to check.
+            # Fallback: grid-based estimate
+            lat = np.linspace(-np.pi/2, np.pi/2, 50)
+            lon = np.linspace(0, 2*np.pi, 100, endpoint=False)
+            LA, LO = np.meshgrid(lat, lon, indexing='ij')
+            z = np.sin(LA)
+            x = np.cos(LA) * np.cos(LO)
+            y = np.cos(LA) * np.sin(LO)
+            grid_pts = np.column_stack([x.ravel(), y.ravel(), z.ravel()])
+            dot = np.dot(grid_pts, pts.T)
+            dot = np.clip(dot, -1.0, 1.0)
+            ang_dists = np.arccos(dot)
+            min_dists = np.min(ang_dists, axis=1)
+            return float(np.max(min_dists))
+    
+    def compute_face_radii(pts):
+        """Return array of face circumradii (in radians) for gradient-aware optimization."""
         try:
-            hull_cand = ConvexHull(cand)
-            radii_cand, _, _ = _vectorized_circumradii_and_poles(cand, hull_cand)
-            curr_r_cand = np.max(radii_cand)
+            hull = ConvexHull(pts)
+            faces = hull.simplices
+            a = pts[faces[:, 0]]
+            b = pts[faces[:, 1]]
+            c = pts[faces[:, 2]]
+            
+            ab = np.cross(a, b)
+            bc = np.cross(b, c)
+            ca = np.cross(c, a)
+            c_dir = ab + bc + ca
+            norms = np.linalg.norm(c_dir, axis=1)
+            
+            radii = np.zeros(len(faces))
+            valid = norms > 1e-10
+            
+            if np.any(valid):
+                c_dir_valid = c_dir[valid] / norms[valid, np.newaxis]
+                cos_r = np.clip(np.sum(c_dir_valid * a[valid], axis=1), -1.0, 1.0)
+                r = np.arccos(cos_r)
+                r[r > np.pi / 2] = np.pi - r[r > np.pi / 2]
+                radii[valid] = r
+            
+            if np.any(~valid):
+                a_deg = a[~valid]
+                b_deg = b[~valid]
+                c_deg = c[~valid]
+                d_ab = np.arccos(np.clip(np.sum(a_deg * b_deg, axis=1), -1, 1))
+                d_bc = np.arccos(np.clip(np.sum(b_deg * c_deg, axis=1), -1, 1))
+                d_ca = np.arccos(np.clip(np.sum(c_deg * a_deg, axis=1), -1, 1))
+                radii[~valid] = np.maximum(np.maximum(d_ab, d_bc), d_ca)
+            
+            return radii, faces
         except Exception:
-            curr_r_cand = np.pi
-            
-        if np.isfinite(curr_r_cand) and curr_r_cand < curr_r:
-            pts = cand
-        else:
-            # If the move didn't help, try a smaller step or a random perturbation
-            # Reduce step size
-            step *= decay
-            if step < 1e-5:
-                step = 1e-5
-                
-            # Occasionally, do a random perturbation to escape local minima
-            if rng.random() < 0.02:
-                j = int(rng.integers(N))
-                noise = rng.normal(size=3) * 0.02
-                cand2 = pts.copy()
-                cand2[j] = cand2[j] + noise
-                cand2[j] /= (np.linalg.norm(cand2[j]) + _EPS)
-                try:
-                    hull_cand2 = ConvexHull(cand2)
-                    radii_cand2, _, _ = _vectorized_circumradii_and_poles(cand2, hull_cand2)
-                    curr_r_cand2 = np.max(radii_cand2)
-                except Exception:
-                    curr_r_cand2 = np.pi
-                if np.isfinite(curr_r_cand2) and curr_r_cand2 < curr_r:
-                    pts = cand2
-                    step = step * 1.5 # Reward success with larger step? Or keep decay. Let's keep decay.
-            
-    return best, best_r
-
-def construct():
-    deadline = time.time() + 110.0  # Safety margin
-    rng = np.random.default_rng(12345)
+            return None, None
     
-    # Start with Fibonacci
-    best = _initial_fib()
-    best_r = np.pi
-    
-    # Try a few different starting configurations
-    starts = [best]
-    
-    # Random starts
-    for k in range(3):
-        p = rng.normal(size=(N, 3))
-        p /= np.linalg.norm(p, axis=1, keepdims=True)
-        starts.append(p)
+    def repulsion_step_density_aware(points, alpha, face_radii=None):
+        """Repulsion with density-aware weighting: points in large-cap regions get stronger push."""
+        dot = np.dot(points, points.T)
+        dot = np.clip(dot, -1.0, 1.0)
+        np.fill_diagonal(dot, 1.0)
+        dist_sq = 2.0 - 2.0 * dot
+        dist_sq[dist_sq < 1e-10] = 1e-10
+        w = 1.0 / (dist_sq ** 1.5)
+        np.fill_diagonal(w, 0.0)
         
-    # Jittered Fibonacci
-    for k in range(3):
-        p = _initial_fib()
-        noise = rng.normal(size=(N, 3)) * 0.1
-        p = p + noise
-        p /= np.linalg.norm(p, axis=1, keepdims=True)
-        starts.append(p)
+        # Density-aware weighting: if we have face radii, weight vertices in large faces more
+        if face_radii is not None:
+            # Compute per-vertex max face radius (approximate local covering deficit)
+            max_rad_per_vertex = np.zeros(len(points))
+            for i, r in enumerate(face_radii):
+                f = face_radii_faces[i] if 'face_radii_faces' in dir() else None
+            # Simpler: use the overall max radius to boost repulsion in sparse areas
+            max_r = np.max(face_radii) if len(face_radii) > 0 else 0
+            if max_r > 0:
+                # Scale repulsion strength by local deficit
+                local_deficit = 1.0 + 0.5 * (max_r / (np.pi / 6.0))  # normalize
+                w *= local_deficit
         
-    for s in starts:
-        if time.time() > deadline - 10.0:
+        sum_w = np.sum(w, axis=1)
+        sum_p_w = w @ points
+        forces = points * sum_w[:, np.newaxis] - sum_p_w
+        points = points + alpha * forces
+        norms = np.linalg.norm(points, axis=1, keepdims=True)
+        points = points / norms
+        return points
+    
+    def polish_step(points, alpha, n_iter=50):
+        """High-precision polish with very small steps."""
+        for _ in range(n_iter):
+            dot = np.dot(points, points.T)
+            dot = np.clip(dot, -1.0, 1.0)
+            np.fill_diagonal(dot, 1.0)
+            dist_sq = 2.0 - 2.0 * dot
+            dist_sq[dist_sq < 1e-10] = 1e-10
+            w = 1.0 / (dist_sq ** 1.5)
+            np.fill_diagonal(w, 0.0)
+            sum_w = np.sum(w, axis=1)
+            sum_p_w = w @ points
+            forces = points * sum_w[:, np.newaxis] - sum_p_w
+            points = points + alpha * forces
+            norms = np.linalg.norm(points, axis=1, keepdims=True)
+            points = points / norms
+        return points
+    
+    best_points = None
+    best_rad = np.inf
+    
+    n_restarts = 5
+    
+    for restart in range(n_restarts):
+        if time.time() > deadline - 20.0:
             break
-        cand, r = _improve_vectorized(s, deadline, rng)
-        if np.isfinite(r) and r < best_r:
-            best_r = r
-            best = cand
-            
-    # Final normalization
-    best = np.array(best, dtype=float)
-    best /= (np.linalg.norm(best, axis=1, keepdims=True) + _EPS)
-    
-    # Validity check
-    if not np.all(np.isfinite(best)) or best.shape != (N, 3):
-        return _initial_fib()
         
-    return best
+        if restart == 0:
+            points = fibonacci_spiral(N).astype(np.float64)
+        elif restart == 1:
+            # Random start
+            points = np.random.randn(N, 3)
+            points /= np.linalg.norm(points, axis=1, keepdims=True)
+        else:
+            points = best_points + 0.12 * np.random.randn(N, 3)
+            norms = np.linalg.norm(points, axis=1, keepdims=True)
+            points = points / norms
+        
+        alpha = 0.04
+        decay = 0.997
+        max_iter = 400
+        stall_count = 0
+        last_improvement = np.inf
+        
+        for it in range(max_iter):
+            if time.time() > deadline - 5.0:
+                break
+            
+            # Get face radii for density-aware weighting
+            face_radii, faces = compute_face_radii(points)
+            
+            # Standard repulsion step
+            dot = np.dot(points, points.T)
+            dot = np.clip(dot, -1.0, 1.0)
+            np.fill_diagonal(dot, 1.0)
+            dist_sq = 2.0 - 2.0 * dot
+            dist_sq[dist_sq < 1e-10] = 1e-10
+            w = 1.0 / (dist_sq ** 1.5)
+            np.fill_diagonal(w, 0.0)
+            
+            # Boost repulsion for points that are vertices of large faces
+            if face_radii is not None and faces is not None:
+                vertex_max_rad = np.zeros(N)
+                for fi in range(len(faces)):
+                    for vi in faces[fi]:
+                        vertex_max_rad[vi] = max(vertex_max_rad[vi], face_radii[fi])
+                # Normalize and use as weight multiplier
+                if np.max(vertex_max_rad) > 1e-10:
+                    weight_boost = 1.0 + 0.3 * vertex_max_rad / np.max(vertex_max_rad)
+                    # Apply per-row scaling to w
+                    w = w * weight_boost[:, np.newaxis]
+            
+            sum_w = np.sum(w, axis=1)
+            sum_p_w = w @ points
+            forces = points * sum_w[:, np.newaxis] - sum_p_w
+            points = points + alpha * forces
+            norms = np.linalg.norm(points, axis=1, keepdims=True)
+            points = points / norms
+            alpha *= decay
+            
+            if it % 3 == 0:
+                rad = compute_covering_radius(points)
+                if rad < best_rad:
+                    best_rad = rad
+                    best_points = points.copy()
+                    stall_count = 0
+                else:
+                    stall_count += 1
+                    if stall_count > 20:
+                        # Reduce alpha more aggressively on stall
+                        alpha *= 0.95
+                        stall_count = 0
+            
+            if alpha < 1e-7:
+                break
+        
+        # Polish phase for this restart
+        if time.time() < deadline - 10.0 and best_points is not None:
+            polished = polish_step(best_points.copy(), 0.005, 30)
+            rad_polished = compute_covering_radius(polished)
+            if rad_polished < best_rad:
+                best_rad = rad_polished
+                best_points = polished
+    
+    # Final global polish
+    if time.time() < deadline - 5.0 and best_points is not None:
+        final = polish_step(best_points.copy(), 0.002, 50)
+        rad_final = compute_covering_radius(final)
+        if rad_final < best_rad:
+            best_rad = rad_final
+            best_points = final
+    
+    if best_points is None:
+        best_points = fibonacci_spiral(N).astype(np.float64)
+    
+    return best_points
+
+# EVOLVE-BLOCK-END

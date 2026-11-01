@@ -2,6 +2,7 @@ import numpy as np
 import time
 from scipy.optimize import minimize
 import itertools
+from functools import partial
 
 N = 14
 D = 3
@@ -77,7 +78,8 @@ def construct():
     
     # 2. Random starts
     rng = np.random.default_rng(42)
-    for _ in range(20):
+    num_random_starts = 30
+    for _ in range(num_random_starts):
         # Random points in a sphere
         pts = rng.normal(size=(N, D))
         # Normalize to unit sphere roughly to keep scale reasonable
@@ -88,31 +90,45 @@ def construct():
         if time.time() - start_time > timeout:
             break
 
+    # Tau schedule for annealing-like optimization
+    tau_schedule = [1.0, 5.0, 20.0, 100.0]
+    maxiter_schedule = [200, 300, 500, 500]
+    
     # Optimization loop
     for i, init_x in enumerate(candidates):
         if time.time() - start_time > timeout:
             break
             
+        x_curr = init_x.copy()
+        
         try:
-            # Use L-BFGS-B as it handles bounds well, though we don't strictly need them
-            # Method 'BFGS' is often good for small N
-            res = minimize(
-                objective_ratio_smooth, 
-                init_x, 
-                method='L-BFGS-B', 
-                options={'maxiter': 2000, 'ftol': 1e-12, 'gtol': 1e-12}
-            )
+            for idx, tau in enumerate(tau_schedule):
+                if time.time() - start_time > timeout:
+                    break
+                
+                obj = partial(objective_ratio_smooth, tau=tau)
+                maxiter = maxiter_schedule[idx]
+                
+                # Use L-BFGS-B
+                res = minimize(
+                    obj, 
+                    x_curr, 
+                    method='L-BFGS-B', 
+                    options={'maxiter': maxiter, 'ftol': 1e-10, 'gtol': 1e-8}
+                )
+                
+                if res.x is not None:
+                    x_curr = res.x
             
-            if res.success or res.fun < best_score:
-                # Evaluate the true non-smooth score for the result
-                pts = res.x.reshape(N, D)
-                sq_dists = get_pairwise_sq_dists(pts)
-                if np.min(sq_dists) > 1e-10:
-                    true_score = (np.max(sq_dists) / np.min(sq_dists))
-                    if true_score < best_score:
-                        best_score = true_score
-                        best_points = pts
-                        
+            # Evaluate the true non-smooth score for the result
+            pts = x_curr.reshape(N, D)
+            sq_dists = get_pairwise_sq_dists(pts)
+            if np.min(sq_dists) > 1e-10:
+                true_score = (np.max(sq_dists) / np.min(sq_dists))
+                if true_score < best_score:
+                    best_score = true_score
+                    best_points = pts
+                    
         except Exception:
             pass
 
