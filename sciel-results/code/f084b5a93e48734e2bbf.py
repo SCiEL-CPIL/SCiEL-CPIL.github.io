@@ -1,0 +1,294 @@
+"""
+Packing 200 equal circles in a unit square [-1/2, 1/2]^2.
+Strategy:
+1. Initialize with hexagonal patterns.
+2. Coarse optimization with L-BFGS-B on smooth repulsive energy.
+3. Fine optimization with a targeted Subgradient/Local Search on the non-smooth minimum distance.
+"""
+
+N = 200
+import numpy as np
+from scipy.optimize import minimize
+from scipy.spatial.distance import pdist
+import time
+
+def _compute_radius(c):
+    """Compute the largest common radius for given centres."""
+    n = c.shape[0]
+    if n == 0:
+        return 0.0
+
+    dists_x = 0.5 - np.abs(c[:, 0])
+    dists_y = 0.5 - np.abs(c[:, 1])
+    min_boundary = np.minimum(np.min(dists_x), np.min(dists_y))
+
+    if n < 2:
+        return min_boundary
+
+    dists = pdist(c, metric='euclidean')
+    min_pair_dist = np.min(dists) if len(dists) > 0 else np.inf
+
+    return min(min_pair_dist / 2.0, min_boundary)
+
+def _energy_and_grad(params, power=4.0):
+    """
+    Compute smooth repulsive energy and its gradient.
+    """
+    c = params.reshape(N, 2)
+    x = c[:, 0]
+    y = c[:, 1]
+
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    d2 = dx**2 + dy**2
+    np.fill_diagonal(d2, 1.0)
+
+    d2_safe = d2.copy()
+    np.fill_diagonal(d2_safe, 1.0)
+    d2_neg2 = 1.0 / (d2_safe**2)
+    d2_neg3 = 1.0 / (d2_safe**3)
+    np.fill_diagonal(d2_neg2, 0.0)
+    np.fill_diagonal(d2_neg3, 0.0)
+
+    E_pair = np.triu(d2_neg2, 1).sum()
+
+    grad_x = -4.0 * (dx * d2_neg3).sum(axis=1)
+    grad_y = -4.0 * (dy * d2_neg3).sum(axis=1)
+
+    eps = 1e-8
+    dx_w = np.clip(0.5 - x, eps, None)
+    dx_w_neg = np.clip(0.5 + x, eps, None)
+    dy_w = np.clip(0.5 - y, eps, None)
+    dy_w_neg = np.clip(0.5 + y, eps, None)
+
+    E_wall = (1.0/dx_w**2 + 1.0/dx_w_neg**2 + 1.0/dy_w**2 + 1.0/dy_w_neg**2).sum()
+
+    grad_x += 2.0 / dx_w**3 - 2.0 / dx_w_neg**3
+    grad_y += 2.0 / dy_w**3 - 2.0 / dy_w_neg**3
+
+    total_E = E_pair + E_wall
+    total_grad = np.concatenate([grad_x, grad_y])
+
+    return total_E, total_grad
+
+def _initialize_hexagonal(d_spacing=None):
+    """Initialize with a hexagonal pattern with given spacing."""
+    if d_spacing is None:
+        d_spacing = 0.07
+
+    points = []
+    row_spacing = d_spacing * np.sqrt(3) / 2
+    x_offset = d_spacing / 2
+
+    y = -0.5 + d_spacing / 2
+    row = 0
+    while y <= 0.5 - d_spacing / 2:
+        x = -0.5 + d_spacing / 2
+        if row % 2 == 1:
+            x += x_offset
+        while x <= 0.5 - d_spacing / 2:
+            points.append([x, y])
+            x += d_spacing
+        y += row_spacing
+        row += 1
+
+    points = np.array(points)
+    if len(points) >= N:
+        c = points[:N].copy()
+        c = np.clip(c, -0.49, 0.49)
+        return c
+    return None
+
+def _initialize_grid():
+    """Initialize with a grid pattern."""
+    m = int(np.ceil(np.sqrt(N)))
+    ticks = (np.arange(m) + 0.5) / m - 0.5
+    grid = np.array([(x, y) for y in ticks for x in ticks])
+    return grid[:N].copy()
+
+def _subgradient_polish(c, max_iters=2000, time_limit=30.0, base_step=1e-4):
+    """
+    Structural change: Subgradient method on the non-smooth objective -min(d).
+    Directly targets the closest pairs/walls.
+    """
+    start_time = time.time()
+    c = c.copy()
+    current_r = _compute_radius(c)
+    best_c = c.copy()
+    best_r = current_r
+    step = base_step
+    stall_count = 0
+    max_stall = 20
+
+    for it in range(max_iters):
+        if time.time() - start_time > time_limit:
+            break
+
+        # Compute distances
+        x = c[:, 0]
+        y = c[:, 1]
+        
+        # Pairwise distances
+        dx = x[:, None] - x[None, :]
+        dy = y[:, None] - y[None, :]
+        d2 = dx**2 + dy**2
+        np.fill_diagonal(d2, np.inf)
+        d = np.sqrt(d2)
+        
+        # Wall distances
+        w_left = x + 0.5
+        w_right = 0.5 - x
+        w_down = y + 0.5
+        w_up = 0.5 - y
+        w = np.minimum(np.minimum(w_left, w_right), np.minimum(w_down, w_up))
+        
+        # Current radius
+        min_pair_d = np.min(d)
+        min_wall_d = np.min(w)
+        current_r = min(min_pair_d / 2.0, min_wall_d)
+        
+        if current_r > best_r:
+            best_r = current_r
+            best_c = c.copy()
+            stall_count = 0
+        else:
+            stall_count += 1
+            if stall_count > max_stall:
+                step *= 0.5
+                if step < 1e-7:
+                    break
+
+        # Compute Subgradient
+        # We want to increase the minimum distance.
+        # Gradient of -d_ij w.r.t x_i is -(x_i - x_j)/d_ij
+        # So we move in direction of +(x_i - x_j)/d_ij to increase d_ij?
+        # Wait, if we move i away from j, d increases.
+        # Vector from j to i is (x_i - x_j).
+        # So we add this vector to the gradient for i.
+        
+        grad_x = np.zeros(N)
+        grad_y = np.zeros(N)
+        
+        # Only consider pairs that are close to the minimum (active constraints)
+        # Threshold: within 10% of min distance to keep gradient sparse
+        threshold_d = min_pair_d * 1.1
+        mask_d = (d < threshold_d) & (d > 0)
+        
+        # Vectorized addition of subgradients for pairs
+        # For each pair (i,j) in mask, add (x_i-x_j)/d to grad_i and (x_j-x_i)/d to grad_j
+        # This is hard to vectorize directly without loops or fancy indexing.
+        # Given N=200, a loop over active pairs is fast enough.
+        
+        active_pairs = np.argwhere(mask_d)
+        # Ensure we only process i < j to avoid double counting
+        active_pairs = active_pairs[active_pairs[:, 0] < active_pairs[:, 1]]
+        
+        for i, j in active_pairs:
+            di = d[i, j]
+            if di < 1e-12: continue
+            inv_d = 1.0 / di
+            gx = (x[i] - x[j]) * inv_d
+            gy = (y[i] - y[j]) * inv_d
+            grad_x[i] += gx
+            grad_y[i] += gy
+            grad_x[j] -= gx
+            grad_y[j] -= gy
+            
+        # Wall subgradients
+        threshold_w = min_wall_d * 1.1
+        # Left wall: x < -0.5 + threshold -> push right (+x)
+        mask_wl = (w_left < threshold_w)
+        grad_x[mask_wl] += 1.0
+        # Right wall: x > 0.5 - threshold -> push left (-x)
+        mask_wr = (w_right < threshold_w)
+        grad_x[mask_wr] -= 1.0
+        # Down wall: y < -0.5 + threshold -> push up (+y)
+        mask_wd = (w_down < threshold_w)
+        grad_y[mask_wd] += 1.0
+        # Up wall: y > 0.5 - threshold -> push down (-y)
+        mask_wu = (w_up < threshold_w)
+        grad_y[mask_wu] -= 1.0
+        
+        # Normalize gradient
+        g_norm = np.sqrt(grad_x**2 + grad_y**2)
+        g_norm = np.where(g_norm > 1e-12, g_norm, 1.0)
+        
+        new_x = x + step * grad_x / g_norm
+        new_y = y + step * grad_y / g_norm
+        
+        # Project to box
+        new_x = np.clip(new_x, -0.499, 0.499)
+        new_y = np.clip(new_y, -0.499, 0.499)
+        
+        c = np.column_stack((new_x, new_y))
+        
+        # Adaptive step
+        if current_r > best_r - 1e-9: # Rough check, actual check is above
+             pass 
+        # We already updated best_r above. 
+        # If we made progress, keep step or increase slightly.
+        # If not, we handled it in the stall logic.
+        
+    return best_c, best_r
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 145
+
+    # Generate initializations
+    inits = []
+    for d in np.linspace(0.065, 0.075, 5):
+        c_hex = _initialize_hexagonal(d)
+        if c_hex is not None:
+            inits.append(c_hex)
+    inits.append(_initialize_grid())
+    
+    # Pick best init
+    init_results = []
+    for c_init in inits:
+        c_init = np.clip(c_init, -0.49, 0.49)
+        r_init = _compute_radius(c_init)
+        init_results.append((r_init, c_init))
+        
+    init_results.sort(key=lambda x: x[0], reverse=True)
+    best_c = init_results[0][1].copy()
+    best_r = init_results[0][0]
+
+    # Phase 1: L-BFGS-B on smooth energy
+    if time.time() < deadline - 60:
+        try:
+            bounds = [(-0.499, 0.499)] * (2 * N)
+            res = minimize(
+                _energy_and_grad,
+                best_c.flatten(),
+                method='L-BFGS-B',
+                jac=True,
+                bounds=bounds,
+                options={'maxiter': 500, 'ftol': 1e-14, 'gtol': 1e-12, 'maxfun': 5000, 'maxls': 50}
+            )
+            c_opt = np.clip(res.x.reshape(N, 2), -0.499, 0.499)
+            r_opt = _compute_radius(c_opt)
+            if r_opt > best_r:
+                best_r = r_opt
+                best_c = c_opt.copy()
+        except Exception:
+            pass
+
+    # Phase 2: Subgradient Polish
+    if time.time() < deadline - 10:
+        time_for_polish = min(35.0, deadline - time.time() - 10)
+        c_polished, r_polished = _subgradient_polish(best_c, max_iters=5000, time_limit=time_for_polish, base_step=5e-4)
+        if r_polished > best_r:
+            best_r = r_polished
+            best_c = c_polished.copy()
+
+    # Phase 3: Final tiny polish
+    if time.time() < deadline - 2:
+        time_for_final = min(5.0, deadline - time.time() - 2)
+        c_final, r_final = _subgradient_polish(best_c, max_iters=1000, time_limit=time_for_final, base_step=1e-5)
+        if r_final > best_r:
+            best_r = r_final
+            best_c = c_final.copy()
+
+    best_c = np.clip(best_c, -0.5, 0.5)
+    return best_c
