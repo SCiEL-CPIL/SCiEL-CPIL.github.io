@@ -196,6 +196,84 @@ def _seed_shell_core():
     return np.vstack([shell, core])
 
 
+def _local_search(c, deadline, iters=2000):
+    """Local search: perturb the closest pair and nearest wall, accept if radius improves."""
+    c = c.copy()
+    c = np.clip(c, -0.499, 0.499)
+    best_r = _compute_radius(c)
+    best_c = c.copy()
+    
+    for it in range(iters):
+        if time.time() > deadline:
+            break
+        
+        # Find the binding constraints
+        d = _pair_dist_matrix(c)
+        min_pair_idx = np.unravel_index(np.argmin(d), d.shape)
+        min_pair_dist = d[min_pair_idx]
+        
+        wall = 0.5 - np.abs(c)
+        min_wall_idx = np.unravel_index(np.argmin(wall), wall.shape)
+        min_wall_val = wall[min_wall_idx]
+        
+        # Determine which constraint is binding
+        if min_pair_dist / 2.0 < min_wall_val:
+            # Binding pair
+            i, j = min_pair_idx
+            # Perturb these two points apart
+            direction = c[i] - c[j]
+            norm = np.linalg.norm(direction)
+            if norm < 1e-10:
+                direction = np.array([1.0, 0, 0])
+            else:
+                direction = direction / norm
+            
+            # Try several step sizes
+            for step in (0.005, 0.01, 0.02, 0.003, 0.008):
+                c_try = c.copy()
+                c_try[i] += step * direction
+                c_try[j] -= step * direction
+                c_try = np.clip(c_try, -0.499, 0.499)
+                r_try = _compute_radius(c_try)
+                if r_try > best_r + 1e-12:
+                    best_r = r_try
+                    best_c = c_try.copy()
+                    c = c_try.copy()
+                    break
+        else:
+            # Binding wall
+            i, k = min_wall_idx
+            # Push point i away from the wall
+            sgn = np.sign(c[i, k])
+            if sgn == 0:
+                sgn = 1.0
+            
+            for step in (0.005, 0.01, 0.02, 0.003, 0.008):
+                c_try = c.copy()
+                c_try[i, k] += step * sgn
+                c_try = np.clip(c_try, -0.499, 0.499)
+                r_try = _compute_radius(c_try)
+                if r_try > best_r + 1e-12:
+                    best_r = r_try
+                    best_c = c_try.copy()
+                    c = c_try.copy()
+                    break
+        
+        # Occasionally add random perturbation to escape local minima
+        if it % 100 == 50:
+            c_try = c.copy()
+            idx = np.random.randint(N)
+            c_try[idx] += np.random.normal(0, 0.01, size=3)
+            c_try = np.clip(c_try, -0.499, 0.499)
+            r_try = _compute_radius(c_try)
+            if r_try > best_r + 1e-12:
+                best_r = r_try
+                best_c = c_try.copy()
+                c = c_try.copy()
+    
+    return best_c, best_r
+
+
 def construct():
     """Maximize the common radius of 50 equal spheres in [-0.5,0.5]^3."""
     start = time.time()
@@ -207,6 +285,7 @@ def construct():
         _seed_shell_core(),
         _seed_random(1),
         _seed_random(2),
+        _seed_random(3),
     ]
 
     best_c = None
@@ -224,8 +303,14 @@ def construct():
         # Stage B: smooth softmin polish
         c_pol, r_pol = _smooth_polish(c_an, deadline)
 
-        r = max(r_an, r_pol)
-        c = c_pol if r_pol >= r_an else c_an
+        # Stage C: local search on the best of A and B
+        c_ls = c_pol if r_pol >= r_an else c_an
+        r_ls = max(r_pol, r_an)
+        if time.time() < deadline:
+            c_ls, r_ls = _local_search(c_ls, deadline, iters=1000)
+
+        r = max(r_an, r_pol, r_ls)
+        c = c_ls if r_ls >= max(r_an, r_pol) else (c_pol if r_pol >= r_an else c_an)
         if r > best_r:
             best_r = r
             best_c = c.copy()
@@ -236,6 +321,13 @@ def construct():
         if r_pol > best_r:
             best_r = r_pol
             best_c = c_pol
+        
+        # Final local search
+        if time.time() < deadline:
+            c_ls, r_ls = _local_search(best_c, deadline, iters=500)
+            if r_ls > best_r:
+                best_r = r_ls
+                best_c = c_ls
 
     if best_c is None:
         best_c = _seed_grid()

@@ -8,6 +8,24 @@ N = 100
 TIME_LIMIT = 115.0  # safety margin before 120s kill
 
 
+def _energy_grad_fast(points):
+    """Compute energy and gradient efficiently."""
+    n = len(points)
+    diff = points[:, np.newaxis, :] - points[np.newaxis, :, :]
+    dist_sq = np.sum(diff * diff, axis=2)
+    np.fill_diagonal(dist_sq, 1.0)
+    dist = np.sqrt(dist_sq)
+    inv_dist_sq = 1.0 / dist_sq
+    np.fill_diagonal(inv_dist_sq, 0.0)
+    grad = -np.sum(inv_dist_sq[:, :, np.newaxis] * diff, axis=1)
+    
+    mask = np.triu(np.ones((n, n), dtype=bool), k=1)
+    d = dist[mask]
+    d = np.maximum(d, 1e-15)
+    energy = math.fsum(np.log(1.0 / d).tolist())
+    return energy, grad
+
+
 def _energy(points):
     """Compute logarithmic energy sum_{i<j} log(1/|x_i - x_j|)."""
     diff = points[:, np.newaxis, :] - points[np.newaxis, :, :]
@@ -84,6 +102,49 @@ def _optimize_single(points, time_budget, maxiter=3000):
     return points
 
 
+def _steepest_descent_sphere(points, time_budget, max_iter=5000):
+    """Steepest descent on the sphere using Riemannian gradient."""
+    start_time = time.time()
+    p = points.copy()
+    best_energy = _energy(p)
+    best_p = p.copy()
+    
+    # Compute initial gradient
+    e, g = _energy_grad(p)
+    # Project to tangent space
+    g_tan = g - (g * p).sum(axis=1, keepdims=True) * p
+    
+    step = 0.01
+    for _ in range(max_iter):
+        if time.time() - start_time > time_budget:
+            break
+        
+        # Normalize gradient for step size
+        g_norm = np.linalg.norm(g_tan)
+        if g_norm < 1e-12:
+            break
+        
+        # Take step
+        new_p = p + step * g_tan
+        new_p = _project_to_sphere(new_p)
+        
+        new_e = _energy(new_p)
+        if new_e < best_energy:
+            best_energy = new_e
+            best_p = new_p.copy()
+            # Recompute gradient
+            _, g = _energy_grad(new_p)
+            g_tan = g - (g * new_p).sum(axis=1, keepdims=True) * new_p
+            p = new_p
+            step = min(step * 1.05, 0.1)
+        else:
+            step *= 0.5
+            if step < 1e-10:
+                break
+    
+    return best_p
+
+
 def _fibonacci_spiral(n):
     """Generate initial points using Fibonacci spiral on sphere."""
     i = np.arange(n) + 0.5
@@ -103,36 +164,38 @@ def _random_points(n, seed=None):
 
 
 def _simulated_annealing_refine(points, time_budget):
-    """Refine points using simulated annealing-like perturbation."""
+    """Refine points using simulated annealing with batch moves."""
     start_time = time.time()
     best_points = points.copy()
     best_energy = _energy(best_points)
-    T = 0.1  # initial temperature
+    T = 0.05  # initial temperature
     
     while True:
         elapsed = time.time() - start_time
         if elapsed > time_budget:
             break
         
-        # Try a perturbation
-        idx = np.random.randint(N)
-        angle = np.random.uniform(0, 2 * np.pi) * T
-        # Rotate point idx by small angle around a random axis
-        axis = np.random.randn(3)
-        axis /= np.linalg.norm(axis)
-        
-        # Rodrigues rotation
-        c = math.cos(angle)
-        s = math.sin(angle)
-        k = axis
-        k_outer_k = np.outer(k, k)
-        K = np.array([[0, -k[2], k[1]],
-                      [k[2], 0, -k[0]],
-                      [-k[1], k[0], 0]])
-        R = c * np.eye(3) + s * K + (1 - c) * k_outer_k
+        # Try a batch perturbation: move 1-3 points
+        n_moves = np.random.choice([1, 1, 1, 2, 2, 3])
+        indices = np.random.choice(N, size=n_moves, replace=False)
         
         new_points = best_points.copy()
-        new_points[idx] = R @ new_points[idx]
+        for idx in indices:
+            angle = np.random.uniform(0, 2 * np.pi) * T
+            axis = np.random.randn(3)
+            axis /= np.linalg.norm(axis)
+            
+            c = math.cos(angle)
+            s = math.sin(angle)
+            k = axis
+            k_outer_k = np.outer(k, k)
+            K = np.array([[0, -k[2], k[1]],
+                          [k[2], 0, -k[0]],
+                          [-k[1], k[0], 0]])
+            R = c * np.eye(3) + s * K + (1 - c) * k_outer_k
+            
+            new_points[idx] = R @ new_points[idx]
+        
         new_points = _project_to_sphere(new_points)
         
         new_energy = _energy(new_points)
@@ -142,7 +205,9 @@ def _simulated_annealing_refine(points, time_budget):
             best_points = new_points
             best_energy = new_energy
         
-        T *= 0.995  # cool down
+        T *= 0.999  # slower cooling for more exploration
+        if T < 1e-6:
+            T = 0.01  # restart with mild temperature
     
     return best_points
 
@@ -198,7 +263,18 @@ def construct():
                 best_energy = e
                 best_points = refined
     
-    # Phase 4: Simulated annealing refinement if time allows
+    # Phase 4: Steepest descent polishing
+    elapsed = time.time() - start_time
+    if elapsed < TIME_LIMIT * 0.85:
+        remaining = TIME_LIMIT * 0.85 - elapsed
+        if remaining > 2.0:
+            sd_points = _steepest_descent_sphere(best_points, remaining * 0.9)
+            e = _energy(sd_points)
+            if e < best_energy:
+                best_energy = e
+                best_points = sd_points
+    
+    # Phase 5: Simulated annealing refinement if time allows
     elapsed = time.time() - start_time
     if elapsed < TIME_LIMIT * 0.95:
         remaining = TIME_LIMIT * 0.95 - elapsed
@@ -210,6 +286,17 @@ def construct():
                 best_energy = e
                 best_points = sa_points
     
+    # Phase 6: Final L-BFGS polish
+    elapsed = time.time() - start_time
+    if elapsed < TIME_LIMIT * 0.98:
+        remaining = TIME_LIMIT * 0.98 - elapsed
+        if remaining > 1.0:
+            final_opt = _optimize_single(best_points, remaining * 0.9, maxiter=2000)
+            e = _energy(final_opt)
+            if e < best_energy:
+                best_energy = e
+                best_points = final_opt
+    
     # Final projection and validation
     best_points = _project_to_sphere(best_points)
     
@@ -218,7 +305,6 @@ def construct():
         for j in range(i + 1, N):
             d = np.linalg.norm(best_points[i] - best_points[j])
             if d < 1e-9:
-                # Perturb point i
                 perturb = np.random.randn(3) * 1e-5
                 best_points[i] = best_points[i] + perturb
                 best_points[i] = best_points[i] / np.linalg.norm(best_points[i])
@@ -226,7 +312,6 @@ def construct():
     # Final energy check
     final_energy = _energy(best_points)
     if not np.isfinite(final_energy):
-        # Fallback to Fibonacci spiral
         best_points = _fibonacci_spiral(N)
     
     return best_points

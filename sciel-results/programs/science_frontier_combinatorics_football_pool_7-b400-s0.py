@@ -4,137 +4,187 @@ import random
 
 def construct(q, n, radius):
     t0 = time.time()
-    deadline = t0 + 110.0
+    deadline = t0 + 115.0  # Safety margin for 120s limit
+    
     total = q ** n
     ball_size = 1 + n * (q - 1)
     
-    # Precompute place values
+    # Precompute place values for index conversion
     base = [1] * n
     for i in range(n - 2, -1, -1):
         base[i] = base[i + 1] * q
         
-    # Precompute all words as indices 0..total-1
-    # Word i in base-q representation (most significant digit first)
-    # This matches the index calculation if we treat index as mixed-radix.
-    # Let's verify:
-    # base[i] = q^(n-1-i)
-    # index = sum(v_i * base[i])
-    # This is standard.
+    # Precompute all words as indices
+    # words[i] is the list of digits for index i
+    # We need ball_indices[i] = list of indices of words within distance 1 of i
+    ball_indices = [[] for _ in range(total)]
     
-    # Precompute balls for all words
-    # balls[i] is an array of indices of words within distance 1 of i
-    balls = np.zeros((total, ball_size), dtype=np.int32)
-    
-    # Generate all words
-    # Use int32 to avoid overflow issues with larger q/n, though int16 might suffice for q=3, n=7
-    # But let's stick to a safe integer type.
-    words = np.array([list(map(int, np.base_repr(i, q).zfill(n))) for i in range(total)], dtype=np.int32)
-    
+    # Generate words and balls
+    # To be efficient, we generate the word digits on the fly or store them.
+    # Storing 2187 * 7 ints is small.
+    words = np.zeros((total, n), dtype=np.int32)
+    for i in range(total):
+        temp = i
+        for j in range(n - 1, -1, -1):
+            words[i, j] = temp % q
+            temp //= q
+            
     for i in range(total):
         w = words[i]
-        balls[i, 0] = i
-        idx = 1
+        ball_indices[i].append(i)
         for coord in range(n):
             orig = w[coord]
             for v in range(q):
                 if v == orig:
                     continue
-                # New index
                 new_idx = i + (v - orig) * base[coord]
-                balls[i, idx] = new_idx
-                idx += 1
+                ball_indices[i].append(new_idx)
                 
-    # Helper to get counts of coverage
-    def get_counts(code_indices):
-        counts = np.zeros(total, dtype=np.int32)
-        for c in code_indices:
-            counts[balls[c]] += 1
-        return counts
-            
-    def is_valid_code(code_indices):
-        counts = get_counts(code_indices)
-        return np.all(counts > 0)
-        
-    def greedy_build(randomize=False, seed=None):
-        if seed is not None:
-            random.seed(seed)
+    # Helper to check if a set of codewords is valid
+    # Returns True if valid, and optionally updates cnt array
+    def is_valid_and_count(code_set, cnt=None):
+        if cnt is None:
+            cnt = np.zeros(total, dtype=np.int32)
+        else:
+            cnt[:] = 0
+        for c in code_set:
+            for x in ball_indices[c]:
+                cnt[x] += 1
+        return np.all(cnt > 0), cnt
+
+    def get_min_count_in_ball(c, cnt):
+        min_val = 255 # max int8
+        for x in ball_indices[c]:
+            if cnt[x] < min_val:
+                min_val = cnt[x]
+        return min_val
+
+    def greedy_build():
         covered = np.zeros(total, dtype=bool)
         code = []
+        # Precompute ball arrays for faster access in greedy
+        # balls_np is a list of numpy arrays? No, lists are fine for small N.
         
         while not np.all(covered):
-            # Calculate new coverage for each word
-            new_cov = np.sum(~covered[balls], axis=1)
-            
-            # Find best candidates
-            max_cov = np.max(new_cov)
-            if max_cov == 0:
-                break # Should not happen
-            
-            candidates = np.where(new_cov == max_cov)[0]
-            
-            if randomize and len(candidates) > 1:
-                # Pick randomly from top candidates
-                best_idx = random.choice(candidates)
-            else:
-                best_idx = candidates[0]
-                
-            # Add to code
-            code.append(best_idx)
-            # Update covered
-            covered[balls[best_idx]] = True
-            
+            best_c = -1
+            max_new = -1
+            # Iterate through all candidates
+            for c in range(total):
+                # Calculate new coverage
+                new_cov = 0
+                for x in ball_indices[c]:
+                    if not covered[x]:
+                        new_cov += 1
+                if new_cov > max_new:
+                    max_new = new_cov
+                    best_c = c
+                    if max_new == ball_size:
+                        break # Can't get better
+            code.append(best_c)
+            for x in ball_indices[best_c]:
+                covered[x] = True
         return code
-        
-    def reduce_code(code_set):
-        """Reduces the code set by removing redundant codewords."""
-        code_set = set(code_set)
-        counts = np.zeros(total, dtype=np.int32)
-        for c in code_set:
-            counts[balls[c]] += 1
-            
-        changed = True
-        while changed:
-            changed = False
-            for c in list(code_set):
-                # Check if c is redundant: all points in its ball are covered by >= 2 codewords
-                if np.min(counts[balls[c]]) >= 2:
-                    code_set.remove(c)
-                    counts[balls[c]] -= 1
-                    changed = True
-        return code_set
 
-    best_code = None
-    best_size = total
+    # Initial greedy
+    current_code = set(greedy_build())
+    best_code = list(current_code)
+    best_size = len(best_code)
     
-    # Run multiple greedy restarts
-    restarts = 0
-    while time.time() < deadline - 10.0:
-        restarts += 1
-        # Alternate between deterministic and randomized greedy
-        if restarts % 3 == 0:
-            code = greedy_build(randomize=True, seed=restarts)
-        else:
-            code = greedy_build(randomize=False)
+    # Initialize counts
+    cnt = np.zeros(total, dtype=np.int32)
+    for c in current_code:
+        for x in ball_indices[c]:
+            cnt[x] += 1
             
-        # Reduce code
-        code_set = reduce_code(code)
+    def run_delete_phase(code_set, cnt_arr):
+        """Removes redundant codewords. Returns True if any removed."""
+        changed = False
+        # Iterate over a copy of the list to allow modification
+        for c in list(code_set):
+            # Check if min count in ball(c) is >= 2
+            min_val = 255
+            for x in ball_indices[c]:
+                if cnt_arr[x] < min_val:
+                    min_val = cnt_arr[x]
+            if min_val >= 2:
+                code_set.remove(c)
+                for x in ball_indices[c]:
+                    cnt_arr[x] -= 1
+                changed = True
+        return changed
+
+    # Local Search Loop
+    while time.time() < deadline - 5.0:
+        # 1. Delete Phase
+        while run_delete_phase(current_code, cnt):
+            if len(current_code) < best_size:
+                best_size = len(current_code)
+                best_code = list(current_code)
+                
+        # 2. Swap Phase
+        # Try a few random swaps
+        swaps_attempted = 0
+        max_swaps = 200
+        while swaps_attempted < max_swaps and time.time() < deadline - 5.0:
+            swaps_attempted += 1
+            if len(current_code) == 0:
+                break
+                
+            # Pick random codeword to remove
+            c = random.choice(list(current_code))
+            
+            # Pick random candidate to add
+            c_prime = random.randint(0, total - 1)
+            
+            if c_prime == c:
+                continue
+            if c_prime in current_code:
+                continue
+                
+            # Simulate swap
+            # We need to check if (current_code - {c} + {c_prime}) is valid.
+            # We can do this by checking if removing c leaves any hole that c_prime doesn't cover,
+            # or simply recalculating the min count.
+            # Efficient check:
+            # 1. Decrement counts for c
+            # 2. Increment counts for c_prime
+            # 3. Check min > 0
+            # 4. Revert if invalid
+            
+            # To avoid modifying the main cnt array if it fails, we can use a temporary check.
+            # Since ball_size is small (15), we can just check the specific points.
+            # Points affected: ball(c) U ball(c_prime)
+            
+            # Let's just do the full update on a copy? No, cnt is numpy array.
+            # Copying 2187 ints is fast.
+            cnt_temp = cnt.copy()
+            
+            for x in ball_indices[c]:
+                cnt_temp[x] -= 1
+            for x in ball_indices[c_prime]:
+                cnt_temp[x] += 1
+                
+            if np.all(cnt_temp > 0):
+                # Swap is valid
+                current_code.remove(c)
+                current_code.add(c_prime)
+                cnt = cnt_temp # Update main cnt
+                
+                # Check for improvement
+                if len(current_code) < best_size:
+                    best_size = len(current_code)
+                    best_code = list(current_code)
                     
-        current_size = len(code_set)
-        if current_size < best_size:
-            best_size = current_size
-            best_code = list(code_set)
-            
-    # Final reduction on best_code to squeeze out more
-    if best_code is not None and time.time() < deadline - 5.0:
-        code_set = reduce_code(best_code)
-        best_size = len(code_set)
-        best_code = list(code_set)
-        
-    # Convert indices back to words
-    # We need to return list of lists of ints
+                # After a swap, run delete phase again immediately
+                # This is crucial for finding smaller codes
+                while run_delete_phase(current_code, cnt):
+                    if len(current_code) < best_size:
+                        best_size = len(current_code)
+                        best_code = list(current_code)
+
+    # Final result conversion
     result = []
     for idx in best_code:
-        # Convert index to base-q digits
         w = []
         temp = idx
         for i in range(n):
