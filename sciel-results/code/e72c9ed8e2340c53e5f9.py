@@ -1,0 +1,37 @@
+<<<<<<< SEARCH
+# EVOLVE-BLOCK-START
+def construct():
+    n, m, p = DIMENSIONS  # 2, 2, 9
+    # Schoolbook rank = n*m*p = 36
+    rank = n * m * p
+    U = [[0.0] * rank for _ in range(n * m)]  # shape (4, rank)
+    V = [[0.0] * rank for _ in range(m * p)]  # shape (18, rank)
+    W = [[0.0] * rank for _ in range(p * n)]  # shape (18, rank)
+    
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][col] = 1.0
+                V[j * p + k][col] = 1.0
+                W[k * n + i][col] = 1.0
+                col += 1
+    
+    return {"U": U, "V": V, "W": W}
+# EVOLVE-BLOCK-END
+=======
+# EVOLVE-BLOCK-START
+def construct():
+    n, m, p = DIMENSIONS  # 2, 2, 9
+    # The matrix multiplication tensor T[i,j,k] = 1 for all valid i,j,k.
+    # This is because C[i,k] = sum_j A[i,j] B[j,k], so every pair (i,j) contributes to every k.
+    # The tensor is the outer product of three all-ones vectors, so its rank is 1.
+    rank = 1
+    
+    U = [[1.0] * rank for _ in range(n * m)]  # shape (4, 1)
+    V = [[1.0] * rank for _ in range(m * p)]  # shape (18, 1)
+    W = [[1.0] * rank for _ in range(p * n)]  # shape (18, 1)
+    
+    return {"U": U, "V": V, "W": W}
+# EVOLVE-BLOCK-END
+>>>>>>> REPLACE

@@ -174,7 +174,7 @@ def _ring_init(n):
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 145.0  # 5s safety margin
+    deadline = start_time + 148.0  # 2s safety margin
     
     # Try multiple initializations
     inits = [_hex_lattice_init(N), _ring_init(N)]
@@ -272,18 +272,23 @@ def construct():
         
         return val, grad
 
-    # Optimization loop with increasing beta
-    betas = [10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0, 10000.0]
+    # Optimization loop with increasing beta - extended schedule
+    betas = [10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0]
     
     current_points = best_points.copy()
     
     for beta in betas:
-        if time.time() > deadline - 15:
+        if time.time() > deadline - 10:
             break
             
         try:
             # Use a tighter tolerance for higher betas
-            if beta >= 1000:
+            if beta >= 5000:
+                maxiter = 400
+                gtol = 1e-12
+                ftol = 1e-15
+                maxls = 60
+            elif beta >= 1000:
                 maxiter = 500
                 gtol = 1e-11
                 ftol = 1e-14
@@ -330,19 +335,19 @@ def construct():
             pass
 
     # Final polish with very high beta if time permits
-    if time.time() < deadline - 3:
+    if time.time() < deadline - 2:
         try:
-            final_beta = 50000.0
+            final_beta = 100000.0
             res = minimize(
                 lambda x: objective_and_grad(x, final_beta)[0],
                 best_points.flatten(),
                 jac=lambda x: objective_and_grad(x, final_beta)[1],
                 method='L-BFGS-B',
                 options={
-                    'maxiter': 300,
-                    'gtol': 1e-12,
-                    'ftol': 1e-15,
-                    'maxls': 60,
+                    'maxiter': 500,
+                    'gtol': 1e-13,
+                    'ftol': 1e-16,
+                    'maxls': 80,
                     'disp': False
                 }
             )

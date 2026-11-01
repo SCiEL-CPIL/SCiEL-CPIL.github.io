@@ -1,0 +1,281 @@
+import time
+import numpy as np
+
+DIMENSIONS = [2, 2, 7]
+_START_TIME = time.time()
+_DEADLINE = _START_TIME + 115.0
+
+def _time_remaining():
+    return _DEADLINE - time.time()
+
+def _build_target_tensor():
+    """Build the (2,2,7) matrix multiplication tensor T[i,j,k] where C[i,k] = sum_j A[i,j]B[j,k]."""
+    n, m, p = 2, 2, 7
+    # T is indexed by (i*m+j, j*p+k, k*n+i) in the flattened convention
+    # Actually the tensor T[a,b,c] where a = i*m+j (A index), b = j*p+k (B index), c = k*n+i (C index)
+    # T[a,b,c] = 1 if a,b,c are consistent with the multiplication, else 0
+    T = np.zeros((n*m, m*p, p*n))
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                a = i * m + j
+                b = j * p + k
+                c = k * n + i
+                T[a, b, c] = 1
+    return T
+
+def _decompose_to_matrices(T, rank, U, V, W):
+    """Check if U, V, W of given rank decompose T exactly.
+    T[a,b,c] should equal sum_r U[a,r] * V[b,r] * W[c,r]
+    """
+    # T_reconstructed = einsum('ar,br,cr->abc', U, V, W)
+    T_rec = np.einsum('ar,br,cr->abc', U, V, W)
+    return np.allclose(T_rec, T, atol=1e-10)
+
+def _verify_decomposition(U, V, W):
+    """Verify U, V, W decompose the target tensor."""
+    T = _build_target_tensor()
+    T_rec = np.einsum('ar,br,cr->abc', U, V, W)
+    return np.allclose(T_rec, T, atol=1e-10)
+
+def _search_rank(T, rank, time_limit=5.0):
+    """Try to find a rank-`rank` decomposition of T using ALS."""
+    n, m, p = 2, 2, 7
+    dim_a, dim_b, dim_c = n*m, m*p, p*n  # 4, 14, 14
+    
+    start = time.time()
+    
+    # Try multiple random initializations
+    for trial in range(50):
+        if time.time() - start > time_limit:
+            break
+        
+        # Random initialization with small values
+        U = np.random.randn(dim_a, rank) * 0.5
+        V = np.random.randn(dim_b, rank) * 0.5
+        W = np.random.randn(dim_c, rank) * 0.5
+        
+        # ALS iterations
+        for it in range(200):
+            if time.time() - start > time_limit:
+                break
+            
+            # Update U: for each a, U[a,:] = (V^T * T[a,:,:] * W) / (V^T * W)
+            # T[a,:,:] is a (dim_b, dim_c) matrix
+            # U[a,r] = sum_{b,c} T[a,b,c] * V[b,r] * W[c,r] / sum_c W[c,r]^2 ... 
+            # Actually: minimize ||T - sum_r U[:,r] V[:,r] W[:,r]||^2
+            # For U[a,r]: U[a,r] = sum_{b,c} T[a,b,c] V[b,r] W[c,r] / sum_{b,c} V[b,r]^2 W[c,r]^2
+            # This isn't quite right for ALS. Let me use the proper formulation.
+            
+            # Better: Fix V and W, solve for U:
+            # T[:, :, :] = sum_r U[:,r] outer(V[:,r], W[:,r])
+            # For each (a, b, c): T[a,b,c] = sum_r U[a,r] V[b,r] W[c,r]
+            # Fix V,W: U[a,r] = sum_{b,c} T[a,b,c] V[b,r] W[c,r] / sum_{b,c} V[b,r]^2 W[c,r]^2
+            # This is correct for the linear system.
+            
+            # Update U
+            for r in range(rank):
+                # U[:,r] = (V[:,r] outer W[:,r])^T * T / ||V[:,r] outer W[:,r]||^2
+                # More efficiently:
+                VW = np.outer(V[:, r], W[:, r])  # (dim_b, dim_c)
+                # U[a,r] = sum_{b,c} T[a,b,c] * VW[b,c] / sum_{b,c} VW[b,c]^2
+                denom = np.sum(VW ** 2)
+                if denom < 1e-12:
+                    continue
+                # U[:,r] = einsum('abc,bc->a', T, VW) / denom
+                U[:, r] = np.einsum('abc,bc->a', T, VW) / denom
+            
+            # Update V similarly
+            for r in range(rank):
+                UW = np.outer(U[:, r], W[:, r])  # (dim_a, dim_c)
+                denom = np.sum(UW ** 2)
+                if denom < 1e-12:
+                    continue
+                V[:, r] = np.einsum('abc,ac->b', T, UW) / denom
+            
+            # Update W similarly
+            for r in range(rank):
+                UV = np.outer(U[:, r], V[:, r])  # (dim_a, dim_b)
+                denom = np.sum(UV ** 2)
+                if denom < 1e-12:
+                    continue
+                W[:, r] = np.einsum('abc,ab->c', T, UV) / denom
+            
+            # Check convergence
+            T_rec = np.einsum('ar,br,cr->abc', U, V, W)
+            residual = np.linalg.norm(T_rec - T)
+            if residual < 1e-10:
+                # Verify exactly
+                if np.allclose(T_rec, T, atol=1e-10):
+                    return U, V, W
+        
+        # Check final residual
+        T_rec = np.einsum('ar,br,cr->abc', U, V, W)
+        if np.allclose(T_rec, T, atol=1e-10):
+            return U, V, W
+    
+    return None
+
+def _schoolbook_decomposition():
+    """Fallback rank-28 schoolbook decomposition."""
+    n, m, p = 2, 2, 7
+    rank = 28
+    U = np.zeros((n*m, rank))
+    V = np.zeros((m*p, rank))
+    W = np.zeros((p*n, rank))
+    idx = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i*m + j, idx] = 1
+                V[j*p + k, idx] = 1
+                W[k*n + i, idx] = 1
+                idx += 1
+    return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}
+
+def _strassen_block_decomposition():
+    """Rank-25 Strassen block decomposition."""
+    n, m, p = 2, 2, 7
+    rank = 25
+    
+    U = np.zeros((n*m, rank))
+    V = np.zeros((m*p, rank))
+    W = np.zeros((p*n, rank))
+    
+    def add_strassen(col_start, k_start):
+        U[0, col_start+0] += 1
+        U[3, col_start+0] += 1
+        V[7*0 + k_start, col_start+0] += 1
+        V[7*1 + (k_start+1), col_start+0] += 1
+        W[2*k_start + 0, col_start+0] += 1
+        W[2*(k_start+1) + 1, col_start+0] += 1
+
+        U[2, col_start+1] += 1
+        U[3, col_start+1] += 1
+        V[7*0 + k_start, col_start+1] += 1
+        W[2*k_start + 1, col_start+1] += 1
+        W[2*(k_start+1) + 1, col_start+1] -= 1
+
+        U[0, col_start+2] += 1
+        V[7*0 + (k_start+1), col_start+2] += 1
+        V[7*1 + (k_start+1), col_start+2] -= 1
+        W[2*(k_start+1) + 0, col_start+2] += 1
+        W[2*(k_start+1) + 1, col_start+2] += 1
+
+        U[3, col_start+3] += 1
+        V[7*1 + k_start, col_start+3] += 1
+        V[7*0 + k_start, col_start+3] -= 1
+        W[2*k_start + 0, col_start+3] += 1
+        W[2*k_start + 1, col_start+3] += 1
+
+        U[0, col_start+4] += 1
+        U[1, col_start+4] += 1
+        V[7*1 + (k_start+1), col_start+4] += 1
+        W[2*k_start + 0, col_start+4] -= 1
+        W[2*(k_start+1) + 0, col_start+4] += 1
+
+        U[2, col_start+5] += 1
+        U[0, col_start+5] -= 1
+        V[7*0 + k_start, col_start+5] += 1
+        V[7*0 + (k_start+1), col_start+5] += 1
+        W[2*(k_start+1) + 1, col_start+5] += 1
+
+        U[1, col_start+6] += 1
+        U[3, col_start+6] -= 1
+        V[7*1 + k_start, col_start+6] += 1
+        V[7*1 + (k_start+1), col_start+6] += 1
+        W[2*k_start + 0, col_start+6] += 1
+        
+    add_strassen(0, 0)
+    add_strassen(7, 2)
+    add_strassen(14, 4)
+    
+    col_start = 21
+    U[0, col_start+0] += 1
+    V[7*0 + 6, col_start+0] += 1
+    W[2*6 + 0, col_start+0] += 1
+    
+    U[1, col_start+1] += 1
+    V[7*1 + 6, col_start+1] += 1
+    W[2*6 + 0, col_start+1] += 1
+    
+    U[2, col_start+2] += 1
+    V[7*0 + 6, col_start+2] += 1
+    W[2*6 + 1, col_start+2] += 1
+    
+    U[3, col_start+3] += 1
+    V[7*1 + 6, col_start+3] += 1
+    W[2*6 + 1, col_start+3] += 1
+    
+    return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}
+
+def construct():
+    """
+    Search for a minimal-rank exact tensor decomposition for 2x2 * 2x7.
+    Structural approach: numerical tensor decomposition search (ALS) to find
+    rank < 25 solutions, falling back to known rank-25 or rank-28.
+    """
+    if _time_remaining() < 10.0:
+        return _strassen_block_decomposition()
+    
+    T = _build_target_tensor()
+    
+    # Try ranks from 14 upward (14 is the trivial lower bound)
+    # Start from lower ranks to find the minimum
+    best_result = _strassen_block_decomposition()
+    best_rank = 25
+    
+    # Time budget for search
+    search_start = time.time()
+    max_search_time = _time_remaining() - 15.0  # Leave 15s buffer
+    
+    # Try ranks 14 through 24
+    for rank in range(14, 25):
+        if time.time() - search_start > max_search_time:
+            break
+        if rank >= best_rank:
+            break
+        
+        # Allocate time per rank attempt
+        time_per_rank = max(1.0, max_search_time / (25 - rank))
+        
+        result = _search_rank(T, rank, time_limit=time_per_rank)
+        if result is not None:
+            U, V, W = result
+            # Verify
+            T_rec = np.einsum('ar,br,cr->abc', U, V, W)
+            if np.allclose(T_rec, T, atol=1e-10):
+                best_rank = rank
+                best_result = {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}
+                break  # Found the minimum, stop
+    
+    return best_result
+
+if __name__ == "__main__":
+    res = construct()
+    U = np.array(res['U'])
+    V = np.array(res['V'])
+    W = np.array(res['W'])
+    
+    A = np.random.rand(2, 2)
+    B = np.random.rand(2, 7)
+    C_expected = A @ B
+    
+    C_W = np.zeros(14)
+    for r in range(U.shape[1]):
+        SA = np.dot(U[:, r], A.flatten())
+        SB = np.dot(V[:, r], B.flatten())
+        for idx in range(14):
+            C_W[idx] += W[idx, r] * SA * SB
+            
+    C_mat = np.zeros((2,7))
+    for k in range(7):
+        for i in range(2):
+            C_mat[i, k] = C_W[2*k+i]
+            
+    if np.allclose(C_mat, C_expected):
+        print("Verification PASSED")
+    else:
+        print("Verification FAILED")
+        print(C_mat)
+        print(C_expected)

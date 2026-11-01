@@ -1,0 +1,6 @@
+def construct():
+    # Schoolbook ...
+    n, m, p = DIMENSIONS
+    rank = n * m * p
+    # ... loops ...
+    return {"U": U, "V": V, "W": W}
