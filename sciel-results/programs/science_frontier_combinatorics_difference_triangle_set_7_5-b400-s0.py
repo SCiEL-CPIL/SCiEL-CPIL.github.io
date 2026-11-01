@@ -43,9 +43,30 @@ def _global_max(rows):
     """Compute the maximum entry across all rows."""
     return max(max(row) for row in rows)
 
+def _compute_new_diffs(cand_row, old_val, pi):
+    """
+    Compute new diffs for a row after changing position pi from old_val to cand_row[pi].
+    Returns (new_diffs_set, is_valid_internal).
+    """
+    n = len(cand_row)
+    new_val = cand_row[pi]
+    
+    # Differences involving position pi
+    new_diffs = set()
+    
+    # Check all pairs
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = cand_row[j] - cand_row[i]
+            if d in new_diffs:
+                return None, False
+            new_diffs.add(d)
+    
+    return new_diffs, True
+
 def construct(n_rows, k):
     start_time = time.time()
-    deadline = start_time + 105.0  # Safety margin for 120s limit
+    deadline = start_time + 110.0  # Safety margin for 120s limit
     
     # 1. Initialization
     rows = _greedy_init(n_rows, k)
@@ -62,12 +83,12 @@ def construct(n_rows, k):
     # 2. Simulated Annealing
     current_rows = [r[:] for r in rows]
     current_val = best_val
-    T = 200.0
-    T_min = 0.5
-    cool = 0.99995
+    T = 300.0
+    T_min = 0.3
+    cool = 0.99997
     
     no_improve = 0
-    max_no_improve = 30000
+    max_no_improve = 25000
     steps = 0
     
     # Precompute row diffs for each row
@@ -87,22 +108,22 @@ def construct(n_rows, k):
         
         # Decreasing candidates - try more of these
         min_allowed = current_rows[ri][pi - 1] + 1
-        max_decrease = min(50, old_val - min_allowed)
+        max_decrease = min(60, old_val - min_allowed)
         for d in range(1, max_decrease + 1):
             new_v = old_val - d
             candidates.append(new_v)
             
         # Increasing candidates (for exploration) - fewer
-        max_allowed = (current_rows[ri][pi + 1] - 1) if pi < k else current_val + 30
-        max_increase = min(15, max_allowed - old_val)
+        max_allowed = (current_rows[ri][pi + 1] - 1) if pi < k else current_val + 40
+        max_increase = min(20, max_allowed - old_val)
         for d in range(1, max_increase + 1):
             new_v = old_val + d
             candidates.append(new_v)
             
         # Random jump (large perturbation)
-        if random.random() < 0.15:
+        if random.random() < 0.2:
             low = current_rows[ri][pi - 1] + 1
-            high = (current_rows[ri][pi + 1] - 1) if pi < k else current_val + 20
+            high = (current_rows[ri][pi + 1] - 1) if pi < k else current_val + 30
             if low <= high:
                 candidates.append(random.randint(low, high))
         
@@ -126,18 +147,7 @@ def construct(n_rows, k):
             cand_row[pi] = new_val
             
             # Calculate new diffs for this row efficiently
-            n = len(cand_row)
-            new_diffs = set()
-            valid_internal = True
-            for i in range(n):
-                for j in range(i + 1, n):
-                    d = cand_row[j] - cand_row[i]
-                    if d in new_diffs:
-                        valid_internal = False
-                        break
-                    new_diffs.add(d)
-                if not valid_internal:
-                    break
+            new_diffs, valid_internal = _compute_new_diffs(cand_row, old_val, pi)
             
             if not valid_internal:
                 continue
@@ -170,7 +180,7 @@ def construct(n_rows, k):
             if delta < 0:
                 accept = True
             elif delta == 0:
-                if random.random() < 0.2:  # Allow some neutral moves to shuffle
+                if random.random() < 0.3:  # Allow some neutral moves to shuffle
                     accept = True
             else:
                 # Accept worse moves with probability
@@ -204,22 +214,22 @@ def construct(n_rows, k):
         T = max(T_min, T * cool)
         
         # Periodic restart if stuck
-        if no_improve > 15000:
+        if no_improve > 12000:
             current_rows = [r[:] for r in best_rows]
             current_val = best_val
             all_used = _compute_all_used(current_rows)
             row_diffs = [_row_diffs_set(r) for r in current_rows]
             row_maxes = [max(r) for r in current_rows]
-            T = 200.0
+            T = 300.0
             no_improve = 0
     
     # 3. Final polishing phase with tighter tolerance
-    polish_deadline = min(deadline, start_time + 108.0)
-    T = 1.0
-    T_min = 0.1
+    polish_deadline = min(deadline, start_time + 113.0)
+    T = 0.5
+    T_min = 0.05
     cool = 0.99999
     no_improve = 0
-    max_no_improve_polish = 10000
+    max_no_improve_polish = 15000
     
     # Reset state to best
     current_rows = [r[:] for r in best_rows]
@@ -237,7 +247,7 @@ def construct(n_rows, k):
         
         # Only try decreasing moves in polish phase
         min_allowed = current_rows[ri][pi - 1] + 1
-        max_decrease = min(20, old_val - min_allowed)
+        max_decrease = min(30, old_val - min_allowed)
         
         candidates = []
         for d in range(1, max_decrease + 1):
@@ -260,18 +270,7 @@ def construct(n_rows, k):
             cand_row = current_rows[ri][:]
             cand_row[pi] = new_val
             
-            n = len(cand_row)
-            new_diffs = set()
-            valid_internal = True
-            for i in range(n):
-                for j in range(i + 1, n):
-                    d = cand_row[j] - cand_row[i]
-                    if d in new_diffs:
-                        valid_internal = False
-                        break
-                    new_diffs.add(d)
-                if not valid_internal:
-                    break
+            new_diffs, valid_internal = _compute_new_diffs(cand_row, old_val, pi)
             
             if not valid_internal:
                 continue
@@ -299,11 +298,11 @@ def construct(n_rows, k):
             if delta < 0:
                 accept = True
             elif delta == 0:
-                if random.random() < 0.1:
+                if random.random() < 0.15:
                     accept = True
             else:
                 if T > T_min:
-                    prob = math.exp(-delta / max(T, 0.05))
+                    prob = math.exp(-delta / max(T, 0.02))
                     if random.random() < prob:
                         accept = True
             
