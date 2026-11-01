@@ -1,0 +1,109 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+DIMENSIONS = [2, 5, 5]
+
+# EVOLVE-BLOCK-START
+import time
+import numpy as np
+from scipy.optimize import minimize
+
+def construct():
+    n, m, p = 2, 5, 5
+    start_time = time.time()
+    deadline = start_time + 110
+    
+    # Build the tensor T
+    # T[a, b, c] where a=i*m+j, b=j*p+k, c=k*n+i
+    T = np.zeros((n*m, m*p, p*n))
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                T[i*m + j, j*p + k, k*n + i] = 1.0
+    
+    # Schoolbook fallback
+    def make_schoolbook():
+        rank = n * m * p
+        U = np.zeros((n * m, rank))
+        V = np.zeros((m * p, rank))
+        W = np.zeros((p * n, rank))
+        col = 0
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    U[i * m + j, col] = 1
+                    V[j * p + k, col] = 1
+                    W[k * n + i, col] = 1
+                    col += 1
+        return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}
+
+    best_result = make_schoolbook()
+    best_rank = n * m * p
+
+    def try_rank(r, seeds=5):
+        if time.time() > deadline - 10:
+            return None
+            
+        # Define objective and gradient for this rank r
+        def objective(x):
+            U = x[:n*m*r].reshape(n*m, r)
+            V = x[n*m*r : n*m*r + m*p*r].reshape(m*p, r)
+            W = x[n*m*r + m*p*r :].reshape(p*n, r)
+            Rec = np.einsum('ik,jk,lk->ijl', U, V, W)
+            Res = T - Rec
+            return np.sum(Res * Res)
+
+        def gradient(x):
+            U = x[:n*m*r].reshape(n*m, r)
+            V = x[n*m*r : n*m*r + m*p*r].reshape(m*p, r)
+            W = x[n*m*r + m*p*r :].reshape(p*n, r)
+            Rec = np.einsum('ik,jk,lk->ijl', U, V, W)
+            Res = T - Rec
+            Grad_U = np.einsum('ijl,jc,lc->ic', Res, V, W)
+            Grad_V = np.einsum('ijl,ic,lc->jc', Res, U, W)
+            Grad_W = np.einsum('ijl,ic,jc->lc', Res, U, V)
+            return np.concatenate([Grad_U.flatten(), Grad_V.flatten(), Grad_W.flatten()])
+
+        for seed in range(seeds):
+            if time.time() > deadline - 10:
+                return None
+                
+            np.random.seed(1000 + r * 100 + seed)
+            x0 = np.random.randn(n*m*r + m*p*r + p*n*r)
+            
+            try:
+                res = minimize(objective, x0, jac=gradient, method='L-BFGS-B', 
+                               options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-12})
+                
+                if res.fun < 1e-8:
+                    x_opt = res.x
+                    U = x_opt[:n*m*r].reshape(n*m, r)
+                    V = x_opt[n*m*r : n*m*r + m*p*r].reshape(m*p, r)
+                    W = x_opt[n*m*r + m*p*r :].reshape(p*n, r)
+                    
+                    # Snap to half-integers
+                    U_snap = np.round(U * 2) / 2
+                    V_snap = np.round(V * 2) / 2
+                    W_snap = np.round(W * 2) / 2
+                    
+                    Rec_snap = np.einsum('ik,jk,lk->ijl', U_snap, V_snap, W_snap)
+                    err_snap = np.linalg.norm(T - Rec_snap)
+                    
+                    if err_snap < 1e-6:
+                        return {
+                            "U": U_snap.tolist(),
+                            "V": V_snap.tolist(),
+                            "W": W_snap.tolist()
+                        }
+            except Exception:
+                pass
+                
+        return None
+
+    # Search for lower ranks
+    for r in range(49, 39, -1):
+        res = try_rank(r)
+        if res is not None:
+            best_result = res
+            best_rank = r
+            
+    return best_result
+# EVOLVE-BLOCK-END

@@ -8,8 +8,8 @@ N = 12
 # EVOLVE-BLOCK-START
 def construct():
     start_time = time.time()
-    deadline = start_time + 140.0  # 10s safety margin
-    
+    deadline = start_time + 145.0  # 5s safety margin before 150s kill
+
     def hexagon_vertices(cx, cy, side, angle_deg):
         angle_rad = np.radians(angle_deg)
         angles = angle_rad + np.radians(np.arange(0, 360, 60))
@@ -42,6 +42,7 @@ def construct():
         """
         Check if two convex polygons are disjoint using Separating Axis Theorem.
         v1, v2: Nx2 arrays of vertices.
+        Returns True if disjoint, False if overlapping.
         """
         axes = []
         for i in range(len(v1)):
@@ -49,16 +50,18 @@ def construct():
             p2 = v1[(i + 1) % len(v1)]
             edge = p2 - p1
             normal = np.array([-edge[1], edge[0]])
-            if np.linalg.norm(normal) > 1e-9:
-                axes.append(normal / np.linalg.norm(normal))
+            norm = np.linalg.norm(normal)
+            if norm > 1e-9:
+                axes.append(normal / norm)
         
         for i in range(len(v2)):
             p1 = v2[i]
             p2 = v2[(i + 1) % len(v2)]
             edge = p2 - p1
             normal = np.array([-edge[1], edge[0]])
-            if np.linalg.norm(normal) > 1e-9:
-                axes.append(normal / np.linalg.norm(normal))
+            norm = np.linalg.norm(normal)
+            if norm > 1e-9:
+                axes.append(normal / norm)
         
         for axis in axes:
             proj1 = np.dot(v1, axis)
@@ -66,15 +69,9 @@ def construct():
             min1, max1 = np.min(proj1), np.max(proj1)
             min2, max2 = np.min(proj2), np.max(proj2)
             
-            # Check for gap
             if max1 < min2 - 1e-9 or max2 < min1 - 1e-9:
                 return True
         return False
-
-    def hexagons_disjoint(v1, s1, a1, v2, s2, a2):
-        verts1 = hexagon_vertices(v1[0], v1[1], s1, a1)
-        verts2 = hexagon_vertices(v2[0], v2[1], s2, a2)
-        return polygons_disjoint_sat(verts1, verts2)
 
     def all_inside_outer(inner_positions, outer_center, outer_side, outer_angle):
         for i in range(len(inner_positions)):
@@ -92,9 +89,14 @@ def construct():
                 cj = (inner_positions[j][0], inner_positions[j][1])
                 ai = inner_positions[i][2]
                 aj = inner_positions[j][2]
-                if not hexagons_disjoint(ci, 1.0, ai, cj, 1.0, aj):
+                v1 = hexagon_vertices(ci[0], ci[1], 1.0, ai)
+                v2 = hexagon_vertices(cj[0], cj[1], 1.0, aj)
+                if not polygons_disjoint_sat(v1, v2):
                     return False
         return True
+
+    def is_valid(inner, oc, os, oa):
+        return all_inside_outer(inner, oc, os, oa) and pairwise_disjoint(inner)
 
     def objective(params):
         n_inner = N
@@ -107,11 +109,11 @@ def construct():
         
         ox = params[3*n_inner]
         oy = params[3*n_inner+1]
-        os = params[3*n_inner+2]
+        os = max(params[3*n_inner+2], 0.1)
         oa = params[3*n_inner+3]
         
         outer_center = (ox, oy)
-        outer_side = max(os, 0.1)
+        outer_side = os
         outer_angle = oa
         
         inside_ok = all_inside_outer(inner_positions, outer_center, outer_side, outer_angle)
@@ -122,7 +124,6 @@ def construct():
         
         penalty = 0.0
         if not inside_ok:
-            # Calculate how much is outside
             for i in range(n_inner):
                 cx, cy, angle = inner_positions[i]
                 verts = hexagon_vertices(cx, cy, 1.0, angle)
@@ -136,97 +137,141 @@ def construct():
                     cj = (inner_positions[j][0], inner_positions[j][1])
                     ai = inner_positions[i][2]
                     aj = inner_positions[j][2]
-                    if not hexagons_disjoint(ci, 1.0, ai, cj, 1.0, aj):
+                    v1 = hexagon_vertices(ci[0], ci[1], 1.0, ai)
+                    v2 = hexagon_vertices(cj[0], cj[1], 1.0, aj)
+                    if not polygons_disjoint_sat(v1, v2):
                         penalty += 1.0
                         
         return outer_side + penalty * 10.0
 
-    # Initial valid configuration: Grid
-    # Spacing x: 2.1 (safe for width 2.0)
-    # Spacing y: 1.8 (safe for height 1.732)
-    # 4 cols, 3 rows
-    initial_positions = []
+    def make_params(inner, oc, os, oa):
+        params = []
+        for pos in inner:
+            params.extend([pos[0], pos[1], pos[2]])
+        params.extend([oc[0], oc[1], os, oa])
+        return np.array(params, dtype=float)
+
+    def parse_params(params):
+        inner = []
+        for i in range(N):
+            inner.append((params[3*i], params[3*i+1], params[3*i+2]))
+        oc = (params[3*N], params[3*N+1])
+        os = params[3*N+2]
+        oa = params[3*N+3]
+        return inner, oc, os, oa
+
+    # Try multiple initial configurations
+    initial_configs = []
+    
+    # Config 1: 4x3 grid (current)
     x_coords = [-3.0, -1.0, 1.0, 3.0]
     y_coords = [-1.8, 0.0, 1.8]
-    
+    config1 = []
     for y in y_coords:
         for x in x_coords:
-            initial_positions.append([x, y, 0.0])
-            
-    # Outer hexagon
-    # Bounding box approx: x [-4.1, 4.1], y [-3.06, 3.06]
-    # Try outer side 5.0, angle 30 deg (flat top)
-    outer_side_init = 5.0
-    outer_center_init = [0.0, 0.0]
-    outer_angle_init = 30.0
+            config1.append([x, y, 0.0])
+    initial_configs.append((config1, [0.0, 0.0], 5.0, 30.0))
     
-    params = []
-    for pos in initial_positions:
-        params.extend([pos[0], pos[1], pos[2]])
-    params.extend([outer_center_init[0], outer_center_init[1], outer_side_init, outer_angle_init])
+    # Config 2: Hexagonal lattice - 1 center + 6 ring + 5 more
+    # Center at origin
+    config2 = [[0.0, 0.0, 0.0]]
+    # Ring of 6 at distance ~2.0
+    for k in range(6):
+        angle = np.radians(60 * k)
+        config2.append([2.0 * np.cos(angle), 2.0 * np.sin(angle), 0.0])
+    # Add 5 more in second ring
+    for k in range(5):
+        angle = np.radians(60 * k + 30)
+        config2.append([3.5 * np.cos(angle), 3.5 * np.sin(angle), 0.0])
+    initial_configs.append((config2, [0.0, 0.0], 5.5, 30.0))
     
-    # Verify initial is valid
-    inner_init = [(p[0], p[1], p[2]) for p in initial_positions]
-    if not (all_inside_outer(inner_init, outer_center_init, outer_side_init, outer_angle_init) and pairwise_disjoint(inner_init)):
-        # If invalid, expand outer
-        outer_side_init = 6.0
-        params[3*N+2] = outer_side_init
-        inner_init = [(p[0], p[1], p[2]) for p in initial_positions]
-        if not (all_inside_outer(inner_init, outer_center_init, outer_side_init, outer_angle_init) and pairwise_disjoint(inner_init)):
-             # Last resort: just return this, evaluator will penalize, but we want to try optimize
-             pass
-
-    best_params = params.copy()
-    best_score = objective(params)
+    # Config 3: 2 rows of 6, staggered
+    config3 = []
+    for i in range(6):
+        config3.append([i * 2.0 - 5.0, -0.9, 0.0])
+        config3.append([i * 2.0 - 4.0, 0.9, 0.0])
+    initial_configs.append((config3, [0.0, 0.0], 6.0, 30.0))
     
-    # Optimize
-    if time.time() < deadline - 10:
+    # Find best initial config
+    best_params = None
+    best_score = float('inf')
+    
+    for config, oc_init, os_init, oa_init in initial_configs:
+        params = make_params(config, oc_init, os_init, oa_init)
+        inner_init = [(p[0], p[1], p[2]) for p in config]
+        
+        # Ensure validity by expanding if needed
+        os_try = os_init
+        while not all_inside_outer(inner_init, oc_init, os_try, oa_init):
+            os_try += 0.1
+            if os_try > 10:
+                break
+        params = make_params(config, oc_init, os_try, oa_init)
+        
+        score = objective(params)
+        if score < best_score:
+            best_score = score
+            best_params = params
+    
+    # Optimization with multiple restarts
+    np.random.seed(42)
+    attempts = 0
+    max_attempts = 8
+    
+    while time.time() < deadline - 15 and attempts < max_attempts:
+        # Create perturbed start
+        if attempts == 0:
+            current_params = best_params.copy()
+        else:
+            noise = np.random.uniform(-0.3, 0.3, size=len(best_params))
+            current_params = best_params + noise
+            # Keep outer side reasonable
+            if current_params[3*N+2] < 4.0:
+                current_params[3*N+2] = 4.0
+        
         try:
-            # Use Nelder-Mead with adaptive
-            res = minimize(objective, params, method='Nelder-Mead', options={'maxiter': 500, 'xatol': 0.01, 'fatol': 0.01, 'adaptive': True})
+            # Use Nelder-Mead for robustness
+            res = minimize(objective, current_params, method='Nelder-Mead', 
+                           options={'maxiter': 200, 'xatol': 0.01, 'fatol': 0.01, 'adaptive': True})
             if res.fun < best_score:
                 best_score = res.fun
-                best_params = res.x
+                best_params = res.x.copy()
         except Exception:
             pass
-            
-    # Second round if time permits
-    if time.time() < deadline - 5:
+        attempts += 1
+        
+        # Early termination if good solution found
+        if best_score < 4.2:
+            break
+
+    # Final refinement if we have time
+    if time.time() < deadline - 5 and best_score < 4.5:
         try:
-            res2 = minimize(objective, best_params, method='Nelder-Mead', options={'maxiter': 200, 'xatol': 0.005, 'fatol': 0.005, 'adaptive': True})
+            res2 = minimize(objective, best_params, method='Nelder-Mead', 
+                           options={'maxiter': 150, 'xatol': 0.005, 'fatol': 0.005, 'adaptive': True})
             if res2.fun < best_score:
                 best_score = res2.fun
-                best_params = res2.x
+                best_params = res2.x.copy()
         except Exception:
             pass
 
     final_params = best_params
+    inner, oc, os, oa = parse_params(final_params)
     
-    inner = []
-    for i in range(N):
-        x = final_params[3*i]
-        y = final_params[3*i+1]
-        a = final_params[3*i+2]
-        inner.append([x, y, a])
-    
-    ox = final_params[3*N]
-    oy = final_params[3*N+1]
-    os = max(final_params[3*N+2], 0.1)
-    oa = final_params[3*N+3]
-    
-    # Final validation check
-    if not (all_inside_outer(inner, (ox, oy), os, oa) and pairwise_disjoint(inner)):
-        # Fallback to initial valid guess
-        inner = [[p[0], p[1], p[2]] for p in initial_positions]
-        ox, oy = outer_center_init
-        os = outer_side_init
-        oa = outer_angle_init
-        # Ensure this fallback is actually valid, if not, expand os
-        if not (all_inside_outer(inner, (ox, oy), os, oa) and pairwise_disjoint(inner)):
-             # Brute force expand
-             while not all_inside_outer(inner, (ox, oy), os, oa):
-                 os += 0.1
-                 if os > 10: break
+    # Final validation and fallback
+    if not is_valid(inner, oc, os, oa):
+        # Use the best initial config as fallback
+        config, oc_init, os_init, oa_init = initial_configs[0]
+        inner = [(p[0], p[1], p[2]) for p in config]
+        oc = tuple(oc_init)
+        os = os_init
+        oa = oa_init
+        
+        # Expand if needed
+        while not all_inside_outer(inner, oc, os, oa):
+            os += 0.1
+            if os > 10:
+                break
 
-    return inner, (ox, oy), os, oa
+    return inner, oc, os, oa
 # EVOLVE-BLOCK-END
