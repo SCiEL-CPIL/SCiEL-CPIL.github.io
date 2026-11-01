@@ -9,364 +9,273 @@ N = 50
 import numpy as np
 import time
 import scipy.optimize as opt
-from scipy.spatial import cKDTree
 
 N = 50
 
 def _compute_radius(centers):
     """
     Compute the true maximum radius for a given configuration.
-    Returns (radius, min_dist_idx) where min_dist_idx is the index of the pair
-    or wall constraint that is tightest (for debugging, not strictly needed for score).
     """
-    n = len(centers)
-    # Wall distances
-    wall_dists = np.min(np.column_stack((
-        0.5 - np.abs(centers[:, 0]),
-        0.5 - np.abs(centers[:, 1])
-    )), axis=1)
-    min_wall = np.min(wall_dists)
+    wall_dists_x = 0.5 - np.abs(centers[:, 0])
+    wall_dists_y = 0.5 - np.abs(centers[:, 1])
+    min_wall = np.min(np.minimum(wall_dists_x, wall_dists_y))
     
-    # Pairwise distances
-    # For N=50, O(N^2) is fine, but let's use a simple loop or vectorized
-    # Vectorized:
     diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
     dists = np.sqrt(np.sum(diff**2, axis=2))
-    # Set diagonal to inf to ignore self
     np.fill_diagonal(dists, np.inf)
     min_pair = np.min(dists) / 2.0
     
     return min(min_pair, min_wall)
 
-def _objective_and_grad(x, r_target=None, penalty_weight=100.0):
+def _violation(centers, r):
     """
-    Objective function for optimization.
-    We want to maximize the minimum distance.
-    A common technique is to minimize the sum of violations of a target radius,
-    or use a soft-min.
-    
-    Here we use a direct approach:
-    If r_target is None, we maximize the minimum distance (minimize negative soft-min).
-    If r_target is given, we minimize the overlap violations (distance < 2*r_target)
-    and wall violations (dist to wall < r_target).
-    
-    Let's stick to a robust approach:
-    Minimize: sum( max(0, 2*r - dist_ij)^2 ) + sum( max(0, r - wall_dist_i)^2 )
-    This is a smooth function if we use softplus or just squared hinge.
-    But we don't know r.
-    
-    Alternative:
-    Maximize the minimum distance.
-    Let's use the soft-min of all constraints (pair dists and wall dists).
-    soft_min = -1/beta * log(sum(exp(-beta * v)))
-    We minimize -soft_min.
+    Compute total violation for radius r.
+    Violation = sum of max(0, r - d/2) for pairs + sum of max(0, r - wall_dist) for walls.
+    Lower is better. Zero means feasible.
     """
-    centers = x.reshape(N, 2)
+    centers = np.asarray(centers)
+    n = len(centers)
     
-    # Wall distances
-    wall_dists = np.column_stack((
-        0.5 - np.abs(centers[:, 0]),
-        0.5 - np.abs(centers[:, 1])
-    ))
-    
-    # Pairwise distances
-    # Efficient computation for N=50
-    # diff (N, N, 2)
+    # Pairwise violations
     diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
     dists = np.sqrt(np.sum(diff**2, axis=2))
-    iu = np.triu_indices(N, k=1)
-    pair_dists = dists[iu]
+    np.fill_diagonal(dists, np.inf)
     
-    all_vals = np.concatenate([pair_dists, wall_dists.ravel()])
+    pair_violation = np.sum(np.maximum(0, r - dists / 2.0))
     
-    # Soft min
-    # To avoid overflow, shift by min
-    min_val = np.min(all_vals)
-    # We want to maximize min_val.
-    # So we minimize -min_val.
-    # Using soft min:
-    beta = 50.0
-    shifted = -beta * (all_vals - min_val)
-    sum_exp = np.sum(np.exp(shifted))
-    if sum_exp == 0:
-        sm = min_val
-    else:
-        sm = min_val - (1.0 / beta) * np.log(sum_exp)
+    # Wall violations
+    wall_dists_x = 0.5 - np.abs(centers[:, 0])
+    wall_dists_y = 0.5 - np.abs(centers[:, 1])
+    wall_dists = np.minimum(wall_dists_x, wall_dists_y)
+    wall_violation = np.sum(np.maximum(0, r - wall_dists))
     
-    val = -sm
-    
-    # Gradient is hard to compute analytically for soft-min easily in this form.
-    # L-BFGS-B can use numerical gradients, but it's slow.
-    # Let's try to provide an analytical gradient or use a different method.
-    
-    # Actually, let's use a different objective that is easier to differentiate.
-    # Minimize the sum of squared violations of a lower bound?
-    # Or simply minimize the sum of distances? No.
-    
-    # Let's try to return just the value and let L-BFGS-B use numerical gradients.
-    # For N=50, 100 variables. Numerical gradient requires 200 evaluations.
-    # Each evaluation is O(N^2) = 2500 ops.
-    # 200 * 2500 = 500,000 ops per gradient step.
-    # L-BFGS-B might take 100-500 steps.
-    # 500 * 500,000 = 250,000,000 ops.
-    # This might be too slow in Python/NumPy if not optimized.
-    
-    # Let's try to optimize the distance computation.
-    # Or use a different optimizer like SLSQP with analytic gradient?
-    # Or use Nelder-Mead? No, too slow.
-    
-    # Let's try to implement the gradient for the soft-min.
-    # f(x) = -soft_min(v(x))
-    # soft_min(v) = m - 1/beta * log(sum(exp(-beta*(v_i - m)))) where m = min(v)
-    # This is not differentiable at the minimum.
-    
-    # Alternative: Use a "max-min" formulation via binary search on r.
-    # Check if there exists a configuration with radius >= r.
-    # This is a feasibility problem.
-    # Constraints: dist_ij >= 2r, wall_dist_i >= r.
-    # We can minimize the violation:
-    # V(x) = sum( max(0, 2r - dist_ij)^2 ) + sum( max(0, r - wall_dist_i)^2 )
-    # If V(x) == 0, then r is achievable.
-    # We can binary search on r.
-    # For each r, we run L-BFGS-B to minimize V(x).
-    # The gradient of V(x) is easy to compute.
-    
-    return val
+    return pair_violation + wall_violation
 
-def _violation_objective(x, r, beta=100.0):
+def _grad_violation(centers, r):
     """
-    Minimize violation of radius r.
-    V(x) = sum( max(0, 2r - dist_ij)^2 ) + sum( max(0, r - wall_dist_i)^2 )
-    We use a soft version to make it differentiable:
-    max(0, u)^2 approx by u^2 / (1 + exp(-beta*u)) or similar?
-    Or just use the hard version and let the optimizer handle the kink?
-    L-BFGS-B might struggle with non-smoothness.
-    
-    Let's use a smooth approximation:
-    h(u) = u^2 if u > 0, 0 otherwise.
-    Smooth: h(u) = 0.5 * u * (u + softplus(u, beta)) ? No.
-    Simple smooth max: m(u) = 0.5 * (u + sqrt(u^2 + eps))
-    Then m(u)^2.
-    
-    Let's try m(u) = u / (1 + exp(-beta*u)) * beta? No.
-    
-    Let's just use the hard version first and see if L-BFGS-B works.
-    If not, we can switch to SLSQP or COBYLA.
+    Compute gradient of violation with respect to centers.
     """
-    centers = x.reshape(N, 2)
-    
-    # Wall distances
-    wall_dists = np.column_stack((
-        0.5 - np.abs(centers[:, 0]),
-        0.5 - np.abs(centers[:, 1])
-    ))
-    wall_viol = np.maximum(0, r - wall_dists)
-    wall_cost = np.sum(wall_viol**2)
-    
-    # Pairwise distances
-    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-    dists = np.sqrt(np.sum(diff**2, axis=2))
-    iu = np.triu_indices(N, k=1)
-    pair_dists = dists[iu]
-    
-    pair_viol = np.maximum(0, 2*r - pair_dists)
-    pair_cost = np.sum(pair_viol**2)
-    
-    return pair_cost + wall_cost
-
-def _violation_grad(x, r):
-    """
-    Gradient of the violation objective.
-    """
-    centers = x.reshape(N, 2)
+    centers = np.asarray(centers)
+    n = len(centers)
     grad = np.zeros_like(centers)
     
-    # Wall gradient
-    wall_dists = np.column_stack((
-        0.5 - np.abs(centers[:, 0]),
-        0.5 - np.abs(centers[:, 1])
-    ))
-    wall_viol = np.maximum(0, r - wall_dists)
-    
-    # d/dx (max(0, r - w(x))^2) = 2 * max(0, r-w) * (-dw/dx)
-    # w_x = 0.5 - |x|
-    # dw/dx = -sign(x)
-    # So -dw/dx = sign(x)
-    
-    # For x coord:
-    sign_x = np.sign(centers[:, 0])
-    sign_y = np.sign(centers[:, 1])
-    
-    # Wall dist x: 0.5 - |x|
-    # If x > 0, w = 0.5 - x, dw/dx = -1. -dw/dx = 1.
-    # If x < 0, w = 0.5 + x, dw/dx = 1. -dw/dx = -1.
-    # So -dw/dx = sign(x)
-    
-    grad[:, 0] += 2 * wall_viol[:, 0] * sign_x
-    grad[:, 1] += 2 * wall_viol[:, 1] * sign_y
-    
-    # Pair gradient
+    # Pairwise gradients
     diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
     dists = np.sqrt(np.sum(diff**2, axis=2))
-    np.fill_diagonal(dists, 1.0) # Avoid division by zero
+    np.fill_diagonal(dists, np.inf)
     
-    iu = np.triu_indices(N, k=1)
-    pair_dists = dists[iu]
-    pair_viol = np.maximum(0, 2*r - pair_dists)
+    # For each pair (i,j) where dist/2 < r, add gradient
+    # d/dr max(0, r - d/2) = 1 if d/2 < r else 0
+    # d/dx_i max(0, r - d/2) = -0.5 * (x_i - x_j)/d * (1 if d/2 < r)
     
-    # d/dx_i (max(0, 2r - d_ij)^2) = 2 * max(0, 2r-d_ij) * (-d(d_ij)/dx_i)
-    # d_ij = ||x_i - x_j||
-    # d(d_ij)/dx_i = (x_i - x_j) / d_ij
+    active = dists / 2.0 < r
+    active[~np.eye(n, dtype=bool)] = active[~np.eye(n, dtype=bool)]
     
-    # We need to accumulate gradients for each i and j.
-    # For each pair (i, j):
-    # grad_i += 2 * viol_ij * (-(x_i - x_j)/d_ij)
-    # grad_j += 2 * viol_ij * ((x_i - x_j)/d_ij)
+    # Only consider upper triangle to avoid double counting
+    for i in range(n):
+        for j in range(i+1, n):
+            if dists[i, j] / 2.0 < r:
+                d = dists[i, j]
+                if d > 1e-12:
+                    factor = 0.5 / d
+                    grad[i] -= factor * (centers[i] - centers[j])
+                    grad[j] += factor * (centers[i] - centers[j])
     
-    for k in range(len(iu[0])):
-        i, j = iu[0][k], iu[1][k]
-        viol = pair_viol[k]
-        if viol == 0:
-            continue
-        d_ij = pair_dists[k]
-        vec = centers[i] - centers[j]
-        grad_vec = vec / d_ij
-        
-        grad[i] -= 2 * viol * grad_vec
-        grad[j] += 2 * viol * grad_vec
+    # Wall gradients
+    wall_dists_x = 0.5 - np.abs(centers[:, 0])
+    wall_dists_y = 0.5 - np.abs(centers[:, 1])
     
-    return grad.flatten()
+    for i in range(n):
+        if wall_dists_x[i] < r:
+            # d/dx_i max(0, r - (0.5 - |x_i|)) = sign(x_i) if 0.5 - |x_i| < r
+            grad[i, 0] += np.sign(centers[i, 0])
+        if wall_dists_y[i] < r:
+            grad[i, 1] += np.sign(centers[i, 1])
+    
+    return grad
 
-def _construct_initial_grid():
+def _soft_min_obj(x, tau):
+    """
+    Soft-min objective: minimize -soft_min(all distances).
+    x: flattened array of 2*N coordinates
+    tau: temperature parameter for soft-min
+    """
+    centers = x.reshape(-1, 2)
+    n = len(centers)
+    
+    # Collect all relevant distances (pairwise and wall)
+    # Wall distances
+    wall_dists_x = 0.5 - np.abs(centers[:, 0])
+    wall_dists_y = 0.5 - np.abs(centers[:, 1])
+    walls = np.minimum(wall_dists_x, wall_dists_y)
+    
+    # Pairwise distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    pair_dists = dists / 2.0
+    
+    # Combine all distances
+    all_dists = np.concatenate([walls, pair_dists[np.triu_indices(n, k=1)]])
+    
+    # Soft-min: -log(sum(exp(-d/tau))) * tau
+    # This is a smooth approximation to min(all_dists)
+    min_d = np.min(all_dists)
+    # Use stable log-sum-exp
+    shifted = all_dists - min_d
+    log_sum = np.log(np.sum(np.exp(-shifted / tau)))
+    soft_min = min_d - tau * log_sum
+    
+    return -soft_min
+
+def _sa_search(centers, rng, budget_time):
+    """
+    Simulated annealing to improve packing.
+    """
+    start_time = time.time()
+    current = centers.copy()
+    current_r = _compute_radius(current)
+    best = current.copy()
+    best_r = current_r
+    
+    T_start = 0.03
+    T_end = 1e-7
+    max_steps = 1000000
+    
+    for step in range(max_steps):
+        if time.time() - start_time > budget_time:
+            break
+        
+        # Temperature schedule
+        T = T_start * (T_end / T_start) ** (step / max_steps)
+        
+        # Random perturbation
+        idx = rng.integers(0, N)
+        step_size = 0.015 * (1.0 + 0.3 * np.cos(np.pi * step / max_steps))
+        delta = rng.normal(0, step_size, 2)
+        
+        new = current.copy()
+        new[idx] += delta
+        new = np.clip(new, -0.5, 0.5)
+        
+        new_r = _compute_radius(new)
+        
+        if new_r > current_r:
+            current = new
+            current_r = new_r
+            if current_r > best_r:
+                best_r = current_r
+                best = current.copy()
+        else:
+            delta_r = new_r - current_r
+            if delta_r > -5 * T:
+                prob = np.exp(delta_r / T)
+                if rng.random() < prob:
+                    current = new
+                    current_r = new_r
+    
+    return best, best_r
+
+def _gradient_polish(centers, r_target, max_iter=500):
+    """
+    Use gradient descent to minimize violation for a target radius.
+    """
+    x = centers.flatten().copy()
+    lr = 0.005
+    
+    for i in range(max_iter):
+        if time.time() > _deadline:
+            break
+        
+        v = _violation(x.reshape(-1, 2), r_target)
+        if v < 1e-10:
+            break
+        
+        g = _grad_violation(x.reshape(-1, 2), r_target).flatten()
+        x -= lr * g
+        x = np.clip(x, -0.5, 0.5)
+    
+    return x.reshape(-1, 2)
+
+# Global deadline
+_deadline = 0.0
+
+def construct():
+    global _deadline
+    start_time = time.time()
+    _deadline = start_time + 145.0  # 5s safety margin
+    
+    # Initial grid
     m = int(np.ceil(np.sqrt(N)))
     ticks = (np.arange(m) + 0.5) / m - 0.5
     grid = np.array([(x, y) for y in ticks for x in ticks])
-    return grid[:N]
-
-def construct():
-    start_time = time.time()
-    deadline = start_time + 140.0  # 10s margin
+    best_centers = grid[:N].copy()
     
-    best_centers = _construct_initial_grid()
+    # Add small random jitter to break symmetry
+    rng = np.random.default_rng(42)
+    best_centers = best_centers + rng.normal(0, 0.01, best_centers.shape)
+    best_centers = np.clip(best_centers, -0.49, 0.49)
+    
     best_radius = _compute_radius(best_centers)
     
-    # Binary search on r
-    # Lower bound: 0
-    # Upper bound: 0.5 / sqrt(N) approx? Or just 0.5/2 = 0.25?
-    # Max possible radius is when circles are in a grid.
-    # For N=50, 7x7 grid. Spacing 1/7. Radius 1/14 ~ 0.0714.
-    # So upper bound 0.08 is safe.
+    # Phase 1: Simulated Annealing
+    remaining = _deadline - time.time()
+    sa_budget = min(80.0, remaining * 0.6)
+    best_centers, best_radius = _sa_search(best_centers, rng, sa_budget)
     
-    r_low = 0.0
-    r_high = 0.08
-    
-    # We will perform a few iterations of binary search.
-    # For each r, we try to find a configuration that satisfies the constraints.
-    # If we find one, r_low = r. Else r_high = r.
-    
-    # To speed up, we can use the previous solution as the initial guess for the next r.
-    current_centers = best_centers.copy()
-    
-    # Number of binary search steps
-    # We have ~140 seconds.
-    # Each L-BFGS-B run might take a few seconds.
-    # Let's do 10-15 steps.
-    
-    for step in range(15):
-        if time.time() > deadline - 5.0:
-            break
+    # Phase 2: Binary search on radius with violation minimization
+    remaining = _deadline - time.time()
+    if remaining > 30:
+        lo = best_radius
+        hi = 0.08  # Upper bound
+        
+        # Try to find better radius via binary search
+        for _ in range(15):
+            if time.time() > _deadline - 10:
+                break
             
-        r_mid = (r_low + r_high) / 2.0
+            mid = (lo + hi) / 2
+            # Try to find feasible configuration for radius mid
+            # Use gradient descent to minimize violation
+            trial = best_centers.copy()
+            trial = _gradient_polish(trial, mid, max_iter=200)
+            
+            trial_r = _compute_radius(trial)
+            if trial_r >= mid - 1e-9:
+                lo = mid
+                best_centers = trial
+                best_radius = trial_r
+            else:
+                hi = mid
+    
+    # Phase 3: Final polish with gradient-based optimization
+    remaining = _deadline - time.time()
+    if remaining > 15:
+        # Use soft-min objective with L-BFGS-B
+        x0 = best_centers.flatten()
         
-        # Try to optimize for this r
-        x0 = current_centers.flatten()
-        
-        bounds = [(-0.5, 0.5)] * (2 * N)
+        def obj(x):
+            return _soft_min_obj(x, 0.01)
         
         try:
-            res = opt.minimize(
-                _violation_objective,
-                x0,
-                jac=_violation_grad,
-                args=(r_mid,),
-                method='L-BFGS-B',
-                bounds=bounds,
-                options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-10}
+            result = opt.minimize(
+                obj, x0, method='L-BFGS-B',
+                bounds=[(-0.5, 0.5)] * (2 * N),
+                options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-8}
             )
-            
-            x_res = res.x
-            r_actual = _compute_radius(x_res.reshape(N, 2))
-            
-            if r_actual >= r_mid - 1e-6:
-                # Feasible
-                r_low = r_mid
-                if r_actual > best_radius:
-                    best_radius = r_actual
-                    best_centers = x_res.reshape(N, 2).copy()
-                current_centers = x_res.reshape(N, 2).copy()
-            else:
-                # Infeasible
-                r_high = r_mid
-                # Update current centers to the result of the optimization?
-                # It might be closer to feasible than the previous one.
-                # But if it's infeasible, it might have overlaps.
-                # Let's keep the previous best feasible center as the starting point
-                # for the next (lower) r.
-                # Actually, using the result of the infeasible run as a start for a lower r
-                # might be good because it's "pushed" towards the feasible region.
-                # Let's use it.
-                current_centers = x_res.reshape(N, 2).copy()
-                
-        except Exception as e:
-            # If optimization fails, break or reduce r_high
-            r_high = r_mid
-            
-    # Final polish
-    if time.time() < deadline - 2.0:
-        # Try to improve the best radius found by local search
-        # Use the soft-min approach for final polish
-        beta = 100.0
-        
-        def _soft_min_obj(x):
-            centers = x.reshape(N, 2)
-            wall_dists = np.column_stack((
-                0.5 - np.abs(centers[:, 0]),
-                0.5 - np.abs(centers[:, 1])
-            ))
-            diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
-            dists = np.sqrt(np.sum(diff**2, axis=2))
-            iu = np.triu_indices(N, k=1)
-            pair_dists = dists[iu]
-            all_vals = np.concatenate([pair_dists, wall_dists.ravel()])
-            min_val = np.min(all_vals)
-            shifted = -beta * (all_vals - min_val)
-            sum_exp = np.sum(np.exp(shifted))
-            if sum_exp == 0:
-                sm = min_val
-            else:
-                sm = min_val - (1.0 / beta) * np.log(sum_exp)
-            return -sm
-        
-        try:
-            res = opt.minimize(
-                _soft_min_obj,
-                best_centers.flatten(),
-                method='L-BFGS-B',
-                bounds=bounds,
-                options={'maxiter': 500, 'ftol': 1e-12, 'gtol': 1e-10}
-            )
-            x_res = res.x
-            r_res = _compute_radius(x_res.reshape(N, 2))
-            if r_res > best_radius:
-                best_radius = r_res
-                best_centers = x_res.reshape(N, 2).copy()
+            if result.success or result.fun < obj(x0):
+                polished = result.x.reshape(-1, 2)
+                polished = np.clip(polished, -0.5, 0.5)
+                polished_r = _compute_radius(polished)
+                if polished_r > best_radius:
+                    best_centers = polished
+                    best_radius = polished_r
         except Exception:
             pass
-            
-    # Ensure validity
-    best_centers = np.clip(best_centers, -0.5, 0.5)
+    
+    # Final check
     if not np.all(np.isfinite(best_centers)):
-        return _construct_initial_grid()
+        return grid[:N]
         
     return best_centers
 # EVOLVE-BLOCK-END

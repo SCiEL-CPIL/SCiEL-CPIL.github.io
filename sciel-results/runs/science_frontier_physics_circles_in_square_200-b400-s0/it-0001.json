@@ -1,0 +1,1 @@
+[{"v":51,"e":55,"t":"2026-11-01T11:25:22.083556+00:00","ok":false,"val":null,"sc":null,"op":"full_rewrite","req":"diff","sel":"bandit","fb":"fresh_design","mode":"base","isl":0,"par":"p26","id":null,"model":"qwen3.8-27b","opp":null,"bet":null,"q":null,"notes":null,"patch":null,"code":"26dd8ae22d6274d1215f","err":"candidate exceeded 120 s","reach":null,"conf":null,"sec":124.6}]
