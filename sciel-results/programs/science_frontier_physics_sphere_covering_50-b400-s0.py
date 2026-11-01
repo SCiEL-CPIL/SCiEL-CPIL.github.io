@@ -1,264 +1,267 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-N = 50
-
-# EVOLVE-BLOCK-START
 import numpy as np
+from scipy.spatial import ConvexHull
+from scipy.optimize import minimize
 import time
-from scipy.spatial import ConvexHull, cKDTree
+
+N = 50
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 118.0  # Safety margin for 120s limit
+    deadline = start_time + 118.0  # 2s safety margin
+
+    def compute_hull_data(p):
+        """Compute hull facets and their circumcenters/radii (vectorized)."""
+        try:
+            hull = ConvexHull(p)
+            facets = hull.simplices
+        except Exception:
+            return None, None, None
+        
+        n_facets = len(facets)
+        if n_facets == 0:
+            return None, None, None
+        
+        # Vectorized circumcenter computation
+        a = p[facets[:, 0]]  # (F, 3)
+        b = p[facets[:, 1]]
+        c = p[facets[:, 2]]
+        
+        v1 = a - b  # (F, 3)
+        v2 = b - c
+        n = np.cross(v1, v2)  # (F, 3)
+        norm_n = np.linalg.norm(n, axis=1)  # (F,)
+        
+        # Handle degenerate facets
+        valid = norm_n > 1e-12
+        circumcenters = np.zeros((n_facets, 3))
+        radii = np.zeros(n_facets)
+        
+        if np.any(valid):
+            cc = n[valid] / norm_n[valid, np.newaxis]
+            # Ensure circumcenter faces outward (toward 'a')
+            dots = np.sum(cc * a[valid], axis=1)
+            cc[dots < 0] *= -1
+            circumcenters[valid] = cc
+            
+            cos_r = np.clip(np.sum(cc * a[valid], axis=1), -1.0, 1.0)
+            radii[valid] = np.arccos(cos_r)
+        
+        return facets, circumcenters, radii
+
+    def get_max_radius(pts):
+        facets, circumcenters, radii = compute_hull_data(pts)
+        if radii is None:
+            return float('inf')
+        return np.max(radii)
+
+    def soft_max_objective(params, beta=200.0):
+        """
+        Soft-max surrogate: approximates max(radii) via log-sum-exp.
+        As beta -> inf, this approaches the true max.
+        This is smoother than sum(radii**power) for the minimax problem.
+        """
+        X = params.reshape(N, 3)
+        norms = np.linalg.norm(X, axis=1, keepdims=True)
+        norms[norms < 1e-12] = 1.0
+        X = X / norms
+        
+        facets, circumcenters, radii = compute_hull_data(X)
+        if facets is None:
+            return 1e10
+        
+        # Soft-max: (1/beta) * log(sum(exp(beta * radii)))
+        # For numerical stability, subtract max
+        r_max = np.max(radii)
+        if r_max < 1e-15:
+            return r_max
+        shifted = beta * (radii - r_max)
+        log_sum_exp = np.log(np.sum(np.exp(shifted))) / beta + r_max
+        return log_sum_exp
+
+    def power_objective(params, power=2.0):
+        """Sum of radii^power as objective."""
+        X = params.reshape(N, 3)
+        norms = np.linalg.norm(X, axis=1, keepdims=True)
+        norms[norms < 1e-12] = 1.0
+        X = X / norms
+        
+        facets, circumcenters, radii = compute_hull_data(X)
+        if facets is None:
+            return 1e10
+        return np.sum(radii**power)
+
+    def optimize_from_start(pts_init, deadline_local, obj_func, maxiter=80):
+        """Run L-BFGS-B optimization from a starting configuration."""
+        best_pts_local = pts_init.copy()
+        best_radius_local = get_max_radius(pts_init)
+        
+        # Normalize initial points
+        norms = np.linalg.norm(pts_init, axis=1, keepdims=True)
+        norms[norms < 1e-12] = 1.0
+        pts_init = pts_init / norms
+        
+        try:
+            res = minimize(obj_func, pts_init.flatten(), method='L-BFGS-B',
+                           options={'maxiter': maxiter, 'ftol': 1e-12, 'gtol': 1e-10, 'maxls': 200})
+            
+            if res.fun < obj_func(pts_init.flatten()):
+                new_pts = res.x.reshape(N, 3)
+                norms = np.linalg.norm(new_pts, axis=1, keepdims=True)
+                norms[norms < 1e-12] = 1.0
+                new_pts = new_pts / norms
+                
+                current_radius = get_max_radius(new_pts)
+                if current_radius < best_radius_local:
+                    best_radius_local = current_radius
+                    best_pts_local = new_pts.copy()
+        except Exception:
+            pass
+            
+        return best_pts_local, best_radius_local
+
+    # Generate multiple initial configurations
+    initial_configs = []
     
-    # 1. Initialize with Fibonacci spiral
+    # 1. Fibonacci spiral
     i = np.arange(N) + 0.5
     z = 1.0 - 2.0 * i / N
     phi = np.pi * (1.0 + np.sqrt(5.0)) * i
     r = np.sqrt(1.0 - z * z)
-    points = np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
+    fib_pts = np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
+    initial_configs.append(fib_pts)
     
-    def get_covering_info(pts):
-        """
-        Computes the convex hull, finds the facet with the largest circumradius,
-        and returns the circumcenter of that facet (the worst-case point on the sphere).
-        Also returns the covering radius (angular distance).
-        """
-        try:
-            hull = ConvexHull(pts)
-        except Exception:
-            # Fallback if hull fails (should not happen for valid points)
-            # Use a grid-based estimate as a rough fallback
-            tree = cKDTree(pts)
-            # Sample some points
-            grid_lat = np.linspace(-np.pi/2, np.pi/2, 50)
-            grid_lon = np.linspace(0, 2*np.pi, 100)
-            lat, lon = np.meshgrid(grid_lat, grid_lon)
-            gp = np.column_stack([
-                (np.cos(lat)*np.cos(lon)).ravel(),
-                (np.cos(lat)*np.sin(lon)).ravel(),
-                (np.sin(lat)).ravel()
-            ])
-            dists, _ = tree.query(gp)
-            angles = 2.0 * np.arcsin(np.clip(dists/2.0, 0, 1))
-            return np.max(angles), gp[np.argmax(angles)]
+    # 2. Fibonacci with different phase offsets
+    for phase in [0.37, 0.618, 0.25]:
+        i2 = np.arange(N) + 0.5
+        z2 = 1.0 - 2.0 * i2 / N
+        phi2 = np.pi * (1.0 + np.sqrt(5.0)) * (i2 + phase)
+        r2 = np.sqrt(1.0 - z2 * z2)
+        fib2_pts = np.column_stack([r2 * np.cos(phi2), r2 * np.sin(phi2), z2])
+        initial_configs.append(fib2_pts)
+    
+    # 3. Random points (seeded for reproducibility)
+    np.random.seed(42)
+    for seed_offset in range(3):
+        np.random.seed(42 + seed_offset * 100)
+        pts = np.random.randn(N, 3)
+        norms = np.linalg.norm(pts, axis=1, keepdims=True)
+        pts = pts / norms
+        initial_configs.append(pts)
+        
+    # 4. Greedy initialization - place points to maximize minimum distance
+    def greedy_init(seed_val):
+        np.random.seed(seed_val)
+        pts = [np.random.randn(3)]
+        norms = np.linalg.norm(pts[0])
+        pts[0] = pts[0] / norms
+        for _ in range(N - 1):
+            candidates = np.random.randn(2000, 3)
+            norms = np.linalg.norm(candidates, axis=1, keepdims=True)
+            candidates = candidates / norms
+            dots = candidates @ np.array(pts).T
+            min_dots = np.max(dots, axis=1)
+            idx = np.argmin(min_dots)
+            pts.append(candidates[idx])
+        return np.array(pts)
+    
+    initial_configs.append(greedy_init(101))
+    initial_configs.append(greedy_init(202))
+    initial_configs.append(greedy_init(303))
 
-        # For each facet, find the circumcenter
-        # Facet indices are in hull.simplices
-        # We want the facet with the largest circumradius.
-        # Circumcenter of a triangle (a,b,c) on the unit sphere:
-        # It is the point c such that |c-a| = |c-b| = |c-c| and c is on the sphere.
-        # Actually, the circumcenter of the spherical triangle is the intersection of the sphere
-        # and the plane passing through a, b, c? No, that's the origin if they are orthonormal.
-        # The circumcenter of a facet defined by vertices v1, v2, v3 is the point on the sphere
-        # equidistant from v1, v2, v3.
-        # Let c be the circumcenter. c is in the span of v1, v2, v3.
-        # c = alpha*v1 + beta*v2 + gamma*v3
-        # |c-v1|^2 = |c-v2|^2 = |c-v3|^2
-        # This is a linear system.
-        
-        # Alternative: The normal vector to the facet is n = cross(v1-v2, v3-v2).
-        # The circumcenter lies on the line passing through the centroid? No.
-        # The circumcenter is the point c on the sphere such that c dot (v1-v2) = 0 and c dot (v1-v3) = 0?
-        # No, |c-v1|^2 = 2 - 2 c.dot(v1). So c.dot(v1) = c.dot(v2) = c.dot(v3) = k.
-        # So c is the solution to c.dot(vi) = k for i=1,2,3.
-        # This implies c is in the span of {v1, v2, v3}.
-        # Let c = A x, where A = [v1, v2, v3] (3x3 matrix).
-        # c.dot(v1) = x^T A^T v1 = x^T (A^T v1).
-        # We want A^T c = k * ones.
-        # A^T (A x) = k * ones => (A^T A) x = k * ones.
-        # This doesn't fix k.
-        
-        # Simpler: The circumcenter c is the normalized vector:
-        # c = normalize( v1/|v1-v2|^2 * (v1-v3) + ... ) ? No.
-        
-        # Let's use the property: c is the intersection of the sphere and the plane
-        # perpendicular to the chord v1-v2 at its midpoint? No, that's for 2D.
-        # In 3D, c is equidistant from v1, v2, v3.
-        # c . v1 = c . v2 = c . v3.
-        # This means c is orthogonal to (v1-v2) and (v1-v3).
-        # So c is parallel to cross(v1-v2, v1-v3).
-        # Wait, if c is parallel to the normal of the facet, does it lie on the sphere?
-        # Yes, we just normalize it.
-        # But is it equidistant?
-        # If c is parallel to n = cross(v1-v2, v1-v3), then c . (v1-v2) = 0 and c . (v1-v3) = 0.
-        # This implies c . v1 = c . v2 and c . v1 = c . v3.
-        # So yes, the circumcenter is simply the normalized cross product of two edge vectors of the facet.
-        
-        max_radius = 0
-        worst_center = None
-        
-        for simplex in hull.simplices:
-            v1 = pts[simplex[0]]
-            v2 = pts[simplex[1]]
-            v3 = pts[simplex[2]]
-            
-            # Check if the triangle is degenerate
-            edge1 = v2 - v1
-            edge2 = v3 - v1
-            n = np.cross(edge1, edge2)
-            norm_n = np.linalg.norm(n)
-            if norm_n < 1e-10:
-                continue
-                
-            c = n / norm_n
-            # Ensure c is on the correct side (pointing outwards)
-            # The centroid of the facet is (v1+v2+v3)/3
-            # The normal should point away from the origin
-            if np.dot(c, v1) < 0:
-                c = -c
-                
-            # Calculate angular distance from c to v1 (or v2, v3)
-            # d = 2 * arcsin(||c - v1|| / 2)
-            d = np.linalg.norm(c - v1)
-            radius = 2.0 * np.arcsin(np.clip(d / 2.0, 0.0, 1.0))
-            
-            if radius > max_radius:
-                max_radius = radius
-                worst_center = c
-                
-        if worst_center is None:
-            # Fallback
-            tree = cKDTree(pts)
-            # Just pick a random point far from others?
-            return 0.0, np.random.randn(3) / np.linalg.norm(np.random.randn(3))
-            
-        return max_radius, worst_center
-
-    def calc_covering_radius(pts):
-        radius, _ = get_covering_info(pts)
-        return radius
-
-    # Initialize
-    current_points = points.copy()
-    best_points = current_points.copy()
-    best_radius = calc_covering_radius(current_points)
+    best_pts = initial_configs[0].copy()
+    best_radius = get_max_radius(best_pts)
     
-    # Optimization Loop: Repulsive Force / Lloyd's Algorithm
-    # We move each point towards the circumcenter of its Voronoi cell.
-    # However, computing Voronoi cells on the sphere is complex.
-    # Approximation: Move each point towards the "worst" point? No, that collapses them.
-    # Better: Use the gradient of the covering radius.
-    # The covering radius is determined by the facet F* with circumcenter C*.
-    # The vertices of F* are v1, v2, v3.
-    # To reduce the radius, we should move v1, v2, v3 towards C*.
-    # Moving them towards C* reduces the distance to C*.
-    # What about other points? They might become the new worst case.
-    # A common heuristic is to move ALL points slightly towards the global centroid? No.
-    # Let's use a simple gradient step on the vertices of the worst facet.
-    
-    step_size = 0.1
-    decay = 0.99
-    
-    for iter in range(1000):
-        if time.time() > deadline - 10:
+    # Phase 1: Quick optimization with soft-max (smooth, good for broad search)
+    current_time = time.time()
+    for idx, init_pts in enumerate(initial_configs):
+        if time.time() > deadline - 15.0:
             break
-            
-        radius, worst_center = get_covering_info(current_points)
         
-        if radius < best_radius:
-            best_radius = radius
-            best_points = current_points.copy()
-            
-        # Find the facet corresponding to worst_center
-        # Re-compute hull to find which simplex has this circumcenter
-        try:
-            hull = ConvexHull(current_points)
-        except:
-            break
-            
-        target_indices = None
-        for simplex in hull.simplices:
-            v1 = current_points[simplex[0]]
-            v2 = current_points[simplex[1]]
-            v3 = current_points[simplex[2]]
-            edge1 = v2 - v1
-            edge2 = v3 - v1
-            n = np.cross(edge1, edge2)
-            norm_n = np.linalg.norm(n)
-            if norm_n < 1e-10:
-                continue
-            c = n / norm_n
-            if np.dot(c, v1) < 0:
-                c = -c
-            # Check if this is the worst center
-            if np.dot(c, worst_center) > 0.9999:
-                target_indices = simplex
-                break
-                
-        if target_indices is None:
-            # If we can't find the facet, break
-            break
-            
-        # Move the vertices of the target facet towards worst_center
-        # Use a small step
-        for idx in target_indices:
-            v = current_points[idx]
-            # Direction to worst_center
-            dir_vec = worst_center - v
-            # Normalize direction
-            norm_dir = np.linalg.norm(dir_vec)
-            if norm_dir > 1e-10:
-                dir_vec /= norm_dir
-            # Move
-            current_points[idx] = v + step_size * dir_vec
-            # Normalize to sphere
-            current_points[idx] /= np.linalg.norm(current_points[idx])
-            
-        # Also, to prevent points from clustering, add a small repulsive force
-        # between all pairs? That's O(N^2) but N=50 is small.
-        # Let's add a small repulsion to maintain spread.
-        # Actually, the "worst facet" method tends to spread points naturally
-        # because as you fix one hole, another appears.
+        def obj_sm(params, _beta=100.0):
+            return soft_max_objective(params, beta=_beta)
         
-        # Decay step size
-        step_size *= decay
+        pts_res, rad_res = optimize_from_start(init_pts, deadline - 15.0, obj_sm, maxiter=60)
+        if rad_res < best_radius:
+            best_radius = rad_res
+            best_pts = pts_res.copy()
+    
+    # Phase 2: Refine with higher beta soft-max (closer to true max)
+    if time.time() < deadline - 10.0:
+        def obj_sm_high(params, _beta=500.0):
+            return soft_max_objective(params, beta=_beta)
         
-        # If step size is too small, restart with random perturbation?
-        if step_size < 0.001:
-            # Add small noise
-            current_points += np.random.randn(N, 3) * 0.01
-            current_points /= np.linalg.norm(current_points, axis=1, keepdims=True)
-            step_size = 0.05
-
-    # Final Polish: Coordinate Descent / Random Search around best
-    if time.time() < deadline - 5:
-        current_best = best_points.copy()
-        current_score = best_radius
-        step = 0.05
+        pts_res, rad_res = optimize_from_start(best_pts, deadline - 10.0, obj_sm_high, maxiter=80)
+        if rad_res < best_radius:
+            best_radius = rad_res
+            best_pts = pts_res.copy()
         
-        for i in range(200):
-            if time.time() > deadline - 5:
-                break
-            improved = False
-            for j in range(N):
-                if time.time() > deadline - 5:
+        # Try from second-best initial config too
+        if time.time() < deadline - 8.0:
+            # Find second best from phase 1
+            second_best_idx = -1
+            second_best_rad = float('inf')
+            for idx, init_pts in enumerate(initial_configs):
+                if time.time() > deadline - 8.0:
                     break
-                for _ in range(5):
-                    rand_vec = np.random.randn(3)
-                    rand_vec /= np.linalg.norm(rand_vec)
-                    
-                    old_p = current_best[j].copy()
-                    new_p = current_best[j] + step * rand_vec
-                    new_p /= np.linalg.norm(new_p)
-                    
-                    current_best[j] = new_p
-                    new_score = calc_covering_radius(current_best)
-                    
-                    if new_score < current_score:
-                        current_score = new_score
-                        improved = True
-                    else:
-                        current_best[j] = old_p
-                        
-            if not improved:
-                break
-                
-        if current_score < best_radius:
-            best_points = current_best
-            best_radius = current_score
-
-    # Final normalization
-    best_points = best_points / np.linalg.norm(best_points, axis=1, keepdims=True)
+                rad_check = get_max_radius(init_pts)
+                if rad_check < second_best_rad and rad_check > best_radius:
+                    second_best_rad = rad_check
+                    second_best_idx = idx
+            
+            if second_best_idx >= 0:
+                pts_res2, rad_res2 = optimize_from_start(
+                    initial_configs[second_best_idx], deadline - 8.0, obj_sm_high, maxiter=60)
+                if rad_res2 < best_radius:
+                    best_radius = rad_res2
+                    best_pts = pts_res2.copy()
     
-    return best_points
-# EVOLVE-BLOCK-END
+    # Phase 3: Final polish with power-based objective (tighter convergence)
+    if time.time() < deadline - 3.0:
+        def obj_power(params, _p=4.0):
+            return power_objective(params, power=_p)
+        
+        try:
+            res = minimize(obj_power, best_pts.flatten(), method='L-BFGS-B',
+                           options={'maxiter': 100, 'ftol': 1e-14, 'gtol': 1e-12, 'maxls': 500})
+            if res.fun < obj_power(best_pts.flatten()):
+                new_pts = res.x.reshape(N, 3)
+                norms = np.linalg.norm(new_pts, axis=1, keepdims=True)
+                norms[norms < 1e-12] = 1.0
+                new_pts = new_pts / norms
+                current_radius = get_max_radius(new_pts)
+                if current_radius < best_radius:
+                    best_radius = current_radius
+                    best_pts = new_pts.copy()
+        except Exception:
+            pass
+    
+    # Phase 4: Ultra-tight final polish
+    if time.time() < deadline - 1.0:
+        def obj_final(params, _beta=1000.0):
+            return soft_max_objective(params, beta=_beta)
+        
+        try:
+            res = minimize(obj_final, best_pts.flatten(), method='L-BFGS-B',
+                           options={'maxiter': 50, 'ftol': 1e-15, 'gtol': 1e-13, 'maxls': 300})
+            if res.fun < obj_final(best_pts.flatten()):
+                new_pts = res.x.reshape(N, 3)
+                norms = np.linalg.norm(new_pts, axis=1, keepdims=True)
+                norms[norms < 1e-12] = 1.0
+                new_pts = new_pts / norms
+                current_radius = get_max_radius(new_pts)
+                if current_radius < best_radius:
+                    best_radius = current_radius
+                    best_pts = new_pts.copy()
+        except Exception:
+            pass
+
+    # Final validation
+    norms = np.linalg.norm(best_pts, axis=1)
+    if np.any(norms < 1e-10) or not np.all(np.isfinite(best_pts)):
+        i = np.arange(N) + 0.5
+        z = 1.0 - 2.0 * i / N
+        phi = np.pi * (1.0 + np.sqrt(5.0)) * i
+        r = np.sqrt(1.0 - z * z)
+        best_pts = np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
+    
+    return best_pts

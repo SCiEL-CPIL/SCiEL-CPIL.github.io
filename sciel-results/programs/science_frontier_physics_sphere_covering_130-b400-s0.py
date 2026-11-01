@@ -299,12 +299,13 @@ def construct():
                 points = fibonacci_spiral(N).astype(np.float64)
 
         # First, optimize with repulsion to get a good starting configuration
-        points = gradient_descent_repulsion(points, 2.0, 0.1, 0.99, 100)
+        # Use higher exponent for better separation
+        points = gradient_descent_repulsion(points, 4.0, 0.05, 0.98, 200)
         
         # Then optimize with L-BFGS-B on the grid-based objective (coarse grid)
         time_left = deadline - time.time() - 10.0
         if time_left > 10.0:
-            points, _ = optimize_with_lbfgsb(points, GRID_COARSE, maxiter=200)
+            points, _ = optimize_with_lbfgsb(points, GRID_COARSE, maxiter=300)
         
         # Evaluate exact covering radius
         rad = compute_covering_radius_exact(points)
@@ -331,11 +332,11 @@ def construct():
                 best_rad = rad
                 best_points = candidate.copy()
 
-    # Phase 3: Coordinate-wise local search
-    if best_points is not None and time.time() < deadline - 10.0:
+    # Phase 3: Improved Local Search using Grid for guidance and Hull for validation
+    if best_points is not None and time.time() < deadline - 15.0:
         points = best_points.copy()
         improved = True
-        max_rounds = 3
+        max_rounds = 10
         round_count = 0
         
         while improved and round_count < max_rounds and time.time() < deadline - 5.0:
@@ -347,10 +348,11 @@ def construct():
                     break
                 
                 old_p = points[i].copy()
+                old_rad = best_rad
                 
                 # Try perturbing point i in random directions
-                rng = np.random.RandomState(i * 1000 + round_count)
-                for trial in range(3):
+                rng = np.random.RandomState(i * 1000 + round_count * 100)
+                for trial in range(5):
                     direction = rng.randn(3)
                     direction -= np.dot(direction, old_p) * old_p  # Project to tangent
                     dir_norm = np.linalg.norm(direction)
@@ -358,34 +360,39 @@ def construct():
                         continue
                     direction /= dir_norm
                     
-                    for step in [0.02, 0.01, 0.005]:
+                    # Adaptive step sizes
+                    for step in [0.05, 0.02, 0.01, 0.005]:
                         new_p = old_p + step * direction
                         new_p /= np.linalg.norm(new_p)
                         points[i] = new_p
                         
+                        # Quick check with grid first? 
+                        # To save time, we can just use the exact hull since N is small.
                         rad = compute_covering_radius_exact(points)
                         if rad < best_rad - 1e-10:
                             best_rad = rad
                             best_points = points.copy()
                             improved = True
+                            # Reset old_p to new_p to continue from here
+                            old_p = new_p.copy()
                             break
                         else:
                             points[i] = old_p
                     else:
                         continue
                     break
-                
-                # If we improved, keep the new position
-                # Otherwise, restore
-                if not improved or rad >= best_rad - 1e-10:
-                    points[i] = old_p
+                # If improved, old_p is updated. If not, points[i] is restored to original old_p (which is unchanged if no improvement)
+                # Wait, if improved, points[i] is new_p. If not, points[i] is old_p (restored in else).
+                # So points[i] is always consistent with best_points if improved, or original if not.
 
     # Phase 4: Final polish with L-BFGS-B using fine grid
     if best_points is not None and time.time() < deadline - 5.0:
         final = best_points.copy()
         time_left = deadline - time.time() - 3.0
-        if time_left > 3.0:
-            final, _ = optimize_with_lbfgsb(final, GRID_FINE, maxiter=50)
+        if time_left > 5.0:
+            # Use more iterations if time permits
+            max_iter = 100 if time_left > 20.0 else 50
+            final, _ = optimize_with_lbfgsb(final, GRID_FINE, maxiter=max_iter)
             rad_final = compute_covering_radius_exact(final)
             if rad_final < best_rad:
                 best_rad = rad_final
