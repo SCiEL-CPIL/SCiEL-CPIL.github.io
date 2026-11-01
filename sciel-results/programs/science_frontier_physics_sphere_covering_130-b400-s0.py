@@ -105,7 +105,7 @@ def construct():
         except Exception:
             return None, None
     
-    def repulsion_step_density_aware(points, alpha, face_radii=None):
+    def repulsion_step_density_aware(points, alpha, face_radii=None, faces=None):
         """Repulsion with density-aware weighting: points in large-cap regions get stronger push."""
         dot = np.dot(points, points.T)
         dot = np.clip(dot, -1.0, 1.0)
@@ -115,18 +115,16 @@ def construct():
         w = 1.0 / (dist_sq ** 1.5)
         np.fill_diagonal(w, 0.0)
         
-        # Density-aware weighting: if we have face radii, weight vertices in large faces more
-        if face_radii is not None:
-            # Compute per-vertex max face radius (approximate local covering deficit)
-            max_rad_per_vertex = np.zeros(len(points))
-            for i, r in enumerate(face_radii):
-                f = face_radii_faces[i] if 'face_radii_faces' in dir() else None
-            # Simpler: use the overall max radius to boost repulsion in sparse areas
-            max_r = np.max(face_radii) if len(face_radii) > 0 else 0
-            if max_r > 0:
-                # Scale repulsion strength by local deficit
-                local_deficit = 1.0 + 0.5 * (max_r / (np.pi / 6.0))  # normalize
-                w *= local_deficit
+        # Density-aware weighting: weight vertices in large faces more
+        if face_radii is not None and faces is not None:
+            vertex_max_rad = np.zeros(len(points))
+            for fi in range(len(faces)):
+                for vi in faces[fi]:
+                    if face_radii[fi] > vertex_max_rad[vi]:
+                        vertex_max_rad[vi] = face_radii[fi]
+            if np.max(vertex_max_rad) > 1e-10:
+                weight_boost = 1.0 + 0.5 * vertex_max_rad / np.max(vertex_max_rad)
+                w = w * weight_boost[:, np.newaxis]
         
         sum_w = np.sum(w, axis=1)
         sum_p_w = w @ points
@@ -153,6 +151,63 @@ def construct():
             norms = np.linalg.norm(points, axis=1, keepdims=True)
             points = points / norms
         return points
+    
+    def targeted_face_reduction(points, n_iter=100):
+        """Directly reduce the largest facet radii by pushing vertices of large facets apart."""
+        best = points.copy()
+        best_rad = compute_covering_radius(best)
+        
+        for it in range(n_iter):
+            if time.time() > deadline - 5.0:
+                break
+            
+            face_radii, faces = compute_face_radii(points)
+            if face_radii is None:
+                break
+            
+            # Find the largest facets and push their vertices apart
+            top_k = min(10, len(faces))
+            top_indices = np.argsort(face_radii)[-top_k:]
+            
+            # For each large facet, compute the circumcenter direction and push vertices away
+            displacement = np.zeros_like(points)
+            for fi in top_indices:
+                if face_radii[fi] < best_rad * 0.8:
+                    continue
+                f = faces[fi]
+                a, b, c = points[f[0]], points[f[1]], points[f[2]]
+                # Compute circumcenter of the triangle on the sphere
+                ab = np.cross(a, b)
+                bc = np.cross(b, c)
+                ca = np.cross(c, a)
+                c_dir = ab + bc + ca
+                norm_c = np.linalg.norm(c_dir)
+                if norm_c < 1e-10:
+                    continue
+                c_dir = c_dir / norm_c
+                # Push each vertex away from the circumcenter
+                for vi in f:
+                    # Gradient: move vertex away from circumcenter
+                    away = points[vi] - np.dot(points[vi], c_dir) * c_dir
+                    away = away / (np.linalg.norm(away) + 1e-15)
+                    # Also add a small component along the vertex direction (to maintain normalization)
+                    displacement[vi] += away * 0.1 + points[vi] * 0.01
+            
+            # Normalize and apply
+            norm_disp = np.linalg.norm(displacement, axis=1, keepdims=True)
+            norm_disp[norm_disp < 1e-15] = 1.0
+            step_size = 0.02 * (1.0 - it / n_iter)
+            points = points + step_size * displacement / norm_disp
+            norms = np.linalg.norm(points, axis=1, keepdims=True)
+            points = points / norms
+            
+            # Check improvement
+            rad = compute_covering_radius(points)
+            if rad < best_rad - 1e-10:
+                best_rad = rad
+                best = points.copy()
+        
+        return best
     
     best_points = None
     best_rad = np.inf
@@ -187,7 +242,7 @@ def construct():
             # Get face radii for density-aware weighting
             face_radii, faces = compute_face_radii(points)
             
-            # Standard repulsion step
+            # Standard repulsion step with density-aware weighting
             dot = np.dot(points, points.T)
             dot = np.clip(dot, -1.0, 1.0)
             np.fill_diagonal(dot, 1.0)
@@ -201,11 +256,11 @@ def construct():
                 vertex_max_rad = np.zeros(N)
                 for fi in range(len(faces)):
                     for vi in faces[fi]:
-                        vertex_max_rad[vi] = max(vertex_max_rad[vi], face_radii[fi])
+                        if face_radii[fi] > vertex_max_rad[vi]:
+                            vertex_max_rad[vi] = face_radii[fi]
                 # Normalize and use as weight multiplier
                 if np.max(vertex_max_rad) > 1e-10:
-                    weight_boost = 1.0 + 0.3 * vertex_max_rad / np.max(vertex_max_rad)
-                    # Apply per-row scaling to w
+                    weight_boost = 1.0 + 0.5 * vertex_max_rad / np.max(vertex_max_rad)
                     w = w * weight_boost[:, np.newaxis]
             
             sum_w = np.sum(w, axis=1)
@@ -224,21 +279,29 @@ def construct():
                     stall_count = 0
                 else:
                     stall_count += 1
-                    if stall_count > 20:
+                    if stall_count > 15:
                         # Reduce alpha more aggressively on stall
-                        alpha *= 0.95
+                        alpha *= 0.93
                         stall_count = 0
             
             if alpha < 1e-7:
                 break
         
         # Polish phase for this restart
-        if time.time() < deadline - 10.0 and best_points is not None:
+        if time.time() < deadline - 15.0 and best_points is not None:
             polished = polish_step(best_points.copy(), 0.005, 30)
             rad_polished = compute_covering_radius(polished)
             if rad_polished < best_rad:
                 best_rad = rad_polished
                 best_points = polished
+            
+            # Targeted face reduction
+            if time.time() < deadline - 10.0:
+                targeted = targeted_face_reduction(best_points.copy(), n_iter=80)
+                rad_targeted = compute_covering_radius(targeted)
+                if rad_targeted < best_rad:
+                    best_rad = rad_targeted
+                    best_points = targeted
     
     # Final global polish
     if time.time() < deadline - 5.0 and best_points is not None:
@@ -247,6 +310,14 @@ def construct():
         if rad_final < best_rad:
             best_rad = rad_final
             best_points = final
+        
+        # Final targeted reduction
+        if time.time() < deadline - 3.0:
+            final2 = targeted_face_reduction(best_points.copy(), n_iter=60)
+            rad_final2 = compute_covering_radius(final2)
+            if rad_final2 < best_rad:
+                best_rad = rad_final2
+                best_points = final2
     
     if best_points is None:
         best_points = fibonacci_spiral(N).astype(np.float64)
