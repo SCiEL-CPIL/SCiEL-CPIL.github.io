@@ -12,33 +12,26 @@ def _energy_and_grad(pts):
     pts: (N, 3) array of unit vectors.
     Returns (energy, grad) where energy = sum_{i<j} log(1/|xi-xj|)
     and grad is the gradient w.r.t. pts in R^{N x 3}.
+    Optimized: single dist2 matrix, no full 3D diff array.
     """
-    # Pairwise differences: (N, N, 3)
-    diff = pts[:, None, :] - pts[None, :, :]
-    # Squared distances
-    dist2 = np.sum(diff * diff, axis=2)
-    # Mask diagonal
-    mask = ~np.eye(N, dtype=bool)
-    # Safe distances
-    dist = np.sqrt(np.where(mask, np.maximum(dist2, EPS), 1.0))
+    # Squared chordal distances: |p_i - p_j|^2 = 2 - 2 p_i . p_j
+    dot = pts @ pts.T
+    dist2 = 2.0 - 2.0 * dot
+    np.fill_diagonal(dist2, 1.0)
+    dist2 = np.maximum(dist2, EPS)
     
-    # Energy: sum_{i<j} log(1/dist) = -sum_{i<j} log(dist)
-    # We sum over all i!=j and divide by 2
-    log_terms = np.where(mask, -np.log(dist), 0.0)
-    energy = 0.5 * np.sum(log_terms)
+    # Energy: sum_{i<j} log(1/dist) = -0.5 * sum_{i!=j} log(dist)
+    dist = np.sqrt(dist2)
+    log_dist = np.log(dist)
+    np.fill_diagonal(log_dist, 0.0)
+    energy = -0.5 * np.sum(log_dist)
     
-    # Gradient:
-    # d/dp_i log(1/|p_i - p_j|) = -(p_i - p_j) / |p_i - p_j|^2
-    # grad_i = sum_{j!=i} (p_j - p_i) / |p_i - p_j|^2
-    # Note: dist2 is |p_i - p_j|^2
-    inv_dist2 = np.where(mask, 1.0 / np.maximum(dist2, EPS), 0.0)
+    # Gradient: grad_i = sum_{j!=i} (p_j - p_i) / |p_i - p_j|^2
+    # = sum_j p_j / dist2[i,j] - p_i * sum_j 1/dist2[i,j]
+    inv_dist2 = 1.0 / dist2
+    np.fill_diagonal(inv_dist2, 0.0)
     
-    # grad[i] = sum_j (pts[j] - pts[i]) * inv_dist2[i, j]
-    # = sum_j pts[j] * inv_dist2[i, j] - pts[i] * sum_j inv_dist2[i, j]
-    # Let's compute the sum of weights for each i
     weight_sums = np.sum(inv_dist2, axis=1, keepdims=True)
-    # Sum of pts[j] * inv_dist2[i, j]
-    # This is inv_dist2 @ pts
     weighted_pts = inv_dist2 @ pts
     
     grad = weighted_pts - weight_sums * pts
@@ -116,6 +109,65 @@ def _fibonacci_spiral(n):
     pts = np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
     return pts / np.linalg.norm(pts, axis=1, keepdims=True)
 
+def _golden_spiral_v2(n):
+    """Alternative golden-angle spiral with different offset."""
+    i = np.arange(n)
+    z = 1.0 - 2.0 * (i + 0.5) / n
+    phi = (1.0 + np.sqrt(5.0)) * np.pi * (i + 0.3)
+    r = np.sqrt(np.maximum(1.0 - z * z, 0.0))
+    pts = np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
+    return pts / np.linalg.norm(pts, axis=1, keepdims=True)
+
+def _icosahedron_subdivide(n):
+    """Start from icosahedron vertices, subdivide and project to get ~n points."""
+    # Icosahedron vertices
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    verts = np.array([
+        [-1,  phi, 0], [ 1,  phi, 0], [-1, -phi, 0], [ 1, -phi, 0],
+        [ 0, -1,  phi], [ 0,  1,  phi], [ 0, -1, -phi], [ 0,  1, -phi],
+        [ phi, 0, -1], [ phi, 0,  1], [-phi, 0, -1], [-phi, 0,  1]
+    ], dtype=float)
+    verts = verts / np.linalg.norm(verts, axis=1, keepdims=True)
+    
+    # Subdivide: add midpoints of edges, then project
+    pts = [verts]
+    # Add midpoints of all edges
+    edges = [(0,1),(0,3),(0,4),(0,5),(0,10),(0,11),
+             (1,2),(1,4),(1,5),(1,8),(1,9),
+             (2,3),(2,6),(2,7),(2,10),(2,11),
+             (3,4),(3,5),(3,8),(3,9),(3,10),(3,11),
+             (4,5),(4,6),(4,7),(4,8),(4,9),
+             (5,6),(5,7),(5,8),(5,9),
+             (6,7),(6,8),(6,10),(6,11),
+             (7,8),(7,9),(7,10),(7,11),
+             (8,9),(8,10),(8,11),
+             (9,10),(9,11),
+             (10,11)]
+    mids = []
+    for a, b in edges:
+        m = (verts[a] + verts[b]) / 2.0
+        m = m / np.linalg.norm(m)
+        mids.append(m)
+    mids = np.array(mids)
+    pts.append(mids)
+    
+    all_pts = np.vstack(pts)  # 12 + 30 = 42 points
+    # If we need more, add more subdivision levels
+    if n > 42:
+        # Add more midpoints from the 42 points
+        all_pts_flat = all_pts
+        # Sample additional points by interpolating between close pairs
+        rng = np.random.RandomState(7)
+        for _ in range(n - len(all_pts_flat)):
+            idx1 = rng.randint(len(all_pts_flat))
+            idx2 = rng.randint(len(all_pts_flat))
+            if idx1 != idx2:
+                m = (all_pts_flat[idx1] + all_pts_flat[idx2]) / 2.0
+                m = m / np.linalg.norm(m)
+                all_pts_flat = np.vstack([all_pts_flat, [m]])
+    
+    return all_pts_flat[:n]
+
 def _random_points(n, seed=42):
     """Generate n random points on sphere."""
     rng = np.random.RandomState(seed)
@@ -161,14 +213,25 @@ def construct():
     # 1. Fibonacci spiral
     inits.append(('fib', _fibonacci_spiral(N)))
     
-    # 2. Random with different seeds
+    # 2. Golden spiral variant
+    inits.append(('golden2', _golden_spiral_v2(N)))
+    
+    # 3. Icosahedron-based
+    inits.append(('icosa', _icosahedron_subdivide(N)))
+    
+    # 4. Random with different seeds
     for seed in [1, 2, 3, 4, 5]:
         inits.append((f'rand{seed}', _random_points(N, seed=seed)))
     
-    # 3. Perturbed Fibonacci with different scales
+    # 5. Perturbed Fibonacci with different scales
     fib_base = _fibonacci_spiral(N)
     for sigma, seed in [(0.1, 10), (0.05, 11), (0.2, 12)]:
         inits.append((f'pert{sigma}_{seed}', _perturbed_points(fib_base, sigma, seed=seed)))
+    
+    # 6. Perturbed golden spiral
+    gold_base = _golden_spiral_v2(N)
+    for sigma, seed in [(0.08, 20), (0.15, 21)]:
+        inits.append((f'gpert{sigma}_{seed}', _perturbed_points(gold_base, sigma, seed=seed)))
     
     best_pts = None
     best_energy = np.inf
@@ -184,7 +247,7 @@ def construct():
         
         # L-BFGS-B Polish
         if time.time() - t_start < DEADLINE_SECONDS - 10:
-            pts_opt, energy_opt = _polish_lbfgs(pts_opt, max_iter=150, gtol=1e-13)
+            pts_opt, energy_opt = _polish_lbfgs(pts_opt, max_iter=200, gtol=1e-13)
         
         if energy_opt < best_energy:
             best_energy = energy_opt
@@ -192,7 +255,31 @@ def construct():
     
     # Final high-precision polish on the best result
     if best_pts is not None and time.time() - t_start < DEADLINE_SECONDS - 5:
-        best_pts, best_energy = _polish_lbfgs(best_pts, max_iter=300, gtol=1e-15)
+        best_pts, best_energy = _polish_lbfgs(best_pts, max_iter=500, gtol=1e-15)
+        
+        # Additional manifold Newton-style refinement
+        if time.time() - t_start < DEADLINE_SECONDS - 2:
+            for _ in range(50):
+                e, g = _energy_and_grad(best_pts)
+                g_t = _tangent_grad(best_pts, g)
+                gnorm = np.linalg.norm(g_t)
+                if gnorm < 1e-14:
+                    break
+                # Adaptive step: use gradient norm to set step size
+                step = g_t / gnorm
+                alpha = min(0.01, 0.1 / (gnorm + 1e-10))
+                new_pts = _retract(best_pts, -alpha * g_t)
+                new_e, _ = _energy_and_grad(new_pts)
+                if new_e < e:
+                    best_pts = new_pts
+                    best_energy = new_e
+                else:
+                    alpha *= 0.5
+                    new_pts = _retract(best_pts, -alpha * g_t)
+                    new_e, _ = _energy_and_grad(new_pts)
+                    if new_e < e:
+                        best_pts = new_pts
+                        best_energy = new_e
     
     # Final Check and Return
     if best_pts is None:
