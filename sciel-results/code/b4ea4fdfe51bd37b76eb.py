@@ -1,0 +1,3 @@
+    if effective_rank < rank:
+        # ...
+        pass

@@ -1,0 +1,320 @@
+import time
+import numpy as np
+import random
+from collections import deque
+
+def construct(q, n, radius):
+    t0 = time.time()
+    deadline = t0 + 115.0
+
+    total = q ** n
+    ball_size = 1 + n * (q - 1)
+
+    # Precompute place values
+    base = [1] * n
+    for i in range(n - 2, -1, -1):
+        base[i] = base[i + 1] * q
+
+    # Precompute ball as bitmask (Python int) for each word
+    # Bit i is set if word i is in the ball of word j
+    ball_mask = [0] * total
+    for i in range(total):
+        mask = 1 << i
+        for coord in range(n):
+            temp = i
+            for j in range(n - 1, -1, -1):
+                digit = temp % q
+                temp //= j if j > 0 else q  # placeholder, fix below
+            # Recompute properly
+        # Redo: extract digits
+        digits = []
+        temp = i
+        for j in range(n - 1, -1, -1):
+            digits.append(temp % q)
+            temp //= q
+        digits.reverse()
+        for coord in range(n):
+            orig = digits[coord]
+            for v in range(q):
+                if v == orig:
+                    continue
+                new_idx = i + (v - orig) * base[coord]
+                mask |= (1 << new_idx)
+        ball_mask[i] = mask
+
+    # Precompute ball as list for iteration
+    ball_list = [None] * total
+    for i in range(total):
+        lst = [i]
+        digits = []
+        temp = i
+        for j in range(n - 1, -1, -1):
+            digits.append(temp % q)
+            temp //= q
+        digits.reverse()
+        for coord in range(n):
+            orig = digits[coord]
+            for v in range(q):
+                if v == orig:
+                    continue
+                new_idx = i + (v - orig) * base[coord]
+                lst.append(new_idx)
+        ball_list[i] = lst
+
+    def greedy_build(seed):
+        rng = random.Random(seed)
+        covered_mask = 0
+        code = []
+        candidates = list(range(total))
+        rng.shuffle(candidates)
+        for c in candidates:
+            new_cov = bin(ball_mask[c] & ~covered_mask).count('1')
+            if new_cov > 0:
+                code.append(c)
+                covered_mask |= ball_mask[c]
+                if covered_mask == (1 << total) - 1:
+                    break
+        return code
+
+    # Multiple greedy restarts
+    best_initial = None
+    best_initial_size = float('inf')
+    for seed in range(20):
+        if time.time() > deadline - 60.0:
+            break
+        init_code = greedy_build(seed)
+        if len(init_code) < best_initial_size:
+            best_initial_size = len(init_code)
+            best_initial = init_code
+
+    current_code = set(best_initial)
+    best_code = list(current_code)
+    best_size = len(current_code)
+
+    # Count coverage using array
+    cnt = np.zeros(total, dtype=np.int32)
+    for c in current_code:
+        for w in ball_list[c]:
+            cnt[w] += 1
+
+    def run_delete_phase(code_set, cnt_arr):
+        removed = 0
+        changed = True
+        while changed:
+            changed = False
+            for c in list(code_set):
+                ball = ball_list[c]
+                if min(cnt_arr[w] for w in ball) >= 2:
+                    code_set.remove(c)
+                    for w in ball:
+                        cnt_arr[w] -= 1
+                    removed += 1
+                    changed = True
+        return removed
+
+    def try_swap(c_remove, c_add, code_set, cnt_arr):
+        if c_add in code_set or c_remove == c_add:
+            return False
+        ball_rem = ball_list[c_remove]
+        ball_add = ball_list[c_add]
+        # Check: for all w in ball_rem not in ball_add, cnt[w] >= 2
+        add_set = set(ball_add)
+        for w in ball_rem:
+            if w not in add_set and cnt_arr[w] < 2:
+                return False
+        code_set.remove(c_remove)
+        code_set.add(c_add)
+        for w in ball_rem:
+            cnt_arr[w] -= 1
+        for w in ball_add:
+            cnt_arr[w] += 1
+        return True
+
+    def get_valid_swaps(c_remove, code_set, cnt_arr):
+        ball_rem = ball_list[c_remove]
+        unique_words = [w for w in ball_rem if cnt_arr[w] == 1]
+        if not unique_words:
+            return None  # any non-code word works
+        # Find intersection of balls of unique words
+        valid_mask = ball_mask[unique_words[0]]
+        for u in unique_words[1:]:
+            valid_mask &= ball_mask[u]
+            if valid_mask == 0:
+                return []
+        # Extract valid indices not in code_set
+        valid_list = []
+        # Iterate over set bits
+        vm = valid_mask
+        while vm:
+            lsb = vm & (-vm)
+            idx = lsb.bit_length() - 1
+            if idx not in code_set:
+                valid_list.append(idx)
+            vm ^= lsb
+        return valid_list
+
+    # Local search
+    no_improve = 0
+    max_no_improve = 15
+    rng = random.Random(123)
+
+    while time.time() < deadline - 5.0:
+        # Delete phase
+        removed = run_delete_phase(current_code, cnt)
+        if removed > 0:
+            if len(current_code) < best_size:
+                best_size = len(current_code)
+                best_code = list(current_code)
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        # Swap phase
+        swaps_done = 0
+        max_swaps = 300
+        while swaps_done < max_swaps and time.time() < deadline - 5.0:
+            swaps_done += 1
+            if not current_code:
+                break
+            c = rng.choice(list(current_code))
+            valid = get_valid_swaps(c, current_code, cnt)
+            if valid is None:
+                # Pick random non-code word
+                c_prime = rng.randint(0, total - 1)
+                attempts = 0
+                while c_prime in current_code and attempts < 100:
+                    c_prime = rng.randint(0, total - 1)
+                    attempts += 1
+                if c_prime in current_code:
+                    continue
+            elif len(valid) == 0:
+                no_improve += 1
+                continue
+            else:
+                c_prime = rng.choice(valid)
+
+            if try_swap(c, c_prime, current_code, cnt):
+                removed = run_delete_phase(current_code, cnt)
+                if removed > 0:
+                    if len(current_code) < best_size:
+                        best_size = len(current_code)
+                        best_code = list(current_code)
+                    no_improve = 0
+                else:
+                    no_improve += 1
+            else:
+                no_improve += 1
+
+        # 2-for-1 move
+        if time.time() < deadline - 8.0 and len(current_code) >= 2:
+            for _ in range(10):
+                if time.time() > deadline - 8.0:
+                    break
+                pair = rng.sample(list(current_code), 2)
+                c1, c2 = pair
+                # Check uncovered
+                covered_after = 0
+                for c in current_code:
+                    if c != c1 and c != c2:
+                        covered_after |= ball_mask[c]
+                uncovered = (~covered_after) & ((1 << total) - 1)
+                if uncovered == 0:
+                    current_code.remove(c1)
+                    current_code.remove(c2)
+                    for w in ball_list[c1]:
+                        cnt[w] -= 1
+                    for w in ball_list[c2]:
+                        cnt[w] -= 1
+                    removed = run_delete_phase(current_code, cnt)
+                    if len(current_code) < best_size:
+                        best_size = len(current_code)
+                        best_code = list(current_code)
+                    no_improve = 0
+                elif bin(uncovered).count('1') <= 4:
+                    # Find word covering all uncovered
+                    target_mask = uncovered
+                    found = None
+                    # Check if any word's ball covers all uncovered bits
+                    # This is expensive; sample a few
+                    for _ in range(50):
+                        cand = rng.randint(0, total - 1)
+                        if cand in current_code:
+                            continue
+                        if (ball_mask[cand] & target_mask) == target_mask:
+                            found = cand
+                            break
+                    if found is not None:
+                        current_code.remove(c1)
+                        current_code.remove(c2)
+                        current_code.add(found)
+                        for w in ball_list[c1]:
+                            cnt[w] -= 1
+                        for w in ball_list[c2]:
+                            cnt[w] -= 1
+                        for w in ball_list[found]:
+                            cnt[w] += 1
+                        removed = run_delete_phase(current_code, cnt)
+                        if len(current_code) < best_size:
+                            best_size = len(current_code)
+                            best_code = list(current_code)
+                        no_improve = 0
+
+        # Restart if stuck
+        if no_improve > max_no_improve and time.time() < deadline - 20.0:
+            seed = int(time.time() * 1000) % 100000
+            init_code = greedy_build(seed)
+            if len(init_code) < len(current_code) + 3:
+                current_code = set(init_code)
+                cnt = np.zeros(total, dtype=np.int32)
+                for c in current_code:
+                    for w in ball_list[c]:
+                        cnt[w] += 1
+                no_improve = 0
+
+        if best_size <= 160:
+            break
+
+    # Final polish
+    if time.time() < deadline - 3.0:
+        changed = True
+        iters = 0
+        while changed and time.time() < deadline - 2.0 and iters < 15:
+            iters += 1
+            changed = False
+            removed = run_delete_phase(current_code, cnt)
+            if removed > 0:
+                changed = True
+                if len(current_code) < best_size:
+                    best_size = len(current_code)
+                    best_code = list(current_code)
+            # Try all swaps
+            for c in list(current_code):
+                if time.time() > deadline - 2.0:
+                    break
+                valid = get_valid_swaps(c, current_code, cnt)
+                if valid is None:
+                    continue
+                if not valid:
+                    continue
+                for cp in valid[:3]:
+                    if time.time() > deadline - 2.0:
+                        break
+                    if try_swap(c, cp, current_code, cnt):
+                        removed = run_delete_phase(current_code, cnt)
+                        if removed > 0:
+                            changed = True
+                            if len(current_code) < best_size:
+                                best_size = len(current_code)
+                                best_code = list(current_code)
+
+    # Convert to output format
+    result = []
+    for idx in best_code:
+        w = []
+        temp = idx
+        for i in range(n):
+            w.append(temp % q)
+            temp //= q
+        w.reverse()
+        result.append(w)
+    return result

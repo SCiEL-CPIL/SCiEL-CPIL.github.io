@@ -28,7 +28,7 @@ def _compute_radius(centers):
     min_pair_dist = np.min(dists)
     return min(min_wall_dist, min_pair_dist / 2.0)
 
-def _soft_min_objective(centers_flat, beta, iu):
+def _soft_min_objective(centers_flat, beta, iu, tree_cache=None):
     centers = centers_flat.reshape(-1, 3)
     dists_to_walls = 0.5 - np.abs(centers)
     wall_vals = dists_to_walls.flatten()
@@ -193,6 +193,70 @@ def _polish_repulsion(centers, deadline, iu):
         step_size *= decay
     return best_centers, best_r
 
+def _coordinate_descent_minmax(centers, max_iters=2000):
+    """
+    Direct coordinate descent: repeatedly find the minimum-distance pair and
+    push them apart, while also pushing wall-violating points inward.
+    This is a fundamentally different paradigm from soft-min optimization.
+    """
+    centers = centers.copy()
+    best_r = _compute_radius(centers)
+    best_centers = centers.copy()
+    
+    for it in range(max_iters):
+        if _time_left() < 2.0:
+            break
+        
+        # Compute current radius and identify bottleneck
+        dists_to_walls = 0.5 - np.abs(centers)
+        min_wall_dist = np.min(dists_to_walls)
+        
+        # Find nearest pair using KD-tree
+        tree = cKDTree(centers)
+        dists, indices = tree.query(centers, k=2)
+        # k=2 gives self + nearest neighbor
+        nn_dists = dists[:, 1]
+        nn_indices = indices[:, 1]
+        min_pair_dist = np.min(nn_dists)
+        min_idx = np.argmin(nn_dists)
+        
+        r = min(min_wall_dist, min_pair_dist / 2.0)
+        
+        if r > best_r + 1e-14:
+            best_r = r
+            best_centers = centers.copy()
+        
+        # Determine which constraint is binding
+        if min_wall_dist <= min_pair_dist / 2.0 + 1e-10:
+            # Wall constraint is binding
+            # Find point(s) closest to wall
+            min_wall_idx = np.argmin(dists_to_walls)
+            point_idx = min_wall_idx // 3
+            axis = min_wall_idx % 3
+            # Push inward
+            direction = -np.sign(centers[point_idx, axis])
+            if direction == 0:
+                direction = 1.0
+            step = 0.002
+            centers[point_idx, axis] += direction * step
+        else:
+            # Pair constraint is binding
+            i = min_idx
+            j = nn_indices[i]
+            diff = centers[i] - centers[j]
+            dist = np.linalg.norm(diff)
+            if dist < 1e-12:
+                continue
+            unit = diff / dist
+            # Push apart
+            step = 0.002
+            centers[i] += unit * step
+            centers[j] -= unit * step
+        
+        centers = np.clip(centers, -0.4999, 0.4999)
+    
+    return best_centers, best_r
+
 def _polish_high_beta(centers, deadline, iu):
     best_centers = centers.copy()
     best_r = _compute_radius(best_centers)
@@ -248,23 +312,23 @@ def _optimize_from_initial(centers, deadline, iu, time_budget=20.0):
     best_centers = centers.copy()
     best_radius = _compute_radius(best_centers)
     start_t = time.time()
-    beta_start = 50.0
-    beta_end = 500.0
-    n_beta_steps = 3
+    beta_start = 30.0
+    beta_end = 3000.0
+    n_beta_steps = 6
     for step in range(n_beta_steps):
-        if _time_left() < 5.0 or (time.time() - start_t) > time_budget - 5.0:
+        if _time_left() < 3.0 or (time.time() - start_t) > time_budget - 3.0:
             break
         beta = beta_start * (beta_end / beta_start) ** (step / (n_beta_steps - 1))
         x0 = best_centers.flatten()
         try:
-            max_iter = 100
+            max_iter = 150 if step < 3 else 80
             res = minimize(
                 _soft_min_objective,
                 x0,
                 args=(beta, iu),
                 method='L-BFGS-B',
                 bounds=[(-0.4999, 0.4999)] * (N * 3),
-                options={'maxiter': max_iter, 'ftol': 1e-12, 'gtol': 1e-8, 'maxls': 15}
+                options={'maxiter': max_iter, 'ftol': 1e-13, 'gtol': 1e-9, 'maxls': 20}
             )
             new_centers = res.x.reshape(-1, 3)
             new_centers = np.clip(new_centers, -0.4999, 0.4999)
@@ -274,22 +338,33 @@ def _optimize_from_initial(centers, deadline, iu, time_budget=20.0):
                 best_centers = new_centers
         except Exception:
             pass
-    if _time_left() > 10.0 and (time.time() - start_t) < time_budget - 5.0:
+    
+    # Coordinate descent refinement
+    if _time_left() > 5.0 and (time.time() - start_t) < time_budget - 3.0:
+        cd_centers, cd_radius = _coordinate_descent_minmax(best_centers, max_iters=1000)
+        if cd_radius > best_radius:
+            best_radius = cd_radius
+            best_centers = cd_centers
+    
+    if _time_left() > 8.0 and (time.time() - start_t) < time_budget - 3.0:
         rep_centers, rep_radius = _polish_repulsion(best_centers, deadline, iu)
         if rep_radius > best_radius:
             best_radius = rep_radius
             best_centers = rep_centers
-    if _time_left() > 15.0 and (time.time() - start_t) < time_budget - 5.0:
-        sa_deadline = min(deadline, start_t + time_budget - 5.0)
+    
+    if _time_left() > 12.0 and (time.time() - start_t) < time_budget - 3.0:
+        sa_deadline = min(deadline, start_t + time_budget - 3.0)
         sa_centers, sa_radius = _simulated_annealing(best_centers, sa_deadline, iu)
         if sa_radius > best_radius:
             best_radius = sa_radius
             best_centers = sa_centers
+    
     if _time_left() > 3.0:
         polish_centers, polish_radius = _polish_high_beta(best_centers, deadline, iu)
         if polish_radius > best_radius:
             best_radius = polish_radius
             best_centers = polish_centers
+    
     return best_centers, best_radius
 
 def construct():
@@ -358,6 +433,12 @@ def construct():
         if rep_radius > best_radius:
             best_radius = rep_radius
             best_centers = rep_centers
+
+        if _time_left() > 8.0:
+            cd_centers, cd_radius = _coordinate_descent_minmax(best_centers, max_iters=2000)
+            if cd_radius > best_radius:
+                best_radius = cd_radius
+                best_centers = cd_centers
 
         if _time_left() > 10.0:
             sa_centers, sa_radius = _simulated_annealing(best_centers, _DEADLINE, iu)
