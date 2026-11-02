@@ -1,0 +1,3 @@
+def get_laderman_decomp():
+    # ...
+    # Returns U, V, W or None if invalid

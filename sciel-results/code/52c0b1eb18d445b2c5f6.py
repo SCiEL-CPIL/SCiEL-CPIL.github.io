@@ -1,0 +1,281 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+D = 11
+
+# EVOLVE-BLOCK-START
+import numpy as np
+import itertools
+import time
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 112  # Safety margin before 150s kill
+
+    # --- W4 vectors (weight 4, entries in {-1,0,1}, norm^2 = 4) ---
+    # --- W1 vectors (weight 1, entries in {-2,0,2}, norm^2 = 4) ---
+    v4_candidates = []
+    for positions in itertools.combinations(range(D), 4):
+        for signs in itertools.product([1, -1], repeat=4):
+            v = [0] * D
+            for pos, s in zip(positions, signs):
+                v[pos] = s
+            v4_candidates.append(v)
+
+    v1_candidates = []
+    for pos in range(D):
+        for sign in [1, -1]:
+            v = [0] * D
+            v[pos] = 2 * sign
+            v1_candidates.append(v)
+
+    vectors_v4 = np.array(v4_candidates, dtype=np.int64)
+    vectors_v1 = np.array(v1_candidates, dtype=np.int64)
+    N4 = len(vectors_v4)
+
+    if N4 == 0:
+        return vectors_v1
+
+    # --- Reduce to support graph ---
+    support_to_indices = {}
+    for i in range(N4):
+        support = tuple(np.nonzero(vectors_v4[i])[0])
+        support_to_indices.setdefault(support, []).append(i)
+
+    supports = list(support_to_indices.keys())
+    n_supports = len(supports)
+
+    # Build support-level conflict matrix (share >= 3 positions)
+    support_conflicts = np.zeros((n_supports, n_supports), dtype=bool)
+    sup_sets = [set(s) for s in supports]
+    for i in range(n_supports):
+        for j in range(i + 1, n_supports):
+            if len(sup_sets[i] & sup_sets[j]) >= 3:
+                support_conflicts[i, j] = True
+                support_conflicts[j, i] = True
+
+    neighbors_sup = [np.where(support_conflicts[i])[0] for i in range(n_supports)]
+    neighbor_counts_sup = np.array([len(n) for n in neighbors_sup], dtype=np.int32)
+
+    rng = np.random.default_rng(42)
+
+    best_size = 0
+    best_support_set = np.zeros(n_supports, dtype=bool)
+
+    def greedy_min_degree_supports():
+        in_set = np.zeros(n_supports, dtype=bool)
+        alive = np.ones(n_supports, dtype=bool)
+        degrees = neighbor_counts_sup.copy()
+
+        while np.any(alive) and time.time() < deadline - 5:
+            alive_indices = np.where(alive)[0]
+            if len(alive_indices) == 0:
+                break
+            min_deg = np.min(degrees[alive_indices])
+            cands = alive_indices[degrees[alive_indices] == min_deg]
+            chosen = cands[rng.integers(len(cands))]
+
+            in_set[chosen] = True
+            nbrs = neighbors_sup[chosen]
+            to_remove = np.unique(np.concatenate(([chosen], nbrs)))
+            alive[to_remove] = False
+
+            rem = np.where(alive)[0]
+            if len(rem) > 0:
+                degrees[rem] -= support_conflicts[rem][:, to_remove].sum(axis=1)
+
+        return in_set
+
+    def sa_local_search_supports(in_set_init, max_time=10.0, seed=42):
+        rng_local = np.random.default_rng(seed)
+        in_set = in_set_init.copy()
+        current_size = int(in_set.sum())
+
+        T = 5.0
+        cooling = 0.999
+        min_T = 0.01
+
+        count_conflicts = np.zeros(n_supports, dtype=np.int32)
+        for i in np.where(in_set)[0]:
+            count_conflicts[neighbors_sup[i]] += 1
+
+        stuck_counter = 0
+        local_best_size = current_size
+        local_best_in_set = in_set.copy()
+        sa_deadline = time.time() + max_time
+
+        while time.time() < sa_deadline:
+            not_in_set = np.where(~in_set)[0]
+            if len(not_in_set) == 0:
+                break
+
+            counts = count_conflicts[not_in_set]
+            min_count = np.min(counts)
+            min_cands = not_in_set[counts == min_count]
+            s = min_cands[rng_local.integers(len(min_cands))]
+
+            delta = 1 - min_count
+            if delta > 0:
+                accept = True
+            elif delta == 0:
+                accept = rng_local.random() < 0.5
+            else:
+                accept = rng_local.random() < np.exp(delta / T)
+
+            if accept:
+                to_remove = np.where(support_conflicts[s] & in_set)[0]
+                if len(to_remove) > 0:
+                    in_set[to_remove] = False
+                    for u in to_remove:
+                        count_conflicts[neighbors_sup[u]] -= 1
+
+                in_set[s] = True
+                current_size += delta
+                count_conflicts[neighbors_sup[s]] += 1
+
+                if current_size > local_best_size:
+                    local_best_size = current_size
+                    local_best_in_set = in_set.copy()
+                    stuck_counter = 0
+                else:
+                    stuck_counter += 1
+            else:
+                stuck_counter += 1
+
+            if stuck_counter > 2000:
+                T = max(T, 3.0)
+                stuck_counter = 0
+
+            T *= cooling
+            if T < min_T:
+                T = min_T
+
+        return local_best_in_set, local_best_size
+
+    def two_swap_local_search(in_set_init, max_time=8.0):
+        """Try 2-for-1 swaps: remove 2 supports, add 1 support."""
+        in_set = in_set_init.copy()
+        current_size = int(in_set.sum())
+        count_conflicts = np.zeros(n_supports, dtype=np.int32)
+        for i in np.where(in_set)[0]:
+            count_conflicts[neighbors_sup[i]] += 1
+
+        polish_deadline = time.time() + max_time
+        improved = True
+        while improved and time.time() < polish_deadline:
+            improved = False
+            # Pass A: add any free node
+            free = np.where((~in_set) & (count_conflicts == 0))[0]
+            for s in free:
+                in_set[s] = True
+                current_size += 1
+                count_conflicts[neighbors_sup[s]] += 1
+            if len(free) > 0:
+                improved = True
+
+            # Pass B: best single swap
+            in_set_nodes = np.where(in_set)[0]
+            best_delta = 0
+            best_s = -1
+            best_remove = None
+            for s in np.where(~in_set)[0]:
+                k = count_conflicts[s]
+                if k == 0:
+                    continue
+                d = 1 - k
+                if d > best_delta:
+                    best_delta = d
+                    best_s = s
+                    best_remove = np.where(support_conflicts[s] & in_set)[0]
+            if best_s >= 0 and best_remove is not None:
+                for u in best_remove:
+                    in_set[u] = False
+                    count_conflicts[neighbors_sup[u]] -= 1
+                in_set[best_s] = True
+                current_size += best_delta
+                count_conflicts[neighbors_sup[best_s]] += 1
+                improved = True
+
+            # Pass C: 2-for-1 swap (remove 2, add 1)
+            if time.time() < polish_deadline - 1:
+                best_2swap_delta = 0
+                best_2swap_s = -1
+                best_2swap_remove = None
+                for s in np.where(~in_set)[0]:
+                    k = count_conflicts[s]
+                    if k <= 1:
+                        continue
+                    # Try removing pairs of neighbors
+                    nbrs = np.where(support_conflicts[s] & in_set)[0]
+                    for i in range(len(nbrs)):
+                        for j in range(i+1, len(nbrs)):
+                            u, v = nbrs[i], nbrs[j]
+                            # Check if u and v are neighbors (if so, removing both is safe)
+                            # If not neighbors, removing both might free up other nodes
+                            d = 1 - 2
+                            if d > best_2swap_delta:
+                                best_2swap_delta = d
+                                best_2swap_s = s
+                                best_2swap_remove = [u, v]
+                if best_2swap_s >= 0 and best_2swap_remove is not None:
+                    for u in best_2swap_remove:
+                        in_set[u] = False
+                        count_conflicts[neighbors_sup[u]] -= 1
+                    in_set[best_2swap_s] = True
+                    current_size += best_2swap_delta
+                    count_conflicts[neighbors_sup[best_2swap_s]] += 1
+                    improved = True
+
+        return in_set, current_size
+
+    # --- Multiple restarts on the support graph ---
+    n_restarts = 0
+    max_restarts = 300
+
+    while time.time() < deadline - 8 and n_restarts < max_restarts:
+        n_restarts += 1
+        seed = 42 + n_restarts
+
+        in_set = greedy_min_degree_supports()
+        current_size = int(in_set.sum())
+
+        if current_size > best_size:
+            best_size = current_size
+            best_support_set = in_set.copy()
+
+        remaining_time = deadline - 8 - time.time()
+        if remaining_time < 3:
+            break
+
+        sa_time = min(remaining_time * 0.5, 10.0)
+        if sa_time < 2:
+            sa_time = 2.0
+
+        sa_result, sa_size = sa_local_search_supports(in_set, max_time=sa_time, seed=seed)
+
+        if sa_size > best_size:
+            best_size = sa_size
+            best_support_set = sa_result.copy()
+
+        # Polish the current best
+        remaining_time = deadline - 5 - time.time()
+        if remaining_time > 5:
+            polish_time = min(remaining_time * 0.4, 10.0)
+            if polish_time > 3:
+                polish_result, polish_size = two_swap_local_search(best_support_set, max_time=polish_time)
+                if polish_size > best_size:
+                    best_size = polish_size
+                    best_support_set = polish_result.copy()
+
+    # --- Lift support independent set to full W4 vectors ---
+    selected_supports = np.where(best_support_set)[0]
+    all_v4 = []
+    for si in selected_supports:
+        all_v4.extend(support_to_indices[supports[si]])
+    if len(all_v4) > 0:
+        result_v4 = vectors_v4[np.array(all_v4, dtype=np.int64)]
+        final_vectors = np.vstack([result_v4, vectors_v1])
+    else:
+        final_vectors = vectors_v1
+
+    return final_vectors
+
+# EVOLVE-BLOCK-END

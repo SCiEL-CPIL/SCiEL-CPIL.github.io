@@ -1,99 +1,114 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+D = 11
+
+# EVOLVE-BLOCK-START
 import numpy as np
 import itertools
 import time
 
-D = 11
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 110
+    deadline = start_time + 120.0  # safety margin before 150s limit
     
-    # Generate candidates with squared norm 4
+    # Generate all weight-4 vectors with ±1 entries
+    # C(11,4) = 330 positions, 2^4 = 16 sign combos -> 5280 vectors
     candidates = []
-    
-    # Type 1: One 2, rest 0
-    for i in range(D):
-        for s in [1, -1]:
-            v = [0] * D
-            v[i] = 2 * s
-            candidates.append(v)
-            
-    # Type 2: Four 1s, rest 0
-    for idxs in itertools.combinations(range(D), 4):
+    for positions in itertools.combinations(range(D), 4):
         for signs in itertools.product([1, -1], repeat=4):
             v = [0] * D
-            for idx, s in zip(idxs, signs):
-                v[idx] = s
+            for pos, s in zip(positions, signs):
+                v[pos] = s
             candidates.append(v)
-            
-    candidates = np.array(candidates, dtype=np.int32)
-    N = len(candidates)
     
-    # Compute dot product matrix
-    # M[i, j] = candidates[i] . candidates[j]
-    # We need M[i, j] <= 2 for i != j
-    # Note M[i, i] = 4
+    candidates = np.array(candidates, dtype=np.int64)
+    n_candidates = len(candidates)
     
-    # Use matrix multiplication for speed
-    M = candidates @ candidates.T
+    # Norm squared of each candidate = 4
+    # Constraint: |u-v|^2 >= 4 for all pairs, i.e., u·v <= 2
     
-    # Threshold mask: 1 if valid (dot <= 2), 0 if invalid
-    # For i != j, we need M[i, j] <= 2
-    # For i == j, we don't care (we won't pick same node twice)
-    
-    best_set_indices = []
-    
-    # Try multiple random orderings
-    rng = np.random.default_rng(42)
-    
-    # Also try sorted by norm? All norms are 4.
-    # Maybe sort by index?
-    
-    orderings = [np.arange(N)]
-    for _ in range(20):
-        orderings.append(rng.permutation(N))
-        
-    for order in orderings:
-        if time.time() > deadline:
-            break
-            
+    def greedy_select(order, time_limit):
+        """Greedy selection following the given order."""
         selected = []
-        selected_mask = np.zeros(N, dtype=bool)
-        
         for idx in order:
-            # Check if idx is compatible with all selected
-            # selected_mask indicates which are selected
-            # We need M[idx, selected] <= 2 for all selected
-            # i.e., np.all(M[idx, selected_mask] <= 2)
-            
-            # Optimization: if selected is empty, valid
+            if time.time() > time_limit:
+                break
+            v = candidates[idx]
             if not selected:
-                selected.append(idx)
-                selected_mask[idx] = True
+                selected.append(v)
                 continue
-                
-            # Check compatibility
-            # M[idx, selected_mask] gets the dot products with selected nodes
-            # We need all of them to be <= 2
-            # Note: M[idx, idx] is 4, but idx is not in selected yet, so selected_mask[idx] is False.
-            
-            dots = M[idx, selected_mask]
+            # Constraint: u·v <= 2 for all selected u
+            dots = np.dot(selected, v)
             if np.all(dots <= 2):
-                selected.append(idx)
-                selected_mask[idx] = True
-                
-        if len(selected) > len(best_set_indices):
-            best_set_indices = selected
+                selected.append(v)
+        return selected
+    
+    def greedy_maxmin(order, time_limit):
+        """Greedy with max-min heuristic: pick vector maximizing min distance to selected."""
+        selected = []
+        remaining = set(order)
+        for _ in range(len(order)):
+            if time.time() > time_limit:
+                break
+            if not selected:
+                selected.append(candidates[order[0]])
+                remaining.discard(order[0])
+                continue
             
-    if not best_set_indices:
-        # Fallback
-        vectors = []
-        for i, j in itertools.combinations(range(D), 2):
-            for si in (1, -1):
-                for sj in (1, -1):
-                    v = [0] * D
-                    v[i], v[j] = si, sj
-                    vectors.append(v)
-        return np.array(vectors, dtype=np.int64)
+            best_idx = None
+            best_min_dist = -1
+            for idx in remaining:
+                v = candidates[idx]
+                dots = np.dot(selected, v)
+                # |v-u|^2 = 8 - 2*v·u, so max min dist = min(8-2*dots)
+                min_dist = np.min(8 - 2 * dots)
+                if min_dist >= 4 and min_dist > best_min_dist:
+                    best_min_dist = min_dist
+                    best_idx = idx
+            
+            if best_idx is None:
+                break
+            selected.append(candidates[best_idx])
+            remaining.discard(best_idx)
         
-    return candidates[best_set_indices].astype(np.int64)
+        return selected
+    
+    # Try multiple strategies
+    best_selected = []
+    np.random.seed(42)
+    
+    # Strategy 1: Original fixed order
+    fixed_order = list(range(n_candidates))
+    sel = greedy_select(fixed_order, deadline - 10.0)
+    if len(sel) > len(best_selected):
+        best_selected = sel
+    
+    # Strategy 2: Multiple random orderings with simple greedy
+    time_per_trial = max(1.0, (deadline - time.time() - 10.0) / 50.0)
+    for trial in range(50):
+        if time.time() > deadline - 10.0:
+            break
+        perm = np.random.permutation(n_candidates)
+        sel = greedy_select(perm, deadline - 10.0)
+        if len(sel) > len(best_selected):
+            best_selected = sel
+    
+    # Strategy 3: Max-min greedy with random starts
+    if time.time() < deadline - 30.0:
+        for trial in range(10):
+            if time.time() > deadline - 10.0:
+                break
+            perm = np.random.permutation(n_candidates)
+            sel = greedy_maxmin(perm, deadline - 10.0)
+            if len(sel) > len(best_selected):
+                best_selected = sel
+    
+    if not best_selected:
+        # Fallback: return a minimal valid set
+        v = [0] * D
+        v[0] = 1
+        v[1] = 1
+        return np.array([v], dtype=np.int64)
+    
+    return np.array(best_selected, dtype=np.int64)
+# EVOLVE-BLOCK-END

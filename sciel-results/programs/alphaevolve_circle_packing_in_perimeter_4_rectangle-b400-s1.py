@@ -1,317 +1,356 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-N = 21
+"""Circle packing in perimeter-4 rectangle: pack 21 circles, maximize sum of radii.
 
-# EVOLVE-BLOCK-START
+Combines:
+ - Delaunay-based LP radii solver (exact feasibility, decoupled structure)
+ - equal-radius SLSQP refinement jointly optimizing aspect ratio w and radius r
+ - hexagonal / grid / random initial configurations
+"""
 import numpy as np
 import time
 import random
+from scipy.optimize import minimize, linprog
+from scipy.spatial import Delaunay
+
+N = 21
+
+
+def _softplus(x):
+    return np.where(x > 20, x, np.log1p(np.exp(x)))
+
+
+def _sigmoid(x):
+    return np.where(x > 0, 1 / (1 + np.exp(-x)), np.exp(x) / (1 + np.exp(x)))
+
+
+def _delaunay_edges(xs, ys):
+    """Return list of (i, j) edges from Delaunay triangulation of centers."""
+    points = np.column_stack((xs, ys))
+    try:
+        tri = Delaunay(points)
+    except Exception:
+        return None
+    edges = set()
+    for simplex in tri.simplices:
+        edges.add(tuple(sorted((simplex[0], simplex[1]))))
+        edges.add(tuple(sorted((simplex[1], simplex[2]))))
+        edges.add(tuple(sorted((simplex[0], simplex[2]))))
+    return list(edges)
+
+
+def _solve_lp_radii(xs, ys, w, h):
+    """
+    Solve LP for per-circle radii given fixed centers and rectangle.
+    Maximize sum(r) s.t.  r_i + r_j <= d_ij  (Delaunay edges)
+                          r_i <= min(x_i, w-x_i, y_i, h-y_i)
+                          r_i >= 0
+    Returns array of radii (zeros on failure).
+    """
+    limits = np.minimum(np.minimum(xs, w - xs), np.minimum(ys, h - ys))
+    if np.any(limits < 0):
+        return np.zeros(N)
+
+    A_list = []
+    b_list = []
+    edges = _delaunay_edges(xs, ys)
+    if edges is not None:
+        for i, j in edges:
+            dx = xs[i] - xs[j]
+            dy = ys[i] - ys[j]
+            dist = np.sqrt(dx * dx + dy * dy)
+            row = np.zeros(N)
+            row[i] = 1
+            row[j] = 1
+            A_list.append(row)
+            b_list.append(dist)
+
+    A_bound = np.eye(N)
+    if A_list:
+        A_ub = np.vstack([A_list, A_bound])
+        b_ub = np.concatenate([b_list, limits])
+    else:
+        A_ub = A_bound
+        b_ub = limits
+
+    c = -np.ones(N)
+    try:
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=(0, None), method='highs')
+        if res.success:
+            return np.maximum(0.0, res.x)
+    except Exception:
+        pass
+    return np.maximum(0.0, limits * 0.9)
+
+
+def _max_equal_radius(xs, ys, w, h):
+    """
+    Largest r such that a single-radius packing is feasible:
+    r <= min_i (x_i, w-x_i, y_i, h-y_i)
+    r <= d_ij / 2 for all Delaunay edges (i, j).
+    """
+    limits = np.minimum(np.minimum(xs, w - xs), np.minimum(ys, h - ys))
+    r = float(np.min(limits))
+    if r < 0:
+        return 0.0
+    edges = _delaunay_edges(xs, ys)
+    if edges is not None:
+        for i, j in edges:
+            dx = xs[i] - xs[j]
+            dy = ys[i] - ys[j]
+            r = min(r, 0.5 * np.sqrt(dx * dx + dy * dy))
+    return max(0.0, r)
+
+
+def _make_hex(rows, w, h):
+    """Hexagonal layout of given per-row counts, scaled to fit w x h."""
+    pts = []
+    for k, n in enumerate(rows):
+        y = k * np.sqrt(3.0)
+        off = 1.0 if k % 2 == 1 else 0.0
+        for i in range(n):
+            pts.append((i * 2.0 + off, y))
+    pts = np.array(pts[:N])
+    xs = pts[:, 0]
+    ys = pts[:, 1]
+    cx = 0.5 * (xs.max() + xs.min())
+    cy = 0.5 * (ys.max() + ys.min())
+    xs = xs - cx
+    ys = ys - cy
+    wc = xs.max() - xs.min()
+    hc = ys.max() - ys.min()
+    wt = wc + 2.0
+    ht = hc + 2.0
+    s = 2.0 / (wt + ht)
+    xs_f = xs * s + 0.5 * (s * wt)
+    ys_f = ys * s + 0.5 * (s * ht)
+    return xs_f, ys_f, s * wt, s * ht
+
+
+def _make_grid(rows, cols, w, h):
+    pts = []
+    for j in range(rows):
+        for i in range(cols):
+            if len(pts) >= N:
+                break
+            pts.append((i * 2.0, j * 2.0))
+    pts = np.array(pts[:N])
+    xs = pts[:, 0]
+    ys = pts[:, 1]
+    cx = 0.5 * (xs.max() + xs.min())
+    cy = 0.5 * (ys.max() + ys.min())
+    xs = xs - cx
+    ys = ys - cy
+    wt = (xs.max() - xs.min()) + 2.0
+    ht = (ys.max() - ys.min()) + 2.0
+    s = 2.0 / (wt + ht)
+    xs_f = xs * s + 0.5 * (s * wt)
+    ys_f = ys * s + 0.5 * (s * ht)
+    return xs_f, ys_f, s * wt, s * ht
+
+
+def _make_random(w, h, seed):
+    rng = np.random.RandomState(seed)
+    xs = rng.uniform(0.1, 0.9, N) * w
+    ys = rng.uniform(0.1, 0.9, N) * h
+    return xs, ys, w, h
+
+
+def _refine_slsqp(w, h, xs, ys, r, deadline):
+    """
+    Equal-radius SLSQP refinement.
+    Variables: [w, r, x0..x20, y0..y20].  h = 2 - w.
+    Maximize r  s.t.  boundary + pairwise non-overlap.
+    Returns (w, h, r, xs, ys) or the input on failure.
+    """
+    if time.time() > deadline - 3.0:
+        return w, h, r, xs, ys
+
+    v0 = np.zeros(2 + 2 * N)
+    v0[0] = w
+    v0[1] = r
+    v0[2:2 + N] = xs
+    v0[2 + N:2 + 2 * N] = ys
+
+    def objective(v):
+        if v[0] <= 0.2 or (2.0 - v[0]) <= 0.2 or v[1] <= 0:
+            return 1e6
+        return -v[1]
+
+    def make_cons():
+        cons = [
+            {'type': 'ineq', 'fun': lambda v: v[0] - 0.2},
+            {'type': 'ineq', 'fun': lambda v: 2.0 - v[0] - 0.2},
+        ]
+        for i in range(N):
+            cons.append({'type': 'ineq', 'fun': lambda v, i=i: v[2 + i] - v[1]})
+            cons.append({'type': 'ineq', 'fun': lambda v, i=i: v[0] - v[2 + i] - v[1]})
+            cons.append({'type': 'ineq', 'fun': lambda v, i=i: v[2 + N + i] - v[1]})
+            cons.append({'type': 'ineq', 'fun': lambda v, i=i: (2.0 - v[0]) - v[2 + N + i] - v[1]})
+        for i in range(N):
+            for j in range(i + 1, N):
+                cons.append({
+                    'type': 'ineq',
+                    'fun': lambda v, i=i, j=j: np.sqrt((v[2 + i] - v[2 + j]) ** 2
+                                                       + (v[2 + N + i] - v[2 + N + j]) ** 2) - 2.0 * v[1]
+                })
+        return cons
+
+    bounds = [(0.2, 1.8), (0.001, 1.0)] + [(0.0, 2.0)] * (2 * N)
+
+    try:
+        res = minimize(objective, v0, method='SLSQP', bounds=bounds,
+                       constraints=make_cons(),
+                       options={'maxiter': 120, 'ftol': 1e-9, 'disp': False})
+    except Exception:
+        return w, h, r, xs, ys
+
+    if res.success:
+        w_r = res.x[0]
+        r_r = res.x[1]
+        h_r = 2.0 - w_r
+        xs_r = res.x[2:2 + N]
+        ys_r = res.x[2 + N:2 + 2 * N]
+        if w_r > 0 and h_r > 0 and r_r > 0:
+            return w_r, h_r, r_r, xs_r, ys_r
+    return w, h, r, xs, ys
+
+
+def _make_result_from_lp(w, h, xs, ys):
+    """Build a valid (N,3) result using per-circle LP radii, then scale to perimeter <= 4."""
+    rs = _solve_lp_radii(xs, ys, w, h)
+    result = np.zeros((N, 3))
+    result[:, 0] = xs
+    result[:, 1] = ys
+    result[:, 2] = rs
+    # ensure non-negative
+    result[:, 2] = np.maximum(result[:, 2], 0.0)
+    _scale_to_perimeter(result)
+    return result
+
+
+def _make_result_equal(w, h, xs, ys, r):
+    result = np.zeros((N, 3))
+    result[:, 0] = xs
+    result[:, 1] = ys
+    result[:, 2] = r
+    _scale_to_perimeter(result)
+    return result
+
+
+def _scale_to_perimeter(result):
+    """Scale result about its bounding-box center so perimeter <= 4."""
+    xs = result[:, 0]
+    ys = result[:, 1]
+    rs = result[:, 2]
+    min_x = np.min(xs - rs)
+    max_x = np.max(xs + rs)
+    min_y = np.min(ys - rs)
+    max_y = np.max(ys + rs)
+    bw = max_x - min_x
+    bh = max_y - min_y
+    perim = 2.0 * (bw + bh)
+    if perim > 4.0 + 1e-9 and perim > 0:
+        scale = 4.0 / perim
+        cx = 0.5 * (min_x + max_x)
+        cy = 0.5 * (min_y + max_y)
+        for i in range(N):
+            result[i, 0] = cx + (result[i, 0] - cx) * scale
+            result[i, 1] = cy + (result[i, 1] - cy) * scale
+            result[i, 2] = result[i, 2] * scale
+    return result
+
+
+def _validity_margin(result, tol=1e-5):
+    """Return minimum clearance (positive = valid)."""
+    xs = result[:, 0]
+    ys = result[:, 1]
+    rs = result[:, 2]
+    if np.any(rs < 1e-6):
+        return -1.0
+    m = min(float(np.min(xs - rs)), float(np.min(ys - rs)))
+    m = min(m, float(np.max(xs + rs)) - 2.0 + float(np.max(ys + rs)) - 0.0)  # placeholder
+    # boundary: need x-r >= 0, y-r >= 0, and (x+r)+(y+r) <= 2 (since w+h=2)
+    m = min(m, float(np.max(xs + rs + ys + rs)) - 2.0)
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = np.sqrt((xs[i] - xs[j]) ** 2 + (ys[i] - ys[j]) ** 2)
+            m = min(m, d - (rs[i] + rs[j]))
+    return m
+
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 110  # Safety margin before 120s limit
-    
-    # Rectangle perimeter is 4, so 2*(w+h) = 4 => w+h = 2.
-    # Let w = 2 * t, h = 2 * (1-t), where t in (0, 1).
-    # To maximize sum of radii, we want to pack efficiently.
-    # Initial guess: square-ish rectangle.
-    # t = 0.5 => w=1, h=1. Perimeter = 4.
-    
-    # State: 
-    # t: aspect ratio parameter (1 variable)
-    # circles: (x, y, r) for N circles (3*N variables)
-    
-    # Total variables: 1 + 3*21 = 64
-    
-    def get_rect_dims(t):
-        # t is in (0, 1)
-        # Clip t to avoid degenerate rectangles
-        t = np.clip(t, 0.1, 0.9)
-        w = 2.0 * t
-        h = 2.0 * (1.0 - t)
-        return w, h
+    deadline = start_time + 145.0  # safety margin before 150s kill
 
-    def evaluate(state):
-        """
-        Returns a score (higher is better) and validity.
-        Score = sum(radii) - penalty
-        Penalty is large if constraints are violated.
-        """
-        t = state[0]
-        circles = state[1:]
-        
-        w, h = get_rect_dims(t)
-        
-        sum_r = 0.0
-        penalty = 0.0
-        
-        # Reshape circles
-        # circles is flat array of x,y,r
-        for i in range(N):
-            xi = circles[3*i]
-            yi = circles[3*i+1]
-            ri = circles[3*i+2]
-            
-            if ri < 1e-6:
-                ri = 1e-6
-                penalty += 1.0 # small penalty for tiny radius? or just clamp
-            
-            sum_r += ri
-            
-            # Boundary constraints:
-            # x - r >= 0, x + r <= w
-            # y - r >= 0, y + r <= h
-            if xi - ri < 0:
-                penalty += (xi - ri) * 1000  # Quadratic or linear penalty? Linear is often faster to fix. Let's use squared for smoothness.
-                # Actually, for SA, simple linear penalty on violation magnitude is robust.
-                # violation = max(0, r - x), max(0, r - (w-x)), etc.
-                penalty += (ri - xi) * 100
-                penalty += (ri - (w - xi)) * 100
-                penalty += (ri - yi) * 100
-                penalty += (ri - (h - yi)) * 100
-            
-            # Wait, the above adds penalty for ALL sides if we just sum max(0, ...).
-            # Let's be precise.
-            # Penalty should be 0 if inside.
-            # Violation if x < r => dist to left wall < r.
-            # Violation if x > w - r => dist to right wall < r.
-            
-            # Let's restart penalty logic inside the loop for clarity and correctness.
-            # I will rewrite the penalty calculation properly below.
-        
-        # Let's do a vectorized or clean loop for penalties
-        penalty = 0.0
-        sum_r = 0.0
-        coords = []
-        for i in range(N):
-            xi = circles[3*i]
-            yi = circles[3*i+1]
-            ri = circles[3*i+2]
-            if ri < 1e-5:
-                ri = 1e-5
-            sum_r += ri
-            coords.append((xi, yi, ri))
-            
-            # Boundaries
-            if xi < ri:
-                penalty += (ri - xi) * 500
-            if xi > w - ri:
-                penalty += (xi - (w - ri)) * 500
-            if yi < ri:
-                penalty += (ri - yi) * 500
-            if yi > h - ri:
-                penalty += (yi - (h - ri)) * 500
-        
-        # Overlaps
-        for i in range(N):
-            xi, yi, ri = coords[i]
-            for j in range(i+1, N):
-                xj, yj, rj = coords[j]
-                dist_sq = (xi - xj)**2 + (yi - yj)**2
-                dist = np.sqrt(dist_sq)
-                min_dist = ri + rj
-                if dist < min_dist:
-                    # Penalty proportional to overlap depth
-                    overlap = min_dist - dist
-                    penalty += overlap * 1000
-        
-        score = sum_r - penalty
-        return score, penalty
+    random.seed(42)
+    np.random.seed(42)
 
-    def check_valid(state):
-        """
-        Check if the state is strictly valid for the final return.
-        """
-        t = state[0]
-        circles = state[1:]
-        w, h = get_rect_dims(t)
-        
-        coords = []
-        for i in range(N):
-            xi = circles[3*i]
-            yi = circles[3*i+1]
-            ri = circles[3*i+2]
-            if ri < 1e-6:
-                return False
-            coords.append((xi, yi, ri))
-            
-            # Strict boundary check with small epsilon
-            if xi - ri < -1e-6 or xi + ri > w + 1e-6 or yi - ri < -1e-6 or yi + ri > h + 1e-6:
-                return False
-        
-        # Strict overlap check
-        for i in range(N):
-            xi, yi, ri = coords[i]
-            for j in range(i+1, N):
-                xj, yj, rj = coords[j]
-                dist_sq = (xi - xj)**2 + (yi - yj)**2
-                if dist_sq < (ri + rj - 1e-6)**2:
-                    return False
-        return True
+    best_result = None
+    best_value = -np.inf
 
-    # Initialization
-    # Start with a grid-like initialization but randomize slightly
-    # Square 1x1
-    t_init = 0.5
-    w, h = get_rect_dims(t_init)
-    
-    state = np.zeros(1 + 3*N)
-    state[0] = t_init
-    
-    # Place circles in a grid pattern initially to get a decent starting point
-    side = int(np.ceil(np.sqrt(N)))
-    idx = 0
-    for i in range(side):
-        for j in range(side):
-            if idx >= N:
-                break
-            # Grid center
-            gx = (i + 0.5) / side * w
-            gy = (j + 0.5) / side * h
-            # Max radius in cell is 0.5/side * min(w,h) roughly, but let's start small
-            r_init = 0.4 / side * min(w, h)
-            
-            state[1 + 3*idx] = gx + random.uniform(-0.01, 0.01)
-            state[1 + 3*idx + 1] = gy + random.uniform(-0.01, 0.01)
-            state[1 + 3*idx + 2] = r_init
-            idx += 1
-    
-    best_state = state.copy()
-    best_score, _ = evaluate(best_state)
-    
-    # Simulated Annealing Parameters
-    T_start = 1.0
-    T_end = 1e-4
-    alpha = 0.999
-    max_iter = 200000  # Cap iterations, but loop until time
-    
-    T = T_start
-    
-    # Pre-compute some constants if needed? No, dynamic w/h.
-    
-    while time.time() < deadline:
-        # Check time frequently
-        if time.time() > deadline - 5:
+    def consider(result):
+        nonlocal best_result, best_value
+        if result is None:
+            return
+        # final validity gate
+        if _validity_margin(result) < -1e-5:
+            return
+        val = float(np.sum(result[:, 2]))
+        if val > best_value:
+            best_value = val
+            best_result = result.copy()
+
+    # ---------- initial configurations ----------
+    inits = []
+    for rows in [[7, 7, 7], [4, 5, 4, 4, 4], [4, 4, 4, 4, 4, 1],
+                 [3, 4, 4, 4, 4, 2], [5, 5, 5, 3, 3], [6, 7, 8]]:
+        if sum(rows) < N:
+            continue
+        xs, ys, w, h = _make_hex(rows, 1.0, 1.0)
+        inits.append((w, h, xs, ys))
+    for rows, cols in [(5, 5), (3, 7), (4, 6), (7, 3), (6, 4)]:
+        xs, ys, w, h = _make_grid(rows, cols, 1.0, 1.0)
+        inits.append((w, h, xs, ys))
+    for seed in range(6):
+        w = 1.0 + 0.15 * (seed - 2) / 5.0
+        h = 2.0 - w
+        xs, ys, w, h = _make_random(w, h, seed + 100)
+        inits.append((w, h, xs, ys))
+
+    # ---------- process each init ----------
+    for idx, (w, h, xs, ys) in enumerate(inits):
+        if time.time() > deadline - 15.0:
             break
-            
-        # Generate neighbor
-        new_state = best_state.copy()
-        
-        # Randomly perturb a variable
-        var_idx = random.randint(0, len(new_state)-1)
-        
-        if var_idx == 0:
-            # Perturb aspect ratio
-            new_state[0] += random.gauss(0, 0.01)
-            # Ensure t is valid
-            if new_state[0] < 0.05 or new_state[0] > 0.95:
-                continue
-        else:
-            # Perturb circle x, y, or r
-            circle_idx = (var_idx - 1) // 3
-            comp = (var_idx - 1) % 3
-            
-            if comp == 0: # x
-                new_state[var_idx] += random.gauss(0, 0.05)
-            elif comp == 1: # y
-                new_state[var_idx] += random.gauss(0, 0.05)
-            else: # r
-                # Radius perturbation should be smaller
-                new_state[var_idx] += random.gauss(0, 0.01)
-                if new_state[var_idx] < 1e-4:
-                    new_state[var_idx] = 1e-4
-                # Cap radius to not exceed half min dimension
-                w, h = get_rect_dims(new_state[0])
-                max_r = 0.5 * min(w, h)
-                if new_state[var_idx] > max_r:
-                    new_state[var_idx] = max_r
 
-        new_score, new_penalty = evaluate(new_state)
-        
-        # Acceptance criterion
-        if new_score > best_score or random.random() < np.exp((new_score - best_score) / T):
-            best_state = new_state
-            best_score = new_score
-            
-            # If we found a valid solution, we can potentially tighten the "best" tracking
-            # But we keep the highest score state as the candidate for annealing.
-            # Note: The score includes penalties. A valid solution has penalty 0.
-            # So maximizing score is equivalent to maximizing sum_r among valid solutions,
-            # and moving towards valid solutions among invalid ones.
-        
-        T *= alpha
-        if T < T_end:
-            T = T_end
-            
-    # Final check and cleanup
-    # We need to return a valid configuration.
-    # If the best state found is invalid, we should try to repair it or return a known valid one.
-    # The seed program returns a valid grid. We should keep a fallback.
-    
-    # Try to repair best_state if invalid
-    if not check_valid(best_state):
-        # Simple repair: shrink radii until valid?
-        # Or just return the seed solution?
-        # Let's try a quick local repair: reduce radii slightly.
-        repair_state = best_state.copy()
-        for _ in range(100):
-            if check_valid(repair_state):
-                break
-            # Shrink all radii by 1%
-            for i in range(N):
-                r_idx = 1 + 3*i + 2
-                repair_state[r_idx] *= 0.99
-        
-        if check_valid(repair_state):
-            best_state = repair_state
-        else:
-            # Fallback to seed grid
-            side = int(np.ceil(np.sqrt(N)))
-            cells = []
-            for i in range(side):
-                for j in range(side):
-                    if len(cells) >= N:
-                        break
-                    # In seed, w=1, h=1 was implicit? 
-                    # Seed: side=5. x,y in (0,1). r=0.5/5 - eps = 0.1 - eps.
-                    # Perimeter of bounding box of these circles:
-                    # Min x: 0.1 - 0.1 = 0. Max x: 0.9 + 0.1 = 1.0. Width 1.
-                    # Min y: 0.1 - 0.1 = 0. Max y: 0.9 + 0.1 = 1.0. Height 1.
-                    # Perimeter = 4.
-                    # So we need to map this to our w,h representation.
-                    # Our representation: w+h=2. If w=1, h=1, t=0.5.
-                    # The seed circles are in [0,1]x[0,1].
-                    # Our evaluator expects coordinates in [0,w]x[0,h].
-                    # So if we return t=0.5, w=1, h=1, the coordinates should be as is.
-                    
-                    gx = (i + 0.5) / side
-                    gy = (j + 0.5) / side
-                    r = 0.5 / side - 1e-3
-                    cells.append([gx, gy, r])
-            # Construct final array format: [t, x1, y1, r1, ...]
-            final_state = np.zeros(1 + 3*N)
-            final_state[0] = 0.5
-            for i in range(N):
-                final_state[1 + 3*i] = cells[i][0]
-                final_state[1 + 3*i + 1] = cells[i][1]
-                final_state[1 + 3*i + 2] = cells[i][2]
-            best_state = final_state
+        # 1) LP-based per-circle radii result (guaranteed-feasible structure)
+        res_lp = _make_result_from_lp(w, h, xs, ys)
+        consider(res_lp)
 
-    # Extract final result
-    t_final = best_state[0]
-    w_final, h_final = get_rect_dims(t_final)
-    
-    # The output format required is (N, 3) array of [x, y, r].
-    # The problem statement says: "construct() -> array of shape (n, 3): n disjoint circles whose bounding rectangle has perimeter at most 4"
-    # It does NOT ask to return t. It asks for the circles.
-    # The evaluator will compute the bounding box of the returned circles.
-    # So we just return the x, y, r coordinates.
-    
-    result = np.zeros((N, 3))
-    for i in range(N):
-        result[i, 0] = best_state[1 + 3*i]
-        result[i, 1] = best_state[1 + 3*i + 1]
-        result[i, 2] = best_state[1 + 3*i + 2]
-        
-    return result
+        # 2) equal-radius seed from LP max feasible r, then SLSQP refine
+        r0 = _max_equal_radius(xs, ys, w, h)
+        if r0 > 0:
+            res_eq0 = _make_result_equal(w, h, xs, ys, r0)
+            consider(res_eq0)
+        if time.time() < deadline - 8.0:
+            w2, h2, r2, xs2, ys2 = _refine_slsqp(w, h, xs, ys, max(r0, 0.02), deadline)
+            # safety: re-derive a feasible equal radius from refined centers
+            r2 = _max_equal_radius(xs2, ys2, w2, h2)
+            if r2 > 0:
+                res_eq1 = _make_result_equal(w2, h2, xs2, ys2, r2)
+                consider(res_eq1)
 
-# EVOLVE-BLOCK-END
+    # ---------- final fallback ----------
+    if best_result is None or best_value <= 0:
+        w = 1.0
+        h = 1.0
+        side = 5
+        result = np.zeros((N, 3))
+        for i in range(N):
+            row = i // side
+            col = i % side
+            result[i, 0] = (col + 0.5) / side * w
+            result[i, 1] = (row + 0.5) / side * h
+            result[i, 2] = 0.48 / side
+        _scale_to_perimeter(result)
+        return result
+
+    return best_result
