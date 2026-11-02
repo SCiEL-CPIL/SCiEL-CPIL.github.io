@@ -1,244 +1,219 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+"""Model-and-optimize approach for the Heilbronn-11 triangle problem."""
 N = 11
 
 # EVOLVE-BLOCK-START
 import numpy as np
 import time
-from scipy.optimize import minimize, differential_evolution
+from scipy.optimize import minimize
+import itertools
 
 S3 = np.sqrt(3)
 S3H = S3 / 2
 TRI_AREA = S3 / 4  # area of the equilateral triangle with side 1
 
-DEADLINE = 140  # safety margin from 150s limit
+DEADLINE = 142  # safety margin from 150s limit
 
+# Triangle vertices
+V0 = np.array([0.0, 0.0])
+V1 = np.array([1.0, 0.0])
+V2 = np.array([0.5, S3H])
 
-def _min_triangle_area(pts):
-    """Compute the minimum area of any triangle formed by three points."""
-    n = len(pts)
-    min_a = float('inf')
-    for i in range(n):
-        for j in range(i + 1, n):
-            for k in range(j + 1, n):
-                # Area = 0.5 * |cross product|
-                ax, ay = pts[i]
-                bx, by = pts[j]
-                cx, cy = pts[k]
-                cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
-                area = abs(cross) * 0.5
-                if area < min_a:
-                    min_a = area
-    return min_a
-
-
-def _is_inside_triangle(p):
-    """Check if point p is inside or on the equilateral triangle (0,0),(1,0),(0.5,sqrt(3)/2)."""
-    x, y = p
-    c = y / S3H
-    b = x - 0.5 * c
-    a = 1.0 - b - c
-    if a < -1e-9 or b < -1e-9 or c < -1e-9:
-        return False
-    if a > 1 + 1e-9 or b > 1 + 1e-9 or c > 1 + 1e-9:
-        return False
-    return True
-
-
-def _all_inside(pts):
-    """Check if all points are inside the triangle."""
-    for p in pts:
-        if not _is_inside_triangle(p):
-            return False
-    return True
-
-
-def _penalized_min_area(flat_params):
-    """Objective: minimize negative of min area, with penalty for points outside triangle."""
-    points = flat_params.reshape(-1, 2)
-    # Penalty for being outside the triangle
-    penalty = 0.0
-    for p in points:
-        x, y = p
-        if y < 0:
-            penalty += abs(y) * 100
-        if y > S3H:
-            penalty += (y - S3H) * 100
-        if x < 0:
-            penalty += abs(x) * 100
-        if x > 1:
-            penalty += (x - 1) * 100
-        # Left edge: y <= sqrt(3)*x  =>  y - sqrt(3)*x <= 0
-        left_viol = y - S3 * x
-        if left_viol > 0:
-            penalty += left_viol * 100
-        # Right edge: y <= sqrt(3)*(1-x)  =>  y + sqrt(3)*x - sqrt(3) <= 0
-        right_viol = y + S3 * x - S3
-        if right_viol > 0:
-            penalty += right_viol * 100
-    ma = _min_triangle_area(points)
-    return -ma + penalty
-
-
-def _random_point_in_triangle(rng):
-    """Generate a random point inside the triangle using barycentric coordinates."""
-    u = rng.random()
-    v = rng.random()
-    if u + v > 1:
-        u = 1 - u
-        v = 1 - v
-    # Barycentric: a=1-u-v, b=u, c=v
-    a = 1 - u - v
-    b = u
-    c = v
-    x = a * 0 + b * 1 + c * 0.5
-    y = a * 0 + b * 0 + c * S3H
-    return np.array([x, y])
+# Precompute all triplets for N=11 points
+_TRIPLETS = list(itertools.combinations(range(N), 3))
+_T_I = np.array([t[0] for t in _TRIPLETS])
+_T_J = np.array([t[1] for t in _TRIPLETS])
+_T_K = np.array([t[2] for t in _TRIPLETS])
 
 
 def _project_to_triangle(pts):
-    """Project points back into the triangle if they are outside."""
-    for i in range(len(pts)):
-        x, y = pts[i]
-        # Clip y
-        y = max(0, min(S3H, y))
-        # Compute valid x range for this y
-        x_min = y / S3
-        x_max = 1 - y / S3
-        x = max(x_min, min(x_max, x))
-        pts[i] = [x, y]
-    return pts
+    """Vectorized projection of points into the unit equilateral triangle."""
+    y = np.clip(pts[:, 1], 0.0, S3H)
+    x_min = y / S3
+    x_max = 1.0 - y / S3
+    x = np.clip(pts[:, 0], x_min, x_max)
+    return np.column_stack([x, y])
+
+
+def _min_triangle_area(pts):
+    """Compute the minimum area of any triangle formed by three points (vectorized)."""
+    pi = pts[_T_I]
+    pj = pts[_T_J]
+    pk = pts[_T_K]
+    dx1 = pj[:, 0] - pi[:, 0]
+    dy1 = pj[:, 1] - pi[:, 1]
+    dx2 = pk[:, 0] - pi[:, 0]
+    dy2 = pk[:, 1] - pi[:, 1]
+    cross = dx1 * dy2 - dy1 * dx2
+    areas = np.abs(cross) * 0.5
+    return np.min(areas)
+
+
+def _soft_min_area(pts, beta):
+    """Soft minimum of triangle areas using log-sum-exp (differentiable)."""
+    pi = pts[_T_I]
+    pj = pts[_T_J]
+    pk = pts[_T_K]
+    dx1 = pj[:, 0] - pi[:, 0]
+    dy1 = pj[:, 1] - pi[:, 1]
+    dx2 = pk[:, 0] - pi[:, 0]
+    dy2 = pk[:, 1] - pi[:, 1]
+    cross = dx1 * dy2 - dy1 * dx2
+    areas = np.abs(cross) * 0.5
+    # Soft min: -1/beta * log(sum(exp(-beta * areas)))
+    max_a = np.max(areas)
+    shifted = -beta * (areas - max_a)
+    log_sum = np.log(np.sum(np.exp(shifted)))
+    soft_min = max_a - log_sum / beta
+    return soft_min
+
+
+def _barycentric_to_cartesian(bary):
+    """Convert barycentric coordinates (u, v, w) with u+v+w=1 to Cartesian."""
+    # bary has shape (n, 3) or we work with (n, 2) where w = 1-u-v
+    u = bary[:, 0]
+    v = bary[:, 1]
+    x = u * 1.0 + v * 0.5
+    y = v * S3H
+    return np.column_stack([x, y])
+
+
+def _cartesian_to_barycentric(pts):
+    """Convert Cartesian to barycentric (u, v) where w = 1-u-v >= 0."""
+    x = pts[:, 0]
+    y = pts[:, 1]
+    v = y / S3H
+    u = x - 0.5 * v
+    return np.column_stack([u, v])
 
 
 def construct():
     start_time = time.time()
-    rng = np.random.default_rng(42)
-    
+    rng = np.random.default_rng(12345)
+
     best_pts = None
     best_area = 0.0
-    
-    # Initial random configuration
-    pts = np.array([_random_point_in_triangle(rng) for _ in range(N)])
-    area = _min_triangle_area(pts)
-    best_pts = pts.copy()
-    best_area = area
-    
-    # Phase 1: Differential evolution for global search
-    elapsed = time.time() - start_time
-    if elapsed < 60:
+
+    def _elapsed_ok(margin):
+        return (time.time() - start_time) < (DEADLINE - margin)
+
+    def _update_best(pts):
+        nonlocal best_pts, best_area
+        area = _min_triangle_area(pts)
+        if area > best_area:
+            best_area = area
+            best_pts = pts.copy()
+
+    # ---- Model: initialize a plausible parameterization (corners, mid-edges, centroid) ----
+    init = np.array([
+        [0.0, 0.0],          # corner 0
+        [1.0, 0.0],          # corner 1
+        [0.5, S3H],          # corner 2
+        [0.5, 0.0],          # mid bottom
+        [0.75, S3H / 2],     # mid right
+        [0.25, S3H / 2],     # mid left
+        [1/3, S3H/3],        # centroid
+        [0.333, 0.0],
+        [0.667, 0.0],
+        [0.5, S3H/3],
+        [0.2, 0.1],
+    ], dtype=float)
+    _update_best(init)
+
+    def _start_from_base(base, scale):
+        pts = base + rng.normal(0, scale, size=(N, 2))
+        return _project_to_triangle(pts)
+
+    def _optimize_from(pts0, beta):
+        """Optimize in barycentric coordinates with L-BFGS-B (naturally inside triangle)."""
+        # Convert to barycentric (u, v) where w = 1-u-v
+        bary0 = _cartesian_to_barycentric(pts0)
+        
+        def objective(x):
+            u = x[0:N]
+            v = x[N:2*N]
+            # Clip to valid barycentric range: u>=0, v>=0, u+v<=1
+            u = np.clip(u, 0, 1)
+            v = np.clip(v, 0, 1 - u)
+            pts = _barycentric_to_cartesian(np.column_stack([u, v]))
+            return -_soft_min_area(pts, beta)
+        
         try:
-            # Bounds: x in [0,1], y in [0, S3H]
-            bounds = [(0, 1), (0, S3H)] * N
-            result = differential_evolution(
-                _penalized_min_area,
-                bounds,
-                maxiter=50,
-                popsize=20,
-                seed=42,
-                tol=1e-6,
-                polish=False,
-                init='latinhypercube',
-                mutation=(0.5, 1.5),
-                recombination=0.7
-            )
-            if result.fun < 0:  # negative means valid improvement
-                opt_pts = result.x.reshape(-1, 2)
-                if _all_inside(opt_pts):
-                    area = _min_triangle_area(opt_pts)
-                    if area > best_area:
-                        best_area = area
-                        best_pts = opt_pts.copy()
+            x0 = np.concatenate([bary0[:, 0], bary0[:, 1]])
+            res = minimize(objective, x0, method='L-BFGS-B',
+                           options={'maxiter': 300, 'ftol': 1e-15, 'gtol': 1e-12})
+            u = np.clip(res.x[0:N], 0, 1)
+            v = np.clip(res.x[N:2*N], 0, 1 - u)
+            pts = _barycentric_to_cartesian(np.column_stack([u, v]))
+            return pts
+        except Exception:
+            return pts0
+
+    # ---- Phase A: multi-start soft-min gradient optimization (annealed beta) ----
+    n_starts = 36
+    bases = [init]
+    for _ in range(18):
+        bases.append(_start_from_base(init, 0.25))
+
+    for s in range(n_starts):
+        if not _elapsed_ok(30):
+            break
+        base = bases[s % len(bases)]
+        pts = _start_from_base(base, 0.05)
+        _update_best(pts)
+        for beta in [10.0, 30.0, 80.0, 200.0, 500.0, 1200.0]:
+            if not _elapsed_ok(30):
+                break
+            pts = _optimize_from(pts, beta)
+            _update_best(pts)
+
+    # ---- Phase B: Nelder-Mead local polish on the best configuration ----
+    if best_pts is not None and _elapsed_ok(12):
+        for scale in [0.04, 0.02, 0.01, 0.005]:
+            if not _elapsed_ok(8):
+                break
+            for _ in range(8):
+                if not _elapsed_ok(8):
+                    break
+                cand = best_pts + rng.normal(0, scale, size=(N, 2))
+                cand = _project_to_triangle(cand)
+
+                def nm_obj(x):
+                    p = x.reshape(-1, 2)
+                    p = _project_to_triangle(p)
+                    return -_soft_min_area(p, 800.0)
+                try:
+                    res = minimize(nm_obj, cand.flatten(), method='Nelder-Mead',
+                                   options={'maxiter': 5000, 'xatol': 1e-10, 'fatol': 1e-12})
+                    p = _project_to_triangle(res.x.reshape(-1, 2))
+                    _update_best(p)
+                except Exception:
+                    pass
+
+    # ---- Final fine polish on the absolute best ----
+    if best_pts is not None and _elapsed_ok(6):
+        def nm_obj(x):
+            p = x.reshape(-1, 2)
+            p = _project_to_triangle(p)
+            return -_soft_min_area(p, 2000.0)
+        try:
+            res = minimize(nm_obj, best_pts.flatten(), method='Nelder-Mead',
+                           options={'maxiter': 10000, 'xatol': 1e-12, 'fatol': 1e-14})
+            p = _project_to_triangle(res.x.reshape(-1, 2))
+            _update_best(p)
         except Exception:
             pass
-    
-    # Phase 2: Local optimization from multiple random starts
-    elapsed = time.time() - start_time
-    if elapsed < 100:
-        n_starts = 30
-        for s in range(n_starts):
-            if time.time() - start_time > DEADLINE - 15:
-                break
-            
-            # Generate random starting configuration
-            pts = np.array([_random_point_in_triangle(rng) for _ in range(N)])
-            
-            # Optimize with L-BFGS-B
-            try:
-                result = minimize(
-                    _penalized_min_area,
-                    pts.flatten(),
-                    method='L-BFGS-B',
-                    options={'maxiter': 500, 'ftol': 1e-12, 'gtol': 1e-8}
-                )
-            except Exception:
-                continue
-            
-            opt_pts = result.x.reshape(-1, 2)
-            
-            # Check validity
-            if not _all_inside(opt_pts):
-                continue
-            
-            area = _min_triangle_area(opt_pts)
-            if area > best_area:
-                best_area = area
-                best_pts = opt_pts.copy()
-    
-    # Phase 3: Polish the best configuration with Nelder-Mead
-    elapsed = time.time() - start_time
-    if best_pts is not None and elapsed < DEADLINE - 5:
-        try:
-            result = minimize(
-                _penalized_min_area,
-                best_pts.flatten(),
-                method='Nelder-Mead',
-                options={'maxiter': 10000, 'xatol': 1e-10, 'fatol': 1e-12}
-            )
-            if result.fun < 0:
-                opt_pts = result.x.reshape(-1, 2)
-                if _all_inside(opt_pts):
-                    area = _min_triangle_area(opt_pts)
-                    if area > best_area:
-                        best_area = area
-                        best_pts = opt_pts.copy()
-        except Exception:
-            pass
-    
-    # Phase 4: Perturb and re-optimize the best configuration
-    elapsed = time.time() - start_time
-    if best_pts is not None and elapsed < DEADLINE - 5:
-        for s in range(10):
-            if time.time() - start_time > DEADLINE - 5:
-                break
-            # Perturb the best configuration
-            perturbed = best_pts + rng.normal(0, 0.03, size=(N, 2))
-            perturbed = _project_to_triangle(perturbed)
-            
-            try:
-                result = minimize(
-                    _penalized_min_area,
-                    perturbed.flatten(),
-                    method='L-BFGS-B',
-                    options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-8}
-                )
-            except Exception:
-                continue
-            
-            opt_pts = result.x.reshape(-1, 2)
-            
-            if not _all_inside(opt_pts):
-                continue
-            
-            area = _min_triangle_area(opt_pts)
-            if area > best_area:
-                best_area = area
-                best_pts = opt_pts.copy()
-    
+
     if best_pts is None:
-        # Fallback: return random points
-        return np.array([_random_point_in_triangle(rng) for _ in range(N)])
-    
+        # fallback random feasible configuration
+        u = rng.random(N)
+        v = rng.random(N)
+        mask = u + v > 1
+        u[mask] = 1 - u[mask]
+        v[mask] = 1 - v[mask]
+        pts = _barycentric_to_cartesian(np.column_stack([u, v]))
+        return pts
+
     # Final projection to ensure validity
     best_pts = _project_to_triangle(best_pts)
-    
     return best_pts
 # EVOLVE-BLOCK-END

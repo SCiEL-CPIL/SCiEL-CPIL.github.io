@@ -2,303 +2,350 @@
 import numpy as np
 import time
 from scipy.optimize import minimize
-from scipy.spatial import Delaunay
+from scipy.spatial import cKDTree
 
 N = 26
 
 # EVOLVE-BLOCK-START
 
-def _validate(xyz):
-    """Check if configuration is valid: circles inside unit square and non-overlapping."""
+def _softplus(z, eps=1e-4):
+    """Smooth approximation of max(z, 0) using log-sum-exp."""
+    return np.logaddexp(0, z / eps) * eps
+
+def _objective_knn(params, penalty_weight, smooth_eps=1e-4, k_neighbors=8):
+    """
+    Vectorized objective using k-NN for overlap checking (faster than full pairwise).
+    params: flat array [x0,y0,r0, x1,y1,r1, ...]
+    """
+    x = params[0::3]
+    y = params[1::3]
+    r = params[2::3]
+    
+    penalty = 0.0
+    
+    # Boundary violations (smooth)
+    lx = r - x
+    ux = x + r - 1.0
+    ly = r - y
+    uy = y + r - 1.0
+    
+    penalty += np.sum(_softplus(lx, smooth_eps)**2)
+    penalty += np.sum(_softplus(ux, smooth_eps)**2)
+    penalty += np.sum(_softplus(ly, smooth_eps)**2)
+    penalty += np.sum(_softplus(uy, smooth_eps)**2)
+    
+    # Negative radius
+    penalty += np.sum(_softplus(-r, smooth_eps)**2)
+    
+    # k-NN overlaps
+    centers = np.column_stack([x, y])
+    try:
+        tree = cKDTree(centers)
+        # Query k nearest neighbors for all points
+        # dists shape (N, k), indices shape (N, k)
+        dists, indices = tree.query(centers, k=min(k_neighbors, N))
+        
+        # We need to check unique pairs only
+        # To avoid double counting and self-checking, we iterate
+        # But vectorizing this is tricky. 
+        # Alternative: Just check all pairs but only if they are close?
+        # Actually, for N=26, full pairwise is O(N^2) = 325 checks. 
+        # k-NN is O(N * log N + N * k). 
+        # The overhead of cKDTree.query might be higher than just doing full pairwise 
+        # in a vectorized numpy operation for N=26.
+        # Let's stick to full pairwise vectorized for the "fast" phase, 
+        # but optimize the calculation.
+        
+        # Re-evaluating: The current _objective_vectorized is already quite fast.
+        # The main cost is in the optimizer iterations.
+        # Let's use a simpler optimization: 
+        # 1. Use a smaller penalty weight initially to allow radius growth.
+        # 2. Use a larger penalty weight later to enforce constraints.
+        # 3. Use a "warm start" from the previous phase.
+        
+        # For now, let's just use the vectorized full pairwise but ensure 
+        # the smooth_eps is tuned well.
+        pass
+    except Exception:
+        pass
+        
+    # Fall back to full pairwise vectorized for reliability and speed at N=26
+    n = len(r)
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    dx = x[idx_i] - x[idx_j]
+    dy = y[idx_i] - y[idx_j]
+    dist_sq = dx*dx + dy*dy
+    dist = np.sqrt(np.maximum(dist_sq, 1e-12))
+    overlap = r[idx_i] + r[idx_j] - dist
+    penalty += np.sum(_softplus(overlap, smooth_eps)**2)
+    
+    return -np.sum(r) + penalty_weight * penalty
+
+def _objective_full(params, penalty_weight, smooth_eps=1e-4):
+    """
+    Full pairwise objective, identical to above but named for clarity.
+    """
+    return _objective_knn(params, penalty_weight, smooth_eps)
+
+def _validate(xyz, tol=1e-7):
+    """Check validity."""
     n = xyz.shape[0]
-    x = xyz[:, 0]
-    y = xyz[:, 1]
-    r = xyz[:, 2]
+    x, y, r = xyz[:,0], xyz[:,1], xyz[:,2]
     if np.any(r < -1e-9):
         return False
-    if np.any(x - r < -1e-7) or np.any(x + r > 1 + 1e-7):
+    if np.any(x - r < -tol) or np.any(x + r > 1 + tol):
         return False
-    if np.any(y - r < -1e-7) or np.any(y + r > 1 + 1e-7):
+    if np.any(y - r < -tol) or np.any(y + r > 1 + tol):
         return False
     for i in range(n):
-        for j in range(i + 1, n):
-            dx = x[i] - x[j]
-            dy = y[i] - y[j]
-            dist = np.sqrt(dx * dx + dy * dy)
-            if dist < r[i] + r[j] - 1e-7:
+        for j in range(i+1, n):
+            dx = x[i]-x[j]
+            dy = y[i]-y[j]
+            dist = np.sqrt(dx*dx+dy*dy)
+            if dist < r[i]+r[j]-tol:
                 return False
     return True
 
-def _get_delaunay_edges(centers):
-    """Get Delaunay triangulation edges for the given centers."""
-    try:
-        tri = Delaunay(centers)
-        edges = set()
-        for simplex in tri.simplices:
-            for i in range(3):
-                a, b = simplex[i], simplex[(i + 1) % 3]
-                if a > b:
-                    a, b = b, a
-                edges.add((a, b))
-        return list(edges)
-    except Exception:
-        # Fallback to all pairs if Delaunay fails
-        return [(i, j) for i in range(N) for j in range(i + 1, N)]
+def _fix_boundaries(xyz):
+    """Project circles inside unit square."""
+    xyz = xyz.copy()
+    for i in range(N):
+        r = max(0, xyz[i,2])
+        xyz[i,0] = np.clip(xyz[i,0], r, 1-r) if r < 0.5 else 0.5
+        xyz[i,1] = np.clip(xyz[i,1], r, 1-r) if r < 0.5 else 0.5
+        xyz[i,2] = r
+    return xyz
 
-def _objective_delaunay(params, edges_cache):
-    """
-    Objective using Delaunay-based constraints.
-    params: [x_0, y_0, r_0, ..., x_25, y_25, r_25]
-    """
-    x = params[0::3]
-    y = params[1::3]
-    r = params[2::3]
-    
-    penalty = 0.0
-    
-    # Boundary penalties
-    for i in range(N):
-        if x[i] - r[i] < 0:
-            penalty += (x[i] - r[i]) ** 2
-        if x[i] + r[i] > 1:
-            penalty += (x[i] + r[i] - 1) ** 2
-        if y[i] - r[i] < 0:
-            penalty += (y[i] - r[i]) ** 2
-        if y[i] + r[i] > 1:
-            penalty += (y[i] + r[i] - 1) ** 2
-        if r[i] < 0:
-            penalty += r[i] ** 2
-    
-    # Get Delaunay edges
-    centers = np.column_stack([x, y])
-    edges = _get_delaunay_edges(centers)
-    edges_cache['edges'] = edges
-    
-    # Overlap penalties only for Delaunay neighbors (and a few extra close pairs)
-    for i, j in edges:
-        dx = x[i] - x[j]
-        dy = y[i] - y[j]
-        dist = np.sqrt(dx * dx + dy * dy)
-        overlap = r[i] + r[j] - dist
-        if overlap > 0:
-            penalty += overlap ** 2
-    
-    # Also check a few nearest neighbors not in Delaunay to be safe
-    # (Delaunay might miss some close pairs in degenerate cases)
-    for i in range(N):
-        for j in range(i + 1, N):
-            if (i, j) in edges or (j, i) in edges:
-                continue
-            dx = x[i] - x[j]
-            dy = y[i] - y[j]
-            dist_sq = dx * dx + dy * dy
-            # Only check if potentially close (within 2*max_r)
-            max_r = max(r[i], r[j])
-            if dist_sq < (4 * max_r * max_r):
-                dist = np.sqrt(dist_sq)
-                overlap = r[i] + r[j] - dist
-                if overlap > 0:
-                    penalty += overlap ** 2
-    
-    return -np.sum(r) + 50.0 * penalty
-
-def _objective_full(params):
-    """Full pairwise objective for final polish."""
-    x = params[0::3]
-    y = params[1::3]
-    r = params[2::3]
-    
-    penalty = 0.0
-    
-    for i in range(N):
-        if x[i] - r[i] < 0:
-            penalty += (x[i] - r[i]) ** 2
-        if x[i] + r[i] > 1:
-            penalty += (x[i] + r[i] - 1) ** 2
-        if y[i] - r[i] < 0:
-            penalty += (y[i] - r[i]) ** 2
-        if y[i] + r[i] > 1:
-            penalty += (y[i] + r[i] - 1) ** 2
-        if r[i] < 0:
-            penalty += r[i] ** 2
-    
-    for i in range(N):
-        for j in range(i + 1, N):
-            dx = x[i] - x[j]
-            dy = y[i] - y[j]
-            dist = np.sqrt(dx * dx + dy * dy)
-            overlap = r[i] + r[j] - dist
-            if overlap > 0:
-                penalty += overlap ** 2
-    
-    return -np.sum(r) + 100.0 * penalty
-
-def _initial_config_hex():
-    """Hexagonal-like initial configuration."""
-    side = 5
+def _initial_hex():
+    """Hexagonal packing initial config."""
+    cols = 5
+    rows = 6
     positions = []
-    for i in range(side):
-        for j in range(side):
-            if j % 2 == 1:
-                x = (i + 0.5) / side + 0.1 / side
+    r = 0.09
+    for row in range(rows):
+        for col in range(cols):
+            if row % 2 == 1:
+                x = (col + 0.5) / cols + 0.5/cols
             else:
-                x = (i + 0.5) / side
-            y = (j + 0.5) / side
-            r = 0.5 / side * 0.95
+                x = (col + 0.5) / cols
+            y = (row + 0.5) / rows
+            if x > 1 or y > 1:
+                continue
             positions.append([x, y, r])
-    
-    positions.append([0.5, 0.5, 0.5 / side * 0.5])
+            if len(positions) >= N:
+                break
+        if len(positions) >= N:
+            break
+    while len(positions) < N:
+        positions.append([0.5, 0.5, r*0.5])
     return np.array(positions[:N])
 
-def _initial_config_grid():
-    """Simple grid initial configuration."""
+def _initial_grid():
+    """Grid initial config."""
     side = int(np.ceil(np.sqrt(N)))
-    cells = []
+    positions = []
+    r = 0.5/side * 0.9
     for i in range(side):
         for j in range(side):
-            x = (i + 0.5) / side
-            y = (j + 0.5) / side
-            r = 0.5 / side * 0.9
-            cells.append([x, y, r])
-    return np.array(cells[:N])
+            x = (i+0.5)/side
+            y = (j+0.5)/side
+            positions.append([x, y, r])
+            if len(positions) >= N:
+                break
+        if len(positions) >= N:
+            break
+    while len(positions) < N:
+        positions.append([0.5, 0.5, r*0.5])
+    return np.array(positions[:N])
 
-def _optimize_delaunay(xyz, time_budget=30.0):
-    """
-    Optimize using Delaunay-based constraints, then polish with full pairwise.
-    """
-    start_time = time.time()
-    params = xyz.flatten()
+def _initial_corner_weighted(seed=0):
+    """Random config with corner preference."""
+    rng = np.random.default_rng(seed)
+    positions = []
+    corners = [[0.08, 0.08], [0.92, 0.08], [0.08, 0.92], [0.92, 0.92],
+               [0.5, 0.08], [0.5, 0.92], [0.08, 0.5], [0.92, 0.5]]
+    for cx, cy in corners:
+        positions.append([cx, cy, 0.08])
+    for _ in range(N - len(positions)):
+        x = rng.uniform(0.05, 0.95)
+        y = rng.uniform(0.05, 0.95)
+        positions.append([x, y, rng.uniform(0.06, 0.10)])
+    return np.array(positions[:N])
+
+def _initial_ring(seed=0):
+    """Ring-shaped initial config."""
+    rng = np.random.default_rng(seed)
+    positions = [[0.5, 0.5, 0.08]]
+    for ring, n_circles, radius in [(1, 6, 0.10), (2, 10, 0.08), (3, 9, 0.07)]:
+        for k in range(n_circles):
+            angle = 2*np.pi*k/n_circles + rng.uniform(-0.1, 0.1)
+            dist = ring * 0.14
+            x = 0.5 + dist*np.cos(angle)
+            y = 0.5 + dist*np.sin(angle)
+            positions.append([x, y, radius])
+            if len(positions) >= N:
+                break
+        if len(positions) >= N:
+            break
+    while len(positions) < N:
+        positions.append([rng.uniform(0.1,0.9), rng.uniform(0.1,0.9), 0.06])
+    return np.array(positions[:N])
+
+def _optimize_single(xyz0, deadline):
+    """Optimize from a single initial config with adaptive penalty."""
+    params = xyz0.flatten().copy()
     best_params = params.copy()
     best_score = np.sum(params[2::3])
     
-    edges_cache = {'edges': None}
-    
-    # Phase 1: Delaunay-based optimization (faster, fewer constraints)
     bounds = []
     for i in range(N):
         bounds.append((0, 1))
         bounds.append((0, 1))
         bounds.append((0, 0.5))
     
-    try:
-        result = minimize(_objective_delaunay, best_params, method='L-BFGS-B',
-                          bounds=bounds, args=(edges_cache,),
-                          options={'maxiter': 800, 'ftol': 1e-12, 'gtol': 1e-10})
-        if result.fun < _objective_delaunay(best_params, edges_cache):
-            best_params = result.x
-            best_score = np.sum(best_params[2::3])
-    except Exception:
-        pass
+    # Phase 1: Low penalty, focus on layout
+    penalty = 5.0
+    remaining = deadline - time.time()
+    if remaining > 4:
+        try:
+            res = minimize(_objective_full, params, method='L-BFGS-B',
+                          bounds=bounds, args=(penalty, 1e-3),
+                          options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-10})
+            if res.fun < _objective_full(params, penalty, 1e-3):
+                params = res.x
+                best_params = params.copy()
+                best_score = np.sum(params[2::3])
+        except Exception:
+            pass
     
-    if time.time() - start_time > time_budget:
-        return best_params.reshape(N, 3)
+    # Phase 2: Medium penalty
+    remaining = deadline - time.time()
+    if remaining > 4:
+        penalty = 50.0
+        try:
+            res = minimize(_objective_full, params, method='L-BFGS-B',
+                          bounds=bounds, args=(penalty, 1e-4),
+                          options={'maxiter': 300, 'ftol': 1e-14, 'gtol': 1e-12})
+            if res.fun < _objective_full(params, penalty, 1e-4):
+                params = res.x
+                best_params = params.copy()
+                best_score = np.sum(params[2::3])
+        except Exception:
+            pass
     
-    # Phase 2: Polish with full pairwise constraints
-    try:
-        result = minimize(_objective_full, best_params, method='L-BFGS-B',
-                          bounds=bounds,
-                          options={'maxiter': 500, 'ftol': 1e-12, 'gtol': 1e-10})
-        if result.fun < _objective_full(best_params):
-            best_params = result.x
-            best_score = np.sum(best_params[2::3])
-    except Exception:
-        pass
+    # Phase 3: High penalty
+    remaining = deadline - time.time()
+    if remaining > 3:
+        penalty = 500.0
+        try:
+            res = minimize(_objective_full, params, method='L-BFGS-B',
+                          bounds=bounds, args=(penalty, 1e-5),
+                          options={'maxiter': 300, 'ftol': 1e-15, 'gtol': 1e-13})
+            if res.fun < _objective_full(params, penalty, 1e-5):
+                params = res.x
+                best_params = params.copy()
+                best_score = np.sum(params[2::3])
+        except Exception:
+            pass
     
-    return best_params.reshape(N, 3)
-
-def _fix_config(xyz):
-    """Try to fix an invalid configuration by reducing radii and adjusting positions."""
-    xyz_fixed = xyz.copy()
-    for _ in range(100):
-        if _validate(xyz_fixed):
-            break
-        xyz_fixed[:, 2] *= 0.95
-        for i in range(N):
-            x, y, r = xyz_fixed[i]
-            xyz_fixed[i, 0] = np.clip(x, r, 1 - r)
-            xyz_fixed[i, 1] = np.clip(y, r, 1 - r)
-    return xyz_fixed
+    # Phase 4: Very high penalty, tight tolerance
+    remaining = deadline - time.time()
+    if remaining > 2:
+        penalty = 5000.0
+        try:
+            res = minimize(_objective_full, params, method='L-BFGS-B',
+                          bounds=bounds, args=(penalty, 1e-6),
+                          options={'maxiter': 200, 'ftol': 1e-15, 'gtol': 1e-14})
+            if res.fun < _objective_full(params, penalty, 1e-6):
+                params = res.x
+                best_params = params.copy()
+                best_score = np.sum(params[2::3])
+        except Exception:
+            pass
+    
+    return best_params.reshape(N, 3), best_score
 
 def construct():
-    """
-    Construct 26 circles with disjoint interiors inside [0,1]^2,
-    maximizing the sum of their radii.
-    """
     global_start = time.time()
-    deadline = 110.0  # Safety margin before 120s limit
+    deadline = global_start + 145.0  # 5s safety margin
     
-    best_xyz = _initial_config_grid()
+    best_xyz = _initial_grid()
     best_score = np.sum(best_xyz[:, 2])
     
-    # Generate initial configurations
-    initial_configs = []
+    # Generate diverse initial configurations
+    inits = [
+        _initial_grid(),
+        _initial_hex(),
+        _initial_corner_weighted(0),
+        _initial_corner_weighted(1),
+        _initial_ring(0),
+        _initial_ring(1)
+    ]
     
-    # 1. Simple grid
-    initial_configs.append(_initial_config_grid())
-    
-    # 2. Hexagonal-like
-    initial_configs.append(_initial_config_hex())
-    
-    # 3. Random configurations
-    np.random.seed(42)
-    for trial in range(4):
-        x = np.random.uniform(0.1, 0.9, N)
-        y = np.random.uniform(0.1, 0.9, N)
-        r = np.random.uniform(0.05, 0.15, N)
-        for i in range(N):
-            x[i] = np.clip(x[i], r[i], 1 - r[i])
-            y[i] = np.clip(y[i], r[i], 1 - r[i])
-        initial_configs.append(np.column_stack([x, y, r]))
-    
-    # 4. Concentric rings pattern
-    positions = []
-    positions.append([0.5, 0.5, 0.10])
-    for k in range(8):
-        angle = 2 * np.pi * k / 8
-        x = 0.5 + 0.12 * 1.8 * np.cos(angle)
-        y = 0.5 + 0.12 * 1.8 * np.sin(angle)
-        positions.append([x, y, 0.12 * 0.9])
-    for k in range(10):
-        angle = 2 * np.pi * k / 10 + np.pi / 10
-        x = 0.5 + 0.10 * 3.5 * np.cos(angle)
-        y = 0.5 + 0.10 * 3.5 * np.sin(angle)
-        positions.append([x, y, 0.10 * 0.9])
-    for k in range(7):
-        angle = 2 * np.pi * k / 7
-        x = 0.5 + 0.08 * 4.8 * np.cos(angle)
-        y = 0.5 + 0.08 * 4.8 * np.sin(angle)
-        positions.append([x, y, 0.08 * 0.9])
-    
-    initial_configs.append(np.array(positions[:N]))
-    
-    # Optimize from each initial configuration
-    for idx, xyz0 in enumerate(initial_configs):
-        elapsed = time.time() - global_start
-        remaining = deadline - elapsed
-        if remaining < 5.0:
+    # Optimize from each
+    for xyz0 in inits:
+        remaining = deadline - time.time()
+        if remaining < 10.0:
             break
+        time_budget = deadline - 3.0
+        xyz_opt, score = _optimize_single(xyz0, time_budget)
         
-        time_budget = min(18.0, remaining - 2.0)
-        if time_budget < 2.0:
-            break
-        
-        xyz_opt = _optimize_delaunay(xyz0, time_budget=time_budget)
-        
-        # Fix if needed
         if not _validate(xyz_opt):
-            xyz_opt = _fix_config(xyz_opt)
+            xyz_fix = xyz_opt.copy()
+            for _ in range(50):
+                if _validate(xyz_fix):
+                    break
+                xyz_fix[:, 2] *= 0.98
+                xyz_fix = _fix_boundaries(xyz_fix)
+            xyz_opt = xyz_fix
+        
+        if not _validate(xyz_opt):
+            continue
         
         score = np.sum(xyz_opt[:, 2])
         if score > best_score:
             best_score = score
             best_xyz = xyz_opt
     
-    # Final validation and fix
-    if not _validate(best_xyz):
-        best_xyz = _fix_config(best_xyz)
+    # Local refinement from the best solution found
+    remaining = deadline - time.time()
+    if remaining > 10.0:
+        rng = np.random.default_rng(42)
+        for _ in range(5):
+            if remaining < 5.0:
+                break
+            # Perturb the best solution
+            perturbed = best_xyz.copy()
+            noise = rng.normal(0, 0.01, perturbed.shape)
+            # Do not perturb radii too much
+            noise[:, 2] *= 0.1
+            perturbed += noise
+            perturbed = _fix_boundaries(perturbed)
+            
+            time_budget = deadline - 3.0
+            xyz_opt, score = _optimize_single(perturbed, time_budget)
+            
+            if not _validate(xyz_opt):
+                xyz_fix = xyz_opt.copy()
+                for _ in range(50):
+                    if _validate(xyz_fix):
+                        break
+                    xyz_fix[:, 2] *= 0.98
+                    xyz_fix = _fix_boundaries(xyz_fix)
+                xyz_opt = xyz_fix
+            
+            if not _validate(xyz_opt):
+                continue
+            
+            score = np.sum(xyz_opt[:, 2])
+            if score > best_score:
+                best_score = score
+                best_xyz = xyz_opt
+            remaining = deadline - time.time()
     
+    # Final validation
     if not _validate(best_xyz):
-        best_xyz = _initial_config_grid()
+        best_xyz = _initial_grid()
     
     return best_xyz
 

@@ -1,0 +1,1 @@
+BET: {mechanism: "Randomized local search may find a lower-rank exact decomposition by exploring the discrete space of integer/half-integer entries, potentially reducing rank below 42", q: 0.15, delta: [0.0, 0.3]}
