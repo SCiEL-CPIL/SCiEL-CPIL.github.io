@@ -3,35 +3,14 @@
 def construct():
     n, m, p = 3, 4, 6
     
-    # We will construct a rank 68 decomposition.
-    # Structure:
-    # Split m=4 into two 2s.
-    # For each m-block, split p=6 into two 3s.
-    # For each p-block, split n=3 into 2 and 1.
-    #   n=2 part: split p=3 into 2 and 1.
-    #     p=2 part: 2x2x2 Strassen (rank 7)
-    #     p=1 part: 2x2x1 Schoolbook (rank 4)
-    #   n=1 part: 1x2x3 Schoolbook (rank 6)
-    
-    rank = 68
+    rank = 66
     U = [[0] * rank for _ in range(n * m)]
     V = [[0] * rank for _ in range(m * p)]
     W = [[0] * rank for _ in range(p * n)]
     
     col = 0
     
-    def add_term(u_idx, u_val, v_idx, v_val, w_idx, w_val):
-        nonlocal col
-        U[u_idx][col] += u_val
-        V[v_idx][col] += v_val
-        W[w_idx][col] += w_val
-        # Note: A single "term" in the tensor decomposition is a rank-1 update.
-        # However, Strassen combines multiple scalar multiplications into one rank-1 term 
-        # by having multiple non-zeros in U, V, W.
-        # So we don't increment col for each scalar, but for each rank-1 component.
-        
     # Helper to add a schoolbook term for A[i,j] * B[j,k] -> C[i,k]
-    # This is a single rank-1 component with 1 non-zero in each vector.
     def add_schoolbook(i, j, k):
         nonlocal col
         u_idx = i * m + j
@@ -44,6 +23,9 @@ def construct():
 
     # Helper to add Strassen terms for a 2x2x2 block
     # i_base, j_base, k_base are the global starting indices for the 2x2 block
+    # Note: i_base, j_base, k_base are local to the sub-problem or global?
+    # In the previous code, they were global indices.
+    # We will use global indices here as well for consistency.
     def add_strassen(i_base, j_base, k_base):
         nonlocal col
         
@@ -107,27 +89,27 @@ def construct():
         W[p_idx][col] = 1
         col += 1
 
-    # Iterate through the blocks
-    for m_block in range(2):
-        j_base = m_block * 2
-        for p_block in range(2):
-            k_base = p_block * 3
+    # Part 1: M(1,4,6) for row 0 of A
+    # A[0, :] * B[:, :] -> C[0, :]
+    # Schoolbook: 4 * 6 = 24 terms
+    for j in range(4):
+        for k in range(6):
+            add_schoolbook(0, j, k)
+
+    # Part 2: M(2,4,6) for rows 1,2 of A
+    # Split k (columns of B) into 3 groups of 2
+    for k_block in range(3):
+        k_base = k_block * 2
+        
+        # For each k_block, we have a 2x4x2 sub-problem
+        # Split j (columns of A / rows of B) into 2 groups of 2
+        for j_block in range(2):
+            j_base = j_block * 2
             
-            # Part 1: n=2 (rows 0, 1)
-            i_base = 0
-            # Sub-Part 1.1: 2x2x2 Strassen (k 0,1)
+            # i_base is 1 (since we are handling rows 1 and 2)
+            i_base = 1
+            
+            # Add Strassen for this 2x2x2 block
             add_strassen(i_base, j_base, k_base)
-            
-            # Sub-Part 1.2: 2x2x1 Schoolbook (k 2)
-            for i in range(2):
-                for j in range(2):
-                    add_schoolbook(i_base + i, j_base + j, k_base + 2)
-            
-            # Part 2: n=1 (row 2)
-            i_base = 2
-            # Sub-Part 2.1: 1x2x3 Schoolbook
-            for j in range(2):
-                for k in range(3):
-                    add_schoolbook(i_base, j_base + j, k_base + k)
 
     return {"U": U, "V": V, "W": W}
