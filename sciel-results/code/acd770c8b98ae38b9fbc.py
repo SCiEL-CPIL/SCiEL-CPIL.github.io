@@ -1,0 +1,1 @@
+BET: {mechanism: "Random half-integer factor search from rank 144 downward may stumble on a known low-rank integer decomposition that the schoolbook-only seed cannot reach, cutting rank", q: 0.15, delta: [0, 25]}

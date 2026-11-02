@@ -1,0 +1,1092 @@
+"""Circle packing in perimeter-4 rectangle: SLSQP + Delaunay inradius + Advanced Polish."""
+import numpy as np
+import time
+from scipy.optimize import minimize
+from scipy.spatial import Delaunay
+
+N = 21
+
+
+def _vectorized_objective(z, penalty_weight=1000.0):
+    """Vectorized objective with smooth penalties for speed."""
+    x = z[0::3][:N]
+    y = z[1::3][:N]
+    r = z[2::3][:N]
+    w = z[-1]
+    h = 2.0 - w
+
+    if w < 0.2 or h < 0.2 or np.any(r < 0):
+        return 1e6
+
+    obj = -np.sum(r)
+
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    d_sq = dx * dx + dy * dy
+    r_sum = r[:, None] + r[None, :]
+
+    iu = np.triu_indices(N, k=1)
+    d_sq_pairs = d_sq[iu]
+    r_sum_pairs = r_sum[iu]
+
+    d_pairs = np.sqrt(np.maximum(d_sq_pairs, 0.0))
+    overlap = np.maximum(r_sum_pairs - d_pairs, 0.0)
+    overlap_penalty = penalty_weight * np.sum(overlap * overlap)
+
+    obj += overlap_penalty
+
+    left_viol = np.maximum(r - x, 0.0)
+    right_viol = np.maximum(x + r - w, 0.0)
+    bottom_viol = np.maximum(r - y, 0.0)
+    top_viol = np.maximum(y + r - h, 0.0)
+
+    boundary_penalty = penalty_weight * (
+        np.sum(left_viol * left_viol) +
+        np.sum(right_viol * right_viol) +
+        np.sum(bottom_viol * bottom_viol) +
+        np.sum(top_viol * top_viol)
+    )
+
+    obj += boundary_penalty
+
+    if w < 0.5:
+        obj += penalty_weight * (0.5 - w) ** 2
+    elif w > 1.5:
+        obj += penalty_weight * (w - 1.5) ** 2
+
+    return obj
+
+
+def _smooth_objective(z, beta=50.0, penalty_weight=1000.0):
+    """Smooth log-sum-exp objective for better gradient information."""
+    x = z[0::3][:N]
+    y = z[1::3][:N]
+    r = z[2::3][:N]
+    w = z[-1]
+    h = 2.0 - w
+
+    if w < 0.2 or h < 0.2 or np.any(r < 0):
+        return 1e6
+
+    obj = -np.sum(r)
+
+    dx = x[:, None] - x[None, :]
+    dy = y[:, None] - y[None, :]
+    d_sq = dx * dx + dy * dy
+    r_sum = r[:, None] + r[None, :]
+
+    iu = np.triu_indices(N, k=1)
+    d_sq_pairs = d_sq[iu]
+    r_sum_pairs = r_sum[iu]
+
+    d_pairs = np.sqrt(np.maximum(d_sq_pairs, 1e-12))
+    viol = r_sum_pairs - d_pairs
+    soft_viol = np.logaddexp(0, beta * viol) / beta
+    overlap_penalty = penalty_weight * np.sum(soft_viol ** 2)
+    obj += overlap_penalty
+
+    left_viol = r - x
+    right_viol = x + r - w
+    bottom_viol = r - y
+    top_viol = y + r - h
+
+    soft_left = np.logaddexp(0, beta * left_viol) / beta
+    soft_right = np.logaddexp(0, beta * right_viol) / beta
+    soft_bottom = np.logaddexp(0, beta * bottom_viol) / beta
+    soft_top = np.logaddexp(0, beta * top_viol) / beta
+
+    boundary_penalty = penalty_weight * (
+        np.sum(soft_left ** 2) +
+        np.sum(soft_right ** 2) +
+        np.sum(soft_bottom ** 2) +
+        np.sum(soft_top ** 2)
+    )
+    obj += boundary_penalty
+
+    if w < 0.5:
+        obj += penalty_weight * (0.5 - w) ** 2
+    elif w > 1.5:
+        obj += penalty_weight * (w - 1.5) ** 2
+
+    return obj
+
+
+def _is_valid(cx, cy, r, W, H, tol=1e-8):
+    """Check if packing is valid."""
+    if W <= 0.05 or H <= 0.05:
+        return False
+    if np.any(cx - r < -tol) or np.any(cy - r < -tol):
+        return False
+    if np.any(cx + r > W + tol) or np.any(cy + r > H + tol):
+        return False
+    for i in range(N):
+        for j in range(i + 1, N):
+            dx = cx[i] - cx[j]
+            dy = cy[i] - cy[j]
+            if dx * dx + dy * dy < (r[i] + r[j]) ** 2 - tol:
+                return False
+    return True
+
+
+def _force_relax_unified(z, max_iter=500):
+    """Force-directed relaxation in unified parameter space with adaptive step (vectorized)."""
+    z = z.copy().astype(float)
+    n = N
+    dt = 0.005
+    min_dt = 0.0001
+    convergence_tol = 1e-8
+
+    for it in range(max_iter):
+        x = z[0::3][:n]
+        y = z[1::3][:n]
+        r = z[2::3][:n]
+        w = z[-1]
+        h = 2.0 - w
+
+        if w < 0.1 or h < 0.1:
+            break
+
+        fx = np.zeros(n)
+        fy = np.zeros(n)
+
+        left_viol = np.maximum(r - x, 0.0)
+        right_viol = np.maximum(x + r - w, 0.0)
+        bottom_viol = np.maximum(r - y, 0.0)
+        top_viol = np.maximum(y + r - h, 0.0)
+        fx -= left_viol * 100
+        fx += right_viol * 100
+        fy -= bottom_viol * 100
+        fy += top_viol * 100
+
+        dx = x[:, None] - x[None, :]
+        dy = y[:, None] - y[None, :]
+        d_sq = dx * dx + dy * dy
+        r_sum = r[:, None] + r[None, :]
+
+        iu = np.triu_indices(n, k=1)
+        d_sq_pairs = d_sq[iu]
+        r_sum_pairs = r_sum[iu]
+
+        d_pairs = np.sqrt(np.maximum(d_sq_pairs, 1e-12))
+        overlap = np.maximum(r_sum_pairs - d_pairs, 0.0)
+        max_overlap = float(np.max(overlap)) if overlap.size > 0 else 0.0
+
+        if max_overlap > convergence_tol:
+            f_pairs = overlap * 15.0
+            dx_pairs = dx[iu]
+            dy_pairs = dy[iu]
+            ux = dx_pairs / d_pairs
+            uy = dy_pairs / d_pairs
+
+            for idx in range(len(iu[0])):
+                i_idx = iu[0][idx]
+                j_idx = iu[1][idx]
+                fx[i_idx] += ux[idx] * f_pairs[idx]
+                fy[i_idx] += uy[idx] * f_pairs[idx]
+                fx[j_idx] -= ux[idx] * f_pairs[idx]
+                fy[j_idx] -= uy[idx] * f_pairs[idx]
+
+        if max_overlap < convergence_tol:
+            break
+
+        force_mag = float(np.max(np.sqrt(fx * fx + fy * fy)))
+        if force_mag > 1.0:
+            dt = max(min_dt, dt * 0.5)
+        elif force_mag < 0.1:
+            dt = min(0.01, dt * 1.1)
+
+        z[0::3][:n] += dt * fx
+        z[1::3][:n] += dt * fy
+
+        for i in range(n):
+            z[3 * i] = np.clip(z[3 * i], r[i], w - r[i])
+            z[3 * i + 1] = np.clip(z[3 * i + 1], r[i], h - r[i])
+
+    return z
+
+
+def _compute_max_radii(x, y, w, h):
+    """Compute maximum inscribed circle radius for each point using Delaunay triangulation."""
+    n = N
+    boundary_pts = np.array([
+        [0, 0], [w, 0], [w, h], [0, h],
+        [w/2, 0], [w, h/2], [w/2, h], [0, h/2],
+        [w/4, 0], [3*w/4, 0], [w, h/4], [w, 3*h/4],
+        [3*w/4, h], [w/4, h], [0, 3*h/4], [0, h/4],
+    ])
+    all_pts = np.vstack([np.column_stack([x, y]), boundary_pts])
+    
+    try:
+        tri = Delaunay(all_pts)
+    except Exception:
+        return np.full(n, min(w, h) / 6.0)
+    
+    inradii = np.zeros(n)
+    for i in range(n):
+        min_dist = min(x[i], w - x[i], y[i], h - y[i])
+        
+        for simplex in tri.simplices:
+            if i in simplex:
+                pts = all_pts[simplex]
+                ax, ay = pts[0]
+                bx, by = pts[1]
+                cx, cy = pts[2]
+                
+                d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+                if abs(d) < 1e-12:
+                    continue
+                ux = ((ax*ax + ay*ay) * (by - cy) + (bx*bx + by*by) * (cy - ay) + (cx*cx + cy*cy) * (ay - by)) / d
+                uy = ((ax*ax + ay*ay) * (cx - bx) + (bx*bx + by*by) * (ax - cx) + (cx*cx + cy*cy) * (bx - ax)) / d
+                
+                dist = np.sqrt((x[i] - ux)**2 + (y[i] - uy)**2)
+                min_dist = min(min_dist, dist)
+        
+        inradii[i] = min_dist
+    
+    return inradii
+
+
+def _polish_result(z, time_budget):
+    """Polish a valid packing with force-directed position adjustment and radius growth."""
+    z = z.copy().astype(float)
+    n = N
+    x = z[0::3][:n].copy()
+    y = z[1::3][:n].copy()
+    r = z[2::3][:n].copy()
+    w = z[-1]
+    h = 2.0 - w
+
+    dt = 0.001
+    max_iter = int(min(5000, time_budget * 250))
+
+    for it in range(max_iter):
+        if time.time() > time_budget:
+            break
+
+        fx = np.zeros(n)
+        fy = np.zeros(n)
+
+        left_viol = np.maximum(r - x, 0.0)
+        right_viol = np.maximum(x + r - w, 0.0)
+        bottom_viol = np.maximum(r - y, 0.0)
+        top_viol = np.maximum(y + r - h, 0.0)
+        fx -= left_viol * 35
+        fx += right_viol * 35
+        fy -= bottom_viol * 35
+        fy += top_viol * 35
+
+        dx = x[:, None] - x[None, :]
+        dy = y[:, None] - y[None, :]
+        d_sq = dx * dx + dy * dy
+        r_sum = r[:, None] + r[None, :]
+
+        iu = np.triu_indices(n, k=1)
+        d_sq_pairs = d_sq[iu]
+        r_sum_pairs = r_sum[iu]
+
+        d_pairs = np.sqrt(np.maximum(d_sq_pairs, 1e-12))
+        overlap = np.maximum(r_sum_pairs - d_pairs, 0.0)
+
+        if np.max(overlap) > 1e-10:
+            f_pairs = overlap * 18.0
+            dx_pairs = dx[iu]
+            dy_pairs = dy[iu]
+            ux = dx_pairs / d_pairs
+            uy = dy_pairs / d_pairs
+
+            for idx in range(len(iu[0])):
+                i_idx = iu[0][idx]
+                j_idx = iu[1][idx]
+                fx[i_idx] += ux[idx] * f_pairs[idx]
+                fy[i_idx] += uy[idx] * f_pairs[idx]
+                fx[j_idx] -= ux[idx] * f_pairs[idx]
+                fy[j_idx] -= uy[idx] * f_pairs[idx]
+
+        max_force = max(float(np.max(np.abs(fx))), float(np.max(np.abs(fy))), 1e-8)
+        if max_force > 0.1:
+            dt = 0.0005
+        else:
+            dt = 0.001
+
+        x += dt * fx
+        y += dt * fy
+        x = np.clip(x, r, w - r)
+        y = np.clip(y, r, h - r)
+
+    # Try to grow radii with binary search for optimal uniform scale
+    lo_scale, hi_scale = 1.0, 2.0
+    for _ in range(30):
+        mid_scale = (lo_scale + hi_scale) / 2.0
+        if _is_valid(x, y, r * mid_scale, w, h):
+            lo_scale = mid_scale
+        else:
+            hi_scale = mid_scale
+    r = r * lo_scale
+
+    # Then try per-circle expansion
+    for _ in range(200):
+        if time.time() > time_budget:
+            break
+        improved = False
+        for i in range(n):
+            r_max = min(x[i], w - x[i], y[i], h - y[i])
+            for j in range(n):
+                if i == j:
+                    continue
+                dx = x[i] - x[j]
+                dy = y[i] - y[j]
+                d = np.sqrt(dx * dx + dy * dy)
+                r_allowed = d - r[j]
+                if r_allowed < r_max:
+                    r_max = r_allowed
+            r_max = max(0.0, r_max)
+            if r_max > r[i] + 1e-8:
+                r[i] = r_max
+                improved = True
+        if not improved:
+            break
+
+    z_new = np.empty(3 * N + 1)
+    z_new[0::3][:n] = x
+    z_new[1::3][:n] = y
+    z_new[2::3][:n] = r
+    z_new[-1] = w
+
+    if _is_valid(x, y, r, w, h):
+        return z_new
+    return None
+
+
+def _expansion_relaxation_polish(z, time_budget):
+    """Advanced polish: Iteratively expand circles and shift positions to create space."""
+    z = z.copy().astype(float)
+    n = N
+    x = z[0::3][:n].copy()
+    y = z[1::3][:n].copy()
+    r = z[2::3][:n].copy()
+    w = z[-1]
+    h = 2.0 - w
+
+    max_rounds = 30
+    for rnd in range(max_rounds):
+        if time.time() > time_budget:
+            break
+
+        improved = False
+        for i in range(n):
+            r_wall = min(x[i], w - x[i], y[i], h - y[i])
+            r_max = r_wall
+            for j in range(n):
+                if i == j:
+                    continue
+                dx = x[i] - x[j]
+                dy = y[i] - y[j]
+                d = np.sqrt(dx * dx + dy * dy)
+                r_allowed = d - r[j]
+                if r_allowed < r_max:
+                    r_max = r_allowed
+            r_max = max(0.0, r_max)
+
+            if r_max > r[i] + 1e-6:
+                lo = r[i]
+                hi = r_max
+                for _ in range(20):
+                    mid = (lo + hi) / 2.0
+                    if _is_valid_move(x, y, np.where(np.arange(n) == i, mid, r), w, h, i, x[i], y[i]):
+                        lo = mid
+                    else:
+                        hi = mid
+                new_r = lo
+                if new_r > r[i] + 1e-7:
+                    r[i] = new_r
+                    improved = True
+
+            min_dist = float('inf')
+            blocker = None
+            d_left = x[i] - r[i]
+            d_right = w - x[i] - r[i]
+            d_bottom = y[i] - r[i]
+            d_top = h - y[i] - r[i]
+
+            if d_left < min_dist:
+                min_dist = d_left
+                blocker = 'left'
+            if d_right < min_dist:
+                min_dist = d_right
+                blocker = 'right'
+            if d_bottom < min_dist:
+                min_dist = d_bottom
+                blocker = 'bottom'
+            if d_top < min_dist:
+                min_dist = d_top
+                blocker = 'top'
+
+            for j in range(n):
+                if i == j:
+                    continue
+                dx = x[i] - x[j]
+                dy = y[i] - y[j]
+                d = np.sqrt(dx * dx + dy * dy)
+                gap = d - (r[i] + r[j])
+                if gap < min_dist:
+                    min_dist = gap
+                    blocker = j
+
+            if min_dist < 0.02:
+                move_x = 0.0
+                move_y = 0.0
+                if blocker == 'left':
+                    move_x = 1.0
+                elif blocker == 'right':
+                    move_x = -1.0
+                elif blocker == 'bottom':
+                    move_y = 1.0
+                elif blocker == 'top':
+                    move_y = -1.0
+                else:
+                    j = blocker
+                    dx = x[i] - x[j]
+                    dy = y[i] - y[j]
+                    d = np.sqrt(dx * dx + dy * dy)
+                    if d > 1e-6:
+                        move_x = dx / d
+                        move_y = dy / d
+
+                for step in [0.05, 0.03, 0.02, 0.01, 0.005, 0.002]:
+                    new_x = x[i] + move_x * step
+                    new_y = y[i] + move_y * step
+                    if _is_valid_move(x, y, r, w, h, i, new_x, new_y):
+                        x[i] = new_x
+                        y[i] = new_y
+                        improved = True
+                        break
+                else:
+                    perp_x = -move_y
+                    perp_y = move_x
+                    for step in [0.03, 0.01, 0.005]:
+                        for sign in [1.0, -1.0]:
+                            new_x = x[i] + sign * perp_x * step
+                            new_y = y[i] + sign * perp_y * step
+                            if _is_valid_move(x, y, r, w, h, i, new_x, new_y):
+                                x[i] = new_x
+                                y[i] = new_y
+                                improved = True
+                                break
+                        if improved:
+                            break
+
+        if not improved:
+            break
+
+    grow_factor = 1.001
+    for _ in range(100):
+        if time.time() > time_budget:
+            break
+        r_trial = r * grow_factor
+        if _is_valid(x, y, r_trial, w, h):
+            r = r_trial
+        else:
+            break
+
+    if _is_valid(x, y, r, w, h):
+        z_new = np.empty(3 * N + 1)
+        z_new[0::3][:n] = x
+        z_new[1::3][:n] = y
+        z_new[2::3][:n] = r
+        z_new[-1] = w
+        return z_new
+    return None
+
+
+def _is_valid_move(x, y, r, w, h, i, new_x, new_y):
+    """Check if moving circle i to new_x, new_y is valid."""
+    if new_x < r[i] or new_x > w - r[i]:
+        return False
+    if new_y < r[i] or new_y > h - r[i]:
+        return False
+
+    for j in range(N):
+        if i == j:
+            continue
+        dx = new_x - x[j]
+        dy = new_y - y[j]
+        d2 = dx * dx + dy * dy
+        r_sum = r[i] + r[j]
+        if d2 < r_sum * r_sum - 1e-9:
+            return False
+    return True
+
+
+def _constraint_refine(z, time_budget):
+    """High-precision SLSQP refinement using explicit constraints."""
+    z = z.copy().astype(float)
+    n = N
+
+    def obj_refine(zv):
+        r = zv[2::3][:n]
+        return -np.sum(r)
+
+    constraints = []
+    bounds = []
+
+    for i in range(n):
+        bounds.extend([(0, 2), (0, 2), (0.001, 1.0)])
+    bounds.append((0.3, 1.7))
+
+    def make_boundary_constraint(idx, axis, side):
+        if axis == 0:
+            if side == 0:
+                return lambda p: p[3 * idx] - p[3 * idx + 2]
+            else:
+                return lambda p: p[-1] - p[3 * idx] - p[3 * idx + 2]
+        else:
+            if side == 0:
+                return lambda p: p[3 * idx + 1] - p[3 * idx + 2]
+            else:
+                return lambda p: (2.0 - p[-1]) - p[3 * idx + 1] - p[3 * idx + 2]
+
+    for i in range(n):
+        constraints.append({'type': 'ineq', 'fun': make_boundary_constraint(i, 0, 0)})
+        constraints.append({'type': 'ineq', 'fun': make_boundary_constraint(i, 0, 1)})
+        constraints.append({'type': 'ineq', 'fun': make_boundary_constraint(i, 1, 0)})
+        constraints.append({'type': 'ineq', 'fun': make_boundary_constraint(i, 1, 1)})
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            def make_overlap_constraint(idx1, idx2):
+                return lambda p: (
+                    (p[3 * idx1] - p[3 * idx2]) ** 2 +
+                    (p[3 * idx1 + 1] - p[3 * idx2 + 1]) ** 2 -
+                    (p[3 * idx1 + 2] + p[3 * idx2 + 2]) ** 2
+                )
+            constraints.append({'type': 'ineq', 'fun': make_overlap_constraint(i, j)})
+
+    maxiter = int(min(800, time_budget * 150))
+    try:
+        res = minimize(obj_refine, z, method='SLSQP',
+                       bounds=bounds,
+                       constraints=constraints,
+                       options={'maxiter': maxiter, 'ftol': 1e-14, 'maxls': 100})
+
+        z_opt = res.x
+        x = z_opt[0::3][:n]
+        y = z_opt[1::3][:n]
+        r = z_opt[2::3][:n]
+        w = z_opt[-1]
+        h = 2.0 - z_opt[-1]
+
+        if _is_valid(x, y, r, w, h):
+            return z_opt
+        return None
+    except Exception:
+        return None
+
+
+def _high_precision_polish(z, time_budget):
+    """High-precision polish: iterative radius growth with position adjustments."""
+    z = z.copy().astype(float)
+    n = N
+    x = z[0::3][:n].copy()
+    y = z[1::3][:n].copy()
+    r = z[2::3][:n].copy()
+    w = z[-1]
+    h = 2.0 - w
+
+    dt = 0.0002
+    max_iter = int(min(5000, time_budget * 200))
+    for it in range(max_iter):
+        if time.time() > time_budget:
+            break
+
+        fx = np.zeros(n)
+        fy = np.zeros(n)
+
+        left_viol = np.maximum(r - x, 0.0)
+        right_viol = np.maximum(x + r - w, 0.0)
+        bottom_viol = np.maximum(r - y, 0.0)
+        top_viol = np.maximum(y + r - h, 0.0)
+        fx -= left_viol * 50
+        fx += right_viol * 50
+        fy -= bottom_viol * 50
+        fy += top_viol * 50
+
+        dx = x[:, None] - x[None, :]
+        dy = y[:, None] - y[None, :]
+        d_sq = dx * dx + dy * dy
+        r_sum = r[:, None] + r[None, :]
+
+        iu = np.triu_indices(n, k=1)
+        d_sq_pairs = d_sq[iu]
+        r_sum_pairs = r_sum[iu]
+
+        d_pairs = np.sqrt(np.maximum(d_sq_pairs, 1e-12))
+        overlap = np.maximum(r_sum_pairs - d_pairs, 0.0)
+
+        if np.max(overlap) > 1e-12:
+            f_pairs = overlap * 25.0
+            dx_pairs = dx[iu]
+            dy_pairs = dy[iu]
+            ux = dx_pairs / d_pairs
+            uy = dy_pairs / d_pairs
+
+            for idx in range(len(iu[0])):
+                i_idx = iu[0][idx]
+                j_idx = iu[1][idx]
+                fx[i_idx] += ux[idx] * f_pairs[idx]
+                fy[i_idx] += uy[idx] * f_pairs[idx]
+                fx[j_idx] -= ux[idx] * f_pairs[idx]
+                fy[j_idx] -= uy[idx] * f_pairs[idx]
+
+        max_force = max(float(np.max(np.abs(fx))), float(np.max(np.abs(fy))), 1e-10)
+        if max_force > 0.01:
+            dt = 0.0001
+        else:
+            dt = 0.0002
+
+        x += dt * fx
+        y += dt * fy
+        x = np.clip(x, r, w - r)
+        y = np.clip(y, r, h - r)
+
+    for rnd in range(50):
+        if time.time() > time_budget:
+            break
+
+        improved = False
+        for i in range(n):
+            r_wall = min(x[i], w - x[i], y[i], h - y[i])
+            r_max = r_wall
+            for j in range(n):
+                if i == j:
+                    continue
+                dx = x[i] - x[j]
+                dy = y[i] - y[j]
+                d = np.sqrt(dx * dx + dy * dy)
+                r_allowed = d - r[j]
+                if r_allowed < r_max:
+                    r_max = r_allowed
+            r_max = max(0.0, r_max)
+
+            if r_max > r[i] + 1e-8:
+                lo = r[i]
+                hi = min(r_max, r[i] * 1.05)
+                for _ in range(30):
+                    mid = (lo + hi) / 2.0
+                    r_test = r.copy()
+                    r_test[i] = mid
+                    if _is_valid(x, y, r_test, w, h, tol=1e-10):
+                        lo = mid
+                    else:
+                        hi = mid
+                if lo > r[i] + 1e-9:
+                    r[i] = lo
+                    improved = True
+
+        if not improved:
+            break
+
+    for _ in range(200):
+        if time.time() > time_budget:
+            break
+        r_trial = r * 1.0001
+        if _is_valid(x, y, r_trial, w, h, tol=1e-10):
+            r = r_trial
+        else:
+            break
+
+    if _is_valid(x, y, r, w, h, tol=1e-10):
+        z_new = np.empty(3 * N + 1)
+        z_new[0::3][:n] = x
+        z_new[1::3][:n] = y
+        z_new[2::3][:n] = r
+        z_new[-1] = w
+        return z_new
+    return None
+
+
+def _optimize_radii_given_positions(z, time_budget):
+    """Decoupled radius optimization: fix positions, optimize radii via SLSQP."""
+    z = z.copy().astype(float)
+    n = N
+    x = z[0::3][:n].copy()
+    y = z[1::3][:n].copy()
+    w = z[-1]
+    h = 2.0 - w
+
+    def obj_rad(rv):
+        return -np.sum(rv)
+
+    bounds = []
+    constraints = []
+
+    for i in range(n):
+        r_max_wall = min(x[i], w - x[i], y[i], h - y[i])
+        bounds.append((0.001, max(0.001, r_max_wall)))
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = x[i] - x[j]
+            dy = y[i] - y[j]
+            d = np.sqrt(dx * dx + dy * dy)
+
+            def make_constraint(idx1, idx2, dist):
+                return lambda rv: dist - rv[idx1] - rv[idx2]
+
+            constraints.append({'type': 'ineq', 'fun': make_constraint(i, j, d)})
+
+    r_init = z[2::3][:n].copy()
+
+    maxiter = int(min(500, time_budget * 100))
+    try:
+        res = minimize(obj_rad, r_init, method='SLSQP',
+                       bounds=bounds,
+                       constraints=constraints,
+                       options={'maxiter': maxiter, 'ftol': 1e-12, 'maxls': 50})
+
+        r_opt = res.x
+        if _is_valid(x, y, r_opt, w, h):
+            z_new = z.copy()
+            z_new[2::3][:n] = r_opt
+            return z_new
+        return None
+    except Exception:
+        return None
+
+
+def _delaunay_construction(w0, h0, max_iter=200, dt=0.002):
+    """Construct initial packing using Delaunay-based inradius optimization."""
+    n = N
+    rows = 4
+    cols = 6
+    x = np.zeros(n)
+    y = np.zeros(n)
+    r = np.zeros(n)
+    
+    rng = np.random.default_rng(42)
+    for i in range(n):
+        row = i // cols
+        col = i % cols
+        x[i] = (col + 0.5) * (w0 / cols) + rng.uniform(-0.1, 0.1) * w0 / cols
+        y[i] = (row + 0.5) * (h0 / rows) + rng.uniform(-0.1, 0.1) * h0 / rows
+        x[i] = np.clip(x[i], 0.05, w0 - 0.05)
+        y[i] = np.clip(y[i], 0.05, h0 - 0.05)
+        r[i] = 0.05
+    
+    for it in range(max_iter):
+        inradii = _compute_max_radii(x, y, w0, h0)
+        r = np.maximum(inradii, 0.01)
+        
+        boundary_pts = np.array([
+            [0, 0], [w0, 0], [w0, h0], [0, h0],
+            [w0/2, 0], [w0, h0/2], [w0/2, h0], [0, h0/2],
+        ])
+        all_pts = np.vstack([np.column_stack([x, y]), boundary_pts])
+        
+        try:
+            tri = Delaunay(all_pts)
+        except Exception:
+            break
+        
+        new_x = x.copy()
+        new_y = y.copy()
+        
+        for i in range(n):
+            cx_sum = 0.0
+            cy_sum = 0.0
+            weight_sum = 0.0
+            
+            for simplex in tri.simplices:
+                if i in simplex:
+                    pts = all_pts[simplex]
+                    ax, ay = pts[0]
+                    bx, by = pts[1]
+                    cx, cy = pts[2]
+                    
+                    d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+                    if abs(d) < 1e-12:
+                        continue
+                    ux = ((ax*ax + ay*ay) * (by - cy) + (bx*bx + by*by) * (cy - ay) + (cx*cx + cy*cy) * (ay - by)) / d
+                    uy = ((ax*ax + ay*ay) * (cx - bx) + (bx*bx + by*by) * (ax - cx) + (cx*cx + cy*cy) * (bx - ax)) / d
+                    
+                    dist = np.sqrt((x[i] - ux)**2 + (y[i] - uy)**2)
+                    weight = 1.0 / max(dist, 0.01)
+                    cx_sum += ux * weight
+                    cy_sum += uy * weight
+                    weight_sum += weight
+            
+            if weight_sum > 0:
+                new_x[i] = cx_sum / weight_sum
+                new_y[i] = cy_sum / weight_sum
+        
+        x = x + dt * (new_x - x)
+        y = y + dt * (new_y - y)
+        x = np.clip(x, 0.05, w0 - 0.05)
+        y = np.clip(y, 0.05, h0 - 0.05)
+    
+    r = _compute_max_radii(x, y, w0, h0)
+    x, y = _force_relax_unified(np.concatenate([x, y, r, [w0]]).reshape(-1), max_iter=300)
+    x = x[:n]
+    y = y[:n]
+    r = r[:n]
+    w_final = w0
+    
+    if _is_valid(x, y, r, w_final, h0):
+        return x, y, r, w_final
+    else:
+        r *= 0.9
+        if _is_valid(x, y, r, w_final, h0):
+            return x, y, r, w_final
+    return None
+
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140.0
+
+    best_value = 0.0
+    best_result = None
+
+    penalty_weight = 1000.0
+
+    def objective(z):
+        return _vectorized_objective(z, penalty_weight)
+
+    def check_validity(z, tol=1e-9):
+        x = z[0::3][:N]
+        y = z[1::3][:N]
+        r = z[2::3][:N]
+        w = z[-1]
+        h = 2.0 - w
+
+        if w <= 0.05 or h <= 0.05:
+            return False, 0.0
+
+        for i in range(N):
+            if r[i] <= 0:
+                return False, 0.0
+            if x[i] < r[i] - tol or x[i] > w - r[i] + tol:
+                return False, 0.0
+            if y[i] < r[i] - tol or y[i] > h - r[i] + tol:
+                return False, 0.0
+
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = x[i] - x[j]
+                dy = y[i] - y[j]
+                d2 = dx * dx + dy * dy
+                r_sum = r[i] + r[j]
+                if d2 < r_sum ** 2 - tol:
+                    return False, 0.0
+
+        val = float(np.sum(r))
+        return True, val
+
+    def get_initial_guesses():
+        guesses = []
+        side = int(np.ceil(np.sqrt(N)))
+
+        aspect_ratios = [1.0, 0.85, 1.18, 0.75, 1.33, 0.67, 1.5, 0.6, 1.75, 0.55, 2.0, 0.5, 1.2, 0.8, 0.7, 1.4, 0.9, 1.1, 0.65, 1.6]
+        for w0 in aspect_ratios:
+            h0 = 2.0 - w0
+            if h0 < 0.3:
+                continue
+            z = np.zeros(3 * N + 1)
+            for i in range(N):
+                row, col = divmod(i, side)
+                cx = (col + 0.5) / side * w0
+                cy = (row + 0.5) / side * h0
+                r0 = min(w0 / side, h0 / side) * 0.45
+                z[3 * i] = cx
+                z[3 * i + 1] = cy
+                z[3 * i + 2] = r0
+            z[-1] = w0
+            guesses.append(z)
+
+        rng = np.random.default_rng(42)
+        for seed in range(20):
+            w0 = rng.uniform(0.5, 1.5)
+            h0 = 2.0 - w0
+            z = np.zeros(3 * N + 1)
+            for i in range(N):
+                r0 = rng.uniform(0.04, 0.14)
+                cx = rng.uniform(r0, w0 - r0)
+                cy = rng.uniform(r0, h0 - r0)
+                z[3 * i] = cx
+                z[3 * i + 1] = cy
+                z[3 * i + 2] = r0
+            z[-1] = w0
+            guesses.append(z)
+
+        for w0 in [0.9, 1.0, 1.1]:
+            h0 = 2.0 - w0
+            if h0 < 0.4:
+                continue
+            z = np.zeros(3 * N + 1)
+            rows = 5
+            cols = 5
+            spacing_x = w0 / (cols + 0.5)
+            spacing_y = h0 / (rows + 0.5)
+            for i in range(N):
+                row, col = divmod(i, cols)
+                cx = (col + 0.5 + (0.5 if row % 2 == 1 else 0)) * spacing_x
+                cy = (row + 0.5) * spacing_y
+                r0 = min(spacing_x, spacing_y) * 0.48
+                cx = min(max(cx, r0), w0 - r0)
+                cy = min(max(cy, r0), h0 - r0)
+                z[3 * i] = cx
+                z[3 * i + 1] = cy
+                z[3 * i + 2] = r0
+            z[-1] = w0
+            guesses.append(z)
+
+        for w0 in [0.95, 1.05, 1.15]:
+            h0 = 2.0 - w0
+            if h0 < 0.4:
+                continue
+            z = np.zeros(3 * N + 1)
+            if w0 >= h0:
+                cols = 5
+                rows = 4
+            else:
+                cols = 4
+                rows = 5
+            spacing_x = w0 / (cols + 0.3)
+            spacing_y = h0 / (rows + 0.3)
+            for i in range(N):
+                row, col = divmod(i, cols)
+                cx = (col + 0.5 + (0.4 if row % 2 == 1 else 0)) * spacing_x
+                cy = (row + 0.5) * spacing_y
+                r0 = min(spacing_x, spacing_y) * 0.47
+                cx = min(max(cx, r0), w0 - r0)
+                cy = min(max(cy, r0), h0 - r0)
+                z[3 * i] = cx
+                z[3 * i + 1] = cy
+                z[3 * i + 2] = r0
+            z[-1] = w0
+            guesses.append(z)
+
+        return guesses
+
+    guesses = get_initial_guesses()
+
+    for i, z0 in enumerate(guesses):
+        if time.time() > deadline - 20:
+            break
+
+        z0_relaxed = _force_relax_unified(z0, max_iter=500)
+
+        remaining = deadline - (time.time() - start_time)
+        maxiter = int(min(600, max(150, remaining * 50)))
+        try:
+            res = minimize(_smooth_objective, z0_relaxed, method='SLSQP',
+                           bounds=[(0, 2)] * (3 * N) + [(0.3, 1.7)],
+                           options={'maxiter': maxiter, 'ftol': 1e-12, 'maxls': 80})
+
+            z_opt = res.x
+            valid, val = check_validity(z_opt)
+
+            if valid and val > best_value:
+                best_value = val
+                best_result = z_opt.copy()
+            elif not valid:
+                z_repair = z_opt.copy()
+                r_idx = np.arange(2, len(z_repair) - 1, 3)
+                z_repair[r_idx] *= 0.95
+                valid, val = check_validity(z_repair)
+                if valid and val > best_value:
+                    best_value = val
+                    best_result = z_repair.copy()
+
+        except Exception:
+            continue
+
+    # --- Delaunay-based construction for additional diversity ---
+    if time.time() < deadline - 30:
+        for w0 in [0.9, 1.0, 1.1, 0.85, 1.15]:
+            if time.time() > deadline - 25:
+                break
+            h0 = 2.0 - w0
+            if h0 < 0.4:
+                continue
+            result = _delaunay_construction(w0, h0, max_iter=150, dt=0.002)
+            if result is not None:
+                x, y, r, w_final = result
+                z_delaunay = np.empty(3 * N + 1)
+                z_delaunay[0::3][:N] = x
+                z_delaunay[1::3][:N] = y
+                z_delaunay[2::3][:N] = r
+                z_delaunay[-1] = w_final
+                valid, val = check_validity(z_delaunay)
+                if valid and val > best_value:
+                    best_value = val
+                    best_result = z_delaunay.copy()
+
+    # --- Phase 2: Advanced Polish on best result ---
+    if best_result is not None and time.time() < deadline - 25:
+        polished = _polish_result(best_result, deadline - (time.time() - start_time) - 15)
+        if polished is not None:
+            valid, val = check_validity(polished)
+            if valid and val > best_value:
+                best_value = val
+                best_result = polished
+
+        if best_result is not None and time.time() < deadline - 18:
+            r_optimized = _optimize_radii_given_positions(best_result, deadline - (time.time() - start_time) - 10)
+            if r_optimized is not None:
+                valid, val = check_validity(r_optimized)
+                if valid and val > best_value:
+                    best_value = val
+                    best_result = r_optimized
+
+        if best_result is not None and time.time() < deadline - 12:
+            expanded = _expansion_relaxation_polish(best_result, deadline - (time.time() - start_time) - 8)
+            if expanded is not None:
+                valid, val = check_validity(expanded)
+                if valid and val > best_value:
+                    best_value = val
+                    best_result = expanded
+
+        if best_result is not None and time.time() < deadline - 10:
+            refined = _constraint_refine(best_result, deadline - (time.time() - start_time) - 6)
+            if refined is not None:
+                valid, val = check_validity(refined)
+                if valid and val > best_value:
+                    best_value = val
+                    best_result = refined
+
+        if best_result is not None and time.time() < deadline - 8:
+            hp = _high_precision_polish(best_result, deadline - (time.time() - start_time) - 4)
+            if hp is not None:
+                valid, val = check_validity(hp)
+                if valid and val > best_value:
+                    best_value = val
+                    best_result = hp
+
+        if best_result is not None and time.time() < deadline - 3:
+            polished2 = _polish_result(best_result, deadline - (time.time() - start_time))
+            if polished2 is not None:
+                valid, val = check_validity(polished2)
+                if valid and val > best_value:
+                    best_value = val
+                    best_result = polished2
+
+    if best_result is None:
+        side = int(np.ceil(np.sqrt(N)))
+        cells = [((i + 0.5) / side, (j + 0.5) / side, 0.5 / side - 1e-3)
+                 for i in range(side) for j in range(side)]
+        return np.array(cells[:N])
+
+    x = best_result[0::3][:N]
+    y = best_result[1::3][:N]
+    r = best_result[2::3][:N]
+    w = best_result[-1]
+    h = 2.0 - w
+
+    for _ in range(10):
+        r_trial = r * (1 - 1e-9)
+        if _is_valid(x, y, r_trial, w, h):
+            r = r_trial
+        else:
+            break
+
+    return np.column_stack((x, y, r))

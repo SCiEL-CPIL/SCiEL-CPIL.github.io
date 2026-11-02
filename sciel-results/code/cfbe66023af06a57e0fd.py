@@ -1,0 +1,22 @@
+import time
+import numpy as np
+
+DIMENSIONS = [3, 4, 8]
+
+def construct():
+    n, m, p = DIMENSIONS
+    rank = n * m  # 12
+    
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    
+    for i in range(n):
+        for j in range(m):
+            r = i * m + j
+            U[i * m + j][r] = 1
+            for k in range(p):
+                V[j * p + k][r] = 1
+                W[k * n + i][r] = 1
+    
+    return {"U": U, "V": V, "W": W}
