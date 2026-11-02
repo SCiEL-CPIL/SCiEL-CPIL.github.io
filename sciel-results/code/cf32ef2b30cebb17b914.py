@@ -1,0 +1,205 @@
+import time
+import sys
+
+import numpy as np
+from scipy.optimize import least_squares
+
+DIMENSIONS = [2, 4, 4]
+
+
+def _build_T(n, m, p):
+    """Multiplication tensor T[a,b,c]=1 iff a=i*m+j, b=j*p+k, c=k*n+i."""
+    T = np.zeros((n * m, m * p, p * n))
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                T[i * m + j, j * p + k, k * n + i] = 1.0
+    return T
+
+
+def _verify(U, V, W, T, tol=1e-7):
+    U = np.asarray(U, dtype=float)
+    V = np.asarray(V, dtype=float)
+    W = np.asarray(W, dtype=float)
+    M = np.einsum('ar,br,cr->abc', U, V, W)
+    return np.max(np.abs(M - T)) < tol
+
+
+def _strassen_solution(n, m, p):
+    """Known rank-28 exact decomposition via Strassen on four 2x2 blocks."""
+    rank = 28
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+
+    def add(A_row0, A_col0, B_row0, B_col0, C_row0, C_col0, start_r):
+        a11 = A_row0 * m + A_col0
+        a12 = A_row0 * m + A_col0 + 1
+        a21 = (A_row0 + 1) * m + A_col0
+        a22 = (A_row0 + 1) * m + A_col0 + 1
+        b11 = B_row0 * p + B_col0
+        b12 = B_row0 * p + B_col0 + 1
+        b21 = (B_row0 + 1) * p + B_col0
+        b22 = (B_row0 + 1) * p + B_col0 + 1
+        c11 = C_col0 * n + C_row0
+        c12 = (C_col0 + 1) * n + C_row0
+        c21 = C_col0 * n + (C_row0 + 1)
+        c22 = (C_col0 + 1) * n + (C_row0 + 1)
+        r = start_r
+        # M1 = (A11+A22)(B11+B22)
+        U[a11][r] += 1; U[a22][r] += 1; V[b11][r] += 1; V[b22][r] += 1
+        W[c11][r] += 1; W[c22][r] += 1; r += 1
+        # M2 = (A21+A22)B11
+        U[a21][r] += 1; U[a22][r] += 1; V[b11][r] += 1
+        W[c21][r] += 1; W[c22][r] += -1; r += 1
+        # M3 = A11(B12-B22)
+        U[a11][r] += 1; V[b12][r] += 1; V[b22][r] += -1
+        W[c12][r] += 1; W[c22][r] += 1; r += 1
+        # M4 = A22(B21-B11)
+        U[a22][r] += 1; V[b21][r] += 1; V[b11][r] += -1
+        W[c11][r] += 1; W[c21][r] += 1; r += 1
+        # M5 = (A11+A12)B22
+        U[a11][r] += 1; U[a12][r] += 1; V[b22][r] += 1
+        W[c11][r] += -1; W[c12][r] += 1; r += 1
+        # M6 = (A21-A11)(B11+B12)
+        U[a21][r] += 1; U[a11][r] += -1; V[b11][r] += 1; V[b12][r] += 1
+        W[c22][r] += 1; r += 1
+        # M7 = (A12-A22)(B21+B22)
+        U[a12][r] += 1; U[a22][r] += -1; V[b21][r] += 1; V[b22][r] += 1
+        W[c11][r] += 1; r += 1
+        return r
+
+    r = add(0, 0, 0, 0, 0, 0, 0)
+    r = add(0, 2, 2, 0, 0, 0, r)
+    r = add(0, 0, 0, 2, 0, 2, r)
+    r = add(0, 2, 2, 2, 0, 2, r)
+    assert r == 28
+    return {"U": U, "V": V, "W": W}
+
+
+def _round_to_half(U, V, W):
+    """Round entries to nearest half-integer (integer/half-integer constraint)."""
+    def rM(M):
+        return np.round(2.0 * M) / 2.0
+    return rM(U), rM(V), rM(W)
+
+
+def _search_rank(T, n, m, p, R, seed, deadline, start_from):
+    """Try to find a rank-R exact decomposition."""
+    A = n * m
+    B = m * p
+    C = p * n
+
+    def _resid(pv):
+        Uf = pv[:A * R].reshape(A, R)
+        Vf = pv[A * R:A * R + B * R].reshape(B, R)
+        Wf = pv[A * R + B * R:].reshape(C, R)
+        M = np.einsum('ar,br,cr->abc', Uf, Vf, Wf)
+        return (M - T).reshape(-1)
+
+    rng = np.random.default_rng(seed)
+
+    # Start from Strassen solution (padded with zeros)
+    U0 = np.asarray(start_from["U"], dtype=float)
+    V0 = np.asarray(start_from["V"], dtype=float)
+    W0 = np.asarray(start_from["W"], dtype=float)
+    
+    # Pad to R if R < 28? No, R should be <= 28.
+    # If R < 28, we can't just pad. We need a good initial guess.
+    # If R == 28, we have an exact solution.
+    # If R < 28, we initialize randomly or by projecting.
+    
+    x0 = None
+    if R == 28:
+        x0 = np.concatenate([U0.reshape(-1), V0.reshape(-1), W0.reshape(-1)])
+    else:
+        # Random initialization
+        x0 = rng.standard_normal(A * R + B * R + C * R)
+        # Normalize columns
+        Uf = x0[:A*R].reshape(A,R)
+        Vf = x0[A*R:A*R+B*R].reshape(B,R)
+        Wf = x0[A*R+B*R:].reshape(C,R)
+        for r in range(R):
+            for M in (Uf, Vf, Wf):
+                nrm = np.linalg.norm(M[:, r])
+                if nrm > 1e-12:
+                    M[:, r] /= nrm
+        x0 = np.concatenate([Uf.reshape(-1), Vf.reshape(-1), Wf.reshape(-1)])
+
+    try:
+        sol = least_squares(_resid, x0, method='trf', max_nfev=200,
+                            xtol=1e-10, ftol=1e-10, gtol=1e-10)
+        if np.max(np.abs(sol.fun)) < 1e-6:
+            Uf = sol.x[:A * R].reshape(A, R)
+            Vf = sol.x[A * R:A * R + B * R].reshape(B, R)
+            Wf = sol.x[A * R + B * R:].reshape(C, R)
+            Uq, Vq, Wq = _round_to_half(Uf, Vf, Wf)
+            if _verify(Uq, Vq, Wq, T, tol=1e-7):
+                return {"U": Uq.tolist(), "V": Vq.tolist(), "W": Wq.tolist()}
+    except Exception:
+        pass
+
+    # Try a few random restarts
+    for i in range(5):
+        if time.time() >= deadline:
+            break
+        x0 = rng.standard_normal(A * R + B * R + C * R)
+        Uf = x0[:A*R].reshape(A,R)
+        Vf = x0[A*R:A*R+B*R].reshape(B,R)
+        Wf = x0[A*R+B*R:].reshape(C,R)
+        for r in range(R):
+            for M in (Uf, Vf, Wf):
+                nrm = np.linalg.norm(M[:, r])
+                if nrm > 1e-12:
+                    M[:, r] /= nrm
+        x0 = np.concatenate([Uf.reshape(-1), Vf.reshape(-1), Wf.reshape(-1)])
+        try:
+            sol = least_squares(_resid, x0, method='trf', max_nfev=200,
+                                xtol=1e-10, ftol=1e-10, gtol=1e-10)
+            if np.max(np.abs(sol.fun)) < 1e-6:
+                Uf = sol.x[:A * R].reshape(A, R)
+                Vf = sol.x[A * R:A * R + B * R].reshape(B, R)
+                Wf = sol.x[A * R + B * R:].reshape(C, R)
+                Uq, Vq, Wq = _round_to_half(Uf, Vf, Wf)
+                if _verify(Uq, Vq, Wq, T, tol=1e-7):
+                    return {"U": Uq.tolist(), "V": Vq.tolist(), "W": Wq.tolist()}
+        except Exception:
+            pass
+            
+    return None
+
+
+def construct():
+    n, m, p = DIMENSIONS
+    t_start = time.time()
+    deadline = t_start + 110.0   # safety margin
+
+    T = _build_T(n, m, p)
+    best = _strassen_solution(n, m, p)   # guaranteed rank-28 fallback
+
+    # Try rank 24
+    for seed in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15):
+        if time.time() >= deadline - 10.0:
+            break
+        try:
+            sol = _search_rank(T, n, m, p, 24, seed, deadline - 10.0, best)
+        except Exception:
+            sol = None
+        if sol is not None and _verify(sol["U"], sol["V"], sol["W"], T, tol=1e-7):
+            best = sol
+            break
+
+    # If still 28, try rank 21?
+    if len(best["U"][0]) == 28:
+        for seed in (0, 1, 2, 3):
+            if time.time() >= deadline - 5.0:
+                break
+            try:
+                sol = _search_rank(T, n, m, p, 21, seed, deadline - 5.0, best)
+            except Exception:
+                sol = None
+            if sol is not None and _verify(sol["U"], sol["V"], sol["W"], T, tol=1e-7):
+                best = sol
+                break
+
+    return best

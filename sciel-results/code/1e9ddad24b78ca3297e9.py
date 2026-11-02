@@ -1,0 +1,8 @@
+V[2, 7 + r] = V_strassen[0, r]  # B[0,2]
+V[3, 7 + r] = V_strassen[1, r]  # B[0,3]
+V[6, 7 + r] = V_strassen[2, r]  # B[1,2]
+V[7, 7 + r] = V_strassen[3, r]  # B[1,3]
+W[4, 7 + r] = W_strassen[0, r]  # C[0,2]
+W[5, 7 + r] = W_strassen[1, r]  # C[0,3]
+W[6, 7 + r] = W_strassen[2, r]  # C[1,2]
+W[7, 7 + r] = W_strassen[3, r]  # C[1,3]

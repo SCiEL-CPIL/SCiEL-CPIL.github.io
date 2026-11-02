@@ -1,220 +1,233 @@
 import itertools
-import numpy as np
-from scipy.optimize import linprog
-from scipy.sparse import csr_matrix
-import heapq
 import time
+import random
+import numpy as np
+from collections import defaultdict
 
 def construct(v, k, t):
-    # Generate all t-subsets
-    t_subsets = list(itertools.combinations(range(v), t))
-    t_index = {s: i for i, s in enumerate(t_subsets)}
-    n_t = len(t_subsets)
+    deadline = time.time() + 115.0
     
-    # Generate all k-subsets
-    k_subsets = list(itertools.combinations(range(v), k))
-    n_k = len(k_subsets)
+    # 1. Precomputation
+    points = list(range(v))
+    all_blocks = list(itertools.combinations(points, k))
+    n_blocks = len(all_blocks)
     
-    # Build sparse matrix A where A[i, j] = 1 if t_subsets[i] is a subset of k_subsets[j]
-    rows = []
-    cols = []
-    data = []
+    all_tsubsets = list(itertools.combinations(points, t))
+    n_tsubsets = len(all_tsubsets)
+    tsub_idx = {ts: i for i, ts in enumerate(all_tsubsets)}
     
-    # Also build subsets_of_block and blocks_of_subset for the dynamic greedy
-    subsets_of_block = [[] for _ in range(n_k)]
-    blocks_of_subset = [[] for _ in range(n_t)]
+    # block_tsubs[i] = list of t-subset indices covered by block i
+    block_tsubs = [None] * n_blocks
+    # tsub_blocks[j] = list of block indices covering t-subset j
+    tsub_blocks = [[] for _ in range(n_tsubsets)]
     
-    for j, B in enumerate(k_subsets):
-        for S in itertools.combinations(B, t):
-            i = t_index[S]
-            rows.append(i)
-            cols.append(j)
-            data.append(1.0)
-            subsets_of_block[j].append(i)
-            blocks_of_subset[i].append(j)
+    for bi, block in enumerate(all_blocks):
+        tsubs = [tsub_idx[ts] for ts in itertools.combinations(block, t)]
+        block_tsubs[bi] = tsubs
+        for ts_idx in tsubs:
+            tsub_blocks[ts_idx].append(bi)
             
-    M = csr_matrix((data, (rows, cols)), shape=(n_t, n_k))
+    # Convert to numpy arrays for faster access if needed, 
+    # but lists are fine for the logic below.
     
-    # LP Formulation:
-    # Minimize sum(x_j)
-    # Subject to: M.T @ x >= ones(n_t)
-    # Which is: -M.T @ x <= -ones(n_t)
-    
-    c = np.ones(n_k)
-    A_ub = -M.T.tocsr()
-    b_ub = -np.ones(n_t)
-    bounds = [(0, 1)] * n_k
-    
-    duals = None
-    try:
-        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-        if not res.success:
-            return _fallback_greedy(v, k, t)
-        
-        # Extract dual variables
-        # res.ineqlin.marginals corresponds to A_ub constraints
-        # The constraint is -M.T @ x <= -1.
-        # The marginal is the change in objective per unit change in b_ub.
-        # For minimization with <= constraints, marginals are <= 0.
-        # The "value" or dual variable y_i for the original constraint >= 1 is -marginal[i].
-        duals = -res.ineqlin.marginals
-        duals = np.maximum(duals, 0)
-        
-    except Exception:
-        return _fallback_greedy(v, k, t)
-    
-    # Dynamic LP-Greedy
-    # 1. Initialize block weights
-    block_weights = np.zeros(n_k)
-    for j in range(n_k):
-        # Sum of duals for subsets in block j
-        # subsets_of_block[j] is a list of indices
-        if subsets_of_block[j]:
-            block_weights[j] = np.sum(duals[subsets_of_block[j]])
+    def greedy_cover(seed):
+        rng = random.Random(seed)
+        uncovered = [True] * n_tsubsets
+        # gain[i] = number of uncovered t-subsets in block i
+        gain = [0] * n_blocks
+        for bi in range(n_blocks):
+            gain[bi] = len(block_tsubs[bi])
             
-    # 2. Heap initialization
-    # (negative_weight, block_index)
-    heap = [(-block_weights[j], j) for j in range(n_k)]
-    heapq.heapify(heap)
-    
-    covered = np.zeros(n_t, dtype=bool)
-    picked = np.zeros(n_k, dtype=bool)
-    blocks = []
-    
-    while heap:
-        neg_w, j = heapq.heappop(heap)
-        w = -neg_w
+        selected = []
+        # Use a heap or just max? 
+        # With 50k blocks, finding max is O(N). 
+        # We can use a heap of (-gain, bi).
+        # But gains change. 
+        # Simple O(N) scan is 50k * 150 steps = 7.5M ops. Very fast.
         
-        # Lazy deletion: check if this entry is still valid
-        # It's valid if the current weight matches the stored weight (approx) and not picked
-        # Since we push updates, old entries remain.
-        # We need to check if the actual current weight is still w?
-        # It's hard to track exact current weight without an array.
-        # We have `block_weights` array.
-        # If `block_weights[j]` is not close to `w`, it's an old entry.
-        # Also if `picked[j]` is True, skip.
-        
-        if picked[j]:
-            continue
+        while True:
+            if time.time() > deadline - 5:
+                break
+                
+            # Find block with max gain
+            max_gain = -1
+            best_bi = -1
+            # Random tie-breaking
+            candidates = []
+            for bi in range(n_blocks):
+                if gain[bi] > max_gain:
+                    max_gain = gain[bi]
+                    candidates = [bi]
+                elif gain[bi] == max_gain and gain[bi] > 0:
+                    candidates.append(bi)
+                    
+            if max_gain <= 0:
+                break
+                
+            # Pick random from candidates
+            bi = candidates[rng.randint(0, len(candidates) - 1)]
+            selected.append(bi)
             
-        # Check if weight changed significantly
-        # Due to floating point, use a small epsilon or just compare
-        # Actually, we update `block_weights` array in place.
-        # The heap contains stale entries.
-        # We must verify if `w` is still the correct weight.
-        # If `block_weights[j] != w`, it's stale.
-        # However, `block_weights[j]` decreases. So `w` (from heap) might be larger than `block_weights[j]`.
-        # If `w > block_weights[j] + 1e-9`, it's stale.
-        if w > block_weights[j] + 1e-9:
-            continue
+            # Update gains
+            for ts_idx in block_tsubs[bi]:
+                if uncovered[ts_idx]:
+                    uncovered[ts_idx] = False
+                    # Decrement gain for all blocks covering this ts_idx
+                    for bj in tsub_blocks[ts_idx]:
+                        gain[bj] -= 1
+                        
+            gain[bi] = -1 # Prevent re-selection
             
-        # Check if this block covers any *uncovered* subsets
-        # If not, its effective weight for new coverage is 0.
-        # We should skip it if it doesn't add new coverage.
-        # But the weight `w` is sum of duals of *all* subsets in B.
-        # If all are covered, `w` should have been reduced to 0?
-        # Yes, because when a subset S is covered, we subtract y[S] from all blocks containing S.
-        # So if a block only contains covered subsets, its weight should be 0.
-        # So if w > 0, it implies it has some uncovered subsets with positive dual.
-        
-        if w <= 1e-9:
-            continue
-            
-        # Select block j
-        picked[j] = True
-        blocks.append(list(k_subsets[j]))
-        
-        # Update weights for blocks that share subsets with j
-        # For each subset S in block j:
-        #   If S is not covered:
-        #     Mark S as covered
-        #     For each block B' containing S:
-        #       block_weights[B'] -= duals[S]
-        #       Push (-block_weights[B'], B') into heap
-        
-        for s_idx in subsets_of_block[j]:
-            if not covered[s_idx]:
-                covered[s_idx] = True
-                y_s = duals[s_idx]
-                if y_s > 0:
-                    for b_prime in blocks_of_subset[s_idx]:
-                        if not picked[b_prime]:
-                            block_weights[b_prime] -= y_s
-                            heapq.heappush(heap, (-block_weights[b_prime], b_prime))
-                            
-    # Check if all covered
-    if not np.all(covered):
-        # Fallback for any remaining
-        # This should rarely happen if LP is valid, but just in case
-        remaining_indices = np.where(~covered)[0]
-        # Simple greedy for remaining
-        rem_blocks = _fallback_greedy_remaining(v, k, t, remaining_indices, t_index, k_subsets)
-        blocks.extend(rem_blocks)
-        
-    return blocks
+        return selected
 
-def _fallback_greedy(v, k, t):
-    # Standard max-coverage greedy
-    uncovered = set(itertools.combinations(range(v), t))
-    blocks = []
-    # Precompute subsets for each block? No, generate on fly or use precomputed if available.
-    # For simplicity in fallback, just use a slow but robust method.
-    # Actually, we can reuse the main logic's data structures if we pass them, but signature is fixed.
-    # So we must be self-contained or fast.
-    # Given v=19, k=7, t=4, this is small.
-    
-    # Generate all k-subsets
-    k_subsets = list(itertools.combinations(range(v), k))
-    
-    while uncovered:
-        best_block = None
-        best_count = -1
-        for B in k_subsets:
-            # Count how many uncovered t-subsets are in B
-            count = 0
-            for S in itertools.combinations(B, t):
-                if S in uncovered:
-                    count += 1
-            if count > best_count:
-                best_count = count
-                best_block = B
-        if best_count == 0:
-            break
-        blocks.append(list(best_block))
-        # Remove covered
-        for S in itertools.combinations(best_block, t):
-            if S in uncovered:
-                uncovered.remove(S)
-    return blocks
-
-def _fallback_greedy_remaining(v, k, t, remaining_indices, t_index, k_subsets):
-    # Convert indices back to tuples
-    inv_t_index = {i: s for s, i in t_index.items()}
-    remaining_sets = set(inv_t_index[i] for i in remaining_indices)
-    
-    if not remaining_sets:
-        return []
+    def local_search(blocks, seed):
+        rng = random.Random(seed)
+        # blocks is a list of indices
+        # We work with a set for O(1) lookup
+        block_set = set(blocks)
+        cover_count = [0] * n_tsubsets
         
-    blocks = []
-    # Use standard greedy on the remaining sets
-    # We only need to cover these specific sets
-    # We can still use any k-subset, but we prioritize those that cover remaining sets
+        # Initialize cover_count
+        for bi in block_set:
+            for ts_idx in block_tsubs[bi]:
+                cover_count[ts_idx] += 1
+                
+        improved = True
+        while improved and time.time() < deadline - 2:
+            improved = False
+            
+            # Phase 1: Remove redundant blocks
+            # A block is redundant if all its t-subsets are covered by other blocks
+            # i.e., cover_count[ts] > 1 for all ts in block
+            to_remove = []
+            for bi in block_set:
+                redundant = True
+                for ts_idx in block_tsubs[bi]:
+                    if cover_count[ts_idx] == 1:
+                        redundant = False
+                        break
+                if redundant:
+                    to_remove.append(bi)
+                    
+            if to_remove:
+                for bi in to_remove:
+                    block_set.remove(bi)
+                    for ts_idx in block_tsubs[bi]:
+                        cover_count[ts_idx] -= 1
+                improved = True
+                continue # Restart loop as structure changed significantly
+            
+            # Phase 2: Try swaps
+            # For each block, try to replace it with another that covers its unique subsets
+            # and potentially allows further reduction
+            current_blocks = list(block_set)
+            rng.shuffle(current_blocks)
+            
+            for bi in current_blocks:
+                if time.time() > deadline - 2:
+                    break
+                if bi not in block_set: # Might have been removed in previous iterations? No, we continue above.
+                    continue
+                    
+                # Find unique subsets for bi
+                unique_tsubs = []
+                for ts_idx in block_tsubs[bi]:
+                    if cover_count[ts_idx] == 1:
+                        unique_tsubs.append(ts_idx)
+                        
+                if not unique_tsubs:
+                    # Should have been caught in Phase 1, but just in case
+                    block_set.remove(bi)
+                    for ts_idx in block_tsubs[bi]:
+                        cover_count[ts_idx] -= 1
+                    improved = True
+                    break # Restart
+                    
+                # Find candidate blocks that cover all unique_tsubs
+                # Candidate must not be in block_set
+                # Intersection of tsub_blocks[ts] for ts in unique_tsubs
+                # Start with the one with fewest blocks
+                min_ts = min(unique_tsubs, key=lambda x: len(tsub_blocks[x]))
+                candidates = set(tsub_blocks[min_ts])
+                
+                for ts_idx in unique_tsubs[1:]:
+                    if not candidates:
+                        break
+                    candidates &= set(tsub_blocks[ts_idx])
+                    
+                # Remove current block from candidates
+                candidates.discard(bi)
+                
+                if not candidates:
+                    continue
+                    
+                # Try candidates
+                cand_list = list(candidates)
+                rng.shuffle(cand_list)
+                
+                swapped = False
+                for bj in cand_list[:20]: # Limit trials per block
+                    if bj in block_set:
+                        continue
+                        
+                    # Check if swapping bi -> bj is valid
+                    # It is valid if bj covers all unique_tsubs of bi
+                    # We already ensured this by intersection.
+                    # But we must ensure that removing bi doesn't uncover any other subset
+                    # that is NOT covered by bj.
+                    # Actually, if bj covers all unique_tsubs of bi, then:
+                    # - Subsets with count > 1 remain covered (by others).
+                    # - Subsets with count == 1 (unique to bi) are now covered by bj.
+                    # So the swap is always valid in terms of coverage!
+                    # Wait, does bj cover *only* those? No, bj covers 35 subsets.
+                    # Some might be new, some might be already covered.
+                    # The condition "bj covers all unique_tsubs of bi" is sufficient for validity.
+                    
+                    # Perform swap
+                    block_set.remove(bi)
+                    for ts_idx in block_tsubs[bi]:
+                        cover_count[ts_idx] -= 1
+                        
+                    block_set.add(bj)
+                    for ts_idx in block_tsubs[bj]:
+                        cover_count[ts_idx] += 1
+                        
+                    improved = True
+                    swapped = True
+                    break # Restart local search loop
+                    
+                if swapped:
+                    break # Restart while loop
+                    
+        return list(block_set)
+
+    best_blocks = None
+    best_len = float('inf')
     
-    while remaining_sets:
-        best_block = None
-        best_count = -1
-        for B in k_subsets:
-            count = 0
-            for S in itertools.combinations(B, t):
-                if S in remaining_sets:
-                    count += 1
-            if count > best_count:
-                best_count = count
-                best_block = B
-        if best_count == 0:
+    # Run multiple greedy starts
+    num_trials = 100
+    for i in range(num_trials):
+        if time.time() > deadline - 20:
             break
-        blocks.append(list(best_block))
-        for S in itertools.combinations(best_block, t):
-            if S in remaining_sets:
-                remaining_sets.remove(S)
-    return blocks
+            
+        blocks = greedy_cover(i)
+        if not blocks:
+            continue
+            
+        # Local search
+        blocks = local_search(blocks, i)
+        
+        if len(blocks) < best_len:
+            best_len = len(blocks)
+            best_blocks = blocks
+            
+    # If we have time, try to improve the best solution further
+    if best_blocks is not None and time.time() < deadline - 10:
+        # Run local search again on the best
+        best_blocks = local_search(best_blocks, 99999)
+        
+    # Fallback if something went wrong
+    if best_blocks is None:
+        best_blocks = greedy_cover(0)
+        
+    return [all_blocks[i] for i in best_blocks]

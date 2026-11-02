@@ -1,90 +1,57 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-N = 14
-
-# EVOLVE-BLOCK-START
 import time
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, differential_evolution
 from scipy.spatial import ConvexHull
-from itertools import combinations
 
-# ---------- Core geometry ----------
+N = 14
+N_HALF = 7
 
-def _min_triangle_area_vec(points):
-    """Vectorized minimum triangle area for N points (returns min area, not doubled)."""
-    n = len(points)
-    min_area = float('inf')
-    x = points[:, 0]
-    y = points[:, 1]
-    for i in range(n):
-        for j in range(i + 1, n):
-            if j + 1 >= n:
-                continue
-            dx_ji = x[j] - x[i]
-            dy_ji = y[j] - y[i]
-            dx_ki = x[j+1:] - x[i]
-            dy_ki = y[j+1:] - y[i]
-            cross = dx_ji * dy_ki - dx_ki * dy_ji
-            areas = 0.5 * np.abs(cross)
-            local_min = np.min(areas)
-            if local_min < min_area:
-                min_area = local_min
-    return min_area
+# Precompute indices for all combinations of 3 points
+_indices = np.arange(N)
+IDX_I, IDX_J, IDX_K = np.meshgrid(_indices, _indices, _indices, indexing='ij')
+mask = (IDX_I < IDX_J) & (IDX_J < IDX_K)
+IDX_I = IDX_I[mask].flatten()
+IDX_J = IDX_J[mask].flatten()
+IDX_K = IDX_K[mask].flatten()
 
-def _hull_area_fast(points):
+def _all_areas(points):
+    pi = points[IDX_I]
+    pj = points[IDX_J]
+    pk = points[IDX_K]
+    v1x = pj[:, 0] - pi[:, 0]
+    v1y = pj[:, 1] - pi[:, 1]
+    v2x = pk[:, 0] - pi[:, 0]
+    v2y = pk[:, 1] - pi[:, 1]
+    areas = 0.5 * np.abs(v1x * v2y - v1y * v2x)
+    return areas
+
+def _compute_min_triangle_area(points):
+    return np.min(_all_areas(points))
+
+def _compute_hull_area(points):
     try:
+        if np.allclose(points[:, 0], points[0, 0]) or np.allclose(points[:, 1], points[0, 1]):
+            return 0.0
         hull = ConvexHull(points)
         return hull.volume
     except Exception:
         return 0.0
 
 def _score(points):
-    hull_area = _hull_area_fast(points)
+    hull_area = _compute_hull_area(points)
     if hull_area < 1e-10:
         return 0.0
-    min_area = _min_triangle_area_vec(points)
+    min_area = _compute_min_triangle_area(points)
     return min_area / hull_area
 
-def _all_triangle_areas(points):
-    """Return array of all triangle areas (N choose 3)."""
-    n = len(points)
-    x = points[:, 0]
-    y = points[:, 1]
-    areas_list = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            if j + 1 >= n:
-                continue
-            dx_ji = x[j] - x[i]
-            dy_ji = y[j] - y[i]
-            dx_ki = x[j+1:] - x[i]
-            dy_ki = y[j+1:] - y[i]
-            cross = dx_ji * dy_ki - dx_ki * dy_ji
-            areas_list.append(0.5 * np.abs(cross))
-    if not areas_list:
-        return np.array([0.0])
-    return np.concatenate(areas_list)
-
-def _objective_hard(points_flat):
-    """Minimize hull_area / min_triangle_area (scale-invariant)."""
-    points = points_flat.reshape(N, 2)
-    if np.any(np.isnan(points)) or np.any(np.isinf(points)):
+def _objective_soft_sym(flat, beta=50.0):
+    """Soft-min objective for centrally symmetric parameterization."""
+    pts_half = flat.reshape(N_HALF, 2)
+    pts = np.vstack([pts_half, -pts_half])
+    if np.any(~np.isfinite(pts)):
         return 1e10
-    min_area = _min_triangle_area_vec(points)
-    if min_area < 1e-12:
-        return 1e10
-    hull_area = _hull_area_fast(points)
-    if hull_area < 1e-10:
-        return 1e10
-    return hull_area / min_area
-
-def _objective_soft(points_flat, beta=150.0):
-    """Smooth soft-min objective: hull_area / soft_min(triangle areas)."""
-    points = points_flat.reshape(N, 2)
-    if np.any(np.isnan(points)) or np.any(np.isinf(points)):
-        return 1e10
-    areas = _all_triangle_areas(points)
-    if len(areas) == 0 or np.min(areas) < 1e-12:
+    areas = _all_areas(pts)
+    if np.min(areas) < 1e-12:
         return 1e10
     z = -beta * areas
     max_z = np.max(z)
@@ -92,284 +59,239 @@ def _objective_soft(points_flat, beta=150.0):
         log_sum = max_z
     else:
         log_sum = max_z + np.log(np.sum(np.exp(z - max_z)))
-    soft_min_val = -log_sum / beta
-    if soft_min_val < 1e-12:
+    soft_min = -log_sum / beta
+    if soft_min < 1e-12:
         return 1e10
-    hull_area = _hull_area_fast(points)
+    hull_area = _compute_hull_area(pts)
     if hull_area < 1e-10:
         return 1e10
-    return hull_area / soft_min_val
+    return hull_area / soft_min
 
-def _normalize_unit_area(points):
-    try:
-        hull = ConvexHull(points)
-        hull_area = hull.volume
-        if hull_area > 1e-10:
-            scale = np.sqrt(1.0 / hull_area)
-            return points * scale
-    except Exception:
-        pass
-    xs = points[:, 0]
-    ys = points[:, 1]
-    w = xs.max() - xs.min()
-    h = ys.max() - ys.min()
-    if w > 1e-10 and h > 1e-10:
-        scale = 1.0 / np.sqrt(w * h)
-        return points * scale
-    return points
+def _objective_sym(flat):
+    """Hard objective for centrally symmetric parameterization."""
+    pts_half = flat.reshape(N_HALF, 2)
+    pts = np.vstack([pts_half, -pts_half])
+    return -_score(pts)
 
-def _hull_pull(points, alpha=0.5):
-    """Expand convex hull outward (structural move to enlarge hull area, improving ratio).
-    Points on hull are pushed radially outward from centroid by alpha*(radius)."""
-    try:
-        hull = ConvexHull(points)
-        hull_idx = set(hull.vertices.tolist())
-    except Exception:
-        return points.copy()
-    centroid = points.mean(axis=0)
-    new_pts = points.copy()
-    for idx in hull_idx:
-        v = points[idx] - centroid
-        norm = np.linalg.norm(v)
-        if norm > 1e-12:
-            new_pts[idx] = points[idx] + alpha * v
-    return new_pts
+def _objective_soft_full(flat, beta=50.0):
+    """Soft-min objective for full 28D parameterization."""
+    pts = flat.reshape(N, 2)
+    if np.any(~np.isfinite(pts)):
+        return 1e10
+    areas = _all_areas(pts)
+    if np.min(areas) < 1e-12:
+        return 1e10
+    z = -beta * areas
+    max_z = np.max(z)
+    if max_z < -500:
+        log_sum = max_z
+    else:
+        log_sum = max_z + np.log(np.sum(np.exp(z - max_z)))
+    soft_min = -log_sum / beta
+    if soft_min < 1e-12:
+        return 1e10
+    hull_area = _compute_hull_area(pts)
+    if hull_area < 1e-10:
+        return 1e10
+    return hull_area / soft_min
 
-def _best_of_two(a, b):
-    sa = _score(a)
-    sb = _score(b)
-    return (a, sa) if sa >= sb else (b, sb)
-
-def _nm(x0, deadline, max_iter=2500, obj=_objective_hard):
-    remaining = deadline - time.time()
-    if remaining < 2.0:
-        return None
-    try:
-        res = minimize(obj, x0, method='Nelder-Mead',
-                       options={'maxiter': max_iter, 'xatol': 1e-9, 'fatol': 1e-11, 'adaptive': True})
-        return res
-    except Exception:
-        return None
-
-def _lbfgs(x0, deadline, max_iter=5000, obj=_objective_soft):
-    remaining = deadline - time.time()
-    if remaining < 5.0:
-        return None
-    try:
-        res = minimize(obj, x0, method='L-BFGS-B',
-                       options={'maxiter': max_iter, 'ftol': 1e-14, 'gtol': 1e-10})
-        return res
-    except Exception:
-        return None
-
-def _powell(x0, deadline, max_iter=1500, obj=_objective_hard):
-    remaining = deadline - time.time()
-    if remaining < 3.0:
-        return None
-    try:
-        res = minimize(obj, x0, method='Powell',
-                       options={'maxiter': max_iter, 'xtol': 1e-11, 'ftol': 1e-13})
-        return res
-    except Exception:
-        return None
-
-def _coordinate_descent(pts, deadline, max_rounds=50):
-    """Cyclic coordinate descent on the hard objective."""
-    pts = pts.copy()
-    n = len(pts)
-    step0 = 0.05
-    for rnd in range(max_rounds):
-        if time.time() > deadline - 5:
-            break
-        improved = False
-        for i in range(n):
-            if time.time() > deadline - 5:
-                break
-            for coord in range(2):
-                orig = pts[i, coord]
-                step = step0
-                for _ in range(30):
-                    pts[i, coord] = orig + step
-                    s_plus = _score(pts)
-                    pts[i, coord] = orig - step
-                    s_minus = _score(pts)
-                    pts[i, coord] = orig
-                    if s_plus > s_minus:
-                        pts[i, coord] = orig + step
-                    elif s_minus > s_plus:
-                        pts[i, coord] = orig - step
-                    else:
-                        break
-                    improved = True
-                    step *= 0.5
-                    if step < 1e-8:
-                        break
-        if not improved:
-            break
-    return pts
-
-# ---------- Initializations ----------
-
-def _make_inits():
-    inits = []
-    rng = np.random.default_rng(2024)
-
-    # 1. Regular 14-gon (convex, all on circle)
-    angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
-    reg = np.column_stack([np.cos(angles), np.sin(angles)])
-    inits.append(reg.flatten())
-
-    # 2. Rotated regular polygons
-    for rot in [0.1, 0.4, 0.9, 1.3, 2.0, 3.5]:
-        a = angles + rot
-        inits.append(np.column_stack([np.cos(a), np.sin(a)]).flatten())
-
-    # 3. Two concentric rings (7 inner, 7 outer) - key structural family
-    for r_inner in [0.3, 0.45, 0.6, 0.75, 0.85]:
-        a_in = np.linspace(0, 2 * np.pi, 7, endpoint=False)
-        a_out = np.linspace(0, 2 * np.pi, 7, endpoint=False) + np.pi / 7
-        pts_in = r_inner * np.column_stack([np.cos(a_in), np.sin(a_in)])
-        pts_out = np.column_stack([np.cos(a_out), np.sin(a_out)])
-        pts = np.vstack([pts_in, pts_out])
-        inits.append(pts.flatten())
-
-    # 4. 3 rings (5, 5, 4)
-    for r1, r2 in [(0.3, 0.65), (0.4, 0.8), (0.5, 0.9)]:
-        a1 = np.linspace(0, 2*np.pi, 5, endpoint=False)
-        a2 = np.linspace(0, 2*np.pi, 5, endpoint=False) + np.pi/5
-        a3 = np.linspace(0, 2*np.pi, 4, endpoint=False) + np.pi/4
-        pts = np.vstack([
-            r1*np.column_stack([np.cos(a1), np.sin(a1)]),
-            r2*np.column_stack([np.cos(a2), np.sin(a2)]),
-            np.column_stack([np.cos(a3), np.sin(a3)])
-        ])
-        inits.append(pts.flatten())
-
-    # 5. Jittered regular polygon
-    for js in [0.05, 0.12, 0.25, 0.4]:
-        pts = reg + rng.normal(0, js, size=(N, 2))
-        inits.append(pts.flatten())
-
-    # 6. Random on circle with varying radius
-    for seed in range(8):
-        rs = np.random.default_rng(seed * 13 + 7)
-        ang = np.sort(rs.uniform(0, 2 * np.pi, N))
-        rad = rs.uniform(0.5, 1.3, N)
-        inits.append(np.column_stack([rad * np.cos(ang), rad * np.sin(ang)]).flatten())
-
-    # 7. Points on two interleaved circles (7 each), with angular offset
-    for r1, r2, off in [(0.5, 1.0, 0.0), (0.5, 1.0, np.pi/7), (0.7, 1.0, np.pi/14),
-                        (0.6, 1.0, np.pi/7), (0.8, 1.0, 0.0)]:
-        a1 = np.linspace(0, 2*np.pi, 7, endpoint=False)
-        a2 = np.linspace(0, 2*np.pi, 7, endpoint=False) + off
-        pts = np.vstack([
-            r1 * np.column_stack([np.cos(a1), np.sin(a1)]),
-            r2 * np.column_stack([np.cos(a2), np.sin(a2)])
-        ])
-        inits.append(pts.flatten())
-
-    # 8. Grid-like: 7 on top arc, 7 on bottom arc
-    for frac in [0.3, 0.5, 0.7]:
-        top_ys = np.linspace(frac, 1.0, 7)
-        bot_ys = np.linspace(-1.0, -frac, 7)
-        top_xs = np.sqrt(np.maximum(0, 1 - top_ys**2)) * np.linspace(-0.8, 0.8, 7)
-        bot_xs = np.sqrt(np.maximum(0, 1 - bot_ys**2)) * np.linspace(-0.8, 0.8, 7)
-        pts = np.vstack([np.column_stack([top_xs, top_ys]),
-                         np.column_stack([bot_xs, bot_ys])])
-        inits.append(pts.flatten())
-
-    return inits
-
-# ---------- Main ----------
+def _objective_full(flat):
+    """Hard objective for full 28D parameterization."""
+    pts = flat.reshape(N, 2)
+    return -_score(pts)
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 142.0  # safety margin before 150s kill
+    deadline = start_time + 145.0  # Safety margin before 150s kill
 
-    best_score = 0.0
-    best_pts = None
+    best_points = None
+    best_score = -np.inf
 
-    def _consider(pts):
-        nonlocal best_score, best_pts
-        pts = np.asarray(pts, dtype=float)
-        if pts.shape != (N, 2) or np.any(~np.isfinite(pts)):
-            return
-        s = _score(pts)
-        if s > best_score:
-            best_score = s
-            best_pts = pts.copy()
+    def update_best(pts, score):
+        nonlocal best_points, best_score
+        if score > best_score:
+            best_score = score
+            best_points = pts.copy()
 
-    inits = _make_inits()
+    def _normalize(pts):
+        center = np.mean(pts, axis=0)
+        pts = pts - center
+        max_norm = np.max(np.linalg.norm(pts, axis=1))
+        if max_norm > 0:
+            pts = pts / max_norm
+        return pts
 
-    # Phase 1: Nelder-Mead on hard objective from diverse starts
-    for x0 in inits:
-        if time.time() > deadline - 50:
-            break
-        res = _nm(x0, deadline, max_iter=1500, obj=_objective_hard)
-        if res is not None and np.isfinite(res.fun) and res.fun < 1e9:
-            _consider(res.x.reshape(N, 2))
+    def refine_sym(flat_init, method='Nelder-Mead', maxiter=2000, tol=1e-10):
+        """Refine in the 14D symmetric space."""
+        try:
+            if method == 'Nelder-Mead':
+                res = minimize(_objective_sym, flat_init, method='Nelder-Mead',
+                               options={'maxiter': maxiter, 'xatol': tol, 'fatol': tol, 'adaptive': True})
+            elif method == 'Powell':
+                res = minimize(_objective_sym, flat_init, method='Powell',
+                               options={'maxiter': maxiter, 'xatol': tol, 'ftol': tol})
+            elif method == 'L-BFGS-B':
+                res = minimize(_objective_sym, flat_init, method='L-BFGS-B',
+                               options={'maxiter': maxiter, 'ftol': 1e-14, 'gtol': 1e-10})
+            else:
+                return None, -np.inf
+            cand_pts = np.vstack([res.x.reshape(N_HALF, 2), -res.x.reshape(N_HALF, 2)])
+            cand_score = -res.fun
+            return cand_pts, cand_score
+        except Exception:
+            return None, -np.inf
 
-    # Phase 2: L-BFGS on soft objective from best (gradient-based, good for smooth refinement)
-    if best_pts is not None and time.time() < deadline - 40:
-        res = _lbfgs(best_pts.flatten(), deadline, max_iter=3000, obj=_objective_soft)
-        if res is not None and np.isfinite(res.fun) and res.fun < 1e9:
-            _consider(res.x.reshape(N, 2))
+    def refine_soft_sym(flat_init, method='L-BFGS-B', maxiter=3000, beta=50.0):
+        """Refine using soft-min in symmetric space."""
+        try:
+            if method == 'L-BFGS-B':
+                res = minimize(lambda x: _objective_soft_sym(x, beta=beta), flat_init,
+                               method='L-BFGS-B', options={'maxiter': maxiter, 'ftol': 1e-14, 'gtol': 1e-10})
+            elif method == 'Powell':
+                res = minimize(lambda x: _objective_soft_sym(x, beta=beta), flat_init,
+                               method='Powell', options={'maxiter': maxiter, 'xtol': 1e-11, 'ftol': 1e-13})
+            else:
+                res = minimize(lambda x: _objective_soft_sym(x, beta=beta), flat_init,
+                               method='Nelder-Mead', options={'maxiter': maxiter, 'xatol': 1e-9, 'fatol': 1e-11, 'adaptive': True})
+            cand_pts = np.vstack([res.x.reshape(N_HALF, 2), -res.x.reshape(N_HALF, 2)])
+            cand_score = _score(cand_pts)
+            return cand_pts, cand_score
+        except Exception:
+            return None, -np.inf
 
-    # Phase 3: soft-min NM from best
-    if best_pts is not None and time.time() < deadline - 35:
-        res = _nm(best_pts.flatten(), deadline, max_iter=2000, obj=_objective_soft)
-        if res is not None and np.isfinite(res.fun) and res.fun < 1e9:
-            _consider(res.x.reshape(N, 2))
+    def refine_full(flat_init, method='Nelder-Mead', maxiter=2000, tol=1e-10):
+        """Refine in the full 28D space."""
+        try:
+            if method == 'Nelder-Mead':
+                res = minimize(_objective_full, flat_init, method='Nelder-Mead',
+                               options={'maxiter': maxiter, 'xatol': tol, 'fatol': tol, 'adaptive': True})
+            elif method == 'Powell':
+                res = minimize(_objective_full, flat_init, method='Powell',
+                               options={'maxiter': maxiter, 'xatol': tol, 'ftol': tol})
+            elif method == 'L-BFGS-B':
+                res = minimize(_objective_full, flat_init, method='L-BFGS-B',
+                               options={'maxiter': maxiter, 'ftol': 1e-14, 'gtol': 1e-10})
+            else:
+                return None, -np.inf
+            cand_pts = res.x.reshape(N, 2)
+            cand_score = -res.fun
+            return cand_pts, cand_score
+        except Exception:
+            return None, -np.inf
 
-    # Phase 4: hull-pull structural move + refine
-    if best_pts is not None and time.time() < deadline - 30:
-        for alpha in [0.1, 0.2, 0.4, 0.6, 0.9]:
-            if time.time() > deadline - 20:
+    def refine_soft_full(flat_init, method='L-BFGS-B', maxiter=3000, beta=50.0):
+        """Refine using soft-min in full space."""
+        try:
+            if method == 'L-BFGS-B':
+                res = minimize(lambda x: _objective_soft_full(x, beta=beta), flat_init,
+                               method='L-BFGS-B', options={'maxiter': maxiter, 'ftol': 1e-14, 'gtol': 1e-10})
+            elif method == 'Powell':
+                res = minimize(lambda x: _objective_soft_full(x, beta=beta), flat_init,
+                               method='Powell', options={'maxiter': maxiter, 'xtol': 1e-11, 'ftol': 1e-13})
+            else:
+                res = minimize(lambda x: _objective_soft_full(x, beta=beta), flat_init,
+                               method='Nelder-Mead', options={'maxiter': maxiter, 'xatol': 1e-9, 'fatol': 1e-11, 'adaptive': True})
+            cand_pts = res.x.reshape(N, 2)
+            cand_score = _score(cand_pts)
+            return cand_pts, cand_score
+        except Exception:
+            return None, -np.inf
+
+    # --- Phase 1: Symmetric Differential Evolution (14D) ---
+    if time.time() < deadline - 50.0:
+        def de_sym_obj(flat):
+            pts_half = flat.reshape(N_HALF, 2)
+            pts = np.vstack([pts_half, -pts_half])
+            if np.allclose(pts, pts[0]):
+                return 1.0
+            return -_score(pts)
+
+        try:
+            bounds = [(-1, 1)] * 14
+            res_de = differential_evolution(
+                de_sym_obj, bounds, seed=42, maxiter=60, popsize=15,
+                tol=1e-6, mutation=(0.5, 1.0), recombination=0.9,
+                polish=True, init='latinhypercube'
+            )
+            if res_de.fun < 0:
+                pts7 = res_de.x.reshape(N_HALF, 2)
+                pts14 = np.vstack([pts7, -pts7])
+                update_best(pts14, -res_de.fun)
+        except Exception:
+            pass
+
+    # --- Phase 2: Symmetric DE with different seeds ---
+    if time.time() < deadline - 35.0:
+        for seed in [7, 99, 1234]:
+            if time.time() > deadline - 35.0:
                 break
-            pulled = _hull_pull(best_pts, alpha=alpha)
-            _consider(pulled)
-            res = _nm(pulled.flatten(), deadline, max_iter=1000, obj=_objective_hard)
-            if res is not None and np.isfinite(res.fun) and res.fun < 1e9:
-                _consider(res.x.reshape(N, 2))
+            def de_sym_obj2(flat):
+                pts_half = flat.reshape(N_HALF, 2)
+                pts = np.vstack([pts_half, -pts_half])
+                if np.allclose(pts, pts[0]):
+                    return 1.0
+                return -_score(pts)
+            try:
+                bounds = [(-1, 1)] * 14
+                res_de = differential_evolution(
+                    de_sym_obj2, bounds, seed=seed, maxiter=40, popsize=12,
+                    tol=1e-5, mutation=(0.3, 0.9), recombination=0.8,
+                    polish=True, init='latinhypercube'
+                )
+                if res_de.fun < 0:
+                    pts7 = res_de.x.reshape(N_HALF, 2)
+                    pts14 = np.vstack([pts7, -pts7])
+                    update_best(pts14, -res_de.fun)
+            except Exception:
+                pass
 
-    # Phase 5: Coordinate descent for fine-tuning
-    if best_pts is not None and time.time() < deadline - 20:
-        cd_pts = _coordinate_descent(best_pts, deadline, max_rounds=30)
-        _consider(cd_pts)
+    # --- Phase 3: Nelder-Mead refinement of DE results in symmetric space ---
+    if best_points is not None and time.time() < deadline - 25.0:
+        half = best_points[:N_HALF].flatten()
+        cand_pts, cand_score = refine_sym(half, 'Nelder-Mead', maxiter=3000, tol=1e-10)
+        if cand_pts is not None:
+            update_best(cand_pts, cand_score)
 
-    # Phase 6: Powell polish
-    if best_pts is not None and time.time() < deadline - 15:
-        res = _powell(best_pts.flatten(), deadline, max_iter=1500, obj=_objective_hard)
-        if res is not None and np.isfinite(res.fun) and res.fun < 1e9:
-            _consider(res.x.reshape(N, 2))
+    # --- Phase 4: Powell refinement in symmetric space ---
+    if best_points is not None and time.time() < deadline - 15.0:
+        half = best_points[:N_HALF].flatten()
+        cand_pts, cand_score = refine_sym(half, 'Powell', maxiter=2000, tol=1e-10)
+        if cand_pts is not None:
+            update_best(cand_pts, cand_score)
 
-    # Phase 7: Final L-BFGS + NM polish
-    if best_pts is not None and time.time() < deadline - 12:
-        res = _lbfgs(best_pts.flatten(), deadline, max_iter=2000, obj=_objective_soft)
-        if res is not None and np.isfinite(res.fun) and res.fun < 1e9:
-            _consider(res.x.reshape(N, 2))
+    # --- Phase 5: Soft-min refinement in symmetric space ---
+    if best_points is not None and time.time() < deadline - 10.0:
+        half = best_points[:N_HALF].flatten()
+        for beta in [30.0, 50.0, 100.0]:
+            if time.time() > deadline - 10.0:
+                break
+            cand_pts, cand_score = refine_soft_sym(half, 'L-BFGS-B', maxiter=3000, beta=beta)
+            if cand_pts is not None:
+                update_best(cand_pts, cand_score)
 
-    if best_pts is not None and time.time() < deadline - 8:
-        res = _nm(best_pts.flatten(), deadline, max_iter=2000, obj=_objective_hard)
-        if res is not None and np.isfinite(res.fun) and res.fun < 1e9:
-            _consider(res.x.reshape(N, 2))
+    # --- Phase 6: Full-space refinement (break symmetry if beneficial) ---
+    if best_points is not None and time.time() < deadline - 5.0:
+        flat_full = best_points.flatten()
+        cand_pts, cand_score = refine_full(flat_full, 'Nelder-Mead', maxiter=2000, tol=1e-10)
+        if cand_pts is not None:
+            update_best(cand_pts, cand_score)
 
-    # Fallback
-    if best_pts is None:
+    # --- Phase 7: Soft-min full-space refinement ---
+    if best_points is not None and time.time() < deadline - 3.0:
+        flat_full = best_points.flatten()
+        cand_pts, cand_score = refine_soft_full(flat_full, 'L-BFGS-B', maxiter=3000, beta=50.0)
+        if cand_pts is not None:
+            update_best(cand_pts, cand_score)
+
+    # --- Phase 8: Final high-precision polish ---
+    if best_points is not None and time.time() < deadline - 1.0:
+        half = best_points[:N_HALF].flatten()
+        cand_pts, cand_score = refine_sym(half, 'Nelder-Mead', maxiter=5000, tol=1e-12)
+        if cand_pts is not None:
+            update_best(cand_pts, cand_score)
+
+    if best_points is None:
         angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
-        best_pts = np.column_stack([np.cos(angles), np.sin(angles)])
+        best_points = np.column_stack((np.cos(angles), np.sin(angles)))
 
-    final_points = _normalize_unit_area(best_pts)
-
-    # Safety check
-    try:
-        hull = ConvexHull(final_points)
-        if hull.volume < 1e-10:
-            angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
-            final_points = _normalize_unit_area(np.column_stack([np.cos(angles), np.sin(angles)]))
-    except Exception:
-        angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
-        final_points = _normalize_unit_area(np.column_stack([np.cos(angles), np.sin(angles)]))
-
-    return final_points
-# EVOLVE-BLOCK-END
+    return best_points

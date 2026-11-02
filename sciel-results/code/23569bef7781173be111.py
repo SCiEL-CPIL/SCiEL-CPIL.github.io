@@ -1,0 +1,321 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+N = 21
+
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.spatial import Delaunay
+from scipy.optimize import linprog
+
+def construct():
+    """
+    Pack 21 circles in a variable rectangle of perimeter 4.
+    Returns array of shape (21, 3) with [x, y, r] for each circle.
+    The bounding rectangle must have perimeter at most 4.
+    
+    Approach: Use Delaunay triangulation to identify relevant circle-circle
+    constraints, solve LP for radii, then optimize centers via gradient ascent
+    on the LP dual (shadow prices).
+    """
+    N = 21
+    
+    def get_delaunay_pairs(centers):
+        """Get Delaunay neighbor pairs from center positions."""
+        try:
+            tri = Delaunay(centers)
+            edges = set()
+            for simplex in tri.simplices:
+                for i in range(3):
+                    for j in range(i + 1, 3):
+                        a, b = simplex[i], simplex[j]
+                        edges.add((min(a, b), max(a, b)))
+            return list(edges)
+        except Exception:
+            # Fallback: all pairs if Delaunay fails
+            return [(i, j) for i in range(len(centers)) for j in range(i + 1, len(centers))]
+    
+    def solve_lp_with_dual(centers, W, H, delaunay_edges):
+        """
+        Solve LP for optimal radii given fixed centers and box size.
+        Returns (radii, dual_values) where dual_values give shadow prices
+        for each constraint, useful for gradient computation.
+        """
+        n = len(centers)
+        c = -np.ones(n)
+        A_ub = []
+        b_ub = []
+        
+        # Pair constraints: r_i + r_j <= d_ij (only Delaunay edges)
+        for i, j in delaunay_edges:
+            d = np.linalg.norm(centers[i] - centers[j])
+            row = np.zeros(n)
+            row[i] = 1
+            row[j] = 1
+            A_ub.append(row)
+            b_ub.append(d)
+        
+        # Boundary constraints: r_i <= dist_to_boundary
+        for i in range(n):
+            # Left
+            row = np.zeros(n); row[i] = 1
+            A_ub.append(row); b_ub.append(centers[i][0])
+            # Right
+            row = np.zeros(n); row[i] = 1
+            A_ub.append(row); b_ub.append(W - centers[i][0])
+            # Bottom
+            row = np.zeros(n); row[i] = 1
+            A_ub.append(row); b_ub.append(centers[i][1])
+            # Top
+            row = np.zeros(n); row[i] = 1
+            A_ub.append(row); b_ub.append(H - centers[i][1])
+            
+        A_ub = np.array(A_ub)
+        b_ub = np.array(b_ub)
+        bounds = [(0, None)] * n
+        
+        try:
+            res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+            if res.success:
+                # Extract dual values (shadow prices) for inequality constraints
+                # In HiGHS, res.ineqlin.marginals gives the duals for A_ub constraints
+                duals = res.ineqlin.marginals if hasattr(res, 'ineqlin') else None
+                return res.x, duals
+        except Exception:
+            pass
+        return None, None
+
+    def compute_forces(centers, radii, W, H, delaunay_edges, duals):
+        """
+        Compute forces on centers using LP dual values (shadow prices).
+        The dual value for constraint r_i + r_j <= d_ij tells us how much
+        increasing d_ij would improve the objective, which guides center movement.
+        """
+        n = len(centers)
+        forces = np.zeros_like(centers)
+        
+        if duals is not None and len(duals) > 0:
+            # Pair constraints come first in A_ub
+            num_pair_constraints = len(delaunay_edges)
+            for k, (i, j) in enumerate(delaunay_edges):
+                if k < len(duals):
+                    dual_val = abs(duals[k])  # Shadow price (should be >= 0 for max)
+                    d_vec = centers[i] - centers[j]
+                    d = np.linalg.norm(d_vec)
+                    if d > 1e-10 and dual_val > 1e-8:
+                        # Moving i away from j (and j away from i) increases d_ij
+                        direction = d_vec / d
+                        forces[i] += direction * dual_val
+                        forces[j] -= direction * dual_val
+            
+            # Boundary constraints follow pair constraints
+            offset = num_pair_constraints
+            for i in range(n):
+                # Left: r_i <= x_i, dual at index offset + 4*i
+                idx = offset + 4 * i
+                if idx < len(duals):
+                    dual_val = abs(duals[idx])
+                    if dual_val > 1e-8:
+                        forces[i][0] += dual_val  # Push right
+                # Right: r_i <= W - x_i, dual at index offset + 4*i + 1
+                idx = offset + 4 * i + 1
+                if idx < len(duals):
+                    dual_val = abs(duals[idx])
+                    if dual_val > 1e-8:
+                        forces[i][0] -= dual_val  # Push left
+                # Bottom: r_i <= y_i, dual at index offset + 4*i + 2
+                idx = offset + 4 * i + 2
+                if idx < len(duals):
+                    dual_val = abs(duals[idx])
+                    if dual_val > 1e-8:
+                        forces[i][1] += dual_val  # Push up
+                # Top: r_i <= H - y_i, dual at index offset + 4*i + 3
+                idx = offset + 4 * i + 3
+                if idx < len(duals):
+                    dual_val = abs(duals[idx])
+                    if dual_val > 1e-8:
+                        forces[i][1] -= dual_val  # Push down
+        else:
+            # Fallback: use tight constraint detection
+            for i, j in delaunay_edges:
+                d_vec = centers[i] - centers[j]
+                d = np.linalg.norm(d_vec)
+                if d < 1e-10:
+                    continue
+                if abs(radii[i] + radii[j] - d) < 1e-5:
+                    direction = d_vec / d
+                    forces[i] += direction
+                    forces[j] -= direction
+            
+            for i in range(n):
+                if abs(radii[i] - centers[i][0]) < 1e-5:
+                    forces[i][0] += 1.0
+                if abs(radii[i] - (W - centers[i][0])) < 1e-5:
+                    forces[i][0] -= 1.0
+                if abs(radii[i] - centers[i][1]) < 1e-5:
+                    forces[i][1] += 1.0
+                if abs(radii[i] - (H - centers[i][1])) < 1e-5:
+                    forces[i][1] -= 1.0
+        
+        return forces
+
+    def optimize_packing(centers, W, H, max_iters=200, tol=1e-7):
+        """
+        Iteratively optimize centers to maximize sum of radii.
+        Uses Delaunay-based constraint set and LP duals for force computation.
+        """
+        centers = centers.copy()
+        n = len(centers)
+        best_val = -np.inf
+        best_centers = centers.copy()
+        best_radii = None
+        
+        step_size = 0.05
+        stall_count = 0
+        delaunay_edges = get_delaunay_pairs(centers)
+        
+        for it in range(max_iters):
+            radii, duals = solve_lp_with_dual(centers, W, H, delaunay_edges)
+            if radii is None:
+                break
+            
+            val = np.sum(radii)
+            if val > best_val:
+                best_val = val
+                best_centers = centers.copy()
+                best_radii = radii.copy()
+                stall_count = 0
+            else:
+                stall_count += 1
+            
+            if stall_count > 30:
+                # Shake to escape local minima
+                centers += np.random.normal(0, 0.005, size=centers.shape)
+                centers[:, 0] = np.clip(centers[:, 0], 1e-4, W - 1e-4)
+                centers[:, 1] = np.clip(centers[:, 1], 1e-4, H - 1e-4)
+                # Recompute Delaunay
+                delaunay_edges = get_delaunay_pairs(centers)
+                stall_count = 0
+                step_size = max(0.005, step_size * 0.5)
+                continue
+            
+            # Compute forces using duals
+            forces = compute_forces(centers, radii, W, H, delaunay_edges, duals)
+            
+            # Normalize and apply step
+            force_norms = np.linalg.norm(forces, axis=1)
+            max_norm = np.max(force_norms)
+            if max_norm > 1e-10:
+                forces = forces / max_norm * step_size
+                centers += forces
+                
+                # Clamp to box with small margin
+                centers[:, 0] = np.clip(centers[:, 0], 1e-4, W - 1e-4)
+                centers[:, 1] = np.clip(centers[:, 1], 1e-4, H - 1e-4)
+                
+                # Recompute Delaunay every 5 iterations
+                if it % 5 == 0:
+                    delaunay_edges = get_delaunay_pairs(centers)
+                
+            # Decay step size
+            step_size *= 0.99
+            
+            if abs(val - best_val) < tol and it > 50:
+                break
+
+        if best_radii is not None:
+            return best_centers, best_radii
+        return None, None
+
+    def run_optimization(W, H, initial_centers):
+        """Run local optimization for a specific box size and initial config."""
+        centers, radii = optimize_packing(initial_centers, W, H, max_iters=150)
+        if radii is not None:
+            return np.sum(radii), centers, radii
+        return -np.inf, None, None
+
+    # Aspect ratios to try
+    # Perimeter 2(W+H) = 4 => W+H=2
+    aspects = [1.0, 1.1, 0.9, 1.2, 0.8, 1.3, 0.7, 1.4, 0.75, 1.5, 0.6, 1.6, 0.5, 1.8, 0.4, 2.0, 0.3]
+    
+    best_val_global = -np.inf
+    best_result_global = None
+    
+    # Initial configurations
+    configs = []
+    
+    # 5x5 grid
+    gx, gy = 5, 5
+    cx = np.linspace(0.5/gx, 1 - 0.5/gx, gx)
+    cy = np.linspace(0.5/gy, 1 - 0.5/gy, gy)
+    grid_pts = np.array([[x, y] for y in cy for x in cx])
+    configs.append(grid_pts[:21])
+    
+    # 4x6 grid
+    gx, gy = 4, 6
+    cx = np.linspace(0.5/gx, 1 - 0.5/gx, gx)
+    cy = np.linspace(0.5/gy, 1 - 0.5/gy, gy)
+    grid_pts = np.array([[x, y] for y in cy for x in cx])
+    configs.append(grid_pts[:21])
+    
+    # 7x3 grid
+    gx, gy = 7, 3
+    cx = np.linspace(0.5/gx, 1 - 0.5/gx, gx)
+    cy = np.linspace(0.5/gy, 1 - 0.5/gy, gy)
+    grid_pts = np.array([[x, y] for y in cy for x in cx])
+    configs.append(grid_pts[:21])
+    
+    # 6x4 grid
+    gx, gy = 6, 4
+    cx = np.linspace(0.5/gx, 1 - 0.5/gx, gx)
+    cy = np.linspace(0.5/gy, 1 - 0.5/gy, gy)
+    grid_pts = np.array([[x, y] for y in cy for x in cx])
+    configs.append(grid_pts[:21])
+    
+    # Hexagonal-like pattern
+    hex_pts = []
+    for row in range(5):
+        for col in range(5):
+            x = (col + 0.5) / 5.0 + (0.5 / 5.0) * (row % 2)
+            y = (row + 0.5) / 5.0
+            hex_pts.append([x, y])
+    configs.append(np.array(hex_pts[:21]))
+    
+    # Multiple random seeds
+    for seed in [42, 123, 456]:
+        np.random.seed(seed)
+        configs.append(np.random.rand(21, 2))
+    
+    for aspect in aspects:
+        H = 2.0 / (aspect + 1.0)
+        W = 2.0 * aspect / (aspect + 1.0)
+        
+        for config in configs:
+            # Scale config to box
+            centers_init = config * np.array([W, H])
+            
+            val, centers, radii = run_optimization(W, H, centers_init)
+            
+            if val > best_val_global:
+                best_val_global = val
+                result = np.zeros((21, 3))
+                result[:, :2] = centers
+                result[:, 2] = radii
+                best_result_global = result
+
+    if best_result_global is not None:
+        # Verify and clamp
+        result = best_result_global.copy()
+        # Ensure circles don't overlap and are within bounds
+        W = result[:, 0].max() - result[:, 0].min()
+        H = result[:, 1].max() - result[:, 1].min()
+        # Re-center if needed
+        if result[:, 0].min() < 0:
+            result[:, 0] -= result[:, 0].min()
+        if result[:, 1].min() < 0:
+            result[:, 1] -= result[:, 1].min()
+        return result
+    
+    # Fallback
+    side = int(np.ceil(np.sqrt(N)))
+    cells = [((i + 0.5) / side, (j + 0.5) / side, 0.5 / side - 1e-3) for i in range(side) for j in range(side)]
+    return np.array(cells[:N])
+# EVOLVE-BLOCK-END

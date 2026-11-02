@@ -1,392 +1,207 @@
-"""Heilbronn triangles: maximize the smallest triangle area among 11 points."""
-import time
-import numpy as np
-from scipy.optimize import minimize
-from itertools import combinations
-
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
 N = 11
 
 # EVOLVE-BLOCK-START
 import numpy as np
+from scipy.optimize import minimize
 import time
-from scipy.optimize import minimize, differential_evolution
 import itertools
 
 S3 = np.sqrt(3)
 S3H = S3 / 2
-TRI_AREA = S3 / 4  # area of the equilateral triangle with side 1
+TRI_AREA = S3 / 4  # Area of equilateral triangle with side 1
 
-DEADLINE = 140  # safety margin from 150s limit
-
-# Triangle vertices
-V0 = np.array([0.0, 0.0])
-V1 = np.array([1.0, 0.0])
-V2 = np.array([0.5, S3H])
+# Safety margin from 150s limit
+DEADLINE_MARGIN = 140.0
 
 # Precompute all triplets for N=11 points
 _TRIPLETS = list(itertools.combinations(range(N), 3))
 _T_I = np.array([t[0] for t in _TRIPLETS])
 _T_J = np.array([t[1] for t in _TRIPLETS])
 _T_K = np.array([t[2] for t in _TRIPLETS])
-_N_TRIP = len(_TRIPLETS)
+NUM_TRIP = len(_TRIPLETS)  # 165
 
-# Barycentric coordinate conversion matrices
-# Point = a*V0 + b*V1 + c*V2 where a+b+c=1, a,b,c >= 0
-# x = b + c*0.5, y = c*S3H
-# So: b = x - 0.5*c, c = y/S3H, a = 1 - b - c
-def _cartesian_to_barycentric(pts):
-    """Convert (x,y) points to (a,b,c) barycentric coords with a+b+c=1."""
-    n = len(pts)
-    abc = np.zeros((n, 3))
-    c = pts[:, 1] / S3H
-    b = pts[:, 0] - 0.5 * c
-    a = 1.0 - b - c
-    abc[:, 0] = a
-    abc[:, 1] = b
-    abc[:, 2] = c
-    return abc
+# Triangle vertices in Cartesian
+_VERTS = np.array([[0, 0], [1, 0], [0.5, S3H]])
 
-def _barycentric_to_cartesian(abc):
-    """Convert (a,b,c) barycentric coords to (x,y) cartesian points."""
-    n = len(abc)
-    pts = np.zeros((n, 2))
-    pts[:, 0] = abc[:, 1] + 0.5 * abc[:, 2]
-    pts[:, 1] = abc[:, 2] * S3H
-    return pts
+def _bary_to_cart(bary):
+    """Convert barycentric coordinates (N, 3) to Cartesian (N, 2)."""
+    return bary[:, 0:1] * _VERTS[0] + bary[:, 1:2] * _VERTS[1] + bary[:, 2:3] * _VERTS[2]
 
-def _min_triangle_area(pts):
-    """Compute the minimum area of any triangle formed by three points (vectorized)."""
-    pi = pts[_T_I]
-    pj = pts[_T_J]
-    pk = pts[_T_K]
-    dx1 = pj[:, 0] - pi[:, 0]
-    dy1 = pj[:, 1] - pi[:, 1]
-    dx2 = pk[:, 0] - pi[:, 0]
-    dy2 = pk[:, 1] - pi[:, 1]
-    cross = dx1 * dy2 - dy1 * dx2
-    areas = np.abs(cross) * 0.5
+def _cart_to_bary(cart):
+    """Convert Cartesian (N, 2) to barycentric coordinates (N, 3)."""
+    # Solve: cart = b0*V0 + b1*V1 + b2*V2, b0+b1+b2=1
+    # Using the inverse of the transformation
+    x = cart[:, 0]
+    y = cart[:, 1]
+    # b2 = y / S3
+    b2 = y / S3
+    # b1 = x - 0.5*b2
+    b1 = x - 0.5 * b2
+    # b0 = 1 - b1 - b2
+    b0 = 1 - b1 - b2
+    return np.column_stack([b0, b1, b2])
+
+def _vectorized_min_area_cart(points):
+    """Calculate the minimum area of all triangles formed by the points in Cartesian."""
+    p1 = points[_T_I]
+    p2 = points[_T_J]
+    p3 = points[_T_K]
+    v1 = p2 - p1
+    v2 = p3 - p1
+    cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+    areas = 0.5 * np.abs(cross)
     return np.min(areas)
 
-def _all_triangle_areas(pts):
-    """Compute all triangle areas (vectorized)."""
-    pi = pts[_T_I]
-    pj = pts[_T_J]
-    pk = pts[_T_K]
-    dx1 = pj[:, 0] - pi[:, 0]
-    dy1 = pj[:, 1] - pi[:, 1]
-    dx2 = pk[:, 0] - pi[:, 0]
-    dy2 = pk[:, 1] - pi[:, 1]
-    cross = dx1 * dy2 - dy1 * dx2
-    areas = np.abs(cross) * 0.5
-    return areas
+def _soft_min_area_cart(points, alpha=100):
+    """Calculate soft minimum of triangle areas using log-sum-exp."""
+    p1 = points[_T_I]
+    p2 = points[_T_J]
+    p3 = points[_T_K]
+    v1 = p2 - p1
+    v2 = p3 - p1
+    cross = v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0]
+    areas = 0.5 * np.abs(cross)
+    # Soft min: -1/alpha * log(sum(exp(-alpha * areas)))
+    min_a = np.min(areas)
+    return min_a - (1.0 / alpha) * np.log(np.sum(np.exp(-alpha * (areas - min_a))))
 
-def _soft_min_area(pts, beta):
-    """Soft minimum of triangle areas using log-sum-exp (differentiable)."""
-    areas = _all_triangle_areas(pts)
-    max_a = np.max(areas)
-    shifted = -beta * (areas - max_a)
-    log_sum = np.log(np.sum(np.exp(shifted)))
-    soft_min = max_a - log_sum / beta
-    return soft_min
+def _project_cartesian(points):
+    """Project points to be inside the triangle."""
+    x = points[:, 0].copy()
+    y = points[:, 1].copy()
+    
+    # Clip to triangle boundaries
+    # y >= 0
+    y = np.maximum(0, y)
+    # y <= sqrt(3) * x
+    y = np.minimum(y, S3 * x)
+    # sqrt(3) * x + y <= sqrt(3)
+    y = np.minimum(y, S3 - S3 * x)
+    
+    # Re-clip x after y adjustments
+    x = np.maximum(0, x)
+    x = np.minimum(1, x)
+    # y >= 0
+    y = np.maximum(0, y)
+    # y <= sqrt(3) * x
+    y = np.minimum(y, S3 * x)
+    # sqrt(3) * x + y <= sqrt(3)
+    y = np.minimum(y, S3 - S3 * x)
+    
+    return np.column_stack([x, y])
 
-def _barycentric_penalty(abc):
-    """Penalty for barycentric coords outside [0,1] or not summing to 1."""
-    # Each coordinate should be in [0,1]
-    penalty = 0.0
-    for i in range(abc.shape[0]):
-        for j in range(3):
-            if abc[i, j] < 0:
-                penalty += abc[i, j] ** 2 * 100
-            elif abc[i, j] > 1:
-                penalty += (abc[i, j] - 1) ** 2 * 100
-    # Sum should be 1
-    sums = abc.sum(axis=1)
-    penalty += np.sum((sums - 1.0) ** 2) * 100
-    return penalty
+def _is_valid_cart(points):
+    """Check if all points are inside the triangle."""
+    x = points[:, 0]
+    y = points[:, 1]
+    tol = 1e-9
+    return (np.all(y >= -tol) and 
+            np.all(y <= S3 * x + tol) and 
+            np.all(S3 * x + y <= S3 + tol))
 
-def _objective_bary(flat, beta):
-    """Objective in barycentric space: minimize -soft_min + penalty."""
-    abc = flat.reshape(-1, 3)
-    pts = _barycentric_to_cartesian(abc)
-    ma = _soft_min_area(pts, beta)
-    pen = _barycentric_penalty(abc)
-    return -ma + pen
+def _random_bary():
+    """Generate random barycentric coordinates."""
+    r = np.random.random((N, 3))
+    r /= r.sum(axis=1, keepdims=True)
+    return r
 
-def _objective_bary_hard(flat):
-    """Hard min objective in barycentric space."""
-    abc = flat.reshape(-1, 3)
-    pts = _barycentric_to_cartesian(abc)
-    ma = _min_triangle_area(pts)
-    pen = _barycentric_penalty(abc)
-    return -ma + pen
-
-def _push_apart(pts, alpha=1.0):
-    """Gradient-free push: move each point away from others to increase min area."""
-    n = len(pts)
-    displacement = np.zeros_like(pts)
-    for i in range(n):
-        for j in range(i + 1, n):
-            d = pts[i] - pts[j]
-            dist = np.linalg.norm(d)
-            if dist > 1e-10:
-                # Push apart proportionally to 1/dist^2
-                force = alpha / (dist * dist)
-                displacement[i] += d / dist * force
-                displacement[j] -= d / dist * force
-    return pts + displacement
-
-def _project_to_triangle(pts):
-    """Project points into the equilateral triangle."""
-    for i in range(len(pts)):
-        x, y = pts[i]
-        y = max(0.0, min(S3H, y))
-        x_min = y / S3
-        x_max = 1 - y / S3
-        x = max(x_min, min(x_max, x))
-        pts[i] = [x, y]
-    return pts
+def _bary_objective(flat_bary, alpha=100):
+    """Objective function in barycentric coordinates."""
+    bary = flat_bary.reshape(N, 3)
+    # Ensure valid barycentric (non-negative, sum to 1)
+    bary = np.maximum(0, bary)
+    bary /= bary.sum(axis=1, keepdims=True)
+    
+    cart = _bary_to_cart(bary)
+    cart = _project_cartesian(cart)
+    
+    # Convert back to barycentric for consistency
+    bary_new = _cart_to_bary(cart)
+    
+    # Soft minimum area
+    soft_min = _soft_min_area_cart(cart, alpha)
+    
+    # Penalty for points outside triangle (should be small after projection)
+    x = cart[:, 0]
+    y = cart[:, 1]
+    pen1 = np.sum(np.maximum(0, -y)**2)
+    pen2 = np.sum(np.maximum(0, y - S3 * x)**2)
+    pen3 = np.sum(np.maximum(0, S3 * x + y - S3)**2)
+    pen = pen1 + pen2 + pen3
+    
+    return -soft_min + 100 * pen
 
 def construct():
     start_time = time.time()
-    rng = np.random.default_rng(12345)
-
-    best_pts = None
-    best_area = 0.0
-
-    def _elapsed_ok(margin):
-        return (time.time() - start_time) < (DEADLINE - margin)
-
-    def _update_best(pts):
-        nonlocal best_pts, best_area
-        pts = _project_to_triangle(pts.copy())
-        area = _min_triangle_area(pts)
-        if area > best_area:
-            best_area = area
-            best_pts = pts.copy()
-
-    # ---- Initial configuration: symmetric placement ----
-    init = np.array([
-        [0.0, 0.0],          # corner 0
-        [1.0, 0.0],          # corner 1
-        [0.5, S3H],          # corner 2
-        [0.5, 0.0],          # mid bottom
-        [0.75, S3H / 2],     # mid right
-        [0.25, S3H / 2],     # mid left
-        [1/3, S3H/3],        # centroid
-        [0.333, 0.0],
-        [0.667, 0.0],
-        [0.5, S3H/3],
-        [0.2, 0.1],
-    ], dtype=float)
-    _update_best(init)
-
-    def _random_point_in_triangle():
-        u = rng.random()
-        v = rng.random()
-        if u + v > 1:
-            u = 1 - u
-            v = 1 - v
-        a = 1 - u - v
-        x = a * 0 + u * 1 + v * 0.5
-        y = a * 0 + u * 0 + v * S3H
-        return np.array([x, y])
-
-    def _random_barycentric():
-        """Generate random point in barycentric coords (a,b,c) with a+b+c=1, all >= 0."""
-        r1 = rng.random()
-        r2 = rng.random()
-        if r1 + r2 > 1:
-            r1 = 1 - r1
-            r2 = 1 - r2
-        a = 1 - r1 - r2
-        b = r1
-        c = r2
-        return np.array([a, b, c])
-
-    # ---- Phase A: Differential Evolution in barycentric space ----
-    if _elapsed_ok(50):
-        try:
-            # Barycentric bounds: each coord in [0, 1], but sum must be 1
-            # We use a relaxed approach: optimize in 2D barycentric (b, c) where a = 1-b-c
-            # b >= 0, c >= 0, b + c <= 1
-            def _de_obj_2d(flat_bc):
-                """DE objective using 2D barycentric (b, c) pairs."""
-                bc = flat_bc.reshape(-1, 2)
-                b = bc[:, 0]
-                c = bc[:, 1]
-                a = 1.0 - b - c
-                abc = np.column_stack([a, b, c])
-                # Penalty for constraint violation
-                pen = 0.0
-                for i in range(N):
-                    if a[i] < 0:
-                        pen += a[i] ** 2 * 500
-                    if b[i] < 0:
-                        pen += b[i] ** 2 * 500
-                    if c[i] < 0:
-                        pen += c[i] ** 2 * 500
-                    if a[i] > 1:
-                        pen += (a[i] - 1) ** 2 * 500
-                    if b[i] > 1:
-                        pen += (b[i] - 1) ** 2 * 500
-                    if c[i] > 1:
-                        pen += (c[i] - 1) ** 2 * 500
-                pts = _barycentric_to_cartesian(abc)
-                ma = _min_triangle_area(pts)
-                return -ma + pen
-
-            bounds_de = [(0, 1), (0, 1)] * N
-            de_result = differential_evolution(
-                _de_obj_2d,
-                bounds_de,
-                maxiter=40,
-                popsize=15,
-                seed=42,
-                tol=1e-5,
-                polish=False,
-                init='latinhypercube',
-                mutation=(0.5, 1.5),
-                recombination=0.7
-            )
-            if de_result.fun < 0:
-                bc = de_result.x.reshape(-1, 2)
-                b = bc[:, 0]
-                c = bc[:, 1]
-                a = 1.0 - b - c
-                abc = np.column_stack([a, b, c])
-                # Clip to valid region
-                for i in range(N):
-                    for j in range(3):
-                        abc[i, j] = max(0.0, min(1.0, abc[i, j]))
-                    s = abc[i].sum()
-                    if s > 0:
-                        abc[i] /= s
-                de_pts = _barycentric_to_cartesian(abc)
-                de_pts = _project_to_triangle(de_pts)
-                _update_best(de_pts)
-        except Exception:
-            pass
-
-    # ---- Phase B: Barycentric soft-min gradient optimization ----
-    n_starts = 20
-    bases_cart = [init.copy()]
-    for _ in range(12):
-        bases_cart.append(init + rng.normal(0, 0.25, size=(N, 2)))
-    if best_pts is not None:
-        bases_cart.append(best_pts.copy())
-
-    for s in range(n_starts):
-        if not _elapsed_ok(35):
+    deadline = start_time + DEADLINE_MARGIN
+    
+    np.random.seed(42)
+    
+    # Initial best
+    best_bary = _random_bary()
+    best_cart = _bary_to_cart(best_bary)
+    best_cart = _project_cartesian(best_cart)
+    best_score = _vectorized_min_area_cart(best_cart)
+    
+    # Annealing schedule
+    alphas = [10, 50, 100, 200, 500, 1000]
+    
+    for alpha in alphas:
+        if time.time() > deadline:
             break
-        base = bases_cart[s % len(bases_cart)]
-        pts = base + rng.normal(0, 0.05, size=(N, 2))
-        pts = _project_to_triangle(pts)
-        _update_best(pts)
-
-        # Convert to barycentric for optimization
-        abc = _cartesian_to_barycentric(pts)
-        # Clip to valid barycentric
-        for i in range(N):
-            for j in range(3):
-                abc[i, j] = max(0.0, min(1.0, abc[i, j]))
-            s_val = abc[i].sum()
-            if s_val > 0:
-                abc[i] /= s_val
-
-        for beta in [15.0, 40.0, 100.0, 250.0, 600.0, 1200.0]:
-            if not _elapsed_ok(30):
+        
+        # Multiple restarts at each alpha level
+        num_restarts = 10
+        for r in range(num_restarts):
+            if time.time() > deadline:
                 break
-            try:
-                res = minimize(
-                    lambda x, b=beta: _objective_bary(x, b),
-                    abc.flatten(),
-                    method='L-BFGS-B',
-                    options={'maxiter': 300, 'ftol': 1e-14, 'gtol': 1e-10}
-                )
-                abc_new = res.x.reshape(-1, 3)
-                # Normalize to valid barycentric
-                for i in range(N):
-                    for j in range(3):
-                        abc_new[i, j] = max(0.0, min(1.0, abc_new[i, j]))
-                    s_val = abc_new[i].sum()
-                    if s_val > 0:
-                        abc_new[i] /= s_val
-                pts_new = _barycentric_to_cartesian(abc_new)
-                pts_new = _project_to_triangle(pts_new)
-                _update_best(pts_new)
-                abc = abc_new
-            except Exception:
-                pass
-
-    # ---- Phase C: Push-apart + Nelder-Mead hybrid local search ----
-    if best_pts is not None and _elapsed_ok(20):
-        for iteration in range(30):
-            if not _elapsed_ok(10):
-                break
-            # Push apart step
-            cand = best_pts.copy()
-            for _ in range(3):
-                cand = _push_apart(cand, alpha=0.005)
-                cand = _project_to_triangle(cand)
-            _update_best(cand)
-
-            # Nelder-Mead polish
-            try:
-                res = minimize(
-                    _objective_bary_hard,
-                    _cartesian_to_barycentric(best_pts).flatten(),
-                    method='Nelder-Mead',
-                    options={'maxiter': 2000, 'xatol': 1e-10, 'fatol': 1e-12}
-                )
-                abc_res = res.x.reshape(-1, 3)
-                for i in range(N):
-                    for j in range(3):
-                        abc_res[i, j] = max(0.0, min(1.0, abc_res[i, j]))
-                    s_val = abc_res[i].sum()
-                    if s_val > 0:
-                        abc_res[i] /= s_val
-                p = _barycentric_to_cartesian(abc_res)
-                p = _project_to_triangle(p)
-                _update_best(p)
-            except Exception:
-                pass
-
-    # ---- Phase D: Final fine polish ----
-    if best_pts is not None and _elapsed_ok(8):
-        for _ in range(3):
-            if not _elapsed_ok(4):
-                break
-            try:
-                abc = _cartesian_to_barycentric(best_pts)
-                for i in range(N):
-                    for j in range(3):
-                        abc[i, j] = max(0.0, min(1.0, abc[i, j]))
-                    s_val = abc[i].sum()
-                    if s_val > 0:
-                        abc[i] /= s_val
-                res = minimize(
-                    _objective_bary_hard,
-                    abc.flatten(),
-                    method='Nelder-Mead',
-                    options={'maxiter': 5000, 'xatol': 1e-12, 'fatol': 1e-14}
-                )
-                abc_res = res.x.reshape(-1, 3)
-                for i in range(N):
-                    for j in range(3):
-                        abc_res[i, j] = max(0.0, min(1.0, abc_res[i, j]))
-                    s_val = abc_res[i].sum()
-                    if s_val > 0:
-                        abc_res[i] /= s_val
-                p = _barycentric_to_cartesian(abc_res)
-                p = _project_to_triangle(p)
-                _update_best(p)
-            except Exception:
-                pass
-
-    if best_pts is None:
-        pts = np.array([_random_point_in_triangle() for _ in range(N)])
-        return pts
-
-    best_pts = _project_to_triangle(best_pts)
-    return best_pts
+            
+            # Start from current best or random
+            if r == 0:
+                x0 = best_bary.flatten()
+            else:
+                x0 = _random_bary().flatten()
+            
+            # Optimize with Nelder-Mead in barycentric space
+            res = minimize(_bary_objective, x0, method='Nelder-Mead',
+                          args=(alpha,),
+                          options={'maxiter': 2000, 'xatol': 1e-6, 'fatol': 1e-6})
+            
+            if res.fun < _bary_objective(best_bary.flatten(), alpha):
+                new_bary = res.x.reshape(N, 3)
+                new_bary = np.maximum(0, new_bary)
+                new_bary /= new_bary.sum(axis=1, keepdims=True)
+                
+                new_cart = _bary_to_cart(new_bary)
+                new_cart = _project_cartesian(new_cart)
+                
+                new_score = _vectorized_min_area_cart(new_cart)
+                if new_score > best_score:
+                    best_score = new_score
+                    best_bary = new_bary
+                    best_cart = new_cart
+    
+    # Final refinement with hard minimum
+    if time.time() < deadline - 10:
+        x0 = best_cart.flatten()
+        
+        def cart_objective(flat_cart):
+            cart = flat_cart.reshape(N, 2)
+            cart = _project_cartesian(cart)
+            area = _vectorized_min_area_cart(cart)
+            return -area
+        
+        res = minimize(cart_objective, x0, method='Nelder-Mead',
+                      options={'maxiter': 3000, 'xatol': 1e-7, 'fatol': 1e-7})
+        
+        if res.fun < -best_score:
+            final_cart = res.x.reshape(N, 2)
+            final_cart = _project_cartesian(final_cart)
+            final_score = _vectorized_min_area_cart(final_cart)
+            if final_score > best_score:
+                best_cart = final_cart
+                best_score = final_score
+    
+    return best_cart
 # EVOLVE-BLOCK-END

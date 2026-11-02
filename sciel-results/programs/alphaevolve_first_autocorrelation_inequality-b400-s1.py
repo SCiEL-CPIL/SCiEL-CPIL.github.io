@@ -1,398 +1,311 @@
 import time
 import numpy as np
+from scipy.optimize import minimize
 
 N = 600
-DEADLINE = 135.0  # Safety margin before 150s kill
 
-def compute_score(heights):
-    """Compute the normalized maximum of autoconvolution for a step function.
-    Returns the value such that uniform heights give score 1.0.
+def compute_score(h):
     """
-    heights = np.asarray(heights, dtype=np.float64)
-    if np.any(heights < -1e-15):
-        return np.inf
-    heights = np.maximum(heights, 0.0)
-    
-    n = len(heights)
-    w = 0.5 / n  # width of each interval
-    
-    # Use FFT for linear autoconvolution
-    # Zero-pad to at least 2*n-1 for linear convolution
-    M = 1
-    while M < 2 * n - 1:
-        M *= 2
-    
-    f = np.zeros(M, dtype=np.float64)
-    f[:n] = heights
-    
-    F = np.fft.rfft(f)
-    conv = np.fft.irfft(F * F, n=M)
-    
+    Compute the normalized maximum of the autoconvolution.
+    h: array of nonnegative values.
+    Returns max_k (h*h)[k] / (sum h)^2
+    """
+    s = np.sum(h)
+    if s == 0:
+        return 0.0
+    # Use FFT for efficient convolution
+    n_fft = 2 * N - 1
+    H = np.fft.fft(h, n=n_fft)
+    conv = np.real(np.fft.ifft(H * H))[:2*N-1]
     max_conv = np.max(conv)
-    total = np.sum(heights)
-    
-    if total <= 0:
-        return np.inf
-    
-    # Normalization: for uniform heights=1, 
-    # integral = n*w = 0.5
-    # autoconvolution peak = n*w^2 (for a rectangle of width 0.5, peak of triangle is 0.25)
-    # Actually for step function with n intervals of width w, all height 1:
-    # The autoconvolution at lag 0 is sum(h_i^2 * w) = n * 1 * w = n*w = 0.5
-    # Wait, let me think more carefully.
-    # 
-    # The step function f(x) = h_i for x in [i*w - 0.25, (i+1)*w - 0.25)
-    # Autoconvolution: (f*f)(t) = integral f(x) f(t-x) dx
-    # At t=0: sum_i h_i^2 * w = n * 1 * w = 0.5
-    # 
-    # Normalized max = max(f*f) / (integral(f))^2 * support_length
-    # For uniform: 0.5 / (0.5)^2 * 0.5 = 0.5/0.25*0.5 = 1.0
-    # 
-    # So: score = max_conv / (total * w)^2 * (n * w)
-    #       = max_conv * n / (total^2 * w)  ... let me verify
-    # integral = total * w
-    # score = max_conv / (total*w)^2 * (n*w) = max_conv * n * w / (total^2 * w^2) = max_conv * n / (total^2 * w)
-    # For uniform: max_conv = n*w (from discrete sum), total = n
-    # score = n*w * n / (n^2 * w) = 1.0 ✓
-    
-    score = max_conv * n / (total * total * w)
-    return score
+    return max_conv / (s * s)
 
-def _autoconv_and_grad(heights, M=None):
-    """Compute autoconvolution and gradient of max autoconvolution w.r.t. heights."""
-    if M is None:
-        n = len(heights)
-        M = 1
-        while M < 2 * n - 1:
-            M *= 2
-    
-    f = np.zeros(M, dtype=np.float64)
-    f[:len(heights)] = heights
-    
-    F = np.fft.rfft(f)
-    conv = np.fft.irfft(F * F, n=M)
-    
-    # Gradient of conv w.r.t. f: conv = f * f (linear)
-    # d(conv_k)/d(f_i) = f_{k-i} + f_{k-i} ... actually for autoconv:
-    # conv_k = sum_i f_i * f_{k-i}
-    # d(conv_k)/d(f_i) = f_{k-i} + f_{k-i} = 2*f_{k-i} (when both terms exist)
-    # But for the max at peak index p:
-    # d(max)/d(f_i) = 2 * f_{p-i} (with appropriate indexing)
-    
-    peak_idx = np.argmax(conv)
-    
-    # The gradient of conv[peak_idx] w.r.t. f[i] is 2*f[peak_idx - i] (circular within M)
-    # But since we're doing linear conv, we need to be careful.
-    # Actually, for linear autoconvolution:
-    # conv[t] = sum_i f[i] * f[t-i] where t-i must be in [0, n-1]
-    # d(conv[t])/d(f[i]) = f[t-i] if 0 <= t-i < n, else 0 (for the first sum)
-    #                     + f[t-i] if 0 <= t-i < n (for the second sum, but it's the same)
-    # Wait, conv[t] = sum_i f[i]*f[t-i], so d/d(f[i]) = f[t-i] (from the i term) 
-    # but also when j = t-i, d/d(f[i]) picks up f[j] = f[t-i] from the j term
-    # So d(conv[t])/d(f[i]) = 2*f[t-i] if 0 <= t-i < n
-    
-    grad = np.zeros(len(heights), dtype=np.float64)
-    for i in range(len(heights)):
-        j = peak_idx - i
-        if 0 <= j < len(heights):
-            grad[i] = 2.0 * heights[j]
-    
-    return conv, grad, peak_idx
+def smooth_max_surrogate(conv, beta=100.0):
+    """
+    Smooth approximation of max(conv) using log-sum-exp.
+    Returns: (1/beta) * log(sum(exp(beta * conv)))
+    """
+    max_val = np.max(conv)
+    shifted = beta * (conv - max_val)
+    # Clip to avoid overflow in exp
+    shifted = np.clip(shifted, -100, 100)
+    log_sum = np.log(np.sum(np.exp(shifted)))
+    return (max_val + log_sum / beta)
 
+def objective(params, beta=100.0):
+    """
+    Objective function for optimization.
+    params: flattened array of h values (non-negative enforced via projection)
+    """
+    h = np.maximum(params, 0.0)
+    s = np.sum(h)
+    if s < 1e-10:
+        return 1e10
+    n_fft = 2 * N - 1
+    H = np.fft.fft(h, n=n_fft)
+    conv = np.real(np.fft.ifft(H * H))[:2*N-1]
+    smoothed_peak = smooth_max_surrogate(conv, beta)
+    return smoothed_peak / (s * s)
+
+def objective_grad(params, beta=100.0):
+    """
+    Gradient of the objective function using FFT for efficiency.
+    """
+    h = np.maximum(params, 0.0)
+    s = np.sum(h)
+    if s < 1e-10:
+        return np.zeros_like(params)
+    
+    n_fft = 2 * N - 1
+    H = np.fft.fft(h, n=n_fft)
+    conv = np.real(np.fft.ifft(H * H))[:2*N-1]
+    
+    # Compute softmax weights for the max surrogate
+    max_val = np.max(conv)
+    shifted = beta * (conv - max_val)
+    shifted = np.clip(shifted, -100, 100)
+    exp_shifted = np.exp(shifted)
+    sum_exp = np.sum(exp_shifted)
+    weights = exp_shifted / sum_exp
+    
+    # Compute gradient using FFT
+    # grad_h = 2 * correlate(weights, h)
+    W = np.fft.fft(weights, n=n_fft)
+    
+    # Correlation via FFT
+    grad_h = 2.0 * np.real(np.fft.ifft(W * np.conj(H)))[:N]
+    
+    # Gradient of objective: f = smooth_max / s^2
+    smooth_max_val = smooth_max_surrogate(conv, beta)
+    grad_obj = grad_h / (s * s) - 2 * smooth_max_val / (s * s * s)
+    
+    # Zero out gradient where h is at boundary (h=0) to respect constraint
+    grad_obj[h <= 1e-12] = 0.0
+    
+    return grad_obj
+
+# EVOLVE-BLOCK-START
 def construct():
     start_time = time.time()
-    deadline = start_time + DEADLINE
-    
-    def time_left():
-        return deadline - time.time()
-    
-    # Start with uniform
-    h = np.ones(N, dtype=np.float64)
-    best_h = h.copy()
-    best_score = compute_score(h)
-    
-    # Compute M once for reuse
-    M = 1
-    while M < 2 * N - 1:
-        M *= 2
-    
-    # Strategy: Use smooth optimization with log-sum-exp surrogate
-    # The objective is max_t (f*f)(t) / (integral(f))^2 * support
-    # We minimize this. Use a smooth surrogate: (1/alpha) * log(sum(exp(alpha * conv_t)))
-    # to approximate max(conv_t)
-    
-    # Also, to handle the normalization, we can fix the integral and just minimize max conv
-    # Or use a parameterization that keeps things simple.
-    
-    # Approach 1: Gradient descent on the smooth surrogate
-    # Approach 2: Try structured shapes (tapered, plateau, etc.)
-    # Approach 3: Combine both
-    
-    rng = np.random.default_rng(12345)
-    
-    # First, try some structured shapes quickly
-    structured_candidates = []
-    
-    # Tapered edges (cosine taper)
-    for taper_frac in [0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5]:
-        h_taper = np.ones(N)
-        taper_len = int(taper_frac * N)
-        if taper_len > 1:
-            ramp = 0.5 * (1 - np.cos(np.pi * np.linspace(0, 1, taper_len)))
-            h_taper[:taper_len] = ramp
-            h_taper[-taper_len:] = ramp[::-1]
-        structured_candidates.append(h_taper)
-    
-    # Raised cosine (smooth bump)
-    x = np.linspace(0, 1, N)
-    for center in [0.5]:
-        for width in [0.3, 0.5, 0.7, 0.9, 1.0]:
-            h_cos = np.exp(-((x - center) / width) ** 2)
-            h_cos = h_cos / np.max(h_cos)  # normalize to max 1
-            structured_candidates.append(h_cos)
-    
-    # Parabolic
-    for a in [0.5, 1.0, 2.0, 3.0]:
-        h_par = 1.0 - a * (2 * x - 1) ** 2
-        h_par = np.maximum(h_par, 0.0)
-        if np.max(h_par) > 0:
-            structured_candidates.append(h_par)
-    
-    # Linear taper
-    for slope in [0.5, 1.0, 2.0, 3.0, 5.0]:
-        h_lin = 1.0 - slope * np.abs(2 * x - 1)
-        h_lin = np.maximum(h_lin, 0.0)
-        if np.max(h_lin) > 0:
-            structured_candidates.append(h_lin)
-    
-    # Plateau with smooth edges
-    for plateau_frac in [0.3, 0.5, 0.7]:
-        h_plat = np.ones(N)
-        edge_len = int((1 - plateau_frac) * N / 2)
-        if edge_len > 1:
-            ramp = 0.5 * (1 - np.cos(np.pi * np.linspace(0, 1, edge_len)))
-            h_plat[:edge_len] = ramp
-            h_plat[-edge_len:] = ramp[::-1]
-        structured_candidates.append(h_plat)
-    
-    # Evaluate structured candidates
-    for h_cand in structured_candidates:
-        if time_left() < 5:
-            break
-        h_cand = np.maximum(h_cand, 0.0)
-        if np.sum(h_cand) <= 0:
-            continue
-        score = compute_score(h_cand)
-        if score < best_score:
-            best_score = score
-            best_h = h_cand.copy()
-    
-    # Now do gradient-based optimization from the best candidate
-    # Use log-sum-exp smooth surrogate for the max
-    
-    def smooth_max(conv, alpha):
-        """Smooth approximation of max(conv) using log-sum-exp."""
-        # Scale to avoid overflow
-        m = np.max(conv)
-        if m < 0:
-            m = 0
-        exp_conv = np.exp(alpha * (conv - m))
-        return m + np.log(np.sum(exp_conv)) / alpha
-    
-    def smooth_obj(heights, alpha):
-        """Smooth objective: smooth_max(autoconv) / (sum(heights)*w)^2 * n*w"""
-        f = np.zeros(M, dtype=np.float64)
-        f[:N] = heights
-        F = np.fft.rfft(f)
-        conv = np.fft.irfft(F * F, n=M)
-        
-        sm = smooth_max(conv, alpha)
-        total = np.sum(heights)
-        w = 0.5 / N
-        if total <= 1e-10:
-            return 1e10
-        return sm / (total * w) ** 2 * (N * w)
-    
-    def smooth_grad(heights, alpha):
-        """Gradient of the smooth objective."""
-        f = np.zeros(M, dtype=np.float64)
-        f[:N] = heights
-        F = np.fft.rfft(f)
-        conv = np.fft.irfft(F * F, n=M)
-        
-        # Gradient of smooth_max
-        m = np.max(conv)
-        if m < 0:
-            m = 0
-        exp_conv = np.exp(alpha * (conv - m))
-        weights = exp_conv / np.sum(exp_conv)  # softmax weights
-        
-        # d(smooth_max)/d(conv_k) = weights[k]
-        # d(conv_k)/d(f_i) = 2*f_{k-i} (for linear autoconv)
-        grad_f = np.zeros(M, dtype=np.float64)
-        for i in range(N):
-            # conv_k = sum_j f_j * f_{k-j}
-            # d(conv_k)/d(f_i) = f_{k-i} (from j=i term) + f_{k-i} (from j=k-i term, when i != k-i)
-            # Actually: conv_k = sum_j f_j f_{k-j}
-            # d/d(f_i) = f_{k-i} (when j=i) + f_{k-i} (when k-j=i, i.e., j=k-i)
-            # So d(conv_k)/d(f_i) = f_{k-i} + f_{k-i} = 2*f_{k-i} if 0<=k-i<N
-            # But wait, if k-i < 0 or k-i >= N, then f_{k-i} = 0
-            # So: d(conv_k)/d(f_i) = 2*f_{k-i} if 0 <= k-i < N, else 0
-            
-            # Vectorized: for each i, sum over k of weights[k] * 2*f[k-i] (if valid)
-            # This is a correlation-like operation
-            pass
-        
-        # More efficient: use FFT
-        # grad_f[i] = sum_k weights[k] * d(conv_k)/d(f_i) = sum_k weights[k] * 2*f[k-i] (if 0<=k-i<N)
-        # = 2 * (weights * f)[circular correlation]
-        # Actually: sum_k weights[k] * f[k-i] = (weights * f) circular correlation at lag i
-        # In FFT domain: ifft(fft(weights) * conj(fft(f)))... 
-        # Let me just do it directly with FFT
-        W = np.fft.rfft(weights[:2*N-1])  # weights is length M, but conv is meaningful in [0, 2N-2]
-        # Actually conv has length M, but only [0, 2N-2] is non-zero
-        # Let's work with the full M-length arrays
-        W_full = np.fft.rfft(weights)
-        F_full = np.fft.rfft(f)
-        # grad_f[i] = 2 * sum_k weights[k] * f[k-i]
-        # = 2 * ifft(W_full * conj(F_full))[i] ... no
-        # sum_k weights[k] * f[k-i] = correlation of weights and f at lag i
-        # = ifft(fft(weights) * conj(fft(f)))... 
-        # Let's use: corr[i] = sum_k weights[k] * f[k-i]
-        # In FFT: corr = ifft(fft(weights) * conj(fft(f)))  -- this gives circular correlation
-        # But we need linear correlation. Since f is zero-padded to M >= 2N-1, 
-        # and weights is also effectively zero outside [0, 2N-2], the circular correlation
-        # in M points should equal the linear correlation for i in [0, N-1].
-        
-        corr = np.fft.irfft(W_full * np.conj(F_full), n=M)
-        grad_f = 2.0 * corr[:N]
-        
-        # Now chain rule: obj = smooth_max / (total*w)^2 * N*w
-        # Let S = sum(heights) = total, w = 0.5/N
-        # obj = sm / (S*w)^2 * N*w = sm * N / (S^2 * w)
-        # d(obj)/d(f_i) = [d(sm)/d(f_i) * N / (S^2 * w)] - [sm * N * 2*S / (S^4 * w) * dS/d(f_i)]
-        #               = [grad_f[i] * N / (S^2 * w)] - [sm * 2*N / (S^3 * w) * 1]
-        
-        S = np.sum(heights)
-        w = 0.5 / N
-        if S <= 1e-10:
-            return np.zeros(N)
-        
-        sm = smooth_max(conv, alpha)
-        obj_grad = grad_f * (N / (S * S * w)) - sm * (2.0 * N / (S * S * S * w))
-        
-        return obj_grad
-    
-    # Gradient descent with adaptive alpha
-    h_opt = best_h.copy()
-    alpha = 50.0  # start with moderate smoothness
-    lr = 0.01
-    
-    for it in range(500):
-        if time_left() < 10:
-            break
-        
-        # Compute gradient
-        grad = smooth_grad(h_opt, alpha)
-        
-        # Normalize gradient
-        grad_norm = np.linalg.norm(grad)
-        if grad_norm < 1e-15:
-            break
-        
-        # Update
-        h_opt = h_opt - lr * grad
-        h_opt = np.maximum(h_opt, 0.0)
-        
-        # Compute actual score
-        score = compute_score(h_opt)
-        if score < best_score:
-            best_score = score
-            best_h = h_opt.copy()
-        
-        # Adapt learning rate and alpha
-        if it % 20 == 0:
-            # Increase alpha (sharper max approximation)
-            alpha = min(alpha * 1.2, 500.0)
-            # Decrease learning rate
-            lr = max(lr * 0.9, 0.001)
-    
-    # Try multiple random restarts
-    for restart in range(20):
-        if time_left() < 15:
-            break
-        
-        # Random smooth initial guess
-        freqs = np.arange(N)
-        h_init = np.ones(N)
-        num_modes = rng.integers(3, 10)
-        for _ in range(num_modes):
-            k = rng.integers(1, N // 3)
-            phase = rng.uniform(0, 2 * np.pi)
-            amp = rng.uniform(0.05, 0.3)
-            h_init += amp * np.cos(2 * np.pi * k * freqs / N + phase)
-        h_init = np.maximum(h_init, 0.0)
-        if np.sum(h_init) <= 0:
-            continue
-        
-        # Optimize from this start
-        h_r = h_init.copy()
-        alpha_r = 50.0
-        lr_r = 0.01
-        
-        for it in range(200):
-            if time_left() < 10:
-                break
-            
-            grad = smooth_grad(h_r, alpha_r)
-            grad_norm = np.linalg.norm(grad)
-            if grad_norm < 1e-15:
-                break
-            
-            h_r = h_r - lr_r * grad
-            h_r = np.maximum(h_r, 0.0)
-            
-            score = compute_score(h_r)
-            if score < best_score:
-                best_score = score
-                best_h = h_r.copy()
-            
-            if it % 20 == 0:
-                alpha_r = min(alpha_r * 1.15, 500.0)
-                lr_r = max(lr_r * 0.92, 0.001)
-    
-    # Final polish: try fine-tuning the best solution
-    if time_left() > 10:
-        h_final = best_h.copy()
-        alpha_f = 200.0
-        lr_f = 0.001
-        
-        for it in range(100):
-            if time_left() < 5:
-                break
-            
-            grad = smooth_grad(h_final, alpha_f)
-            grad_norm = np.linalg.norm(grad)
-            if grad_norm < 1e-15:
-                break
-            
-            h_final = h_final - lr_f * grad
-            h_final = np.maximum(h_final, 0.0)
-            
-            score = compute_score(h_final)
-            if score < best_score:
-                best_score = score
-                best_h = h_final.copy()
-            
-            lr_f = max(lr_f * 0.98, 0.0001)
-    
-    # Ensure non-negativity
-    best_h = np.maximum(best_h, 0.0)
-    return list(best_h)
+    deadline = start_time + 145.0
 
-if __name__ == "__main__":
-    res = construct()
-    assert len(res) == N
-    assert all(h >= 0 for h in res)
-    print("Constructed optimized step function.")
-    print(f"Score: {compute_score(np.array(res))}")
+    best_h = np.ones(N) / N
+    best_score = compute_score(best_h)
+
+    np.random.seed(42)
+    
+    # Multiple initializations
+    initializations = []
+    
+    # 1. Uniform
+    initializations.append(np.ones(N) / N)
+    
+    # 2. Gaussian
+    x = np.linspace(-1, 1, N)
+    gauss = np.exp(-x**2 / (2 * 0.5**2))
+    gauss /= np.sum(gauss)
+    initializations.append(gauss)
+    
+    # 3. Linear ramp
+    lin = np.linspace(0.1, 1.0, N)
+    lin /= np.sum(lin)
+    initializations.append(lin)
+    
+    # 4. Sine
+    sine = np.sin(np.pi * (x + 1) / 2) ** 2
+    sine /= np.sum(sine)
+    initializations.append(sine)
+    
+    # 5. Step function (left half vs right half)
+    step = np.zeros(N)
+    step[:N//2] = 1.0
+    step /= np.sum(step)
+    initializations.append(step)
+    
+    # 6. Random
+    rand_h = np.random.rand(N)
+    rand_h /= np.sum(rand_h)
+    initializations.append(rand_h)
+    
+    # 7. Triangular
+    tri = np.abs(np.linspace(-1, 1, N))
+    tri = 1.0 - tri
+    tri /= np.sum(tri)
+    initializations.append(tri)
+    
+    # 8. Two-block: high-low-high pattern
+    two_block = np.zeros(N)
+    two_block[:N//3] = 1.0
+    two_block[2*N//3:] = 1.0
+    two_block /= np.sum(two_block)
+    initializations.append(two_block)
+    
+    # 9. Cosine bump
+    cos_bump = np.cos(np.pi * x) ** 2
+    cos_bump = np.maximum(cos_bump, 0)
+    cos_bump /= np.sum(cos_bump)
+    initializations.append(cos_bump)
+
+    bounds = [(0, None)] * N
+    
+    for h0 in initializations:
+        if time.time() > deadline - 25:
+            break
+            
+        # Optimize with adaptive beta
+        try:
+            # Start with lower beta for smoother landscape
+            res = minimize(
+                objective, 
+                h0, 
+                method='L-BFGS-B', 
+                jac=objective_grad, 
+                args=(50.0,),
+                bounds=bounds,
+                options={'maxiter': 500, 'ftol': 1e-12, 'gtol': 1e-8}
+            )
+            
+            h_opt = res.x
+            h_opt = np.maximum(h_opt, 0)
+            
+            # Refine with higher beta
+            if time.time() < deadline - 20:
+                res2 = minimize(
+                    objective, 
+                    h_opt, 
+                    method='L-BFGS-B', 
+                    jac=objective_grad, 
+                    args=(100.0,),
+                    bounds=bounds,
+                    options={'maxiter': 500, 'ftol': 1e-12, 'gtol': 1e-8}
+                )
+                h_opt = res2.x
+                h_opt = np.maximum(h_opt, 0)
+            
+            score_opt = compute_score(h_opt)
+            
+            if score_opt < best_score:
+                best_score = score_opt
+                best_h = h_opt.copy()
+                
+        except Exception:
+            pass
+
+    # Final polish with tighter tolerance and higher beta
+    if time.time() < deadline - 10:
+        try:
+            res = minimize(
+                objective, 
+                best_h, 
+                method='L-BFGS-B', 
+                jac=objective_grad, 
+                args=(200.0,),
+                bounds=bounds,
+                options={'maxiter': 1000, 'ftol': 1e-14, 'gtol': 1e-10}
+            )
+            h_opt = res.x
+            h_opt = np.maximum(h_opt, 0)
+            score_opt = compute_score(h_opt)
+            if score_opt < best_score:
+                best_score = score_opt
+                best_h = h_opt.copy()
+        except Exception:
+            pass
+    
+    # Coordinate descent refinement with adaptive step size
+    if time.time() < deadline - 5:
+        h_cd = best_h.copy()
+        step_size = 0.005  # Start with smaller steps
+        
+        for iteration in range(200):
+            if time.time() > deadline - 3:
+                break
+            improved = False
+            
+            # Focus on indices near the peak of autoconvolution
+            n_fft = 2 * N - 1
+            H = np.fft.fft(h_cd, n=n_fft)
+            conv = np.real(np.fft.ifft(H * H))[:2*N-1]
+            peak_idx = np.argmax(conv)
+            
+            # Priority: indices that contribute most to the peak
+            # The peak at index k gets contributions from h[i]*h[k-i] for valid i
+            priority_order = list(range(N))
+            
+            for i in priority_order:
+                if time.time() > deadline - 3:
+                    break
+                
+                old_val = h_cd[i]
+                trial = h_cd.copy()
+                
+                # Try increasing
+                trial[i] = old_val + step_size
+                trial /= np.sum(trial)
+                trial_score = compute_score(trial)
+                if trial_score < best_score - 1e-12:
+                    h_cd = trial
+                    best_score = trial_score
+                    best_h = trial.copy()
+                    improved = True
+                    continue
+                
+                # Try decreasing
+                trial = h_cd.copy()
+                trial[i] = max(0, old_val - step_size)
+                trial /= np.sum(trial)
+                trial_score = compute_score(trial)
+                if trial_score < best_score - 1e-12:
+                    h_cd = trial
+                    best_score = trial_score
+                    best_h = trial.copy()
+                    improved = True
+                    continue
+                
+                # Try setting to zero if currently positive
+                if old_val > 1e-6:
+                    trial = h_cd.copy()
+                    trial[i] = 0
+                    if np.sum(trial) > 0:
+                        trial /= np.sum(trial)
+                        trial_score = compute_score(trial)
+                        if trial_score < best_score - 1e-12:
+                            h_cd = trial
+                            best_score = trial_score
+                            best_h = trial.copy()
+                            improved = True
+                            continue
+            
+            # Adapt step size
+            if improved:
+                step_size = max(0.001, step_size * 0.7)
+            else:
+                step_size = min(0.02, step_size * 1.5)
+            
+            if not improved and step_size < 0.001:
+                break
+
+    # Final high-precision polish with very high beta
+    if time.time() < deadline - 2:
+        try:
+            res = minimize(
+                objective, 
+                best_h, 
+                method='L-BFGS-B', 
+                jac=objective_grad, 
+                args=(500.0,),
+                bounds=bounds,
+                options={'maxiter': 2000, 'ftol': 1e-16, 'gtol': 1e-12}
+            )
+            h_opt = res.x
+            h_opt = np.maximum(h_opt, 0)
+            score_opt = compute_score(h_opt)
+            if score_opt < best_score:
+                best_score = score_opt
+                best_h = h_opt.copy()
+        except Exception:
+            pass
+    
+    best_h = np.maximum(best_h, 0)
+    return best_h.tolist()
+# EVOLVE-BLOCK-END

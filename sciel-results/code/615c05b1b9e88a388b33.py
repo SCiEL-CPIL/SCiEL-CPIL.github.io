@@ -1,0 +1,297 @@
+import time
+import math
+import numpy as np
+from itertools import combinations
+
+def _score_set(U):
+    """Compute the lower bound 1 + log(|U-U|/|U+U|)/log(2 max U + 1)."""
+    if not U or len(U) < 2:
+        return 0.0
+    arr = np.array(U, dtype=np.int64)
+    if arr[0] != 0:
+        arr = np.concatenate(([0], arr))
+    arr = np.unique(arr)
+    n = len(arr)
+    if n < 2:
+        return 0.0
+    mx = int(arr.max())
+    if mx == 0:
+        return 0.0
+    
+    # Size of sumset U+U: values in [0, 2*mx]
+    # Size of diffset U-U: values in [-mx, mx], shift by mx -> [0, 2*mx]
+    N = 2 * mx + 1
+    
+    # Efficient counting via FFT
+    sig = np.zeros(N, dtype=np.float64)
+    sig[arr] = 1.0
+    
+    fft_size = 1
+    while fft_size < 2 * N:
+        fft_size *= 2
+        
+    F = np.fft.rfft(sig, n=fft_size)
+    
+    # Sumset
+    S_sum = np.fft.irfft(F * F, n=fft_size)
+    sumset_size = np.sum(S_sum[:N] > 1e-6) # Sums range 0..2*mx which is 0..N-1
+    
+    # Diffset
+    flip_sig = np.zeros(N, dtype=np.float64)
+    flip_sig[:] = sig[::-1]
+    
+    F_flip = np.fft.rfft(flip_sig, n=fft_size)
+    S_diff = np.fft.irfft(F * F_flip, n=fft_size)
+    
+    diffset_size = np.sum(S_diff > 1e-6)
+    
+    if sumset_size == 0:
+        return 0.0
+        
+    ratio = diffset_size / sumset_size
+    if ratio <= 0:
+        return 0.0
+        
+    denom = np.log(2 * mx + 1)
+    if denom == 0:
+        return 0.0
+        
+    return 1.0 + np.log(ratio) / denom
+
+def _is_prime(n):
+    if n < 2:
+        return False
+    if n == 2:
+        return True
+    if n % 2 == 0:
+        return False
+    if n < 9:
+        return True
+    if n % 3 == 0:
+        return False
+    f = 5
+    while f * f <= n:
+        if n % f == 0:
+            return False
+        f += 2
+    return True
+
+def _next_prime(n):
+    n += 1
+    while not _is_prime(n):
+        n += 1
+    return n
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 110.0  # Safety margin
+    
+    # Strategy: Mixed-radix construction U = {0, b1, b1+b2, b1+b2+b3, ...}
+    # This is equivalent to the set of prefix sums of a sequence of bases b1, b2, ...
+    # If bases are distinct primes, the representation of any sum of two prefix sums
+    # is highly constrained.
+    
+    # We want to maximize score = 1 + log(|U-U|/|U+U|) / log(2*max(U)+1)
+    
+    # Let's build the set incrementally.
+    # Current set U_k = {0, s1, s2, ..., sk} where si = sum_{j=1}^i b_j
+    # We choose b_{k+1} to be a prime.
+    
+    # Initial state: U = [0]
+    # We need at least 2 elements.
+    # Let's start with a few small primes to establish structure, then grow.
+    
+    # Note: The set U is the set of prefix sums.
+    # U = {0, b1, b1+b2, ...}
+    # max(U) = sum(b_i)
+    
+    # We will maintain the list of bases and the current set of prefix sums.
+    bases = []
+    prefix_sums = [0]
+    current_max = 0
+    
+    best_set = [0, 1]
+    best_score = _score_set(best_set)
+    
+    # Precompute a list of primes up to a certain limit
+    # The max element will be sum of bases. If we use ~50 bases of size ~1000, max ~ 50000.
+    # This is well within the 120s limit for FFT if we are careful.
+    # Let's generate primes up to 5000.
+    primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97]
+    # Extend primes
+    p = 101
+    while p < 5000:
+        if _is_prime(p):
+            primes.append(p)
+        p += 1 if p < 3 else 2
+    
+    # Greedy selection of bases
+    # We start with a small base to allow many elements.
+    # However, small bases lead to small max(U), which reduces the denominator log(2*max+1).
+    # But they also make the set "dense" in terms of additive structure?
+    # Actually, for prefix sums of distinct primes, the sumset size is roughly O(k^2) if bases are small?
+    # No, if bases are distinct primes, the sums of two prefix sums are:
+    # (sum_{i=1}^a b_i) + (sum_{j=1}^c b_j)
+    # If a <= c, this is sum_{i=1}^a 2b_i + sum_{i=a+1}^c b_i.
+    # These are distinct for different (a,c) pairs if the bases grow fast enough or are distinct primes?
+    # Actually, just distinct primes isn't enough to guarantee uniqueness of all sums, but it minimizes collisions.
+    
+    # Let's try to optimize the sequence of primes.
+    # We'll try a few different starting points and growth rates.
+    
+    # Strategy A: Start with small primes, grow slowly.
+    # Strategy B: Start with larger primes.
+    
+    # We will implement a greedy loop where at each step k, we pick the next prime b_{k+1}
+    # from a candidate pool (primes larger than b_k) that maximizes the score of the new set.
+    
+    # To speed this up, we can limit the candidate pool.
+    # Also, we can stop adding elements if the score starts decreasing or if max(U) gets too large.
+    
+    # Let's run multiple trials with different initial bases.
+    
+    for start_prime_idx in range(0, 10):
+        if time.time() > deadline - 10:
+            break
+            
+        bases = [primes[start_prime_idx]]
+        prefix_sums = [0, primes[start_prime_idx]]
+        current_max = primes[start_prime_idx]
+        
+        current_set = prefix_sums[:]
+        current_score = _score_set(current_set)
+        
+        if current_score > best_score:
+            best_score = current_score
+            best_set = current_set[:]
+        
+        # Greedy extension
+        for step in range(50): # Max 50 more elements
+            if time.time() > deadline - 5:
+                break
+                
+            # Candidate next primes: primes from index start_prime_idx + step to start_prime_idx + step + 50
+            # This ensures we pick "next" primes, not arbitrarily large ones immediately.
+            # Actually, we should consider a window of primes.
+            start_idx = start_prime_idx + len(bases)
+            end_idx = min(len(primes), start_idx + 100)
+            
+            best_candidate = None
+            best_candidate_score = current_score
+            
+            for j in range(start_idx, end_idx):
+                if time.time() > deadline - 5:
+                    break
+                p = primes[j]
+                new_max = current_max + p
+                # Heuristic check: if new_max is too large, score might drop due to denominator
+                # log(2*new_max+1) grows slowly, but if ratio drops, score drops.
+                
+                new_prefix = current_max + p
+                new_set = current_set + [new_prefix]
+                
+                # Quick check: is new_set valid? Yes.
+                new_score = _score_set(new_set)
+                
+                if new_score > best_candidate_score:
+                    best_candidate_score = new_score
+                    best_candidate = (p, new_set)
+            
+            if best_candidate is None:
+                break
+                
+            p, new_set = best_candidate
+            bases.append(p)
+            current_set = new_set
+            current_max = current_max + p
+            current_score = best_candidate_score
+            
+            if current_score > best_score:
+                best_score = current_score
+                best_set = current_set[:]
+                
+            # If score dropped significantly from peak, maybe stop?
+            # Or continue to see if it recovers?
+            # Usually, adding more elements to a "sparse" set keeps ratio high.
+            # But denominator grows.
+            
+            # Check if we should stop
+            # If current_score < best_score * 0.95, maybe stop this branch?
+            # No, keep searching, we have best_set saved.
+            
+    # Final local search on the best_set found?
+    # The mixed-radix structure is rigid. Changing one base changes all subsequent prefix sums.
+    # So a local search on the set elements directly might break the structure.
+    # However, we can try to swap a prime in the bases with a nearby prime.
+    
+    if best_score > 1.0125: # Only if we found something better than seed
+        # Try to refine the best_set by swapping bases
+        # We need to reconstruct bases from best_set?
+        # best_set is prefix sums. b1 = s1, b2 = s2-s1, etc.
+        # We can try to replace b_i with b_i +/- 2 (next/prev prime)
+        
+        # Extract bases
+        bs = []
+        prev = 0
+        for s in best_set[1:]:
+            bs.append(s - prev)
+            prev = s
+            
+        # Try swapping one base
+        for i in range(len(bs)):
+            if time.time() > deadline - 2:
+                break
+            old_b = bs[i]
+            # Find index of old_b in primes
+            # Since we generated primes, we can find it
+            # But it might not be in the list if we went up to 5000 and old_b is larger?
+            # Our primes list goes to 5000.
+            # Let's just try old_b +/- 1, +/- 2, +/- 3 to find a prime.
+            
+            for delta in [1, -1, 2, -2, 3, -3, 4, -4, 5, -5]:
+                new_b = old_b + delta
+                if new_b <= 0:
+                    continue
+                if not _is_prime(new_b):
+                    continue
+                if new_b in bs: # Must be distinct? 
+                    # The strategy assumes distinct primes.
+                    # If not distinct, sumset collisions increase.
+                    continue
+                    
+                # Reconstruct set with new base
+                new_bs = bs[:]
+                new_bs[i] = new_b
+                
+                # Rebuild prefix sums
+                new_prefix_sums = [0]
+                cur = 0
+                for b in new_bs:
+                    cur += b
+                    new_prefix_sums.append(cur)
+                    
+                new_set = new_prefix_sums
+                new_score = _score_set(new_set)
+                
+                if new_score > best_score:
+                    best_score = new_score
+                    best_set = new_set
+                    bs = new_bs
+                    # Don't break, maybe we can improve further?
+                    # But we modified bs, so the loop variable i is still valid?
+                    # Yes, length is same.
+                    # But we should probably restart the swap search or continue carefully.
+                    # For simplicity, just accept and continue to next i?
+                    # Actually, changing bs[i] changes all subsequent prefix sums.
+                    # So the "current" bs is updated.
+                    # We should break out of the delta loop to avoid checking invalid deltas
+                    # based on the old bs? No, new_b is fixed.
+                    # But other deltas might be better? Unlikely if we found an improvement.
+                    break
+
+    return best_set
+
+# Test locally
+if __name__ == "__main__":
+    s = construct()
+    print(f"Result: {s[:10]}... Size: {len(s)}, Max: {max(s)}, Score: {_score_set(s)}")

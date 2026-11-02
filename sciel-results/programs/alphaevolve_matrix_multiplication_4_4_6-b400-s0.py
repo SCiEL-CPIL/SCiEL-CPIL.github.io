@@ -12,7 +12,7 @@ def construct():
     # V: (m*p, rank) -> (24, rank)
     # W: (p*n, rank) -> (24, rank)
     
-    rank = 81
+    rank = 77
     U = [[0] * rank for _ in range(n * m)]
     V = [[0] * rank for _ in range(m * p)]
     W = [[0] * rank for _ in range(p * n)]
@@ -208,20 +208,85 @@ def construct():
             
             add_term(u_coeffs, v_coeffs, w_coeffs)
             
-    # --- Part 2: Schoolbook for 4x4x2 (B cols 4-5, C cols 4-5) ---
+    # --- Part 2: Strassen-based 4x4x2 (B cols 4-5, C cols 4-5) ---
     # A is 4x4. B2 is 4x2 (cols 4-5). C2 is 4x2 (cols 4-5).
-    for i in range(4):
-        for j in range(4):
-            for k in range(2):
-                # B2 col k corresponds to global col 4+k
-                # C2 col k corresponds to global col 4+k
-                b_col = 4 + k
-                c_col = 4 + k
+    # Split A into 2x2 blocks: A00, A01, A10, A11.
+    # Split B2 into top 2x2 (T) and bottom 2x2 (B).
+    # C2 = [A00*T + A01*B; A10*T + A11*B].
+    # Compute 4 products: P1=A00*T, P2=A01*B, P3=A10*T, P4=A11*B.
+    # Each product is 2x2x2, rank 7. Total 28 terms.
+    
+    # Indices for A blocks
+    # A00: rows 0-1, cols 0-1
+    # A01: rows 0-1, cols 2-3
+    # A10: rows 2-3, cols 0-1
+    # A11: rows 2-3, cols 2-3
+    
+    # Indices for B2 blocks
+    # T: rows 0-1, cols 4-5 (global cols 4,5)
+    # B: rows 2-3, cols 4-5
+    
+    # Indices for C2 blocks
+    # C2_top: rows 0-1, cols 4-5
+    # C2_bot: rows 2-3, cols 4-5
+    
+    # Define the 4 products
+    products = [
+        ('00', 'T', 'top'), # P1 = A00 * T -> C2_top
+        ('01', 'B', 'top'), # P2 = A01 * B -> C2_top
+        ('10', 'T', 'bot'), # P3 = A10 * T -> C2_bot
+        ('11', 'B', 'bot')  # P4 = A11 * B -> C2_bot
+    ]
+    
+    for a_block, b_block, c_part in products:
+        # Iterate over 7 Strassen terms for 2x2x2
+        for s_idx in range(7):
+            x_coeffs, y_coeffs = strassen_2x2_terms[s_idx]
+            
+            # Construct global U coeffs
+            u_coeffs = []
+            for (rx, cx), cx_c in x_coeffs:
+                # a_block is '00', '01', '10', '11'
+                x, y = int(a_block[0]), int(a_block[1])
+                idx = (x*2+rx)*4 + (y*2+cx)
+                u_coeffs.append((idx, cx_c))
+            
+            # Construct global V coeffs
+            v_coeffs = []
+            for (ry, cy), cy_c in y_coeffs:
+                if b_block == 'T':
+                    # T is rows 0-1, cols 4-5
+                    # j = ry, k = 4+cy
+                    idx = ry*6 + (4+cy)
+                else: # 'B'
+                    # B is rows 2-3, cols 4-5
+                    # j = 2+ry, k = 4+cy
+                    idx = (2+ry)*6 + (4+cy)
+                v_coeffs.append((idx, cy_c))
+            
+            # Construct global W coeffs
+            w_coeffs = []
+            for rc, s_contribs in result_map.items():
+                small_coeff = 0
+                for s_check, s_c in s_contribs:
+                    if s_check == s_idx:
+                        small_coeff = s_c
+                        break
+                if small_coeff == 0:
+                    continue
                 
-                u_idx = i * 4 + j
-                v_idx = j * 6 + b_col
-                w_idx = c_col * 4 + i
+                # rc is (r, c) in 0..1 for the 2x2 result
+                if c_part == 'top':
+                    # C2_top: rows 0-1, cols 4-5
+                    # i = r, k = 4+c
+                    idx = (4+rc[1])*4 + rc[0]
+                else: # 'bot'
+                    # C2_bot: rows 2-3, cols 4-5
+                    # i = 2+r, k = 4+c
+                    idx = (4+rc[1])*4 + (2+rc[0])
                 
-                add_term([(u_idx, 1)], [(v_idx, 1)], [(w_idx, 1)])
+                w_coeffs.append((idx, small_coeff))
+            
+            add_term(u_coeffs, v_coeffs, w_coeffs)
                 
     return {"U": U, "V": V, "W": W}

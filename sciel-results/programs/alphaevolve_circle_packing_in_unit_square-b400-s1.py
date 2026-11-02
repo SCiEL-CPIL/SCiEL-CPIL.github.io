@@ -1,527 +1,394 @@
+"""Circle packing in unit square: maximize sum of radii for 26 disjoint circles."""
 import numpy as np
 import time
-from scipy.optimize import minimize
-from scipy.spatial import Voronoi
 from scipy.spatial import Delaunay
+from scipy.optimize import minimize
 
 N = 26
-EPS = 1e-8
-DEADLINE = 145.0  # safety margin before 150s kill
+
+# EVOLVE-BLOCK-START
+
+_start_time = time.time()
+_TIME_LIMIT = 145  # seconds, safety margin before 150s kill
 
 
-def _penalty_objective(params, penalty=1000.0):
-    """Penalty objective: minimize -sum(r) + penalty*(overlaps + wall violations)."""
-    p = params.reshape(N, 3)
-    x = p[:, 0]
-    y = p[:, 1]
-    r = p[:, 2]
-
-    score = -np.sum(r)
-
-    # Wall boundary violations
-    wx = np.maximum(0.0, r - x) + np.maximum(0.0, r - (1.0 - x))
-    wy = np.maximum(0.0, r - y) + np.maximum(0.0, r - (1.0 - y))
-    wall = np.sum(wx) + np.sum(wy)
-
-    # Pairwise overlap violations
-    iu = np.triu_indices(N, k=1)
-    dx = x[iu[0]] - x[iu[1]]
-    dy = y[iu[0]] - y[iu[1]]
-    dist = np.sqrt(dx * dx + dy * dy)
-    overlap = np.maximum(0.0, (r[iu[0]] + r[iu[1]]) - dist)
-    pair = np.sum(overlap)
-
-    return score + penalty * (pair + wall)
+def _elapsed():
+    return time.time() - _start_time
 
 
-def _penalty_grad(params, penalty=1000.0):
-    """Analytic gradient of penalty objective."""
-    p = params.reshape(N, 3)
-    x = p[:, 0]
-    y = p[:, 1]
-    r = p[:, 2]
-    n = N
-    g = np.zeros_like(params)
+def _remaining():
+    return _TIME_LIMIT - _elapsed()
 
-    # d(-sum r)/dr = -1
-    g[2::3] = -1.0
 
-    # Wall contributions
+def _softplus(z, eps=1e-4):
+    """Smooth approximation of max(z, 0) using log-sum-exp."""
+    return np.logaddexp(0, z / eps) * eps
+
+
+def _validate(circles, tol=1e-7):
+    """Check circles are inside unit square and non-overlapping."""
+    x, y, r = circles[:, 0], circles[:, 1], circles[:, 2]
+    if np.any(r < -tol) or np.any(x < -tol) or np.any(x > 1 + tol) or np.any(y < -tol) or np.any(y > 1 + tol):
+        return False
+    if np.any(x - r < -tol) or np.any(x + r > 1 + tol):
+        return False
+    if np.any(y - r < -tol) or np.any(y + r > 1 + tol):
+        return False
+    n = len(circles)
     for i in range(n):
-        if r[i] - x[i] > 0:
-            g[3*i] += penalty * (-1.0)
-            g[3*i+2] += penalty * (+1.0)
-        if r[i] - (1.0 - x[i]) > 0:
-            g[3*i] += penalty * (+1.0)
-            g[3*i+2] += penalty * (+1.0)
-        if r[i] - y[i] > 0:
-            g[3*i+1] += penalty * (-1.0)
-            g[3*i+2] += penalty * (+1.0)
-        if r[i] - (1.0 - y[i]) > 0:
-            g[3*i+1] += penalty * (+1.0)
-            g[3*i+2] += penalty * (+1.0)
-
-    # Pairwise
-    iu = np.triu_indices(n, k=1)
-    dx = x[iu[0]] - x[iu[1]]
-    dy = y[iu[0]] - y[iu[1]]
-    dist = np.sqrt(dx * dx + dy * dy)
-    dist_safe = np.maximum(dist, 1e-10)
-    ov = (r[iu[0]] + r[iu[1]]) - dist
-    active = ov > 0
-    if np.any(active):
-        ax = iu[0][active]
-        ay = iu[1][active]
-        adx = dx[active] / dist_safe[active]
-        ady = dy[active] / dist_safe[active]
-        for k in range(len(ax)):
-            i = ax[k]
-            j = ay[k]
-            g[3*i] += penalty * (-adx[k])
-            g[3*j] += penalty * (+adx[k])
-            g[3*i+1] += penalty * (-ady[k])
-            g[3*j+1] += penalty * (+ady[k])
-            g[3*i+2] += penalty * (+1.0)
-            g[3*j+2] += penalty * (+1.0)
-
-    return g
+        for j in range(i + 1, n):
+            dx = x[i] - x[j]
+            dy = y[i] - y[j]
+            dist = np.sqrt(dx * dx + dy * dy)
+            if dist < r[i] + r[j] - tol:
+                return False
+    return True
 
 
-def _voronoi_initial(seed):
-    """Initialize using Voronoi cells to estimate max possible radii."""
-    rng = np.random.RandomState(seed)
-    points = rng.uniform(0.05, 0.95, size=(N, 2))
-    
+def _fix_boundaries(circles):
+    """Project circles inside unit square and ensure non-overlap by shrinking if necessary."""
+    circles = circles.copy()
+    # First pass: Clip positions to keep circles inside the square
+    for i in range(N):
+        r = max(0.0, circles[i, 2])
+        # Ensure radius is small enough to fit in the square
+        r = min(r, 0.5)
+        circles[i, 2] = r
+        circles[i, 0] = np.clip(circles[i, 0], r, 1.0 - r)
+        circles[i, 1] = np.clip(circles[i, 1], r, 1.0 - r)
+        
+    # Second pass: Resolve overlaps by shrinking radii or moving. 
+    # Simple approach: Iteratively shrink radii of overlapping circles.
+    for _iter in range(10):
+        changed = False
+        for i in range(N):
+            for j in range(i + 1, N):
+                dx = circles[i, 0] - circles[j, 0]
+                dy = circles[i, 1] - circles[j, 1]
+                dist = np.sqrt(dx * dx + dy * dy)
+                min_dist = circles[i, 2] + circles[j, 2]
+                if dist < min_dist:
+                    # Shrink both radii slightly to resolve overlap
+                    overlap = min_dist - dist
+                    shrink = overlap / 2.0 + 1e-5
+                    circles[i, 2] = max(0.0, circles[i, 2] - shrink)
+                    circles[j, 2] = max(0.0, circles[j, 2] - shrink)
+                    # Re-clip positions after shrinking
+                    circles[i, 0] = np.clip(circles[i, 0], circles[i, 2], 1.0 - circles[i, 2])
+                    circles[i, 1] = np.clip(circles[i, 1], circles[i, 2], 1.0 - circles[i, 2])
+                    circles[j, 0] = np.clip(circles[j, 0], circles[j, 2], 1.0 - circles[j, 2])
+                    circles[j, 1] = np.clip(circles[j, 1], circles[j, 2], 1.0 - circles[j, 2])
+                    changed = True
+        if not changed:
+            break
+            
+    return circles
+
+
+def _objective_penalty(params, penalty_weight, smooth_eps=1e-4):
+    """
+    Vectorized objective with soft penalty for constraint violations.
+    params: flat array [x0, y0, r0, x1, y1, r1, ...]
+    """
+    x = params[0::3]
+    y = params[1::3]
+    r = params[2::3]
+
+    penalty = 0.0
+
+    # Boundary violations (smooth)
+    lx = r - x
+    ux = x + r - 1.0
+    ly = r - y
+    uy = y + r - 1.0
+
+    penalty += np.sum(_softplus(lx, smooth_eps) ** 2)
+    penalty += np.sum(_softplus(ux, smooth_eps) ** 2)
+    penalty += np.sum(_softplus(ly, smooth_eps) ** 2)
+    penalty += np.sum(_softplus(uy, smooth_eps) ** 2)
+
+    # Negative radius
+    penalty += np.sum(_softplus(-r, smooth_eps) ** 2)
+
+    # Full pairwise overlaps (vectorized)
+    n = len(r)
+    idx_i, idx_j = np.triu_indices(n, k=1)
+    dx = x[idx_i] - x[idx_j]
+    dy = y[idx_i] - y[idx_j]
+    dist_sq = dx * dx + dy * dy
+    dist = np.sqrt(np.maximum(dist_sq, 1e-12))
+    overlap = r[idx_i] + r[idx_j] - dist
+    penalty += np.sum(_softplus(overlap, smooth_eps) ** 2)
+
+    return -np.sum(r) + penalty_weight * penalty
+
+
+def _objective_delaunay(params, penalty_weight, smooth_eps=1e-4, contact_edges=None):
+    """
+    Objective using Delaunay-based contact graph for overlap constraints.
+    Faster than full pairwise when contact graph is sparse.
+    """
+    x = params[0::3]
+    y = params[1::3]
+    r = params[2::3]
+
+    penalty = 0.0
+
+    # Boundary violations (smooth)
+    lx = r - x
+    ux = x + r - 1.0
+    ly = r - y
+    uy = y + r - 1.0
+
+    penalty += np.sum(_softplus(lx, smooth_eps) ** 2)
+    penalty += np.sum(_softplus(ux, smooth_eps) ** 2)
+    penalty += np.sum(_softplus(ly, smooth_eps) ** 2)
+    penalty += np.sum(_softplus(uy, smooth_eps) ** 2)
+
+    # Negative radius
+    penalty += np.sum(_softplus(-r, smooth_eps) ** 2)
+
+    # Overlaps on contact edges only
+    if contact_edges is not None and len(contact_edges) > 0:
+        for (i, j) in contact_edges:
+            dx = x[i] - x[j]
+            dy = y[i] - y[j]
+            dist = np.sqrt(dx * dx + dy * dy)
+            overlap = r[i] + r[j] - dist
+            penalty += _softplus(overlap, smooth_eps) ** 2
+    else:
+        # Fallback to full pairwise
+        n = len(r)
+        idx_i, idx_j = np.triu_indices(n, k=1)
+        dx = x[idx_i] - x[idx_j]
+        dy = y[idx_i] - y[idx_j]
+        dist_sq = dx * dx + dy * dy
+        dist = np.sqrt(np.maximum(dist_sq, 1e-12))
+        overlap = r[idx_i] + r[idx_j] - dist
+        penalty += np.sum(_softplus(overlap, smooth_eps) ** 2)
+
+    return -np.sum(r) + penalty_weight * penalty
+
+
+def _get_contact_edges(circles):
+    """Get contact edges from Delaunay triangulation of centers."""
+    centers = circles[:, :2]
     try:
-        vor = Voronoi(points)
+        tri = Delaunay(centers)
+        edges = set()
+        for simplex in tri.simplices:
+            for k in range(3):
+                a, b = simplex[k], simplex[(k + 1) % 3]
+                edges.add((min(a, b), max(a, b)))
+        return list(edges)
     except Exception:
-        # Fallback to grid if Voronoi fails
-        return _grid_initial(seed)
-    
-    radii = np.zeros(N)
-    for i, p in enumerate(points):
-        # Distance to nearest neighbor
-        dists = np.linalg.norm(points - p, axis=1)
-        dists[i] = np.inf
-        min_dist_neighbor = np.min(dists)
-        
-        # Distance to walls
-        wall_dist = np.min([p[0], 1-p[0], p[1], 1-p[1]])
-        
-        # Initial radius is half the min distance, with a small safety factor
-        radii[i] = 0.5 * np.min([min_dist_neighbor, wall_dist]) * 0.95
-        
-    params = np.empty(3 * N)
-    params[0::3] = points[:, 0]
-    params[1::3] = points[:, 1]
-    params[2::3] = radii
-    
-    # Small jitter to break symmetry
-    params += rng.uniform(-1e-5, 1e-5, size=params.size)
-    return params
-
-def _hex_initial(seed):
-    """Hexagonal grid initialization."""
-    rng = np.random.RandomState(seed)
-    points = []
-    for i in range(7):
-        for j in range(7):
-            x = i
-            y = j * 1.5 + (0.5 if i % 2 else 0)
-            points.append((x, y))
-    
-    points = np.array(points)
-    points -= np.mean(points, axis=0)
-    max_coord = np.max(np.abs(points))
-    scale = 0.45 / max_coord
-    points *= scale
-    points += 0.5
-    
-    dists = np.sum((points - 0.5)**2, axis=1)
-    indices = np.argsort(dists)[:N]
-    
-    p = points[indices]
-    radii = np.full(N, 0.05)
-    
-    params = np.empty(3 * N)
-    params[0::3] = p[:, 0]
-    params[1::3] = p[:, 1]
-    params[2::3] = radii
-    
-    params += rng.uniform(-1e-4, 1e-4, size=params.size)
-    return params
+        return None
 
 
-def _grid_initial(seed):
-    """Grid of equal circles with small jitter."""
-    rng = np.random.RandomState(seed)
+def _initial_hex():
+    """Hexagonal packing initial config."""
+    cols = 5
+    rows = 6
+    positions = []
+    r = 0.09
+    for row in range(rows):
+        for col in range(cols):
+            if row % 2 == 1:
+                x = (col + 0.5) / cols + 0.5 / cols
+            else:
+                x = (col + 0.5) / cols
+            y = (row + 0.5) / rows
+            if x > 1 or y > 1:
+                continue
+            positions.append([x, y, r])
+            if len(positions) >= N:
+                break
+        if len(positions) >= N:
+            break
+    while len(positions) < N:
+        positions.append([0.5, 0.5, r * 0.5])
+    return np.array(positions[:N])
+
+
+def _initial_grid():
+    """Grid initial config."""
     side = int(np.ceil(np.sqrt(N)))
-    cells = []
+    positions = []
+    r = 0.5 / side * 0.9
     for i in range(side):
         for j in range(side):
-            cells.append(((i + 0.5) / side, (j + 0.5) / side, 0.5 / side - 1e-4))
-    cells = cells[:N]
-    arr = np.array(cells, dtype=float).reshape(-1)
-    arr += rng.uniform(-1e-5, 1e-5, size=arr.size)
-    return arr
+            x = (i + 0.5) / side
+            y = (j + 0.5) / side
+            positions.append([x, y, r])
+            if len(positions) >= N:
+                break
+        if len(positions) >= N:
+            break
+    while len(positions) < N:
+        positions.append([0.5, 0.5, r * 0.5])
+    return np.array(positions[:N])
 
 
-def _bounds():
-    lo = np.zeros(3 * N)
-    hi = np.zeros(3 * N)
+def _initial_corner_weighted(seed=0):
+    """Random config with corner preference."""
+    rng = np.random.default_rng(seed)
+    positions = []
+    corners = [[0.08, 0.08], [0.92, 0.08], [0.08, 0.92], [0.92, 0.92],
+               [0.5, 0.08], [0.5, 0.92], [0.08, 0.5], [0.92, 0.5]]
+    for cx, cy in corners:
+        positions.append([cx, cy, 0.08])
+    for _ in range(N - len(positions)):
+        x = rng.uniform(0.05, 0.95)
+        y = rng.uniform(0.05, 0.95)
+        positions.append([x, y, rng.uniform(0.06, 0.10)])
+    return np.array(positions[:N])
+
+
+def _optimize_single(xyz0, deadline):
+    """Optimize from a single initial config with adaptive penalty."""
+    params = xyz0.flatten().copy()
+    best_params = params.copy()
+    best_score = np.sum(params[2::3])
+
+    bounds = []
     for i in range(N):
-        lo[3*i] = 0.0
-        hi[3*i] = 1.0
-        lo[3*i+1] = 0.0
-        hi[3*i+1] = 1.0
-        lo[3*i+2] = 1e-6
-        hi[3*i+2] = 0.5
-    return (lo, hi)
+        bounds.append((0, 1))
+        bounds.append((0, 1))
+        bounds.append((0, 0.5))
 
-
-def _enforce_validity(params):
-    """Enforce all constraints: walls and pairwise non-overlap by shrinking radii."""
-    p = params.reshape(N, 3).copy()
-    p[:, 0] = np.clip(p[:, 0], 0.0, 1.0)
-    p[:, 1] = np.clip(p[:, 1], 0.0, 1.0)
-    p[:, 2] = np.clip(p[:, 2], 1e-6, 0.5)
-
-    # Clamp to walls
-    wall = np.minimum(np.minimum(p[:, 0], 1.0 - p[:, 0]),
-                      np.minimum(p[:, 1], 1.0 - p[:, 1]))
-    p[:, 2] = np.minimum(p[:, 2], np.maximum(wall, 1e-6))
-
-    # Iteratively resolve overlaps by shrinking the smaller circle
-    for _ in range(100):
-        iu = np.triu_indices(N, k=1)
-        dx = p[iu[0], 0] - p[iu[1], 0]
-        dy = p[iu[0], 1] - p[iu[1], 1]
-        dist = np.sqrt(dx * dx + dy * dy)
-        overlap = (p[iu[0], 2] + p[iu[1], 2]) - dist
-        active = overlap > 0
-        if not np.any(active):
-            break
-        for k in range(len(active)):
-            if not active[k]:
-                continue
-            i = iu[0][k]
-            j = iu[1][k]
-            ov = overlap[k]
-            # Shrink the smaller circle by ov (or split if equal)
-            if p[i, 2] <= p[j, 2]:
-                shrink = min(ov, p[i, 2] - 1e-6)
-                p[i, 2] -= shrink
-                rem = ov - shrink
-                if rem > 0:
-                    shrink2 = min(rem, p[j, 2] - 1e-6)
-                    p[j, 2] -= shrink2
-            else:
-                shrink = min(ov, p[j, 2] - 1e-6)
-                p[j, 2] -= shrink
-                rem = ov - shrink
-                if rem > 0:
-                    shrink2 = min(rem, p[i, 2] - 1e-6)
-                    p[i, 2] -= shrink2
-        # Re-clamp to walls
-        wall = np.minimum(np.minimum(p[:, 0], 1.0 - p[:, 0]),
-                          np.minimum(p[:, 1], 1.0 - p[:, 1]))
-        p[:, 2] = np.minimum(p[:, 2], np.maximum(wall, 1e-6))
-
-    return p
-
-
-def _score_valid(p):
-    """Compute sum of radii for a valid configuration."""
-    return np.sum(p[:, 2])
-
-
-def _shake_and_refine(p, steps=5000, time_limit=20.0, seed=42):
-    """
-    Refine a valid configuration using random perturbations (shake and solve).
-    This helps escape local minima found by gradient-based methods.
-    """
-    current_score = _score_valid(p)
-    best_p = p.copy()
-    best_score = current_score
-    rng = np.random.RandomState(seed)
-    
-    start = time.time()
-    sigma = 0.02
-    
-    for _ in range(steps):
-        if time.time() - start > time_limit:
-            break
-            
-        # Perturb positions and radii
-        p_new = best_p.copy()
-        p_new[:, :2] += rng.normal(0, sigma, size=(N, 2))
-        p_new[:, 2] += rng.normal(0, sigma * 0.5, size=N)
-        
-        # Enforce validity
-        p_new = _enforce_validity(p_new)
-        
-        # Score
-        s_new = _score_valid(p_new)
-        
-        if s_new > best_score:
-            best_score = s_new
-            best_p = p_new
-            
-    return best_p
-
-def _slsqp_refine(p, time_limit=10.0, seed=42):
-    """
-    Iterative SLSQP refinement based on contact graph.
-    """
-    best_p = p.copy()
-    best_score = _score_valid(best_p)
-    rng = np.random.RandomState(seed)
-    start = time.time()
-    
-    # We will iterate a few times, each time identifying active constraints
-    # and solving for max sum of radii subject to those constraints.
-    for iteration in range(20):
-        if time.time() > start + time_limit:
-            break
-        
-        x = best_p[:, 0]
-        y = best_p[:, 1]
-        r = best_p[:, 2]
-        
-        # Identify active constraints (contacts)
-        # 1. Wall contacts
-        # 2. Pairwise contacts
-        
-        # We define "active" as being within a small tolerance of touching
-        tol = 1e-5
-        
-        # Constraints list for SLSQP
-        constraints = []
-        
-        # Wall constraints
-        # x_i - r_i >= 0  => x_i - r_i - 0 >= 0
-        # 1 - x_i - r_i >= 0
-        # y_i - r_i >= 0
-        # 1 - y_i - r_i >= 0
-        
-        # Pairwise constraints
-        # dist(i,j) - r_i - r_j >= 0
-        
-        # Instead of adding ALL constraints, we add only active ones to speed up SLSQP
-        # and help it focus on the "rigid" parts of the packing.
-        
-        # However, SLSQP needs a consistent set. If we drop a constraint that becomes active later,
-        # we might violate it. A safer approach for "contact graph" is to include all 
-        # constraints that are "close" to active, or just all of them if N is small enough.
-        # N=26 => 325 pairs + 104 walls = 429 constraints. This is manageable for SLSQP.
-        
-        # Let's try adding all constraints but using a tighter tolerance for "activity" 
-        # in the initial guess? No, SLSQP handles inequality constraints.
-        
-        # Objective: Maximize sum(r) => Minimize -sum(r)
-        def obj(params):
-            return -np.sum(params[2::3])
-            
-        def obj_grad(params):
-            g = np.zeros_like(params)
-            g[2::3] = -1.0
-            return g
-            
-        # Constraints
-        # Format: {'type': 'ineq', 'fun': lambda x: ..., 'jac': lambda x: ...}
-        # fun(x) >= 0
-        
-        cons = []
-        
-        # Walls
-        for i in range(N):
-            # x_i - r_i >= 0
-            def wall_x1(params, i=i):
-                return params[3*i] - params[3*i+2]
-            def wall_x1_jac(params, i=i):
-                g = np.zeros_like(params)
-                g[3*i] = 1.0
-                g[3*i+2] = -1.0
-                return g
-            cons.append({'type': 'ineq', 'fun': wall_x1, 'jac': wall_x1_jac})
-            
-            # 1 - x_i - r_i >= 0
-            def wall_x2(params, i=i):
-                return 1.0 - params[3*i] - params[3*i+2]
-            def wall_x2_jac(params, i=i):
-                g = np.zeros_like(params)
-                g[3*i] = -1.0
-                g[3*i+2] = -1.0
-                return g
-            cons.append({'type': 'ineq', 'fun': wall_x2, 'jac': wall_x2_jac})
-            
-            # y_i - r_i >= 0
-            def wall_y1(params, i=i):
-                return params[3*i+1] - params[3*i+2]
-            def wall_y1_jac(params, i=i):
-                g = np.zeros_like(params)
-                g[3*i+1] = 1.0
-                g[3*i+2] = -1.0
-                return g
-            cons.append({'type': 'ineq', 'fun': wall_y1, 'jac': wall_y1_jac})
-            
-            # 1 - y_i - r_i >= 0
-            def wall_y2(params, i=i):
-                return 1.0 - params[3*i+1] - params[3*i+2]
-            def wall_y2_jac(params, i=i):
-                g = np.zeros_like(params)
-                g[3*i+1] = -1.0
-                g[3*i+2] = -1.0
-                return g
-            cons.append({'type': 'ineq', 'fun': wall_y2, 'jac': wall_y2_jac})
-            
-        # Pairs
-        iu = np.triu_indices(N, k=1)
-        for k in range(len(iu[0])):
-            i = iu[0][k]
-            j = iu[1][k]
-            
-            def pair_dist(params, i=i, j=j):
-                dx = params[3*i] - params[3*j]
-                dy = params[3*i+1] - params[3*j+1]
-                dist = np.sqrt(dx*dx + dy*dy)
-                return dist - params[3*i+2] - params[3*j+2]
-                
-            def pair_dist_jac(params, i=i, j=j):
-                g = np.zeros_like(params)
-                dx = params[3*i] - params[3*j]
-                dy = params[3*i+1] - params[3*j+1]
-                dist = np.sqrt(dx*dx + dy*dy)
-                if dist < 1e-10:
-                    dist = 1e-10
-                g[3*i] = dx / dist
-                g[3*j] = -dx / dist
-                g[3*i+1] = dy / dist
-                g[3*j+1] = -dy / dist
-                g[3*i+2] = -1.0
-                g[3*j+2] = -1.0
-                return g
-                
-            cons.append({'type': 'ineq', 'fun': pair_dist, 'jac': pair_dist_jac})
-
-        # Bounds
-        lo, hi = _bounds()
-        bounds = list(zip(lo, hi))
-        
-        # Solve
+    # Phase 1: Low penalty, focus on layout
+    penalty = 5.0
+    remaining = deadline - time.time()
+    if remaining > 4:
         try:
-            res = minimize(
-                obj,
-                best_p.flatten(),
-                method='SLSQP',
-                jac=obj_grad,
-                bounds=bounds,
-                constraints=cons,
-                options={'maxiter': 100, 'ftol': 1e-12}
-            )
-            
-            if res.success:
-                p_new = res.x.reshape(N, 3)
-                # Enforce validity just in case SLSQP drifted slightly
-                p_new = _enforce_validity(p_new)
-                s_new = _score_valid(p_new)
-                
-                if s_new > best_score:
-                    best_score = s_new
-                    best_p = p_new
-                else:
-                    # If no improvement, maybe shake a bit?
-                    # Or break if we are stagnating?
-                    pass
-                    
-        except Exception as e:
-            # If SLSQP fails, try a small shake and retry? Or just continue.
+            res = minimize(_objective_penalty, params, method='L-BFGS-B',
+                          bounds=bounds, args=(penalty, 1e-3),
+                          options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-10})
+            if res.fun < _objective_penalty(params, penalty, 1e-3):
+                params = res.x
+                best_params = params.copy()
+                best_score = np.sum(params[2::3])
+        except Exception:
             pass
-            
-    return best_p
+
+    # Phase 2: Medium penalty
+    remaining = deadline - time.time()
+    if remaining > 4:
+        penalty = 50.0
+        try:
+            res = minimize(_objective_penalty, params, method='L-BFGS-B',
+                          bounds=bounds, args=(penalty, 1e-4),
+                          options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-10})
+            if res.fun < _objective_penalty(params, penalty, 1e-4):
+                params = res.x
+                best_params = params.copy()
+                best_score = np.sum(params[2::3])
+        except Exception:
+            pass
+
+    # Phase 3: High penalty with Delaunay contact graph
+    remaining = deadline - time.time()
+    if remaining > 4:
+        penalty = 500.0
+        # Get contact edges from current best
+        circles = np.column_stack([best_params[0::3], best_params[1::3], best_params[2::3]])
+        contact_edges = _get_contact_edges(circles)
+        try:
+            res = minimize(_objective_delaunay, params, method='L-BFGS-B',
+                          bounds=bounds, args=(penalty, 1e-4, contact_edges),
+                          options={'maxiter': 300, 'ftol': 1e-12, 'gtol': 1e-10})
+            if res.fun < _objective_delaunay(params, penalty, 1e-4, contact_edges):
+                params = res.x
+                best_params = params.copy()
+                best_score = np.sum(params[2::3])
+        except Exception:
+            pass
+
+    # Final polish with full pairwise
+    remaining = deadline - time.time()
+    if remaining > 2:
+        penalty = 1000.0
+        try:
+            res = minimize(_objective_penalty, best_params, method='L-BFGS-B',
+                          bounds=bounds, args=(penalty, 1e-5),
+                          options={'maxiter': 200, 'ftol': 1e-14, 'gtol': 1e-12})
+            if res.fun < _objective_penalty(best_params, penalty, 1e-5):
+                best_params = res.x
+                best_score = np.sum(best_params[2::3])
+        except Exception:
+            pass
+
+    return best_params, best_score
 
 
 def construct():
+    """
+    Pack 26 circles in the unit square, maximizing the sum of radii.
+    Uses multi-start optimization with Delaunay-based contact graph.
+    """
     start_time = time.time()
-    deadline = start_time + DEADLINE
+    deadline = _start_time + _TIME_LIMIT
 
-    lo, hi = _bounds()
-    bounds_list = list(zip(lo, hi))
-
-    best_params = None
-    best_score = -np.inf
-
-    # Multi-start with different initializations
-    initializers = [
-        lambda s: _voronoi_initial(s),
-        lambda s: _hex_initial(s),
-        lambda s: _grid_initial(s),
+    # Generate multiple initial configurations
+    inits = [
+        _initial_hex(),
+        _initial_grid(),
+        _initial_corner_weighted(seed=42),
+        _initial_corner_weighted(seed=123),
+        _initial_corner_weighted(seed=999),
     ]
 
-    # Use more seeds to explore the landscape better
-    seeds = [42, 123, 7, 999, 555, 2024, 31415, 271828, 1234, 5678, 
-             11, 22, 33, 44, 55, 66, 77, 88, 99, 100]
-    
-    for seed in seeds:
-        if time.time() > deadline - 5:
+    best_overall = None
+    best_score_overall = -np.inf
+
+    for i, xyz0 in enumerate(inits):
+        remaining = deadline - time.time()
+        if remaining < 5:
             break
-        for init_fn in initializers:
-            if time.time() > deadline - 5:
-                break
-            
-            x0 = init_fn(seed)
-            
-            # First, enforce validity to get a safe starting point
-            x0 = _enforce_validity(x0).flatten()
-            
-            # Run SLSQP refinement (Contact Graph Aware)
-            # Allocate time per refinement
-            time_per_refine = 5.0 # 5 seconds per SLSQP run
-            if time.time() + time_per_refine > deadline:
-                 continue
-                
-            try:
-                p_refined = _slsqp_refine(x0.reshape(N, 3), time_limit=time_per_refine, seed=seed)
-                s = _score_valid(p_refined)
-                
-                if s > best_score:
-                    best_score = s
-                    best_params = p_refined.copy()
-                    
-            except Exception:
-                continue
 
-    # If we didn't find any valid solution, use a fallback
-    if best_params is None:
-        best_params = _enforce_validity(_grid_initial(42)).reshape(N, 3)
+        # Allocate time proportionally
+        alloc = min(remaining - 5, 25)
+        local_deadline = time.time() + alloc
 
-    # Final refinement: Use stochastic shake and solve to escape local minima
-    # Allocate remaining time to this step
-    remaining_time = deadline - time.time() - 2.0 # 2s safety margin
-    if remaining_time > 5.0:
-        # Run shake and refine
-        refine_seeds = [1, 2, 3, 4, 5]
-        for r_seed in refine_seeds:
-            if time.time() > deadline - 2.0:
-                break
-            t_limit = (deadline - time.time() - 2.0) / len(refine_seeds)
-            if t_limit < 1.0:
-                break
-            p_refined = _shake_and_refine(best_params, steps=10000, time_limit=t_limit, seed=r_seed)
-            s_refined = _score_valid(p_refined)
-            if s_refined > best_score:
-                best_score = s_refined
-                best_params = p_refined
-            # After shaking, try SLSQP again on the new start?
-            # This might be too slow. Let's just stick to shake.
-            # Or maybe a quick SLSQP if time permits?
-            if time.time() < deadline - 10:
-                 p_slsqp = _slsqp_refine(best_params, time_limit=5.0, seed=r_seed+100)
-                 s_slsqp = _score_valid(p_slsqp)
-                 if s_slsqp > best_score:
-                     best_score = s_slsqp
-                     best_params = p_slsqp
+        params, score = _optimize_single(xyz0, local_deadline)
 
-    # Return in the required format: (x, y, radius)
-    result = best_params.copy()
-    return result
+        # Validate
+        circles = np.column_stack([params[0::3], params[1::3], params[2::3]])
+        if _validate(circles):
+            if score > best_score_overall:
+                best_score_overall = score
+                best_overall = circles.copy()
+        else:
+            # Try to fix
+            circles_fixed = _fix_boundaries(circles)
+            if _validate(circles_fixed):
+                score_fixed = np.sum(circles_fixed[:, 2])
+                if score_fixed > best_score_overall:
+                    best_score_overall = score_fixed
+                    best_overall = circles_fixed.copy()
+
+    # Always ensure the result is valid by fixing boundaries and validating
+    if best_overall is not None:
+        # Try to repair the best result
+        repaired = _fix_boundaries(best_overall)
+        if _validate(repaired):
+            best_overall = repaired
+        else:
+            # If repair failed, discard and fall back
+            best_overall = None
+
+    if best_overall is None:
+        # Fallback: grid of 26 circles with small radii
+        result = np.zeros((N, 3))
+        side = 5
+        for idx in range(N):
+            i = idx % side
+            j = idx // side
+            result[idx, 0] = (i + 0.5) / side
+            result[idx, 1] = (j + 0.5) / side
+            result[idx, 2] = 0.5 / side * 0.8
+        return result
+
+    return best_overall
+
+# EVOLVE-BLOCK-END

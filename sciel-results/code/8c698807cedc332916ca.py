@@ -1,0 +1,167 @@
+import itertools
+import random
+import time
+
+def construct(q, n, radius):
+    # Constants for the specific task instance
+    # q=3, n=6, radius=1
+    if q != 3 or n != 6 or radius != 1:
+        # Fallback for other instances, though task implies specific
+        # Just return a trivial valid code (all words) if not the target case
+        # This is inefficient but valid
+        return [list(t) for t in itertools.product(range(q), repeat=n)]
+
+    # Precompute neighbors for all 729 words
+    # Index: v[0]*3^5 + v[1]*3^4 + ... + v[5]
+    # Convert index to tuple
+    def idx_to_tuple(idx):
+        t = [0] * n
+        for i in range(n):
+            t[n - 1 - i] = idx % q
+            idx //= q
+        return tuple(t)
+    
+    def tuple_to_idx(t):
+        idx = 0
+        for i in range(n):
+            idx = idx * q + t[i]
+        return idx
+
+    # Precompute balls
+    all_indices = list(range(q**n))
+    neighbors = [[] for _ in range(q**n)]
+    
+    # Generate all words
+    words = [tuple(t) for t in itertools.product(range(q), repeat=n)]
+    
+    for idx, w in enumerate(words):
+        neighbors[idx].append(idx)
+        for i in range(n):
+            for d in range(1, q):
+                new_w = list(w)
+                new_w[i] = (new_w[i] + d) % q
+                neighbors[idx].append(tuple_to_idx(tuple(new_w)))
+        # Remove duplicates just in case, though logic above is unique
+        neighbors[idx] = list(set(neighbors[idx]))
+
+    # Initial Code: Direct Sum of Tetracode
+    tetracode = [[a, b, (a + b) % 3, (a + 2 * b) % 3] for a in range(3) for b in range(3)]
+    initial_code_tuples = []
+    for h in tetracode:
+        for tail in itertools.product(range(3), repeat=2):
+            initial_code_tuples.append(tuple(h + list(tail)))
+    
+    code = list(initial_code_tuples)
+    
+    # Initialize cover counts
+    cover_count = [0] * (q**n)
+    for c in code:
+        c_idx = tuple_to_idx(c)
+        for nb in neighbors[c_idx]:
+            cover_count[nb] += 1
+
+    start_time = time.time()
+    deadline = 140.0 # Safety margin
+    
+    # Local Search
+    def try_remove(c_tuple):
+        c_idx = tuple_to_idx(c_tuple)
+        uncovered = []
+        for nb in neighbors[c_idx]:
+            cover_count[nb] -= 1
+            if cover_count[nb] == 0:
+                uncovered.append(nb)
+        
+        if not uncovered:
+            return True, [] # Successfully removed, no uncovered
+        else:
+            # Restore
+            for nb in neighbors[c_idx]:
+                cover_count[nb] += 1
+            return False, uncovered
+
+    def try_add(c_tuple):
+        c_idx = tuple_to_idx(c_tuple)
+        for nb in neighbors[c_idx]:
+            cover_count[nb] += 1
+
+    def find_swap_target(uncovered_indices):
+        # Find a word w such that all indices in uncovered_indices are in neighbors[w]
+        # Heuristic: Pick a random point from uncovered, check its neighbors
+        if not uncovered_indices:
+            return None
+        
+        # If only 1 point, any neighbor works
+        # If more, intersection of balls
+        # Strategy: Pick a candidate from neighbors of uncovered_indices[0]
+        # and check if it covers all others
+        
+        u0 = uncovered_indices[0]
+        candidates = neighbors[u0]
+        
+        # Shuffle candidates for randomness
+        random.shuffle(candidates)
+        
+        for c_idx in candidates:
+            # Check if c_idx covers all uncovered
+            c_nb_set = set(neighbors[c_idx])
+            if all(u in c_nb_set for u in uncovered_indices):
+                return idx_to_tuple(c_idx)
+        
+        return None
+
+    improved = True
+    while improved and time.time() < deadline:
+        improved = False
+        random.shuffle(code) # Randomize order to avoid bias
+        
+        # Phase 1: Remove
+        for i in range(len(code)):
+            if time.time() > deadline:
+                break
+            c = code[i]
+            success, uncovered = try_remove(c)
+            if success:
+                code.pop(i)
+                improved = True
+                break # Restart scan
+        
+        if time.time() > deadline:
+            break
+            
+        if improved:
+            continue
+            
+        # Phase 2: Swap
+        # Try to swap a codeword to potentially allow future removals
+        for i in range(len(code)):
+            if time.time() > deadline:
+                break
+            c = code[i]
+            success, uncovered = try_remove(c)
+            if success:
+                # Should have been caught in Phase 1, but just in case
+                code.pop(i)
+                improved = True
+                break
+            
+            # Try to find a swap
+            if uncovered:
+                new_c = find_swap_target(uncovered)
+                if new_c is not None:
+                    # Perform swap
+                    # c is already removed from cover_count
+                    try_add(new_c)
+                    code[i] = new_c
+                    improved = True
+                    break
+                else:
+                    # Restore c
+                    for nb in neighbors[tuple_to_idx(c)]:
+                        cover_count[nb] += 1
+            else:
+                # This case (uncovered empty) means removal was possible, handled above
+                pass
+
+    # Convert back to lists
+    return [list(c) for c in code]
