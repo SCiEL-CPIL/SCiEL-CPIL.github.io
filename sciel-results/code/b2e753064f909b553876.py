@@ -1,0 +1,19 @@
+import numpy as np
+
+DIMENSIONS = [2, 2, 11]
+
+# EVOLVE-BLOCK-START
+def construct():
+    n, m, p = DIMENSIONS
+    rank = 1
+    
+    # U: (n*m, rank)
+    # V: (m*p, rank)
+    # W: (p*n, rank)
+    
+    U = np.ones((n * m, rank), dtype=float)
+    V = np.ones((m * p, rank), dtype=float)
+    W = np.ones((p * n, rank), dtype=float)
+    
+    return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}
+# EVOLVE-BLOCK-END

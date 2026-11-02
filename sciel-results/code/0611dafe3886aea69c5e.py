@@ -1,0 +1,646 @@
+"""Packing 50 equal circles in a unit circle using soft-min surrogate + gradient optimization with binary search on radius."""
+import numpy as np
+import time
+from scipy.optimize import minimize
+
+N = 50
+DEADLINE = 140.0  # Safety margin for 150s limit
+
+# EVOLVE-BLOCK-START
+
+def _compute_score(centers):
+    """
+    Compute the maximum radius r for which circles centered at 'centers' 
+    are disjoint and inside the unit circle.
+    r = min( min_{i<j} |c_i - c_j| / 2, min_i (1 - |c_i|) )
+    """
+    if centers.size == 0:
+        return 0.0
+    n = centers.shape[0]
+    
+    # Pairwise distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.linalg.norm(diff, axis=2)
+    np.fill_diagonal(dists, np.inf)
+    min_pair_dist = np.min(dists)
+    
+    # Boundary distances
+    norms = np.linalg.norm(centers, axis=1)
+    min_bound_dist = np.min(1.0 - norms)
+    
+    return min(min_pair_dist / 2.0, min_bound_dist)
+
+def _soft_min_obj_and_grad(params, n, beta):
+    """
+    Objective: -soft_min(constraints)
+    Constraints: d_ij / 2 for pairs, 1 - |c_i| for boundary.
+    We want to maximize the minimum of these, so we minimize the negative soft-min.
+    """
+    centers = params.reshape(n, 2)
+    
+    # 1. Compute pair distances (vectorized)
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff * diff, axis=2))
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    pair_dists = dists[i_idx, j_idx]
+    
+    # 2. Compute boundary distances
+    norms = np.sqrt(np.sum(centers * centers, axis=1))
+    bound_dists = 1.0 - norms
+    
+    # 3. Combine all constraints into a single vector
+    vals = np.concatenate([pair_dists / 2.0, bound_dists])
+    
+    # 4. Compute Soft Min
+    m = np.min(vals)
+    shifted = vals - m
+    exp_terms = np.exp(-beta * shifted)
+    S = np.sum(exp_terms)
+    
+    obj_val = -(m - (1.0 / beta) * np.log(S))
+    
+    # 5. Compute Gradient (vectorized)
+    weights = exp_terms / S
+    
+    grad_centers = np.zeros_like(centers)
+    
+    # Pair contributions (vectorized)
+    pair_weights = weights[:n*(n-1)//2]
+    # Only include pairs with significant weight
+    mask = pair_weights > 1e-12
+    if np.any(mask):
+        i_m = i_idx[mask]
+        j_m = j_idx[mask]
+        w_m = pair_weights[mask]
+        d_m = dists[i_m, j_m]
+        d_safe = np.where(d_m > 1e-10, d_m, 1e-10)
+        vecs = (centers[i_m] - centers[j_m]) / d_safe[:, np.newaxis]
+        contrib = w_m[:, np.newaxis] * 0.5 * vecs
+        # Scatter add for i indices
+        np.add.at(grad_centers, i_m, -contrib)
+        # Scatter add for j indices
+        np.add.at(grad_centers, j_m, contrib)
+
+    # Boundary contributions (vectorized)
+    bound_weights = weights[n*(n-1)//2:]
+    mask_b = bound_weights > 1e-12
+    if np.any(mask_b):
+        idx_b = np.where(mask_b)[0]
+        w_b = bound_weights[idx_b]
+        norm_b = norms[idx_b]
+        norm_safe = np.where(norm_b > 1e-10, norm_b, 1e-10)
+        vecs_b = centers[idx_b] / norm_safe[:, np.newaxis]
+        contrib_b = w_b[:, np.newaxis] * vecs_b
+        np.add.at(grad_centers, idx_b, contrib_b)
+            
+    return obj_val, grad_centers.flatten()
+
+def _feasibility_obj_and_grad(params, n, r_target, beta):
+    """
+    For binary search: given target radius r_target, minimize the violation.
+    We use soft-min of (constraints - r_target).
+    If soft-min > 0, all constraints >= r_target (feasible)
+    """
+    centers = params.reshape(n, 2)
+    
+    # 1. Compute pair distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff * diff, axis=2))
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    pair_dists = dists[i_idx, j_idx]
+    
+    # 2. Compute boundary distances
+    norms = np.sqrt(np.sum(centers * centers, axis=1))
+    bound_dists = 1.0 - norms
+    
+    # 3. Constraints minus target radius
+    vals = np.concatenate([pair_dists / 2.0 - r_target, bound_dists - r_target])
+    
+    # 4. Compute Soft Min (we want to maximize the minimum, so minimize negative soft-min)
+    m = np.min(vals)
+    shifted = vals - m
+    exp_terms = np.exp(-beta * shifted)
+    S = np.sum(exp_terms)
+    
+    # soft_min = m - (1/beta)*log(S)
+    # We want to maximize soft_min, so minimize -soft_min
+    obj_val = -(m - (1.0 / beta) * np.log(S))
+    
+    # 5. Gradient
+    weights = exp_terms / S
+    
+    grad_centers = np.zeros_like(centers)
+    
+    # Pair contributions
+    pair_weights = weights[:n*(n-1)//2]
+    mask = pair_weights > 1e-12
+    if np.any(mask):
+        i_m = i_idx[mask]
+        j_m = j_idx[mask]
+        w_m = pair_weights[mask]
+        d_m = dists[i_m, j_m]
+        d_safe = np.where(d_m > 1e-10, d_m, 1e-10)
+        vecs = (centers[i_m] - centers[j_m]) / d_safe[:, np.newaxis]
+        contrib = w_m[:, np.newaxis] * 0.5 * vecs
+        np.add.at(grad_centers, i_m, -contrib)
+        np.add.at(grad_centers, j_m, contrib)
+
+    # Boundary contributions
+    bound_weights = weights[n*(n-1)//2:]
+    mask_b = bound_weights > 1e-12
+    if np.any(mask_b):
+        idx_b = np.where(mask_b)[0]
+        w_b = bound_weights[idx_b]
+        norm_b = norms[idx_b]
+        norm_safe = np.where(norm_b > 1e-10, norm_b, 1e-10)
+        vecs_b = centers[idx_b] / norm_safe[:, np.newaxis]
+        contrib_b = w_b[:, np.newaxis] * vecs_b
+        np.add.at(grad_centers, idx_b, contrib_b)
+            
+    return obj_val, grad_centers.flatten()
+
+def _get_ring_initialization(n):
+    """
+    Generate a ring-based initialization.
+    """
+    centers = []
+    centers.append([0.0, 0.0])
+    
+    rings = [
+        (6, 0.22),
+        (12, 0.44),
+        (12, 0.66),
+        (9, 0.82),
+        (10, 0.92)
+    ]
+    
+    count = 1
+    for count_in_ring, radius in rings:
+        if count >= n:
+            break
+        angles = np.linspace(0, 2 * np.pi, count_in_ring, endpoint=False)
+        for angle in angles:
+            if count >= n:
+                break
+            centers.append([radius * np.cos(angle), radius * np.sin(angle)])
+            count += 1
+            
+    return np.array(centers[:n])
+
+def _get_hex_lattice_initialization(n):
+    """
+    Generate a hexagonal lattice initialization.
+    """
+    r_est = 0.12
+    s = 2 * r_est
+    points = []
+    max_range = int(2.0 / s) + 3
+    
+    for j in range(-max_range, max_range + 1):
+        for i in range(-max_range, max_range + 1):
+            x = i * s + (j % 2) * s / 2.0
+            y = j * s * np.sqrt(3) / 2.0
+            if np.hypot(x, y) <= 0.95:
+                points.append([x, y])
+                
+    if len(points) < n:
+        return _get_ring_initialization(n)
+        
+    points = np.array(points)
+    dists = np.linalg.norm(points, axis=1)
+    sorted_idx = np.argsort(dists)
+    return points[sorted_idx[:n]]
+
+def _get_random_initialization(n, seed=42):
+    """Generate random initialization."""
+    rng = np.random.default_rng(seed)
+    centers = []
+    for _ in range(10000):
+        if len(centers) >= n:
+            break
+        x = rng.uniform(-1, 1)
+        y = rng.uniform(-1, 1)
+        if x*x + y*y > 0.95**2:
+            continue
+        if centers:
+            pts = np.array(centers)
+            dists = np.hypot(pts[:,0] - x, pts[:,1] - y)
+            if np.min(dists) < 0.15:
+                continue
+        centers.append([x, y])
+    
+    while len(centers) < n:
+        x = rng.uniform(-0.9, 0.9)
+        y = rng.uniform(-0.9, 0.9)
+        centers.append([x, y])
+        
+    return np.array(centers[:n])
+
+def _force_directed_relax(centers, time_budget=5.0):
+    """
+    Pre-processing step: use force-directed relaxation to resolve overlaps.
+    """
+    centers = centers.copy()
+    start_time = time.time()
+    step = 0.01
+    best_centers = centers.copy()
+    best_score = _compute_score(centers)
+    n = len(centers)
+    
+    while time.time() - start_time < time_budget:
+        forces = np.zeros_like(centers)
+        
+        # Pairwise repulsion (vectorized)
+        diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = np.sqrt(np.sum(diff * diff, axis=2))
+        np.fill_diagonal(dists, 1e10)
+        
+        # Force magnitude: 1/(d^2 + eps), direction: diff/d
+        force_mag = 1.0 / (dists * dists + 1e-6)
+        np.fill_diagonal(force_mag, 0.0)
+        force_vec = diff * force_mag[:, :, np.newaxis] / np.maximum(dists, 1e-10)[:, :, np.newaxis]
+        forces = np.sum(force_vec, axis=1)
+        
+        # Boundary constraint (vectorized)
+        radii = np.sqrt(np.sum(centers * centers, axis=1))
+        boundary_mask = radii > 0.95
+        if np.any(boundary_mask):
+            r_safe = np.maximum(radii, 1e-10)
+            forces[boundary_mask] -= 0.5 * centers[boundary_mask] / r_safe[boundary_mask][:, np.newaxis]
+        
+        new_centers = centers + step * forces
+        new_radii = np.sqrt(np.sum(new_centers * new_centers, axis=1))
+        mask = new_radii > 1.0
+        if np.any(mask):
+            new_centers[mask] = new_centers[mask] / new_radii[mask][:, None] * 0.999
+        
+        new_score = _compute_score(new_centers)
+        if new_score > best_score:
+            best_score = new_score
+            best_centers = new_centers.copy()
+            centers = new_centers
+            step *= 1.05
+        else:
+            step *= 0.9
+            centers = best_centers.copy()
+            
+        if step < 1e-8:
+            break
+            
+    return best_centers, best_score
+
+def _optimize_feasibility(centers, r_target, time_budget=5.0, beta=500.0):
+    """
+    Try to find a configuration where all constraints >= r_target.
+    Returns (success, best_centers, best_score)
+    """
+    start_time = time.time()
+    current_centers = centers.copy()
+    
+    # First do a quick force-directed relaxation
+    current_centers, _ = _force_directed_relax(current_centers, time_budget=min(2.0, time_budget * 0.2))
+    
+    # Optimize using feasibility objective
+    def fun_and_grad(x):
+        val, grad = _feasibility_obj_and_grad(x, N, r_target, beta)
+        return val, grad
+    
+    try:
+        result = minimize(
+            fun_and_grad,
+            current_centers.flatten(),
+            method='L-BFGS-B',
+            jac=True,
+            options={'maxiter': 3000, 'ftol': 1e-14, 'gtol': 1e-10, 'maxfun': 15000}
+        )
+        current_centers = result.x.reshape(N, 2)
+    except Exception:
+        pass
+    
+    # Check if feasible
+    score = _compute_score(current_centers)
+    feasible = score >= r_target - 1e-9
+    
+    return feasible, current_centers, score
+
+def _binary_search_radius(centers, r_low, r_high, time_budget=20.0):
+    """
+    Binary search for the maximum feasible radius.
+    """
+    start_time = time.time()
+    best_centers = centers.copy()
+    best_score = _compute_score(centers)
+    
+    # Ensure r_low is feasible
+    _, best_centers, best_score = _optimize_feasibility(centers, r_low, time_budget=min(3.0, time_budget * 0.1))
+    
+    for _ in range(15):  # ~15 iterations for good precision
+        if time.time() - start_time > time_budget - 5.0:
+            break
+        
+        r_mid = (r_low + r_high) / 2.0
+        elapsed = time.time() - start_time
+        remaining = time_budget - elapsed
+        if remaining < 3.0:
+            break
+        
+        time_per_check = max(1.0, min(remaining / 3.0, 5.0))
+        
+        feasible, test_centers, test_score = _optimize_feasibility(
+            best_centers, r_mid, time_budget=time_per_check, beta=1000.0
+        )
+        
+        if feasible:
+            r_low = r_mid
+            if test_score > best_score:
+                best_score = test_score
+                best_centers = test_centers.copy()
+        else:
+            r_high = r_mid
+    
+    return best_centers, best_score, r_low
+
+def _optimize_from_start(centers, time_budget=20.0):
+    """
+    Optimize starting from a given configuration.
+    Uses a combination of direct optimization and binary search.
+    """
+    start_time = time.time()
+    current_centers = centers.copy()
+    best_centers = centers.copy()
+    best_score = _compute_score(centers)
+    
+    # Force-directed relaxation first
+    current_centers, _ = _force_directed_relax(current_centers, time_budget=min(3.0, time_budget * 0.15))
+    score = _compute_score(current_centers)
+    if score > best_score:
+        best_score = score
+        best_centers = current_centers.copy()
+    
+    # Phase 1: Direct soft-min optimization with increasing beta
+    betas = [50.0, 200.0, 1000.0, 5000.0]
+    
+    for beta in betas:
+        if time.time() - start_time > time_budget - 10.0:
+            break
+        
+        elapsed = time.time() - start_time
+        remaining = time_budget - elapsed
+        if remaining < 3.0:
+            break
+            
+        def fun_and_grad(x):
+            val, grad = _soft_min_obj_and_grad(x, N, beta)
+            return val, grad
+            
+        try:
+            result = minimize(
+                fun_and_grad,
+                current_centers.flatten(),
+                method='L-BFGS-B',
+                jac=True,
+                options={'maxiter': 1500, 'ftol': 1e-14, 'gtol': 1e-10, 'maxfun': 8000}
+            )
+            current_centers = result.x.reshape(N, 2)
+        except Exception:
+            break
+            
+        score = _compute_score(current_centers)
+        if score > best_score:
+            best_score = score
+            best_centers = current_centers.copy()
+    
+    # Phase 2: Binary search on radius to refine
+    if time.time() - start_time < time_budget - 5.0:
+        remaining = time_budget - time.time()
+        if remaining > 5.0:
+            r_low = best_score * 0.999
+            r_high = best_score * 1.02
+            # Ensure r_low is feasible
+            _, _, test_score = _optimize_feasibility(best_centers, r_low, time_budget=min(2.0, remaining * 0.1))
+            if test_score > best_score:
+                best_score = test_score
+                # Re-optimize
+                _, best_centers, best_score = _optimize_feasibility(best_centers, r_low, time_budget=min(2.0, remaining * 0.1))
+            
+            binary_result = _binary_search_radius(best_centers, r_low, r_high, time_budget=remaining * 0.6)
+            if binary_result[1] > best_score:
+                best_score = binary_result[1]
+                best_centers = binary_result[0].copy()
+    
+    # Phase 3: Final high-precision polish
+    if time.time() - start_time < time_budget - 2.0:
+        remaining = time_budget - time.time()
+        if remaining > 2.0:
+            try:
+                def fun_and_grad_polish(x):
+                    val, grad = _soft_min_obj_and_grad(x, N, 500000.0)
+                    return val, grad
+                
+                result = minimize(
+                    fun_and_grad_polish,
+                    best_centers.flatten(),
+                    method='L-BFGS-B',
+                    jac=True,
+                    options={'maxiter': 3000, 'ftol': 1e-15, 'gtol': 1e-12, 'maxfun': 15000}
+                )
+                polished_centers = result.x.reshape(N, 2)
+                # Ensure validity
+                radii = np.sqrt(np.sum(polished_centers * polished_centers, axis=1))
+                mask = radii > 1.0
+                if np.any(mask):
+                    polished_centers[mask] = polished_centers[mask] / radii[mask][:, None] * 0.999999
+                polish_score = _compute_score(polished_centers)
+                if polish_score > best_score:
+                    best_score = polish_score
+                    best_centers = polished_centers.copy()
+            except Exception:
+                pass
+    
+    return best_centers, best_score
+
+def _epigraph_obj_and_grad(params, n, beta=1000.0):
+    """
+    Epigraph formulation: minimize t subject to constraints >= t.
+    Parameters: [x1,y1,...,x50,y50,t]
+    """
+    centers = params[:2*n].reshape(n, 2)
+    t = params[2*n]
+    
+    # Pair distances
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff * diff, axis=2))
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    pair_dists = dists[i_idx, j_idx]
+    
+    # Boundary distances
+    norms = np.sqrt(np.sum(centers * centers, axis=1))
+    bound_dists = 1.0 - norms
+    
+    # Constraints: we want pair_dists/2 >= t and bound_dists >= t
+    # So violations are: t - pair_dists/2 and t - bound_dists
+    # We want to minimize sum of positive violations
+    pair_viol = np.maximum(t - pair_dists / 2.0, 0.0)
+    bound_viol = np.maximum(t - bound_dists, 0.0)
+    
+    # Smooth approximation
+    eps = 1e-6
+    pair_viol_smooth = np.logaddexp(0, -beta * (t - pair_dists/2.0)) / beta
+    bound_viol_smooth = np.logaddexp(0, -beta * (t - bound_dists)) / beta
+    
+    obj_val = t + np.sum(pair_viol_smooth) + np.sum(bound_viol_smooth)
+    
+    # Gradient
+    grad = np.zeros(2*n + 1)
+    
+    # dt/dt = 1 + sum of derivatives of violations
+    pair_weight = np.exp(-beta * (t - pair_dists/2.0)) / (1.0 + np.exp(-beta * (t - pair_dists/2.0)))
+    bound_weight = np.exp(-beta * (t - bound_dists)) / (1.0 + np.exp(-beta * (t - bound_dists)))
+    
+    grad[2*n] = 1.0 - np.sum(pair_weight) - np.sum(bound_weight)
+    
+    # d/dcenters of pair violations
+    mask = pair_weight > 1e-12
+    if np.any(mask):
+        i_m = i_idx[mask]
+        j_m = j_idx[mask]
+        w_m = pair_weight[mask]
+        d_m = dists[i_m, j_m]
+        d_safe = np.where(d_m > 1e-10, d_m, 1e-10)
+        vecs = (centers[i_m] - centers[j_m]) / d_safe[:, np.newaxis]
+        contrib = w_m[:, np.newaxis] * 0.5 * vecs
+        np.add.at(grad[:2*n].reshape(n,2), i_m, contrib)
+        np.add.at(grad[:2*n].reshape(n,2), j_m, -contrib)
+    
+    # d/dcenters of bound violations
+    mask_b = bound_weight > 1e-12
+    if np.any(mask_b):
+        idx_b = np.where(mask_b)[0]
+        w_b = bound_weight[idx_b]
+        norm_b = norms[idx_b]
+        norm_safe = np.where(norm_b > 1e-10, norm_b, 1e-10)
+        vecs_b = centers[idx_b] / norm_safe[:, np.newaxis]
+        contrib_b = w_b[:, np.newaxis] * vecs_b
+        np.add.at(grad[:2*n].reshape(n,2), idx_b, -contrib_b)
+    
+    return obj_val, grad
+
+def construct():
+    """Main function to construct the packing."""
+    start_time = time.time()
+    
+    # Generate multiple diverse initializations
+    initializations = []
+    
+    # Ring structure
+    initializations.append(_get_ring_initialization(N))
+    
+    # Hex lattice
+    initializations.append(_get_hex_lattice_initialization(N))
+    
+    # Random with different seeds
+    for seed in [1, 2, 3, 4, 5]:
+        initializations.append(_get_random_initialization(N, seed=seed))
+    
+    best_centers = None
+    best_score = 0.0
+    
+    # First pass: quick optimization of all initializations
+    n_inits = len(initializations)
+    for i, init in enumerate(initializations):
+        elapsed = time.time() - start_time
+        if elapsed > DEADLINE - 15.0:
+            break
+            
+        remaining = DEADLINE - elapsed - 10.0
+        time_per_opt = max(1.0, min(remaining / (n_inits - i), 12.0))
+        
+        optimized, score = _optimize_from_start(init, time_budget=time_per_opt)
+        
+        if score > best_score:
+            best_score = score
+            best_centers = optimized.copy()
+    
+    # Second pass: refine the best solution with more time
+    if best_centers is not None and time.time() - start_time < DEADLINE - 10.0:
+        remaining = DEADLINE - time.time() - 5.0
+        if remaining > 5.0:
+            # Try epigraph formulation for a different optimization path
+            try:
+                initial_params = np.concatenate([best_centers.flatten(), [best_score * 0.999]])
+                
+                def epigraph_fun(x):
+                    val, grad = _epigraph_obj_and_grad(x, N, beta=500.0)
+                    return val, grad
+                
+                result = minimize(
+                    epigraph_fun,
+                    initial_params,
+                    method='L-BFGS-B',
+                    jac=True,
+                    options={'maxiter': 2000, 'ftol': 1e-14, 'gtol': 1e-10, 'maxfun': 10000}
+                )
+                epigraph_centers = result.x[:2*N].reshape(N, 2)
+                radii = np.sqrt(np.sum(epigraph_centers * epigraph_centers, axis=1))
+                mask = radii > 1.0
+                if np.any(mask):
+                    epigraph_centers[mask] = epigraph_centers[mask] / radii[mask][:, None] * 0.999999
+                epigraph_score = _compute_score(epigraph_centers)
+                if epigraph_score > best_score:
+                    best_score = epigraph_score
+                    best_centers = epigraph_centers.copy()
+            except Exception:
+                pass
+            
+            # Use binary search for final refinement
+            r_low = best_score * 0.999
+            r_high = best_score * 1.01
+            _, _, test_score = _optimize_feasibility(best_centers, r_low, time_budget=min(2.0, remaining * 0.15))
+            if test_score > best_score:
+                best_score = test_score
+            
+            binary_result = _binary_search_radius(best_centers, r_low, r_high, time_budget=remaining * 0.5)
+            if binary_result[1] > best_score:
+                best_score = binary_result[1]
+                best_centers = binary_result[0].copy()
+            
+            # Final polish
+            if time.time() - start_time < DEADLINE - 3.0:
+                remaining2 = DEADLINE - time.time() - 2.0
+                if remaining2 > 2.0:
+                    try:
+                        def fun_and_grad_final(x):
+                            val, grad = _soft_min_obj_and_grad(x, N, 1000000.0)
+                            return val, grad
+                        
+                        result = minimize(
+                            fun_and_grad_final,
+                            best_centers.flatten(),
+                            method='L-BFGS-B',
+                            jac=True,
+                            options={'maxiter': 5000, 'ftol': 1e-15, 'gtol': 1e-13, 'maxfun': 25000}
+                        )
+                        final_centers = result.x.reshape(N, 2)
+                        # Ensure validity
+                        radii = np.sqrt(np.sum(final_centers * final_centers, axis=1))
+                        mask = radii > 1.0
+                        if np.any(mask):
+                            final_centers[mask] = final_centers[mask] / radii[mask][:, None] * 0.999999
+                        final_score = _compute_score(final_centers)
+                        if final_score > best_score:
+                            best_score = final_score
+                            best_centers = final_centers.copy()
+                    except Exception:
+                        pass
+    
+    if best_centers is None:
+        best_centers = initializations[0]
+    
+    # Ensure validity
+    radii = np.sqrt(np.sum(best_centers * best_centers, axis=1))
+    mask = radii > 1.0
+    if np.any(mask):
+        best_centers[mask] = best_centers[mask] / radii[mask][:, None] * 0.999999
+        
+    return best_centers
+# EVOLVE-BLOCK-END

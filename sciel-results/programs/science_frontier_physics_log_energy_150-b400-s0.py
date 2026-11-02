@@ -1,4 +1,12 @@
-"""Dual-representation optimization for minimal logarithmic energy of 150 points on sphere."""
+"""Optimized logarithmic energy of 150 points on the unit sphere.
+
+Strategy:
+- Vectorized energy/gradient with tangent-space projection.
+- Riemannian L-BFGS (via exponential map) as the primary optimizer.
+- Multiple diverse initializations (Fibonacci, Halton, random, farthest-point).
+- Adaptive time allocation and final high-precision polish.
+- Penalty term to enforce minimum pairwise separation.
+"""
 import time
 import math
 import numpy as np
@@ -7,8 +15,8 @@ from scipy.optimize import minimize
 N = 150
 
 
-def _log_energy(pts):
-    """Compute logarithmic energy sum_{i<j} log(1/|x_i - x_j|) using math.fsum."""
+def _log_energy_exact(pts):
+    """Compute logarithmic energy using math.fsum for exact scoring."""
     n = len(pts)
     terms = []
     for i in range(n):
@@ -21,23 +29,28 @@ def _log_energy(pts):
 
 
 def _energy_and_grad(pts):
-    """Vectorized energy and gradient (projected to tangent space)."""
+    """Vectorized log energy and tangent-space gradient."""
     n = len(pts)
+    # Pairwise differences
     diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
     dists_sq = np.sum(diff * diff, axis=2)
     np.fill_diagonal(dists_sq, 1.0)
+    
     inv_d2 = 1.0 / dists_sq
     np.fill_diagonal(inv_d2, 0.0)
     
+    # Gradient: grad_i = -sum_{j!=i} (1/|x_i - x_j|^2) * (x_i - x_j)
+    #             = -sum_{j!=i} inv_d2[i,j] * (x_i - x_j)
+    #             = -pts[i] * sum_j inv_d2[i,j] + sum_j inv_d2[i,j] * pts[j]
     weighted_sum_pts = inv_d2 @ pts
     sum_inv_d2 = np.sum(inv_d2, axis=1)
     grad = -pts * sum_inv_d2[:, np.newaxis] + weighted_sum_pts
     
-    # Project gradient to tangent space
+    # Project to tangent space
     dot_prod = np.sum(grad * pts, axis=1)
     grad -= dot_prod[:, np.newaxis] * pts
     
-    # Compute energy (upper triangle only)
+    # Energy (upper triangle)
     iu = np.triu_indices(n, k=1)
     d = np.sqrt(dists_sq[iu])
     d = np.maximum(d, 1e-15)
@@ -46,8 +59,76 @@ def _energy_and_grad(pts):
     return energy, grad
 
 
+def _penalty_energy_and_grad(pts, min_dist=0.05, penalty_strength=100.0):
+    """
+    Energy with penalty for points closer than min_dist.
+    Penalty: sum_{i<j, d_ij < min_dist} penalty_strength * (min_dist - d_ij)^2
+    """
+    n = len(pts)
+    diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
+    dists_sq = np.sum(diff * diff, axis=2)
+    np.fill_diagonal(dists_sq, 1.0)
+    
+    d = np.sqrt(dists_sq)
+    np.fill_diagonal(d, 1.0)
+    
+    # Log energy
+    iu = np.triu_indices(n, k=1)
+    d_iu = d[iu]
+    d_iu = np.maximum(d_iu, 1e-15)
+    log_energy = np.sum(np.log(1.0 / d_iu))
+    
+    # Penalty energy
+    violations = np.maximum(0.0, min_dist - d_iu)
+    penalty = penalty_strength * np.sum(violations ** 2)
+    
+    total_energy = log_energy + penalty
+    
+    # Gradient of log energy
+    inv_d2 = 1.0 / dists_sq
+    np.fill_diagonal(inv_d2, 0.0)
+    weighted_sum_pts = inv_d2 @ pts
+    sum_inv_d2 = np.sum(inv_d2, axis=1)
+    log_grad = -pts * sum_inv_d2[:, np.newaxis] + weighted_sum_pts
+    
+    # Gradient of penalty: for each pair (i,j) with d_ij < min_dist,
+    # d/dx_i [penalty_strength * (min_dist - d_ij)^2] = 2 * penalty_strength * (min_dist - d_ij) * (x_i - x_j) / d_ij
+    # This is in the direction of increasing d_ij, so we add it to the gradient
+    # (since we want to minimize, and the penalty increases when d_ij decreases)
+    
+    # Compute penalty gradient
+    pen_grad = np.zeros_like(pts)
+    mask = d_iu < min_dist
+    if np.any(mask):
+        i_idx, j_idx = iu
+        i_mask = i_idx[mask]
+        j_mask = j_idx[mask]
+        d_mask = d_iu[mask]
+        viol = min_dist - d_mask
+        
+        # For each violating pair, add gradient contribution
+        # d/dx_i penalty = 2 * penalty_strength * viol * (x_i - x_j) / d_ij
+        # d/dx_j penalty = 2 * penalty_strength * viol * (x_j - x_i) / d_ij
+        coeff = 2.0 * penalty_strength * viol / d_mask
+        for k in range(len(i_mask)):
+            i = i_mask[k]
+            j = j_mask[k]
+            c = coeff[k]
+            pen_grad[i] += c * (pts[i] - pts[j])
+            pen_grad[j] += c * (pts[j] - pts[i])
+    
+    # Total gradient
+    grad = log_grad + pen_grad
+    
+    # Project to tangent space
+    dot_prod = np.sum(grad * pts, axis=1)
+    grad -= dot_prod[:, np.newaxis] * pts
+    
+    return total_energy, grad
+
+
 def _log_energy_fast(pts):
-    """Vectorized log energy computation for speed."""
+    """Vectorized log energy for speed."""
     n = len(pts)
     diffs = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
     dists_sq = np.sum(diffs * diffs, axis=2)
@@ -57,19 +138,34 @@ def _log_energy_fast(pts):
     return np.sum(np.log(1.0 / d))
 
 
+def _normalize(pts):
+    """Normalize points to unit sphere."""
+    norms = np.linalg.norm(pts, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-15)
+    return pts / norms
+
+
+def _exponential_map(pts, tangent_vecs):
+    """Exponential map on unit sphere."""
+    norms = np.linalg.norm(tangent_vecs, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-15)
+    cos_norms = np.cos(norms)
+    sin_norms_over_norms = np.sin(norms) / norms
+    return cos_norms * pts + sin_norms_over_norms * tangent_vecs
+
+
 def _fibonacci_sphere(n):
-    """Generate Fibonacci spiral points on unit sphere."""
+    """Fibonacci spiral points on unit sphere."""
     i = np.arange(n) + 0.5
     z = 1.0 - 2.0 * i / n
     phi = np.pi * (1.0 + np.sqrt(5.0)) * i
     r = np.sqrt(np.maximum(0.0, 1.0 - z * z))
     pts = np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
-    pts /= np.linalg.norm(pts, axis=1, keepdims=True)
-    return pts
+    return _normalize(pts)
 
 
-def _halton_sphere(n, base_start=2):
-    """Generate Halton sequence points on unit sphere."""
+def _halton_sphere(n):
+    """Halton sequence points on unit sphere."""
     def halton(index, base):
         f = 1.0
         r = 0.0
@@ -82,64 +178,201 @@ def _halton_sphere(n, base_start=2):
     
     pts = []
     for i in range(1, n + 1):
-        u1 = halton(i, base_start)
-        u2 = halton(i, base_start + 1)
-        u3 = halton(i, base_start + 2)
-        
-        # Map to sphere using spherical coordinates
+        u1 = halton(i, 2)
+        u2 = halton(i, 3)
         theta = 2.0 * np.pi * u1
         phi = np.arccos(2.0 * u2 - 1.0)
-        
         x = np.sin(phi) * np.cos(theta)
         y = np.sin(phi) * np.sin(theta)
         z = np.cos(phi)
-        
         pts.append([x, y, z])
-    
     pts = np.array(pts)
-    pts /= np.linalg.norm(pts, axis=1, keepdims=True)
+    return _normalize(pts)
+
+
+def _farthest_point_init(n, seed=0):
+    """Farthest-point sampling initialization."""
+    rng = np.random.default_rng(seed)
+    pts = np.zeros((n, 3))
+    # Start with a random point
+    pts[0] = rng.standard_normal(3)
+    pts[0] /= np.linalg.norm(pts[0])
+    
+    for i in range(1, n):
+        # Generate many candidates and pick the one farthest from all existing points
+        candidates = rng.standard_normal((500, 3))
+        candidates = _normalize(candidates)
+        min_dists = np.min([np.sum((candidates - pts[j]) ** 2, axis=1) for j in range(i)], axis=0)
+        best_idx = np.argmax(min_dists)
+        pts[i] = candidates[best_idx]
+    
     return pts
 
 
-def _normalize(pts):
-    """Normalize points to unit sphere."""
-    norms = np.linalg.norm(pts, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-15)
-    return pts / norms
+def _riemannian_lbfgs(pts, time_limit=30.0, use_penalty=False, min_dist=0.05, penalty_strength=100.0):
+    """Riemannian L-BFGS optimization using exponential map."""
+    start = time.time()
+    
+    # L-BFGS history
+    m = 10  # number of correction pairs to store
+    S = []  # step vectors
+    Y = []  # gradient difference vectors
+    
+    if use_penalty:
+        current = pts.copy()
+        energy, grad = _penalty_energy_and_grad(current, min_dist, penalty_strength)
+    else:
+        current = pts.copy()
+        energy, grad = _energy_and_grad(current)
+    
+    # Initial direction = negative gradient
+    d = -grad.copy()
+    
+    for it in range(2000):
+        if time.time() - start > time_limit - 0.5:
+            break
+        
+        # L-BFGS two-loop recursion to compute new direction
+        r = grad.copy()
+        alphas = []
+        rhos = []
+        
+        # Backward loop
+        for k in range(len(S) - 1, -1, -1):
+            s_k = S[k].flatten()
+            y_k = Y[k].flatten()
+            ys = np.sum(y_k * s_k)
+            if ys > 1e-12:
+                rho_k = 1.0 / ys
+            else:
+                rho_k = 0.0
+            alpha_k = rho_k * np.sum(s_k * r)
+            alphas.append(alpha_k)
+            r = r - alpha_k * y_k
+            rhos.append(rho_k)
+        
+        alphas.reverse()
+        rhos.reverse()
+        
+        # Initial Hessian approximation
+        if len(S) > 0:
+            s_last = S[-1].flatten()
+            y_last = Y[-1].flatten()
+            ys = np.sum(y_last * s_last)
+            if ys > 1e-12:
+                gamma = np.sum(s_last * y_last) / ys
+            else:
+                gamma = 1.0
+        else:
+            gamma = 1.0
+        
+        q = gamma * r
+        
+        # Forward loop
+        for k in range(len(S)):
+            s_k = S[k].flatten()
+            y_k = Y[k].flatten()
+            beta_k = rhos[k] * np.sum(y_k * q)
+            q = q + (alphas[k] - beta_k) * s_k
+        
+        d = -q.reshape(N, 3)
+        
+        # Project to tangent space
+        dot_prod = np.sum(d * current, axis=1)
+        d -= dot_prod[:, np.newaxis] * current
+        
+        # Line search (backtracking)
+        alpha = 1.0
+        best_energy = energy
+        best_pts = current.copy()
+        best_grad = grad.copy()
+        best_alpha = 0.0
+        
+        for ls in range(50):
+            new_pts = _exponential_map(current, alpha * d)
+            if use_penalty:
+                new_energy, new_grad = _penalty_energy_and_grad(new_pts, min_dist, penalty_strength)
+            else:
+                new_energy, new_grad = _energy_and_grad(new_pts)
+            
+            if new_energy < best_energy:
+                best_energy = new_energy
+                best_pts = new_pts
+                best_grad = new_grad
+                best_alpha = alpha
+            
+            # Armijo condition
+            if new_energy <= energy + 1e-4 * alpha * np.sum(grad * d):
+                break
+            
+            alpha *= 0.7
+        
+        if best_alpha == 0.0:
+            # Try very small step
+            alpha = 1e-3
+            for ls in range(20):
+                new_pts = _exponential_map(current, alpha * d)
+                if use_penalty:
+                    new_energy, new_grad = _penalty_energy_and_grad(new_pts, min_dist, penalty_strength)
+                else:
+                    new_energy, new_grad = _energy_and_grad(new_pts)
+                if new_energy < best_energy:
+                    best_energy = new_energy
+                    best_pts = new_pts
+                    best_grad = new_grad
+                    best_alpha = alpha
+                    break
+                alpha *= 0.5
+            if best_alpha == 0.0:
+                break
+        
+        # Update L-BFGS history
+        s_vec = (best_pts - current).flatten()
+        y_vec = (best_grad - grad).flatten()
+        sy = np.sum(s_vec * y_vec)
+        if sy > 1e-12:
+            S.append(s_vec)
+            Y.append(y_vec)
+            if len(S) > m:
+                S.pop(0)
+                Y.pop(0)
+        
+        current = best_pts
+        energy = best_energy
+        grad = best_grad
+        
+        # Convergence check
+        grad_norm = np.linalg.norm(grad)
+        if grad_norm < 1e-14:
+            break
+    
+    return current, energy
 
 
-def _exponential_map(pts, tangent_vecs):
-    """Apply exponential map on sphere: move points along tangent vectors."""
-    # For unit sphere, exponential map: exp_p(v) = cos(|v|)p + sin(|v|)/|v| v
-    norms = np.linalg.norm(tangent_vecs, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-15)
-    cos_norms = np.cos(norms)
-    sin_norms_over_norms = np.sin(norms) / norms
-    return cos_norms * pts + sin_norms_over_norms * tangent_vecs
-
-
-def _riemannian_cg(pts, time_limit=15.0, max_iter=200):
-    """Riemannian conjugate gradient on the sphere using exponential maps."""
+def _riemannian_cg(pts, time_limit=20.0):
+    """Riemannian conjugate gradient with Armijo line search."""
     start = time.time()
     current = pts.copy()
     energy, grad = _energy_and_grad(current)
     
-    # Initial search direction = negative gradient (already in tangent space)
     d = -grad.copy()
     prev_grad = grad.copy()
     
-    for it in range(max_iter):
-        if time.time() - start > time_limit - 0.1:
+    for it in range(500):
+        if time.time() - start > time_limit - 0.3:
             break
         
-        # Backtracking line search with Armijo condition
+        # Project d to tangent space
+        dot_d = np.sum(d * current, axis=1)
+        d = d - dot_d[:, np.newaxis] * current
+        
+        # Line search
         alpha = 0.5
         best_energy = energy
         best_pts = current.copy()
-        best_alpha = 0.0
         best_grad = grad.copy()
+        best_alpha = 0.0
         
-        # Try a few candidate step sizes
         for ls in range(40):
             new_pts = _exponential_map(current, alpha * d)
             new_energy, new_grad = _energy_and_grad(new_pts)
@@ -147,207 +380,85 @@ def _riemannian_cg(pts, time_limit=15.0, max_iter=200):
             if new_energy < best_energy:
                 best_energy = new_energy
                 best_pts = new_pts
-                best_alpha = alpha
                 best_grad = new_grad
+                best_alpha = alpha
             
-            # Armijo condition: accept if sufficient decrease
             if new_energy <= energy + 1e-4 * alpha * np.sum(grad * d):
                 break
             
             alpha *= 0.7
         
         if best_alpha == 0.0:
-            # Try smaller step
-            alpha = 1e-3
-            for ls in range(20):
-                new_pts = _exponential_map(current, alpha * d)
-                new_energy, new_grad = _energy_and_grad(new_pts)
-                if new_energy < best_energy:
-                    best_energy = new_energy
-                    best_pts = new_pts
-                    best_alpha = alpha
-                    best_grad = new_grad
-                    break
-                alpha *= 0.5
-            if best_alpha == 0.0:
-                break
+            break
         
-        # Update
         current = best_pts
         energy = best_energy
         grad = best_grad
         
-        # Check convergence
         grad_norm = np.linalg.norm(grad)
         if grad_norm < 1e-14:
             break
         
-        # Polak-Ribiere beta for conjugate gradient
-        d_new = -grad
-        beta = 0.0
-        if it > 0:
-            beta_num = np.sum(grad * (grad - prev_grad))
-            beta_den = np.sum(prev_grad * prev_grad)
-            if beta_den > 1e-30:
-                beta = max(0.0, beta_num / beta_den)
-            # Reset direction if beta is too large
-            if beta > 1.0:
-                beta = 0.0
+        # Polak-Ribiere update
+        beta_num = np.sum(grad * (grad - prev_grad))
+        beta_den = np.sum(prev_grad * prev_grad)
+        if beta_den > 1e-30:
+            beta = max(0.0, beta_num / beta_den)
+        else:
+            beta = 0.0
+        if beta > 1.0:
+            beta = 0.0
         
-        d = d_new + beta * d
+        d = -grad + beta * d
         prev_grad = grad.copy()
     
     return current, energy
 
 
-def _lbfgs_optimize(pts, time_limit=30.0):
-    """Optimize using L-BFGS-B with projected gradient."""
-    start = time.time()
-    
-    x0 = pts.flatten()
-    
-    def fun_and_grad(x):
-        p = x.reshape(N, 3)
-        p = _normalize(p)
-        energy, grad = _energy_and_grad(p)
-        return energy, grad.flatten()
-    
-    # Use tighter tolerances for better convergence
-    res = minimize(fun_and_grad, x0, method='L-BFGS-B', jac=True,
-                   options={'maxiter': 5000, 'ftol': 1e-18, 'gtol': 1e-14,
-                            'maxfun': 20000, 'maxls': 100})
-    
-    x_opt = res.x.reshape(N, 3)
-    x_opt = _normalize(x_opt)
-    energy = _log_energy_fast(x_opt)
-    
-    return x_opt, energy
-
-
-def _dual_optimize(pts, time_limit=40.0):
-    """Alternate between L-BFGS-B and Riemannian CG with Newton polish."""
-    start = time.time()
-    current = pts.copy()
-    energy = _log_energy_fast(current)
-    
-    # Phase 1: L-BFGS-B for coarse optimization
-    time_left = time_limit - (time.time() - start)
-    if time_left > 10:
-        current, energy = _lbfgs_optimize(current, time_limit=min(time_left * 0.5, 20.0))
-    
-    # Phase 2: Riemannian CG for fine optimization
-    time_left = time_limit - (time.time() - start)
-    if time_left > 5:
-        current, energy = _riemannian_cg(current, time_limit=min(time_left * 0.7, 15.0))
-    
-    # Phase 3: Newton-based polish
-    time_left = time_limit - (time.time() - start)
-    if time_left > 3:
-        current, energy = _polish(current, time_limit=min(time_left * 0.8, 8.0))
-    
-    # Phase 4: Final L-BFGS-B micro-polish
-    time_left = time_limit - (time.time() - start)
-    if time_left > 2:
-        current, energy = _lbfgs_optimize(current, time_limit=min(time_left, 5.0))
-    
-    return current, energy
-
-
 def _polish(pts, time_limit=5.0):
-    """High-precision polish using Riemannian Newton steps."""
+    """High-precision gradient descent with adaptive step sizes."""
     start = time.time()
     current = pts.copy()
     energy = _log_energy_fast(current)
     
-    for it in range(5000):
+    for it in range(10000):
         if time.time() - start > time_limit - 0.1:
             break
         
         e, grad = _energy_and_grad(current)
         grad_norm = np.linalg.norm(grad)
         
-        if grad_norm < 1e-15:
+        if grad_norm < 1e-16:
             break
         
-        # Try Newton-like step with Hessian approximation
-        # For log energy, the Hessian in tangent space can be approximated
-        # Use a simplified approach: scale gradient by inverse curvature estimate
-        n = len(current)
+        # Exact line search along negative gradient
+        d = -grad
+        dot_prod = np.sum(d * current, axis=1)
+        d = d - dot_prod[:, np.newaxis] * current
         
-        # Estimate local curvature from energy landscape
-        # Use a small perturbation to estimate Hessian action
-        eps = 1e-5
-        H_approx = np.zeros((n * 3, n * 3))
-        
-        # Sample Hessian-vector products in random directions
-        rng_local = np.random.default_rng(42 + it)
-        for _ in range(3):
-            v = rng_local.standard_normal((n, 3))
-            # Project to tangent space
-            dot = np.sum(v * current, axis=1)
-            v -= dot[:, np.newaxis] * current
-            v_norm = np.linalg.norm(v)
-            if v_norm > 1e-15:
-                v = v / v_norm
-                # Compute Hessian action via finite difference
-                vp = current + eps * v
-                vp = _normalize(vp)
-                e_plus, _ = _energy_and_grad(vp)
-                vm = current - eps * v
-                vm = _normalize(vm)
-                e_minus, _ = _energy_and_grad(vm)
-                hessian_v = (e_plus - 2 * e + e_minus) / (eps * eps)
-                # Add to Hessian approximation (rank-1 update)
-                H_approx += hessian_v * np.outer(v.flatten(), v.flatten())
-        
-        # Try solving for Newton step
-        try:
-            # Add regularization for stability
-            reg = 1e-6
-            H_reg = H_approx + reg * np.eye(n * 3)
-            # Solve H_reg * step = -grad
-            step = np.linalg.solve(H_reg, -grad.flatten()).reshape(n, 3)
-            
-            # Project step to tangent space
-            dot = np.sum(step * current, axis=1)
-            step -= dot[:, np.newaxis] * current
-            
-            # Scale step to ensure it's not too large
-            step_norm = np.linalg.norm(step)
-            if step_norm > 0.1:
-                step = step / step_norm * 0.1
-        except:
-            # Fallback to gradient step
-            step = -grad / (grad_norm + 1e-15)
-            step_norm = np.linalg.norm(step)
-            if step_norm > 0.01:
-                step = step / step_norm * 0.01
-        
-        # Line search along the computed step
-        alpha = 1.0
+        # Backtracking line search with sufficient decrease
+        alpha = 1.0 / (grad_norm + 1e-15)
         accepted = False
-        for ls in range(30):
-            new_pts = _exponential_map(current, alpha * step)
+        for ls in range(60):
+            new_pts = _exponential_map(current, alpha * d)
             new_energy = _log_energy_fast(new_pts)
-            
-            if new_energy < e - 1e-14 * alpha * grad_norm * np.linalg.norm(step):
+            if new_energy < e - 1e-14 * alpha * grad_norm:
+                current = new_pts
+                energy = new_energy
                 accepted = True
                 break
-            alpha *= 0.5
+            alpha *= 0.7
         
-        if accepted:
-            current = new_pts
-            energy = new_energy
-        else:
-            # If Newton step failed, try pure gradient
-            alpha = 0.01
-            for ls in range(20):
-                new_pts = _exponential_map(current, alpha * (-grad / (grad_norm + 1e-15)))
+        if not accepted:
+            # Try even smaller steps
+            for alpha in [1e-4, 1e-5, 1e-6]:
+                new_pts = _exponential_map(current, alpha * d)
                 new_energy = _log_energy_fast(new_pts)
-                if new_energy < e:
+                if new_energy < e - 1e-16:
+                    current = new_pts
+                    energy = new_energy
                     accepted = True
                     break
-                alpha *= 0.5
             if not accepted:
                 break
     
@@ -356,120 +467,113 @@ def _polish(pts, time_limit=5.0):
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 145.0  # 5s safety margin
+    deadline = start_time + 147.0  # 3s safety margin
     
-    # Generate diverse initializations
+    # Generate diverse initializations (reduced count, more time each)
     initializations = []
     
     # 1. Fibonacci spiral
-    pts_fib = _fibonacci_sphere(N)
-    initializations.append(pts_fib.copy())
+    initializations.append(_fibonacci_sphere(N).copy())
     
     # 2. Halton sequence
-    pts_halton = _halton_sphere(N)
-    initializations.append(pts_halton.copy())
+    initializations.append(_halton_sphere(N).copy())
     
-    # 3. Random initializations with different distributions
-    for seed in range(4):
+    # 3. Two random initializations
+    for seed in range(2):
         rng_local = np.random.default_rng(seed * 123 + 7)
         pts_rand = rng_local.standard_normal((N, 3))
-        pts_rand = _normalize(pts_rand)
-        initializations.append(pts_rand)
+        initializations.append(_normalize(pts_rand))
     
-    # 3b. Uniform random on sphere (proper uniform distribution)
-    for seed in range(2):
-        rng_local = np.random.default_rng(seed * 321 + 99)
-        # Generate uniform points using Marsaglia's method
-        pts_uniform = []
-        for _ in range(N):
-            while True:
-                u1 = rng_local.uniform(-1, 1)
-                u2 = rng_local.uniform(-1, 1)
-                s = u1 * u1 + u2 * u2
-                if s < 1.0 and s > 1e-15:
-                    break
-            scale = 2.0 * np.sqrt(1.0 - s)
-            pts_uniform.append([u1 * scale, u2 * scale, 1.0 - s])
-        pts_uniform = np.array(pts_uniform)
-        pts_uniform = _normalize(pts_uniform)
-        initializations.append(pts_uniform)
+    # 4. Farthest-point sampling
+    initializations.append(_farthest_point_init(N, seed=0))
     
-    # 4. Perturbed Fibonacci
-    for seed in range(3):
-        rng_local = np.random.default_rng(seed * 456 + 13)
-        pts_pert = pts_fib + rng_local.standard_normal((N, 3)) * 0.02
-        pts_pert = _normalize(pts_pert)
-        initializations.append(pts_pert)
-    
-    # 5. Perturbed Halton
-    for seed in range(2):
-        rng_local = np.random.default_rng(seed * 789 + 23)
-        pts_pert = pts_halton + rng_local.standard_normal((N, 3)) * 0.02
-        pts_pert = _normalize(pts_pert)
-        initializations.append(pts_pert)
-    
-    # 6. Different Fibonacci variants
-    for offset in [0.3, 0.7]:
-        i = np.arange(N) + offset
-        z = 1.0 - 2.0 * i / N
-        phi = np.pi * (1.0 + np.sqrt(5.0)) * i
-        r = np.sqrt(np.maximum(0.0, 1.0 - z * z))
-        pts = np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
-        initializations.append(_normalize(pts))
+    # 5. Perturbed Fibonacci
+    rng_local = np.random.default_rng(456 + 13)
+    pts_pert = _fibonacci_sphere(N) + rng_local.standard_normal((N, 3)) * 0.03
+    initializations.append(_normalize(pts_pert))
     
     best_pts = initializations[0].copy()
     best_energy = _log_energy_fast(best_pts)
     
-    # Optimize each initialization with dual-representation approach
-    # Use adaptive time allocation: give more time to promising starts
+    # Optimize each initialization
     for idx, init_pts in enumerate(initializations):
         if time.time() > deadline - 20:
             break
         
-        time_left = deadline - time.time() - 3
-        if time_left < 8:
+        time_left = deadline - time.time() - 5
+        if time_left < 10:
             break
         
-        # Allocate time based on how many initializations remain
+        # Allocate time: fewer starts, more time each
         remaining = len(initializations) - idx
-        base_time = min(time_left, max(15.0, 60.0 / remaining))
+        base_time = min(time_left, max(15.0, 100.0 / remaining))
         
-        # Use dual optimization
         try:
-            opt_pts, opt_energy = _dual_optimize(init_pts, time_limit=base_time)
+            # Phase 1: Riemannian L-BFGS with penalty for early iterations
+            t1 = min(base_time * 0.45, 18.0)
+            opt_pts, opt_energy = _riemannian_lbfgs(init_pts, time_limit=t1 * 0.5, 
+                                                     use_penalty=True, min_dist=0.04, 
+                                                     penalty_strength=80.0)
+            # Then continue without penalty
+            if time.time() < deadline - 15:
+                t1_rem = min(base_time * 0.35, 12.0)
+                if t1_rem > 2:
+                    opt_pts, opt_energy = _riemannian_lbfgs(opt_pts, time_limit=t1_rem,
+                                                             use_penalty=False)
+            
+            # Phase 2: Riemannian CG polish
+            t2 = min(base_time * 0.2, 10.0)
+            if time.time() < deadline - 10:
+                opt_pts, opt_energy = _riemannian_cg(opt_pts, time_limit=t2)
+            
+            # Phase 3: Final polish
+            if time.time() < deadline - 6:
+                opt_pts, opt_energy = _polish(opt_pts, time_limit=4.0)
             
             if opt_energy < best_energy:
                 best_energy = opt_energy
                 best_pts = opt_pts.copy()
                 
         except Exception:
-            # Fallback to simple L-BFGS-B
+            # Fallback to L-BFGS-B
             try:
-                time_left = deadline - time.time() - 3
-                if time_left > 5:
-                    opt_pts, opt_energy = _lbfgs_optimize(init_pts, time_limit=min(time_left, 15.0))
-                    if opt_energy < best_energy:
-                        best_energy = opt_energy
-                        best_pts = opt_pts.copy()
+                x0 = init_pts.flatten()
+                
+                def fun_and_grad(x):
+                    p = x.reshape(N, 3)
+                    p = _normalize(p)
+                    e, g = _energy_and_grad(p)
+                    return e, g.flatten()
+                
+                res = minimize(fun_and_grad, x0, method='L-BFGS-B', jac=True,
+                               options={'maxiter': 1000, 'ftol': 1e-16, 'gtol': 1e-12})
+                x_opt = res.x.reshape(N, 3)
+                x_opt = _normalize(x_opt)
+                e_opt = _log_energy_fast(x_opt)
+                if e_opt < best_energy:
+                    best_energy = e_opt
+                    best_pts = x_opt.copy()
             except Exception:
                 pass
     
     # Final high-precision polish on best solution
     if time.time() < deadline - 2:
-        final_time = min(deadline - time.time() - 1, 10.0)
+        final_time = min(deadline - time.time() - 1, 12.0)
         if final_time > 1.0:
             try:
-                # First do Riemannian CG for fine-tuning
-                if final_time > 5:
-                    final_pts, final_energy = _riemannian_cg(best_pts, time_limit=min(final_time * 0.6, 8.0))
+                # Riemannian CG
+                if final_time > 4:
+                    cg_time = min(final_time * 0.5, 6.0)
+                    final_pts, final_energy = _riemannian_cg(best_pts, time_limit=cg_time)
                     if final_energy < best_energy:
                         best_energy = final_energy
                         best_pts = final_pts
-                        final_time -= min(final_time * 0.6, 8.0)
+                    final_time -= cg_time
                 
-                # Then Newton polish
-                if final_time > 2:
-                    final_pts, final_energy = _polish(best_pts, time_limit=min(final_time * 0.8, 6.0))
+                # Polish with more time
+                if final_time > 1:
+                    pol_time = min(final_time * 0.9, 6.0)
+                    final_pts, final_energy = _polish(best_pts, time_limit=pol_time)
                     if final_energy < best_energy:
                         best_energy = final_energy
                         best_pts = final_pts
@@ -484,11 +588,9 @@ def construct():
         for j in range(i + 1, N):
             d = np.linalg.norm(best_pts[i] - best_pts[j])
             if d < 1e-9:
-                # Separate them slightly
                 mid = (best_pts[i] + best_pts[j]) / 2
                 perp = best_pts[i] - best_pts[j]
                 perp = perp / (np.linalg.norm(perp) + 1e-15)
-                # Find a direction perpendicular to both
                 cross = np.cross(best_pts[i], perp)
                 cross = cross / (np.linalg.norm(cross) + 1e-15)
                 best_pts[i] = _normalize(best_pts[i] + 1e-8 * cross)

@@ -1,0 +1,113 @@
+import time
+import numpy as np
+
+DIMENSIONS = [2, 2, 12]
+
+# EVOLVE-BLOCK-START
+def construct():
+    n, m, p = DIMENSIONS
+    
+    start_time = time.time()
+    timeout = 120.0
+    
+    # Strassen-based decomposition: partition p=12 columns into 6 pairs
+    # Each pair uses 7 rank-1 terms (Strassen for 2x2x2 matrix mult)
+    # Total rank = 6 * 7 = 42
+    
+    num_blocks = p // 2  # 6 blocks
+    rank = num_blocks * 7  # 42
+    
+    U = np.zeros((n * m, rank), dtype=float)
+    V = np.zeros((m * p, rank), dtype=float)
+    W = np.zeros((p * n, rank), dtype=float)
+    
+    # Strassen coefficients for 2x2x2 matrix multiplication
+    # A: a00=0, a01=1, a10=2, a11=3
+    # B: b00=0, b01=1, b10=2, b11=3  
+    # C: c00=0, c01=1, c10=2, c11=3
+    strassen_terms = [
+        {0: 1, 3: 1}, {0: 1, 3: 1}, {0: 1, 3: 1}, 
+        {2: 1, 3: 1}, {0: 1}, {2: 1, 3: -1}, 
+        {0: 1}, {2: 1, 3: -1}, {1: 1, 3: 1},  
+        {3: 1}, {1: 1, 0: -1}, {0: 1, 2: 1},  
+        {0: 1, 1: 1}, {3: 1}, {0: 1, 1: -1}, 
+        {2: 1, 0: -1}, {0: 1, 2: 1}, {3: 1},        
+        {1: 1, 3: -1}, {1: 1, 3: 1}, {0: 1},        
+    ]
+    
+    for t in range(num_blocks):
+        for s in range(7):
+            col = t * 7 + s
+            u_coeffs = strassen_terms[s * 3]
+            v_coeffs = strassen_terms[s * 3 + 1]
+            w_coeffs = strassen_terms[s * 3 + 2]
+            
+            for a_idx, val in u_coeffs.items():
+                U[a_idx, col] = val
+            
+            for local_b, val in v_coeffs.items():
+                if local_b == 0:
+                    global_b = 2 * t
+                elif local_b == 1:
+                    global_b = 2 * t + 1
+                elif local_b == 2:
+                    global_b = m * p // 2 + 2 * t
+                else:
+                    global_b = m * p // 2 + 2 * t + 1
+                V[global_b, col] = val
+            
+            for local_c, val in w_coeffs.items():
+                if local_c == 0:
+                    global_w = (2 * t) * n + 0
+                elif local_c == 1:
+                    global_w = (2 * t + 1) * n + 0
+                elif local_c == 2:
+                    global_w = (2 * t) * n + 1
+                else:
+                    global_w = (2 * t + 1) * n + 1
+                W[global_w, col] += val
+    
+    # Verify decomposition
+    def verify(U, V, W, tol=1e-10):
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    c_idx = k * n + i
+                    a_idx = i * m + j
+                    b_idx = j * p + k
+                    val = np.dot(U[a_idx, :], np.multiply(V[b_idx, :], W[c_idx, :]))
+                    if abs(val - 1.0) > tol:
+                        return False
+        for a in range(n * m):
+            for b in range(m * p):
+                for c in range(p * n):
+                    i = a // m
+                    j = a % m
+                    jj = b // p
+                    k = b % p
+                    kk = c // n
+                    ii = c % n
+                    if (i == ii and j == jj and k == kk):
+                        continue
+                    val = np.dot(U[a, :], np.multiply(V[b, :], W[c, :]))
+                    if abs(val) > tol:
+                        return False
+        return True
+    
+    if not verify(U, V, W):
+        # Fallback to schoolbook
+        rank_fb = n * m * p
+        U_fb = np.zeros((n * m, rank_fb), dtype=float)
+        V_fb = np.zeros((m * p, rank_fb), dtype=float)
+        W_fb = np.zeros((p * n, rank_fb), dtype=float)
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    col = i * m * p + j * p + k
+                    U_fb[i * m + j, col] = 1.0
+                    V_fb[j * p + k, col] = 1.0
+                    W_fb[k * n + i, col] = 1.0
+        return {"U": U_fb.tolist(), "V": V_fb.tolist(), "W": W_fb.tolist()}
+    
+    return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}
+# EVOLVE-BLOCK-END

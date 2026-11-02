@@ -1,0 +1,3 @@
+for trial_x in range(x + 1, x + window):
+...
+for trial_x in range(x + window, x + window + 1000):

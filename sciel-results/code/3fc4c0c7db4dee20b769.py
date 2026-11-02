@@ -1,0 +1,1 @@
+BET: {mechanism: "Hardcoded verified blocks eliminate the unreliable numerical search failure mode; linear dependency reduction on the 32-term base may uncover rank-30/31 solutions; the 2x2x4+2x2x5 split with search for the 5-column block targets rank 25-27 via the directive's shared-rank-1 overlap strategy", q: 0.35, delta: [0.0, 0.15]}
