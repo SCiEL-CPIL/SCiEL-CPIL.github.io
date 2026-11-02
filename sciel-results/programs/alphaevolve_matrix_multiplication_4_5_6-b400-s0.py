@@ -128,6 +128,70 @@ def _build_strassen_4x4():
     
     return U, V, W
 
+def _build_strassen_4x4x2():
+    """
+    Build 4x4x2 decomposition using 4 Strassen 2x2x2 blocks.
+    A is 4x4, B is 4x2, C is 4x2.
+    Rank = 28.
+    """
+    U2, V2, W2 = _build_strassen_2x2()
+    
+    rank = 28
+    U = [[0]*rank for _ in range(16)] # 4x4 = 16 rows
+    V = [[0]*rank for _ in range(8)]  # 4x2 = 8 rows
+    W = [[0]*rank for _ in range(8)]  # 4x2 = 8 rows (p*n = 2*4)
+    
+    def add_strassen_block(a_i_start, a_j_start, b_j_start, c_i_start, c_k_start, base_rank):
+        for t in range(7):
+            col = base_rank + t
+            
+            # A part
+            for li in range(2):
+                for lj in range(2):
+                    local_a_row = li * 2 + lj
+                    coeff_a = U2[local_a_row][t]
+                    if coeff_a != 0:
+                        global_i = a_i_start + li
+                        global_j = a_j_start + lj
+                        u_row = global_i * 4 + global_j # m=4
+                        U[u_row][col] += coeff_a
+                        
+            # B part
+            for lj in range(2):
+                for lk in range(2):
+                    local_b_row = lj * 2 + lk
+                    coeff_b = V2[local_b_row][t]
+                    if coeff_b != 0:
+                        global_j = b_j_start + lj
+                        global_k = c_k_start + lk # B's col is C's col
+                        v_row = global_j * 2 + global_k # p=2
+                        V[v_row][col] += coeff_b
+                        
+            # C part
+            for lk in range(2):
+                for li in range(2):
+                    local_c_row = lk * 2 + li
+                    coeff_c = W2[local_c_row][t]
+                    if coeff_c != 0:
+                        global_k = c_k_start + lk
+                        global_i = c_i_start + li
+                        w_row = global_k * 4 + global_i # n=4
+                        W[w_row][col] += coeff_c
+
+    # 1. A11 * B11 -> C11
+    add_strassen_block(0, 0, 0, 0, 0, 0)
+    
+    # 2. A12 * B21 -> C11
+    add_strassen_block(0, 2, 2, 0, 0, 7)
+    
+    # 3. A21 * B11 -> C21
+    add_strassen_block(2, 0, 0, 2, 0, 14)
+    
+    # 4. A22 * B21 -> C21
+    add_strassen_block(2, 2, 2, 2, 0, 21)
+    
+    return U, V, W
+
 def _build_schoolbook(n, m, p):
     """
     Build schoolbook decomposition for n x m * m x p -> n x p.
@@ -214,8 +278,8 @@ def construct():
         U2, V2, W2 = _build_schoolbook(4, 1, 6)
         decomp2 = (U2, V2, W2, (0, 4), (4, 5), (0, 6))
         
-        # 3. Build 4x4x2 Schoolbook (Rank 32) - Safer than the buggy Strassen attempt
-        U3, V3, W3 = _build_schoolbook(4, 4, 2)
+        # 3. Build 4x4x2 Strassen (Rank 28)
+        U3, V3, W3 = _build_strassen_4x4x2()
         decomp3 = (U3, V3, W3, (0, 4), (0, 4), (4, 6))
         
         U, V, W = _combine_decompositions([decomp1, decomp2, decomp3], n, m, p)

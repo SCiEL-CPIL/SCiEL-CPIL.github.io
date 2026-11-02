@@ -1,0 +1,242 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+N = 21
+
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.optimize import minimize
+import time
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 115  # Safety margin
+    
+    best_value = -np.inf
+    best_result = None
+    best_w = 1.0
+    best_h = 1.0
+
+    def is_valid(x, w, h, tol=1e-6):
+        """Check if configuration is strictly valid with tolerance."""
+        n = len(x) // 3
+        # Check bounds
+        for i in range(n):
+            xi, yi, ri = x[3*i], x[3*i+1], x[3*i+2]
+            if ri < 1e-9:
+                return False
+            if xi - ri < -tol or xi + ri > w + tol or yi - ri < -tol or yi + ri > h + tol:
+                return False
+        
+        # Check disjointness
+        for i in range(n):
+            xi, yi, ri = x[3*i], x[3*i+1], x[3*i+2]
+            for j in range(i+1, n):
+                xj, yj, rj = x[3*j], x[3*j+1], x[3*j+2]
+                dx = xi - xj
+                dy = yi - yj
+                dist_sq = dx*dx + dy*dy
+                min_dist = ri + rj
+                # Use squared distance to avoid sqrt and be precise
+                if dist_sq < (min_dist - tol)**2:
+                    return False
+        return True
+
+    def check_and_update(x, w, h):
+        nonlocal best_value, best_result, best_w, best_h
+        if time.time() > deadline:
+            return
+        
+        if is_valid(x, w, h, tol=1e-5):
+            val = np.sum(x[2::3])
+            if val > best_value:
+                best_value = val
+                best_result = x.copy()
+                best_w = w
+                best_h = h
+
+    def soft_objective(params, w, h, beta=50.0):
+        """
+        Smooth soft-constraint objective.
+        We want to maximize sum(r), so we minimize -sum(r) + penalty.
+        Penalty uses exponential soft barriers for overlaps and boundary violations.
+        """
+        xs = params[0::3]
+        ys = params[1::3]
+        rs = params[2::3]
+        
+        # Ensure radii are positive for the soft terms to make sense
+        # If any radius is too small, add a large penalty
+        min_r = np.min(rs)
+        if min_r < 1e-6:
+            return 1e6 - min_r - np.sum(rs)
+            
+        penalty = 0.0
+        sum_r = np.sum(rs)
+        
+        # Boundary soft constraints
+        # We want xi - ri >= 0, xi + ri <= w, etc.
+        # Violation v = max(0, -xi + ri) etc.
+        # Soft penalty: exp(beta * v)
+        
+        # Left
+        v_l = np.maximum(0, rs - xs)
+        # Right
+        v_r = np.maximum(0, xs + rs - w)
+        # Bottom
+        v_b = np.maximum(0, rs - ys)
+        # Top
+        v_t = np.maximum(0, ys + rs - h)
+        
+        # Sum of exps
+        penalty += np.sum(np.exp(beta * v_l)) + np.sum(np.exp(beta * v_r))
+        penalty += np.sum(np.exp(beta * v_b)) + np.sum(np.exp(beta * v_t))
+        
+        # Overlap soft constraints
+        # For each pair i, j: dist > ri + rj
+        # Violation v = max(0, ri + rj - dist)
+        for i in range(N):
+            for j in range(i+1, N):
+                dx = xs[i] - xs[j]
+                dy = ys[i] - ys[j]
+                dist = np.sqrt(dx*dx + dy*dy)
+                min_dist = rs[i] + rs[j]
+                v = max(0, min_dist - dist)
+                if v > 0:
+                    penalty += np.exp(beta * v)
+        
+        return penalty - sum_r
+
+    def polish(x, w, h):
+        """Attempt to fix small violations and maximize radii further using the soft objective."""
+        if time.time() > deadline:
+            return x
+        
+        bounds = []
+        r_max = min(w, h) / 2.0
+        for i in range(N):
+            bounds.append((0, w))
+            bounds.append((0, h))
+            bounds.append((1e-6, r_max))
+            
+        try:
+            # Use higher beta for polishing to make constraints harder
+            res = minimize(lambda p: soft_objective(p, w, h, beta=100.0), x, method='L-BFGS-B', bounds=bounds, 
+                           options={'maxiter': 300, 'ftol': 1e-10, 'gtol': 1e-8})
+            if res.success and is_valid(res.x, w, h, tol=1e-6):
+                if np.sum(res.x[2::3]) >= np.sum(x[2::3]) - 1e-6:
+                    return res.x
+        except Exception:
+            pass
+        return x
+
+    # Loop over aspect ratios
+    widths = np.linspace(0.7, 1.5, 13)
+    
+    for w in widths:
+        if time.time() > deadline:
+            break
+        h = 2.0 - w
+        
+        # Initialize with a grid
+        a = int(np.ceil(np.sqrt(N * w / h)))
+        b = int(np.ceil(N / a))
+        while a * b < N:
+            b += 1
+            
+        centers = np.zeros((N, 2))
+        for i in range(N):
+            col = i % a
+            row = i // a
+            centers[i][0] = (col + 0.5) * w / a
+            centers[i][1] = (row + 0.5) * h / b
+            
+        r_est = 0.5 * min(w/a, h/b) * 0.8
+        r_est = min(r_est, w/2, h/2)
+        
+        x0 = np.zeros(3*N)
+        for i in range(N):
+            x0[3*i] = centers[i][0]
+            x0[3*i+1] = centers[i][1]
+            x0[3*i+2] = r_est
+            
+        bounds = []
+        r_max = min(w, h) / 2.0
+        for i in range(N):
+            bounds.append((0, w))
+            bounds.append((0, h))
+            bounds.append((1e-4, r_max))
+            
+        # Multi-start with slight jitter and different beta
+        for restart in range(3):
+            if time.time() > deadline:
+                break
+                
+            x_current = x0.copy()
+            if restart > 0:
+                # Add jitter
+                for i in range(N):
+                    x_current[3*i] += np.random.uniform(-0.05, 0.05)
+                    x_current[3*i+1] += np.random.uniform(-0.05, 0.05)
+                    # Clip to bounds
+                    x_current[3*i] = np.clip(x_current[3*i], 0, w)
+                    x_current[3*i+1] = np.clip(x_current[3*i+1], 0, h)
+            
+            beta = 20.0 + 10.0 * restart # Start softer, get harder
+            
+            try:
+                res = minimize(lambda p: soft_objective(p, w, h, beta=beta), x_current, 
+                               method='L-BFGS-B', bounds=bounds, 
+                               options={'maxiter': 200, 'ftol': 1e-8, 'gtol': 1e-6})
+                
+                if time.time() > deadline:
+                    break
+                
+                if res.success:
+                    # Polish with tighter constraints
+                    polished = polish(res.x, w, h)
+                    check_and_update(polished, w, h)
+                else:
+                    check_and_update(res.x, w, h)
+                    
+            except Exception:
+                pass
+
+    # Fallback if no valid result found
+    if best_result is None:
+        a, b = 7, 3
+        w, h = 1.4, 0.6
+        r = 0.09
+        best_result = np.zeros(3*N)
+        for i in range(a):
+            for j in range(b):
+                idx = i*b + j
+                best_result[3*idx] = (i + 0.5) * w / a
+                best_result[3*idx+1] = (j + 0.5) * h / b
+                best_result[3*idx+2] = r
+        best_w = w
+        best_h = h
+
+    # Final strict validation and correction
+    if not is_valid(best_result, best_w, best_h, tol=1e-7):
+        for i in range(N):
+            best_result[3*i+2] *= 0.99
+        
+        if not is_valid(best_result, best_w, best_h, tol=1e-7):
+            a, b = 7, 3
+            w, h = 1.4, 0.6
+            r = 0.05
+            best_result = np.zeros(3*N)
+            for i in range(a):
+                for j in range(b):
+                    idx = i*b + j
+                    best_result[3*idx] = (i + 0.5) * w / a
+                    best_result[3*idx+1] = (j + 0.5) * h / b
+                    best_result[3*idx+2] = r
+            best_w = w
+            best_h = h
+
+    result = np.zeros((N, 3))
+    for i in range(N):
+        result[i] = best_result[3*i:3*i+3]
+    
+    return result
+# EVOLVE-BLOCK-END

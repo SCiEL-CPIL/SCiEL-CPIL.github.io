@@ -1,0 +1,261 @@
+import numpy as np
+import time
+import scipy.optimize as opt
+from scipy.spatial import ConvexHull
+
+N = 13
+
+# EVOLVE-BLOCK-START
+def construct():
+    start_time = time.time()
+    time_limit = 145.0  # Leave 5s margin for safety
+
+    # Precompute indices for all triples as numpy arrays for vectorized computation
+    tri_i = []
+    tri_j = []
+    tri_k = []
+    for i in range(N):
+        for j in range(i+1, N):
+            for k in range(j+1, N):
+                tri_i.append(i)
+                tri_j.append(j)
+                tri_k.append(k)
+    tri_i = np.array(tri_i, dtype=np.int32)
+    tri_j = np.array(tri_j, dtype=np.int32)
+    tri_k = np.array(tri_k, dtype=np.int32)
+    n_triples = len(tri_i)
+    
+    def compute_score(points):
+        """Compute min triangle area / convex hull area for given points."""
+        try:
+            hull = ConvexHull(points)
+            area_hull = hull.volume
+        except Exception:
+            return 0.0, 0.0
+            
+        if area_hull < 1e-9:
+            return 0.0, 0.0
+
+        x = points[:, 0]
+        y = points[:, 1]
+        # Vectorized triangle area computation
+        v1x = x[tri_j] - x[tri_i]
+        v1y = y[tri_j] - y[tri_i]
+        v2x = x[tri_k] - x[tri_i]
+        v2y = y[tri_k] - y[tri_i]
+        cross = np.abs(v1x * v2y - v1y * v2x)
+        areas = 0.5 * cross
+        min_area = np.min(areas)
+
+        score = min_area / area_hull
+        return score, area_hull
+
+    def _soft_min_score(points, beta=50.0):
+        """
+        Smooth surrogate: use log-sum-exp to approximate the minimum triangle area.
+        Returns negative soft-min score for minimization.
+        """
+        try:
+            hull = ConvexHull(points)
+            area_hull = hull.volume
+        except Exception:
+            return 1e6
+            
+        if area_hull < 1e-9:
+            return 1e6
+
+        x = points[:, 0]
+        y = points[:, 1]
+        
+        # Vectorized triangle area computation
+        v1x = x[tri_j] - x[tri_i]
+        v1y = y[tri_j] - y[tri_i]
+        v2x = x[tri_k] - x[tri_i]
+        v2y = y[tri_k] - y[tri_i]
+        cross = np.abs(v1x * v2y - v1y * v2x)
+        areas = 0.5 * cross
+
+        # Soft-min via log-sum-exp
+        neg_beta_areas = -beta * areas
+        max_val = np.max(neg_beta_areas)
+        if max_val < -1e6:
+            return 1e6
+        log_sum_exp = max_val + np.log(np.sum(np.exp(neg_beta_areas - max_val)))
+        soft_min_area = -log_sum_exp / beta
+
+        score = soft_min_area / area_hull
+        return -score
+
+    def _hard_score_neg(points_flat):
+        """Negative hard score for final evaluation."""
+        points = points_flat.reshape(-1, 2)
+        score, _ = compute_score(points)
+        return -score
+
+    def _soft_objective(points_flat, beta=50.0):
+        """Soft-min objective for gradient-based optimization."""
+        points = points_flat.reshape(-1, 2)
+        return _soft_min_score(points, beta)
+
+    def _regular_polygon(n, radius=1.0, center=(0.0, 0.0)):
+        """Generate points of a regular n-gon."""
+        if n == 1:
+            return np.array([center])
+        angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        xs = center[0] + radius * np.cos(angles)
+        ys = center[1] + radius * np.sin(angles)
+        return np.column_stack([xs, ys])
+
+    def _make_config(k_hull, k_inner, seed=0):
+        """
+        Create a configuration with k_hull points on a regular polygon
+        and k_inner points arranged inside.
+        """
+        rng = np.random.RandomState(seed)
+        hull_pts = _regular_polygon(k_hull, radius=1.0)
+        # Add small random perturbation to break symmetry
+        hull_pts = hull_pts + rng.randn(k_hull, 2) * 0.01
+        
+        if k_inner == 0:
+            return hull_pts
+        
+        # Arrange interior points
+        if k_inner == 1:
+            inner_pts = np.array([[0.0, 0.0]])
+        else:
+            # Place interior points on a smaller circle with random offset
+            inner_pts = _regular_polygon(k_inner, radius=0.3, center=(0.0, 0.0))
+            inner_pts = inner_pts + rng.randn(k_inner, 2) * 0.05
+        
+        return np.vstack([hull_pts, inner_pts])
+
+    best_points = None
+    best_score = -float('inf')
+    
+    # Focus primarily on k_hull=13 (all points on hull) with multiple seeds
+    # Then try a few other configurations if time permits
+    
+    # Primary: k_hull=13 with several random perturbations
+    for seed in [0, 1, 2, 3, 4]:
+        if time.time() > start_time + time_limit - 20:
+            break
+        
+        config = _make_config(N, 0, seed=seed)
+        
+        # Evaluate initial config
+        s, _ = compute_score(config)
+        if s > best_score:
+            best_score = s
+            best_points = config.copy()
+        
+        # Optimize this specific configuration with beta annealing
+        current = config.copy()
+        # More aggressive beta annealing with more iterations
+        for beta in [10.0, 30.0, 80.0, 150.0, 300.0]:
+            if time.time() > start_time + time_limit - 20:
+                break
+            try:
+                result = opt.minimize(
+                    lambda x, b=beta: _soft_objective(x, b),
+                    current.flatten(),
+                    method='L-BFGS-B',
+                    options={'maxiter': 120, 'ftol': 1e-14, 'gtol': 1e-12, 'maxls': 50}
+                )
+                optimized = result.x.reshape(-1, 2)
+                opt_score, _ = compute_score(optimized)
+                if opt_score > best_score:
+                    best_score = opt_score
+                    best_points = optimized.copy()
+                current = optimized
+            except Exception:
+                pass
+        
+        # Quick NM polish
+        if best_points is not None and time.time() < start_time + time_limit - 15:
+            try:
+                res = opt.minimize(
+                    _hard_score_neg,
+                    best_points.flatten(),
+                    method='Nelder-Mead',
+                    options={'maxiter': 150, 'adaptive': True, 'xatol': 1e-11, 'fatol': 1e-13}
+                )
+                nm_points = res.x.reshape(-1, 2)
+                nm_score, _ = compute_score(nm_points)
+                if nm_score > best_score:
+                    best_score = nm_score
+                    best_points = nm_points.copy()
+            except Exception:
+                pass
+
+    # Try a few k_hull=12 configs if time permits
+    if time.time() < start_time + time_limit - 25:
+        for seed in [0, 1]:
+            if time.time() > start_time + time_limit - 20:
+                break
+            
+            config = _make_config(12, 1, seed=seed + 10)
+            
+            s, _ = compute_score(config)
+            if s > best_score:
+                best_score = s
+                best_points = config.copy()
+            
+            current = config.copy()
+            for beta in [20.0, 60.0, 120.0]:
+                if time.time() > start_time + time_limit - 20:
+                    break
+                try:
+                    result = opt.minimize(
+                        lambda x, b=beta: _soft_objective(x, b),
+                        current.flatten(),
+                        method='L-BFGS-B',
+                        options={'maxiter': 80, 'ftol': 1e-13, 'gtol': 1e-11}
+                    )
+                    optimized = result.x.reshape(-1, 2)
+                    opt_score, _ = compute_score(optimized)
+                    if opt_score > best_score:
+                        best_score = opt_score
+                        best_points = optimized.copy()
+                    current = optimized
+                except Exception:
+                    pass
+
+    # Final global polish with high beta
+    if best_points is not None and time.time() < start_time + time_limit - 8:
+        try:
+            result = opt.minimize(
+                lambda x: _soft_objective(x, 500.0),
+                best_points.flatten(),
+                method='L-BFGS-B',
+                options={'maxiter': 150, 'ftol': 1e-15, 'gtol': 1e-13, 'maxls': 50}
+            )
+            polished = result.x.reshape(-1, 2)
+            pol_score, _ = compute_score(polished)
+            if pol_score > best_score:
+                best_score = pol_score
+                best_points = polished.copy()
+        except Exception:
+            pass
+        
+        if time.time() < start_time + time_limit - 3:
+            try:
+                res = opt.minimize(
+                    _hard_score_neg,
+                    best_points.flatten(),
+                    method='Nelder-Mead',
+                    options={'maxiter': 300, 'adaptive': True, 'xatol': 1e-13, 'fatol': 1e-15}
+                )
+                final_points = res.x.reshape(-1, 2)
+                final_score, _ = compute_score(final_points)
+                if final_score > best_score:
+                    best_score = final_score
+                    best_points = final_points.copy()
+            except Exception:
+                pass
+
+    if best_points is None:
+        best_points = _regular_polygon(13, radius=1.0)
+    
+    return best_points
+
+# EVOLVE-BLOCK-END

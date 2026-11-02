@@ -1,0 +1,1 @@
+BET: {mechanism: "Attempting rank-54 via numerical optimization may find a lower-rank solution, but the structural analysis suggests rank 55 is likely minimal for this block decomposition; probability of success is low", q: 0.05, delta: [0.0, 0.0185]}

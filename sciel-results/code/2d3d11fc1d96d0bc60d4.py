@@ -1,0 +1,240 @@
+import numpy as np
+from scipy.spatial import ConvexHull
+from itertools import combinations
+
+N = 13
+
+def _score_configuration(points):
+    """
+    Calculate the score for a given set of points.
+    Score = min_triangle_area / convex_hull_area
+    """
+    # Remove duplicate points if any (shouldn't happen in our symmetric search)
+    points = np.unique(points, axis=0)
+    if len(points) < 3:
+        return 0.0
+    
+    # Calculate Convex Hull Area
+    try:
+        hull = ConvexHull(points)
+        hull_area = hull.volume # In 2D, volume is area
+    except Exception:
+        return 0.0
+    
+    if hull_area <= 1e-10:
+        return 0.0
+        
+    # Calculate min triangle area
+    min_area = float('inf')
+    # 13 points -> 286 triangles
+    # Vectorized calculation might be faster, but 286 is small
+    for i in range(len(points)):
+        for j in range(i+1, len(points)):
+            for k in range(j+1, len(points)):
+                p1, p2, p3 = points[i], points[j], points[k]
+                # Area = 0.5 * | (x2-x1)(y3-y1) - (x3-x1)(y2-y1) |
+                area = 0.5 * abs((p2[0]-p1[0])*(p3[1]-p1[1]) - (p3[0]-p1[0])*(p2[1]-p1[1]))
+                if area < min_area:
+                    min_area = area
+                    
+    return min_area / hull_area
+
+def construct():
+    best_score = 0.0
+    best_points = None
+    
+    # Search parameters
+    # r: ratio of inner radius to outer radius (outer is fixed at 1.0)
+    # phi: angular offset of inner ring relative to outer ring (0 to 60 degrees)
+    
+    # Coarse search
+    r_vals = np.linspace(0.1, 1.0, 50)
+    phi_vals = np.linspace(0, np.pi/3, 36)
+    
+    # Outer points are fixed at radius 1, angles 0, 60, ...
+    outer_angles = np.arange(6) * (np.pi / 3)
+    outer_pts = np.column_stack([np.cos(outer_angles), np.sin(outer_angles)])
+    
+    for r in r_vals:
+        for phi in phi_vals:
+            inner_angles = outer_angles + phi
+            inner_pts = r * np.column_stack([np.cos(inner_angles), np.sin(inner_angles)])
+            
+            # Add center
+            center = np.array([[0.0, 0.0]])
+            
+            points = np.vstack([center, outer_pts, inner_pts])
+            
+            # Check for duplicates (if r is very small or phi aligns with outer)
+            # If r=0, inner points are all at center.
+            # We should avoid r=0 to keep 13 distinct points if possible, 
+            # but the problem says "13 points", usually implies distinct.
+            # If duplicates exist, np.unique will reduce count, score might be invalid or 0.
+            # Let's enforce r > 0.05 to be safe.
+            
+            score = _score_configuration(points)
+            
+            if score > best_score:
+                best_score = score
+                best_points = points.copy()
+                
+    # Fine search around the best coarse solution
+    if best_points is not None:
+        # Extract best r and phi from best_points? 
+        # Easier: just do a local grid search around the best (r, phi) found.
+        # But we didn't store the params. Let's re-run a finer grid globally? 
+        # 50x36 is fast. Let's do a second pass with higher resolution.
+        
+        r_vals_fine = np.linspace(0.1, 1.0, 200)
+        phi_vals_fine = np.linspace(0, np.pi/3, 144)
+        
+        for r in r_vals_fine:
+            for phi in phi_vals_fine:
+                inner_angles = outer_angles + phi
+                inner_pts = r * np.column_stack([np.cos(inner_angles), np.sin(inner_angles)])
+                center = np.array([[0.0, 0.0]])
+                points = np.vstack([center, outer_pts, inner_pts])
+                
+                score = _score_configuration(points)
+                
+                if score > best_score:
+                    best_score = score
+                    best_points = points.copy()
+
+    return best_points
+
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.spatial import ConvexHull
+from scipy.optimize import minimize
+
+def _score_configuration(points):
+    """
+    Calculate the score for a given set of points.
+    Score = min_triangle_area / convex_hull_area
+    """
+    points = np.array(points)
+    if len(points) < 3:
+        return 0.0
+    
+    # Calculate Convex Hull Area
+    try:
+        hull = ConvexHull(points)
+        hull_area = hull.volume
+    except Exception:
+        return 0.0
+    
+    if hull_area <= 1e-10:
+        return 0.0
+        
+    # Calculate min triangle area
+    # Vectorized approach for speed
+    n = len(points)
+    # Create indices for all combinations of 3 points
+    # Using itertools combinations is slow, let's use a simple loop for min area
+    # since n=13, C(13,3)=286. 286 * 13 evaluations is small.
+    min_area = float('inf')
+    for i in range(n):
+        for j in range(i+1, n):
+            for k in range(j+1, n):
+                p1, p2, p3 = points[i], points[j], points[k]
+                area = 0.5 * abs((p2[0]-p1[0])*(p3[1]-p1[1]) - (p3[0]-p1[0])*(p2[1]-p1[1]))
+                if area < min_area:
+                    min_area = area
+                    
+    return min_area / hull_area
+
+def _neg_score(params):
+    """
+    Negative score for minimization.
+    params: [r, theta]
+    """
+    r, theta = params
+    # Ensure r is positive and theta is in range
+    if r <= 0.01 or r >= 1.0:
+        return 1.0 # Bad score (minimize negative, so large positive is bad)
+        
+    outer_angles = np.arange(6) * (np.pi / 3)
+    outer_pts = np.column_stack([np.cos(outer_angles), np.sin(outer_angles)])
+    center = np.array([[0.0, 0.0]])
+    
+    inner_angles = outer_angles + theta
+    inner_pts = r * np.column_stack([np.cos(inner_angles), np.sin(inner_angles)])
+    
+    points = np.vstack([center, outer_pts, inner_pts])
+    
+    # Check for duplicates
+    if len(np.unique(points, axis=0)) < 13:
+        return 1.0
+        
+    score = _score_configuration(points)
+    return -score
+
+def construct():
+    best_score = 0.0
+    best_points = None
+    
+    # Search space: r (inner radius), theta (rotation offset)
+    # r in (0.1, 0.95)
+    # theta in [0, pi/6]
+    
+    # 1. Global Grid Search
+    r_vals = np.linspace(0.1, 0.95, 100)
+    theta_vals = np.linspace(0, np.pi/6, 50)
+    
+    candidates = []
+    for r in r_vals:
+        for theta in theta_vals:
+            # Quick evaluation
+            neg_s = _neg_score([r, theta])
+            score = -neg_s
+            if score > best_score:
+                best_score = score
+                # Reconstruct points for storage
+                outer_angles = np.arange(6) * (np.pi / 3)
+                outer_pts = np.column_stack([np.cos(outer_angles), np.sin(outer_angles)])
+                center = np.array([[0.0, 0.0]])
+                inner_angles = outer_angles + theta
+                inner_pts = r * np.column_stack([np.cos(inner_angles), np.sin(inner_angles)])
+                best_points = np.vstack([center, outer_pts, inner_pts])
+            candidates.append((score, r, theta))
+            
+    # Sort candidates by score descending
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    
+    # 2. Local Optimization on Top K Candidates
+    top_k = 20
+    for i in range(min(top_k, len(candidates))):
+        _, r_init, theta_init = candidates[i]
+        
+        # Define bounds
+        bounds = [(0.05, 0.98), (0.0, np.pi/6)]
+        
+        # Use Nelder-Mead for local refinement
+        try:
+            res = minimize(_neg_score, x0=[r_init, theta_init], method='Nelder-Mead', bounds=bounds, 
+                           options={'maxiter': 200, 'xatol': 1e-6, 'fatol': 1e-8})
+            
+            if res.success:
+                r_opt, theta_opt = res.x
+                # Clamp to bounds
+                r_opt = np.clip(r_opt, 0.05, 0.98)
+                theta_opt = np.clip(theta_opt, 0.0, np.pi/6)
+                
+                # Reconstruct points
+                outer_angles = np.arange(6) * (np.pi / 3)
+                outer_pts = np.column_stack([np.cos(outer_angles), np.sin(outer_angles)])
+                center = np.array([[0.0, 0.0]])
+                inner_angles = outer_angles + theta_opt
+                inner_pts = r_opt * np.column_stack([np.cos(inner_angles), np.sin(inner_angles)])
+                points = np.vstack([center, outer_pts, inner_pts])
+                
+                score = _score_configuration(points)
+                if score > best_score:
+                    best_score = score
+                    best_points = points.copy()
+        except Exception:
+            pass
+            
+    return best_points
+# EVOLVE-BLOCK-END

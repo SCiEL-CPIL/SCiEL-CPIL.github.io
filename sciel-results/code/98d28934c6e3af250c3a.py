@@ -1,0 +1,166 @@
+import time
+import numpy as np
+
+DIMENSIONS = [2, 4, 8]
+
+# EVOLVE-BLOCK-START
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140.0
+    
+    n, m, p = DIMENSIONS
+    # n=2, m=4, p=8
+    # U: n*m x rank
+    # V: m*p x rank
+    # W: p*n x rank
+    
+    # Try rank 49 first: 7 blocks of rank 7
+    # This exploits potential sharing between adjacent blocks
+    total_rank_49 = 49
+    
+    U49 = [[0] * total_rank_49 for _ in range(n * m)]
+    V49 = [[0] * total_rank_49 for _ in range(m * p)]
+    W49 = [[0] * total_rank_49 for _ in range(p * n)]
+    
+    # For rank 49, we use 7 Strassen blocks instead of 8
+    # Block layout: (u, v) where u in {0,1}, v in {0,1,2,3}
+    # We try to merge some blocks or use a different partition
+    
+    # Actually, let's try a different approach: use the fact that
+    # the tensor has structure T = T_A ⊗ T_B in some sense
+    # For now, let's just verify the rank-56 works and return it
+    # if rank-49 doesn't work out
+    
+    # Rank 56 construction using Strassen on 2x2 blocks
+    # 8 blocks of 2x2 multiplication
+    # Each block has rank 7
+    total_rank = 56
+    
+    U = [[0] * total_rank for _ in range(n * m)]
+    V = [[0] * total_rank for _ in range(m * p)]
+    W = [[0] * total_rank for _ in range(p * n)]
+    
+    # Indices for A (2x4): i in 0..1, j in 0..3
+    # Indices for B (4x8): j in 0..3, k in 0..7
+    # Indices for C (2x8): i in 0..1, k in 0..7
+    # W index: k*n + i -> k*2 + i
+    
+    # u: block index for middle dimension (0, 1) -> rows 2u, 2u+1 of B, cols 2u, 2u+1 of A
+    # v: block index for last dimension (0, 1, 2, 3) -> cols 2v, 2v+1 of B, cols 2v, 2v+1 of C
+    
+    for u in range(2):
+        for v in range(4):
+            base_col = 7 * (4 * u + v)
+            
+            # A block indices
+            # A[0, 2u], A[0, 2u+1], A[1, 2u], A[1, 2u+1]
+            a11_idx = 0 * 4 + 2 * u
+            a12_idx = 0 * 4 + 2 * u + 1
+            a21_idx = 1 * 4 + 2 * u
+            a22_idx = 1 * 4 + 2 * u + 1
+            
+            # B block indices
+            # B[2u, 2v], B[2u, 2v+1], B[2u+1, 2v], B[2u+1, 2v+1]
+            b11_idx = 2 * u * 8 + 2 * v
+            b12_idx = 2 * u * 8 + 2 * v + 1
+            b21_idx = (2 * u + 1) * 8 + 2 * v
+            b22_idx = (2 * u + 1) * 8 + 2 * v + 1
+            
+            # C block indices (W indices)
+            # C[0, 2v], C[0, 2v+1], C[1, 2v], C[1, 2v+1]
+            # W index = k * n + i = k * 2 + i
+            c11_idx = 2 * v * 2 + 0
+            c12_idx = (2 * v + 1) * 2 + 0
+            c21_idx = 2 * v * 2 + 1
+            c22_idx = (2 * v + 1) * 2 + 1
+            
+            # s=0: M1 = (A11+A22)(B11+B22)
+            U[a11_idx][base_col] += 1
+            U[a22_idx][base_col] += 1
+            V[b11_idx][base_col] += 1
+            V[b22_idx][base_col] += 1
+            W[c11_idx][base_col] += 1
+            W[c22_idx][base_col] += 1
+            
+            # s=1: M2 = (A21+A22)B11
+            U[a21_idx][base_col + 1] += 1
+            U[a22_idx][base_col + 1] += 1
+            V[b11_idx][base_col + 1] += 1
+            W[c21_idx][base_col + 1] += 1
+            W[c22_idx][base_col + 1] -= 1
+            
+            # s=2: M3 = A11(B12-B22)
+            U[a11_idx][base_col + 2] += 1
+            V[b12_idx][base_col + 2] += 1
+            V[b22_idx][base_col + 2] -= 1
+            W[c12_idx][base_col + 2] += 1
+            W[c22_idx][base_col + 2] += 1
+            
+            # s=3: M4 = A22(B21-B11)
+            U[a22_idx][base_col + 3] += 1
+            V[b21_idx][base_col + 3] += 1
+            V[b11_idx][base_col + 3] -= 1
+            W[c11_idx][base_col + 3] += 1
+            W[c21_idx][base_col + 3] += 1
+            
+            # s=4: M5 = (A11+A12)B22
+            U[a11_idx][base_col + 4] += 1
+            U[a12_idx][base_col + 4] += 1
+            V[b22_idx][base_col + 4] += 1
+            W[c11_idx][base_col + 4] -= 1
+            W[c12_idx][base_col + 4] += 1
+            
+            # s=5: M6 = (A21-A11)(B11+B12)
+            U[a21_idx][base_col + 5] += 1
+            U[a11_idx][base_col + 5] -= 1
+            V[b11_idx][base_col + 5] += 1
+            V[b12_idx][base_col + 5] += 1
+            W[c22_idx][base_col + 5] += 1
+            
+            # s=6: M7 = (A12-A22)(B21+B22)
+            U[a12_idx][base_col + 6] += 1
+            U[a22_idx][base_col + 6] -= 1
+            V[b21_idx][base_col + 6] += 1
+            V[b22_idx][base_col + 6] += 1
+            W[c11_idx][base_col + 6] += 1
+    
+    # Fast vectorized verification
+    U_arr = np.array(U, dtype=float)
+    V_arr = np.array(V, dtype=float)
+    W_arr = np.array(W, dtype=float)
+    
+    # Compute tensor T[a,b,c] = sum_r U[a,r] V[b,r] W[c,r]
+    # Using einsum for efficiency
+    T = np.einsum('ar,br,cr->abc', U_arr, V_arr, W_arr)
+    
+    # Construct expected tensor
+    # T[a,b,c] = 1 if a=4i+j, b=8j+k, c=2k+i else 0
+    # a in 0..7, b in 0..31, c in 0..15
+    expected_T = np.zeros((n*m, m*p, p*n), dtype=float)
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                a = i * m + j
+                b = j * p + k
+                c = k * n + i
+                expected_T[a, b, c] = 1.0
+                
+    # Check validity
+    if not np.allclose(T, expected_T, atol=1e-9):
+        # Fallback to schoolbook rank 64
+        rank = n * m * p
+        U = [[0] * rank for _ in range(n * m)]
+        V = [[0] * rank for _ in range(m * p)]
+        W = [[0] * rank for _ in range(p * n)]
+        col = 0
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    U[i * m + j][col] = 1
+                    V[j * p + k][col] = 1
+                    W[k * n + i][col] = 1
+                    col += 1
+        return {"U": U, "V": V, "W": W}
+        
+    return {"U": U, "V": V, "W": W}
+# EVOLVE-BLOCK-END
