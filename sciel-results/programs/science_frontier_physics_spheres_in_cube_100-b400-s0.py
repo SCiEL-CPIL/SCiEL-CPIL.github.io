@@ -28,7 +28,7 @@ def _compute_radius(centers):
     min_pair_dist = np.min(dists)
     return min(min_wall_dist, min_pair_dist / 2.0)
 
-def _soft_min_objective(centers_flat, beta, iu, tree_cache=None):
+def _soft_min_objective(centers_flat, beta, iu):
     centers = centers_flat.reshape(-1, 3)
     dists_to_walls = 0.5 - np.abs(centers)
     wall_vals = dists_to_walls.flatten()
@@ -64,7 +64,7 @@ def _build_grid_init(nx, ny, nz, noise_scale=0.0, seed=42):
     centers = np.clip(centers, -0.499, 0.499)
     return centers
 
-def _build_bcc_init():
+def _build_bcc_init(seed=42, noise_scale=0.005):
     nx, ny, nz = 5, 5, 2
     points = []
     for i in range(nx):
@@ -76,8 +76,8 @@ def _build_bcc_init():
                 points.append([cx, cy, cz])
                 points.append([cx + 0.5/nx, cy + 0.5/ny, cz + 0.5/nz])
     centers = np.array(points[:N])
-    rng = np.random.default_rng(42)
-    centers += rng.normal(0, 0.005, centers.shape)
+    rng = np.random.default_rng(seed)
+    centers += rng.normal(0, noise_scale, centers.shape)
     centers = np.clip(centers, -0.499, 0.499)
     return centers
 
@@ -193,68 +193,82 @@ def _polish_repulsion(centers, deadline, iu):
         step_size *= decay
     return best_centers, best_r
 
-def _coordinate_descent_minmax(centers, max_iters=2000):
+def _polish_bottleneck(centers, deadline, iu, k_nearest=5):
     """
-    Direct coordinate descent: repeatedly find the minimum-distance pair and
-    push them apart, while also pushing wall-violating points inward.
-    This is a fundamentally different paradigm from soft-min optimization.
+    Targeted polish: identify the k nearest pairs and k nearest wall points,
+    and apply forces to alleviate these specific bottlenecks.
     """
     centers = centers.copy()
     best_r = _compute_radius(centers)
     best_centers = centers.copy()
+    step_size = 0.002
+    decay = 0.95
+    min_step = 1e-7
+    no_improve_count = 0
+    max_no_improve = 100
     
-    for it in range(max_iters):
-        if _time_left() < 2.0:
-            break
-        
-        # Compute current radius and identify bottleneck
-        dists_to_walls = 0.5 - np.abs(centers)
-        min_wall_dist = np.min(dists_to_walls)
-        
-        # Find nearest pair using KD-tree
-        tree = cKDTree(centers)
-        dists, indices = tree.query(centers, k=2)
-        # k=2 gives self + nearest neighbor
-        nn_dists = dists[:, 1]
-        nn_indices = indices[:, 1]
-        min_pair_dist = np.min(nn_dists)
-        min_idx = np.argmin(nn_dists)
-        
-        r = min(min_wall_dist, min_pair_dist / 2.0)
-        
-        if r > best_r + 1e-14:
-            best_r = r
+    while _time_left() > 1.0 and step_size > min_step and no_improve_count < max_no_improve:
+        r_current = _compute_radius(centers)
+        if r_current > best_r + 1e-12:
+            best_r = r_current
             best_centers = centers.copy()
-        
-        # Determine which constraint is binding
-        if min_wall_dist <= min_pair_dist / 2.0 + 1e-10:
-            # Wall constraint is binding
-            # Find point(s) closest to wall
-            min_wall_idx = np.argmin(dists_to_walls)
-            point_idx = min_wall_idx // 3
-            axis = min_wall_idx % 3
-            # Push inward
-            direction = -np.sign(centers[point_idx, axis])
-            if direction == 0:
-                direction = 1.0
-            step = 0.002
-            centers[point_idx, axis] += direction * step
+            no_improve_count = 0
         else:
-            # Pair constraint is binding
-            i = min_idx
-            j = nn_indices[i]
-            diff = centers[i] - centers[j]
-            dist = np.linalg.norm(diff)
-            if dist < 1e-12:
-                continue
-            unit = diff / dist
-            # Push apart
-            step = 0.002
-            centers[i] += unit * step
-            centers[j] -= unit * step
+            no_improve_count += 1
+            
+        forces = np.zeros_like(centers)
         
+        # 1. Wall Bottlenecks
+        wall_dists = 0.5 - np.abs(centers)
+        flat_wall_dists = wall_dists.flatten()
+        # Find indices of the k smallest wall distances
+        k_wall = min(k_nearest, N * 3)
+        wall_indices = np.argpartition(flat_wall_dists, k_wall)[:k_wall]
+        for idx in wall_indices:
+            i = idx // 3
+            k = idx % 3
+            dist = flat_wall_dists[idx]
+            if dist < r_current * 1.1:
+                # Push inward
+                direction = -np.sign(centers[i, k])
+                if direction == 0:
+                    direction = 1.0
+                strength = max(0, 1.1 * r_current - dist) / (1.1 * r_current)
+                forces[i, k] += direction * strength
+
+        # 2. Pair Bottlenecks
+        tree = cKDTree(centers)
+        # Query k+1 nearest neighbors for each point to get k pairs
+        dists, indices = tree.query(centers, k=k_nearest + 1)
+        # We have N x (k_nearest+1) distances. Flatten and find k_nearest smallest unique pairs.
+        # This is a bit tricky to avoid duplicates.
+        # Simpler: iterate through all points, take their k_nearest neighbors, and add force.
+        # This might double-count, but for repulsion it's okay.
+        
+        for i in range(N):
+            for j_idx in range(1, k_nearest + 1):
+                j = indices[i, j_idx]
+                dist = dists[i, j_idx]
+                if dist < 2.0 * r_current * 1.1:
+                    diff = centers[i] - centers[j]
+                    norm = np.linalg.norm(diff)
+                    if norm > 1e-9:
+                        strength = (2.0 * r_current * 1.1 - dist) / (2.0 * r_current * 1.1)
+                        unit_diff = diff / norm
+                        forces[i] += strength * unit_diff
+                        # Note: force on j will be added when i=j's neighbor or vice versa.
+                        # To be symmetric and efficient, we could just add to i here and let the loop handle j?
+                        # No, the loop iterates i. So j gets force when j is the main index.
+                        # This results in roughly 2x the force compared to a unique pair loop.
+                        # We can scale down by 0.5 if we want, or just accept it.
+        
+        norms = np.linalg.norm(forces, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        forces = forces / norms
+        centers += step_size * forces
         centers = np.clip(centers, -0.4999, 0.4999)
-    
+        step_size *= decay
+        
     return best_centers, best_r
 
 def _polish_high_beta(centers, deadline, iu):
@@ -284,7 +298,7 @@ def _polish_high_beta(centers, deadline, iu):
 def _polish_very_high_beta(centers, deadline, iu):
     best_centers = centers.copy()
     best_r = _compute_radius(best_centers)
-    betas = [5000.0, 10000.0, 50000.0]
+    betas = [5000.0, 10000.0, 50000.0, 100000.0]
     for beta in betas:
         if _time_left() < 3.0:
             break
@@ -341,7 +355,7 @@ def _optimize_from_initial(centers, deadline, iu, time_budget=20.0):
     
     # Coordinate descent refinement
     if _time_left() > 5.0 and (time.time() - start_t) < time_budget - 3.0:
-        cd_centers, cd_radius = _coordinate_descent_minmax(best_centers, max_iters=1000)
+        cd_centers, cd_radius = _polish_bottleneck(best_centers, deadline, iu)
         if cd_radius > best_radius:
             best_radius = cd_radius
             best_centers = cd_centers
@@ -392,9 +406,15 @@ def construct():
                     best_radius = polish_radius
                     best_centers = polish_centers
 
+    # Primary init: BCC
     if _time_left() > 30.0:
-        centers = _build_bcc_init()
+        centers = _build_bcc_init(seed=42)
         try_init(centers, time_budget=25.0)
+        
+        # Second BCC init with different seed
+        if _time_left() > 25.0:
+            centers2 = _build_bcc_init(seed=123, noise_scale=0.01)
+            try_init(centers2, time_budget=20.0)
 
     grid_configs = [
         (5, 5, 4),
@@ -428,17 +448,19 @@ def construct():
         centers = rng.uniform(-0.45, 0.45, (N, 3))
         try_init(centers, time_budget=6.0)
 
+    # Final Global Polish
     if best_centers is not None and _time_left() > 5.0:
-        rep_centers, rep_radius = _polish_repulsion(best_centers, _DEADLINE, iu)
-        if rep_radius > best_radius:
-            best_radius = rep_radius
-            best_centers = rep_centers
+        # Apply bottleneck polish
+        bp_centers, bp_radius = _polish_bottleneck(best_centers, _DEADLINE, iu)
+        if bp_radius > best_radius:
+            best_radius = bp_radius
+            best_centers = bp_centers
 
         if _time_left() > 8.0:
-            cd_centers, cd_radius = _coordinate_descent_minmax(best_centers, max_iters=2000)
-            if cd_radius > best_radius:
-                best_radius = cd_radius
-                best_centers = cd_centers
+            rep_centers, rep_radius = _polish_repulsion(best_centers, _DEADLINE, iu)
+            if rep_radius > best_radius:
+                best_radius = rep_radius
+                best_centers = rep_centers
 
         if _time_left() > 10.0:
             sa_centers, sa_radius = _simulated_annealing(best_centers, _DEADLINE, iu)

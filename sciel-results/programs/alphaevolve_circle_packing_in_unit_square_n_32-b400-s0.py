@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, linprog
 import time
 
 N = 32
@@ -7,6 +7,60 @@ TIME_LIMIT = 138.0  # evaluator kills at 150s; keep 12s margin
 
 def _elapsed(start):
     return time.time() - start
+
+def _optimize_radii_lp(x, y):
+    """
+    Solve for maximum radii given fixed centers using Linear Programming.
+    Maximize sum(r) subject to r_i + r_j <= d_ij and r_i <= dist_to_bound.
+    """
+    c = -np.ones(N)
+    A_ub = []
+    b_ub = []
+    
+    # Pairwise constraints
+    for i in range(N):
+        for j in range(i+1, N):
+            d = np.hypot(x[i]-x[j], y[i]-y[j])
+            row = np.zeros(N)
+            row[i] = 1.0
+            row[j] = 1.0
+            A_ub.append(row)
+            b_ub.append(d)
+            
+    # Boundary constraints
+    for i in range(N):
+        b = min(x[i], 1.0-x[i], y[i], 1.0-y[i])
+        row = np.zeros(N)
+        row[i] = 1.0
+        A_ub.append(row)
+        b_ub.append(b)
+        
+    A_ub = np.array(A_ub)
+    b_ub = np.array(b_ub)
+    bounds = [(0, None)] * N
+    
+    try:
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x
+    except Exception:
+        pass
+        
+    # Fallback: iterative shrink
+    r = np.array([min(x[i], 1.0-x[i], y[i], 1.0-y[i]) for i in range(N)])
+    for _ in range(10):
+        changed = False
+        for i in range(N):
+            for j in range(i+1, N):
+                d = np.hypot(x[i]-x[j], y[i]-y[j])
+                if r[i] + r[j] > d:
+                    shrink = d / (r[i] + r[j]) if (r[i] + r[j]) > 0 else 0.5
+                    r[i] *= shrink
+                    r[j] *= shrink
+                    changed = True
+        if not changed: 
+            break
+    return r
 
 def _is_valid(x, y, r, eps=1e-7):
     if np.any(x < -eps) or np.any(x > 1.0 + eps):
@@ -253,12 +307,14 @@ def _local_search(params, start_time, max_iter=1000):
         except Exception:
             continue
         
-        # Make valid
+        # Use LP to find optimal radii for these centers
         vx = p_opt[:N]
         vy = p_opt[N:2*N]
-        vr = p_opt[2*N:3*N]
-        vx, vy, vr = _make_valid(vx, vy, vr)
+        vr = _optimize_radii_lp(vx, vy)
         
+        if not _is_valid(vx, vy, vr):
+            vx, vy, vr = _make_valid(vx, vy, vr)
+            
         score = _sum_r(vr)
         if score > best_score:
             best_score = score
@@ -312,12 +368,15 @@ def construct():
         # Optimize
         result = _optimize(x0_opt, start_time)
         
-        # Make valid
+        # Use LP to find optimal radii for these centers
         vx = result[:N]
         vy = result[N:2*N]
-        vr = result[2*N:3*N]
-        vx, vy, vr = _make_valid(vx, vy, vr)
+        vr = _optimize_radii_lp(vx, vy)
         
+        # Verify validity, fallback to _make_valid if LP failed or numerical issues
+        if not _is_valid(vx, vy, vr):
+            vx, vy, vr = _make_valid(vx, vy, vr)
+            
         score = _sum_r(vr)
         
         if score > best_score:
@@ -329,8 +388,11 @@ def construct():
         polished = _tight_polish(best_params, start_time)
         px = polished[:N]
         py = polished[N:2*N]
-        pr = polished[2*N:3*N]
-        px, py, pr = _make_valid(px, py, pr)
+        pr = _optimize_radii_lp(px, py)
+        
+        if not _is_valid(px, py, pr):
+            px, py, pr = _make_valid(px, py, pr)
+            
         p_score = _sum_r(pr)
         if p_score > best_score:
             best_score = p_score
@@ -341,8 +403,11 @@ def construct():
         ls_result = _local_search(best_params, start_time, max_iter=200)
         ls_x = ls_result[:N]
         ls_y = ls_result[N:2*N]
-        ls_r = ls_result[2*N:3*N]
-        ls_x, ls_y, ls_r = _make_valid(ls_x, ls_y, ls_r)
+        ls_r = _optimize_radii_lp(ls_x, ls_y)
+        
+        if not _is_valid(ls_x, ls_y, ls_r):
+            ls_x, ls_y, ls_r = _make_valid(ls_x, ls_y, ls_r)
+            
         ls_score = _sum_r(ls_r)
         if ls_score > best_score:
             best_score = ls_score
@@ -353,8 +418,11 @@ def construct():
         result2 = _optimize(best_params, start_time)
         vx2 = result2[:N]
         vy2 = result2[N:2*N]
-        vr2 = result2[2*N:3*N]
-        vx2, vy2, vr2 = _make_valid(vx2, vy2, vr2)
+        vr2 = _optimize_radii_lp(vx2, vy2)
+        
+        if not _is_valid(vx2, vy2, vr2):
+            vx2, vy2, vr2 = _make_valid(vx2, vy2, vr2)
+            
         s2 = _sum_r(vr2)
         if s2 > best_score:
             best_score = s2
@@ -365,8 +433,11 @@ def construct():
         polished2 = _tight_polish(best_params, start_time)
         px2 = polished2[:N]
         py2 = polished2[N:2*N]
-        pr2 = polished2[2*N:3*N]
-        px2, py2, pr2 = _make_valid(px2, py2, pr2)
+        pr2 = _optimize_radii_lp(px2, py2)
+        
+        if not _is_valid(px2, py2, pr2):
+            px2, py2, pr2 = _make_valid(px2, py2, pr2)
+            
         p2_score = _sum_r(pr2)
         if p2_score > best_score:
             best_score = p2_score
