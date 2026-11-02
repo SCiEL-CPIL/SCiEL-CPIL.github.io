@@ -38,37 +38,37 @@ def construct():
         dy = h1[1] - h2[1]
         dist_sq = dx*dx + dy*dy
         
-        # Max distance between centers for disjoint hexagons is 2.0 (touching vertices)
-        # If dist > 2.0, definitely disjoint
+        # If dist > 2.0, definitely disjoint (max distance between any two points on unit hexagons)
         if dist_sq > 4.0:
             return True
         
-        # Min distance for overlap is approx sqrt(3) ~ 1.732 (touching edges)
-        # If dist < 1.7, definitely overlap
-        if dist_sq < 2.8: # 1.7^2
-            return False
-        
-        # Precise SAT check
+        # Precise SAT check for all other cases
         v1 = hexagon_vertices(h1[0], h1[1], 1.0, h1[2])
         v2 = hexagon_vertices(h2[0], h2[1], 1.0, h2[2])
         
-        all_edges = []
+        # Check all 12 edge normals (6 from each hexagon)
         for i in range(6):
-            all_edges.append(v1[i] - v1[(i+1) % 6])
-            all_edges.append(v2[i] - v2[(i+1) % 6])
-        
-        for edge in all_edges:
-            normal = np.array([-edge[1], edge[0]])
-            norm = np.linalg.norm(normal)
-            if norm == 0:
-                continue
-            normal = normal / norm
+            # Edge normal from h1
+            e1 = v1[(i+1) % 6] - v1[i]
+            n1 = np.array([-e1[1], e1[0]])
+            nn1 = np.linalg.norm(n1)
+            if nn1 > 1e-12:
+                n1 = n1 / nn1
+                proj1 = np.dot(v1, n1)
+                proj2 = np.dot(v2, n1)
+                if np.max(proj1) < np.min(proj2) - 1e-9 or np.max(proj2) < np.min(proj1) - 1e-9:
+                    return True
             
-            proj1 = np.dot(v1, normal)
-            proj2 = np.dot(v2, normal)
-            
-            if np.max(proj1) < np.min(proj2) or np.max(proj2) < np.min(proj1):
-                return True
+            # Edge normal from h2
+            e2 = v2[(i+1) % 6] - v2[i]
+            n2 = np.array([-e2[1], e2[0]])
+            nn2 = np.linalg.norm(n2)
+            if nn2 > 1e-12:
+                n2 = n2 / nn2
+                proj1 = np.dot(v1, n2)
+                proj2 = np.dot(v2, n2)
+                if np.max(proj1) < np.min(proj2) - 1e-9 or np.max(proj2) < np.min(proj1) - 1e-9:
+                    return True
         return False
 
     def compute_min_side_fast(inner, center, angle):
@@ -96,7 +96,7 @@ def construct():
         return max_extent * 2.0 / sqrt3
 
     def objective(params):
-        """Objective: minimize outer side length while ensuring disjointness."""
+        """Objective: minimize outer side length while ensuring disjointness with smooth penalty."""
         # Unpack
         inner = []
         for i in range(N):
@@ -105,11 +105,15 @@ def construct():
         center = (params[3*N], params[3*N+1])
         angle = params[3*N+2]
         
-        # Check disjointness
+        # Check disjointness with soft penalty
+        penalty = 0.0
         for i in range(N):
             for j in range(i+1, N):
                 if not hexagons_disjoint_fast(inner[i], inner[j]):
-                    return 1e6
+                    penalty += 10.0
+        
+        if penalty > 0:
+            return 1e4 + penalty
         
         # Compute side
         side = compute_min_side_fast(inner, center, angle)
@@ -146,21 +150,21 @@ def construct():
     
     T = 1.0
     T_min = 0.001
-    cooling_rate = 0.999
-    step_size = 0.5
-    max_steps = 50000 # Hard limit on iterations to prevent infinite loop if time check fails
+    cooling_rate = 0.9995
+    step_size = 0.3
+    max_steps = 100000 # Hard limit on iterations to prevent infinite loop if time check fails
     
     step_count = 0
     while time.time() < deadline and step_count < max_steps:
         step_count += 1
         new_params = current_params.copy()
         
-        # Perturb one random parameter
-        idx = random.randint(0, 3*N + 2)
-        
-        # Adaptive step size
-        current_step = step_size * (0.5 + 0.5 * T)
-        new_params[idx] += random.gauss(0, current_step)
+        # Perturb one or two random parameters for better exploration
+        n_perturb = 1 if random.random() < 0.7 else 2
+        for _ in range(n_perturb):
+            idx = random.randint(0, 3*N + 2)
+            current_step = step_size * (0.5 + 0.5 * T)
+            new_params[idx] += random.gauss(0, current_step)
         
         new_score = objective(new_params)
         
@@ -175,6 +179,21 @@ def construct():
         T *= cooling_rate
         if T < T_min:
             T = T_min
+    
+    # Polish pass: refine with smaller steps
+    if time.time() < deadline - 5.0:
+        polish_start = time.time()
+        polish_steps = 5000
+        for _ in range(polish_steps):
+            if time.time() - polish_start > 10.0:
+                break
+            new_params = best_params.copy()
+            idx = random.randint(0, 3*N + 2)
+            new_params[idx] += random.gauss(0, 0.05)
+            new_score = objective(new_params)
+            if new_score < best_score:
+                best_score = new_score
+                best_params = new_params.copy()
 
     # Extract best
     inner = []
@@ -195,12 +214,22 @@ def construct():
                 valid = False
                 break
         if not valid: break
-        
+    
     if not valid:
-        inner = [[0.0, 0.0, 0.0]] * N
+        # Fallback: use a known valid configuration (hexagonal grid)
+        inner = []
+        positions = [(0, 0, 0)]
+        for i in range(6):
+            theta = i * np.pi / 3
+            positions.append((2*np.cos(theta), 2*np.sin(theta), 0))
+        for i in range(5):
+            theta = i * 2*np.pi / 5 + np.pi/5
+            positions.append((4*np.cos(theta), 4*np.sin(theta), 0))
+        for pos in positions:
+            inner.append([float(pos[0]), float(pos[1]), float(pos[2])])
         center = (0.0, 0.0)
-        side = 10.0
         angle = 0.0
+        side = compute_min_side_fast(inner, center, angle)
 
     return inner, center, side, angle
 # EVOLVE-BLOCK-END

@@ -1,0 +1,66 @@
+"""
+Optimized program for 2x2 matrix multiplication rank minimization.
+Returns the verified rank-7 Strassen decomposition immediately.
+Rank 6 is impossible for 2x2 matrix multiplication over any field.
+"""
+import time
+
+DIMENSIONS = [2, 2, 2]
+
+# EVOLVE-BLOCK-START
+def construct():
+    """
+    Returns the rank-minimal exact tensor decomposition for 2x2 matrix multiplication.
+    The rank is 7 (Strassen's algorithm).
+    """
+    # The optimal rank for 2x2 matrix multiplication is 7.
+    # Any search for rank 6 is guaranteed to fail and wastes time.
+    # We return the static, verified Strassen decomposition.
+    
+    rank = 7
+    
+    # U shape: (4, 7) -> indices i*2+j
+    # V shape: (4, 7) -> indices j*2+k
+    # W shape: (4, 7) -> indices k*2+i
+    
+    U = [[0] * rank for _ in range(4)]
+    V = [[0] * rank for _ in range(4)]
+    W = [[0] * rank for _ in range(4)]
+    
+    # M1 = (A00 + A11)(B00 + B11)
+    U[0][0] = 1; U[3][0] = 1
+    V[0][0] = 1; V[3][0] = 1
+    W[0][0] = 1; W[3][0] = 1
+    
+    # M2 = (A10 + A11) * B00
+    U[2][1] = 1; U[3][1] = 1
+    V[0][1] = 1
+    W[1][1] = 1; W[3][1] = -1
+    
+    # M3 = A00 * (B01 - B11)
+    U[0][2] = 1
+    V[1][2] = 1; V[3][2] = -1
+    W[2][2] = 1; W[3][2] = 1
+    
+    # M4 = A11 * (B10 - B00)
+    U[3][3] = 1
+    V[2][3] = 1; V[0][3] = -1
+    W[0][3] = 1; W[1][3] = 1
+    
+    # M5 = (A00 + A01) * B11
+    U[0][4] = 1; U[1][4] = 1
+    V[3][4] = 1
+    W[0][4] = -1; W[2][4] = 1
+    
+    # M6 = (A10 - A00) * (B00 + B01)
+    U[2][5] = 1; U[0][5] = -1
+    V[0][5] = 1; V[1][5] = 1
+    W[3][5] = 1
+    
+    # M7 = (A01 - A11) * (B10 + B11)
+    U[1][6] = 1; U[3][6] = -1
+    V[2][6] = 1; V[3][6] = 1
+    W[0][6] = 1
+    
+    return {"U": U, "V": V, "W": W}
+# EVOLVE-BLOCK-END
