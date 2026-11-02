@@ -240,10 +240,6 @@ def _polish_bottleneck(centers, deadline, iu, k_nearest=5):
         tree = cKDTree(centers)
         # Query k+1 nearest neighbors for each point to get k pairs
         dists, indices = tree.query(centers, k=k_nearest + 1)
-        # We have N x (k_nearest+1) distances. Flatten and find k_nearest smallest unique pairs.
-        # This is a bit tricky to avoid duplicates.
-        # Simpler: iterate through all points, take their k_nearest neighbors, and add force.
-        # This might double-count, but for repulsion it's okay.
         
         for i in range(N):
             for j_idx in range(1, k_nearest + 1):
@@ -256,11 +252,6 @@ def _polish_bottleneck(centers, deadline, iu, k_nearest=5):
                         strength = (2.0 * r_current * 1.1 - dist) / (2.0 * r_current * 1.1)
                         unit_diff = diff / norm
                         forces[i] += strength * unit_diff
-                        # Note: force on j will be added when i=j's neighbor or vice versa.
-                        # To be symmetric and efficient, we could just add to i here and let the loop handle j?
-                        # No, the loop iterates i. So j gets force when j is the main index.
-                        # This results in roughly 2x the force compared to a unique pair loop.
-                        # We can scale down by 0.5 if we want, or just accept it.
         
         norms = np.linalg.norm(forces, axis=1, keepdims=True)
         norms[norms == 0] = 1
@@ -298,7 +289,8 @@ def _polish_high_beta(centers, deadline, iu):
 def _polish_very_high_beta(centers, deadline, iu):
     best_centers = centers.copy()
     best_r = _compute_radius(best_centers)
-    betas = [5000.0, 10000.0, 50000.0, 100000.0]
+    # Increase betas to squeeze out more precision
+    betas = [5000.0, 10000.0, 50000.0, 100000.0, 500000.0]
     for beta in betas:
         if _time_left() < 3.0:
             break
@@ -310,7 +302,7 @@ def _polish_very_high_beta(centers, deadline, iu):
                 args=(beta, iu),
                 method='L-BFGS-B',
                 bounds=[(-0.4999, 0.4999)] * (N * 3),
-                options={'maxiter': 300, 'ftol': 1e-15, 'gtol': 1e-12, 'maxls': 30}
+                options={'maxiter': 400, 'ftol': 1e-15, 'gtol': 1e-12, 'maxls': 30}
             )
             new_centers = res.x.reshape(-1, 3)
             new_centers = np.clip(new_centers, -0.4999, 0.4999)
@@ -409,19 +401,25 @@ def construct():
     # Primary init: BCC
     if _time_left() > 30.0:
         centers = _build_bcc_init(seed=42)
-        try_init(centers, time_budget=25.0)
+        try_init(centers, time_budget=30.0) # Increased time budget for primary
         
-        # Second BCC init with different seed
+        # Second BCC init with different seed and slightly different noise
         if _time_left() > 25.0:
             centers2 = _build_bcc_init(seed=123, noise_scale=0.01)
             try_init(centers2, time_budget=20.0)
+
+        # Third BCC init: Rotated or Sheared? 
+        # Simple perturbation of the best BCC result to break symmetry
+        if _time_left() > 20.0 and best_centers is not None:
+            rng = np.random.default_rng(999)
+            centers3 = best_centers + rng.normal(0, 0.002, best_centers.shape)
+            centers3 = np.clip(centers3, -0.499, 0.499)
+            try_init(centers3, time_budget=15.0)
 
     grid_configs = [
         (5, 5, 4),
         (4, 5, 5),
         (5, 4, 5),
-        (6, 5, 4),
-        (5, 6, 4),
     ]
 
     for nx, ny, nz in grid_configs:

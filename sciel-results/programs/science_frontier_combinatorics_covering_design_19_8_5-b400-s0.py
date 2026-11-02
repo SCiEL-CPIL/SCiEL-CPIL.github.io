@@ -66,6 +66,7 @@ def construct(v, k, t):
                 break
 
             if explore_prob > 0 and rng.random() < explore_prob:
+                # Explore: pick from top 5% or gain >= max_gain - 3
                 threshold = max_gain - 3
                 explore_cands = np.where((gain >= threshold) & (~is_selected))[0]
                 if len(explore_cands) > 0:
@@ -88,6 +89,7 @@ def construct(v, k, t):
 
             is_uncovered[newly_covered] = False
 
+            # Vectorized gain update
             if len(newly_covered) > 0:
                 all_blocks_to_decrement = []
                 for ts_idx in newly_covered:
@@ -159,205 +161,125 @@ def construct(v, k, t):
             if len(blocks) == 0:
                 break
 
-            # With some probability, try 2-for-1
-            if len(blocks) >= 2 and random.random() < 0.1:
-                i, j = random.sample(range(len(blocks)), 2)
-                ts_i = block_ts_indices[i]
-                ts_j = block_ts_indices[j]
-                
-                # Find subsets that will be uncovered if we remove i and j
-                # These are subsets in (ts_i U ts_j) with count <= 2
-                # And specifically:
-                # - In ts_i, count == 1 (unique to i)
-                # - In ts_j, count == 1 (unique to j)
-                # - In ts_i AND ts_j, count == 2 (unique to pair)
-                
-                # Efficient way:
-                # Create a temporary view of cover_count? No, just check.
-                # unique_to_pair = []
-                # for x in np.unique(np.concatenate([ts_i, ts_j])):
-                #    if cover_count[x] == 1 and x in ts_i: unique_to_pair.append(x)
-                #    elif cover_count[x] == 1 and x in ts_j: unique_to_pair.append(x)
-                #    elif cover_count[x] == 2 and x in ts_i and x in ts_j: unique_to_pair.append(x)
-                
-                # This loop is slow in Python. Use NumPy.
-                # We need to know which subsets in ts_i are unique to i (count 1)
-                # Which in ts_j are unique to j (count 1)
-                # Which in intersection are unique to pair (count 2)
-                
-                # Let's approximate:
-                # If we remove i and j, the "risk" subsets are those with count 1 in i, 1 in j, or 2 in both.
-                # Let's just gather candidates for replacement.
-                
-                # Find intersection of ts_i and ts_j
-                # This is O(N_i + N_j).
-                # Set intersection is fast.
-                set_i = set(ts_i)
-                set_j = set(ts_j)
-                inter = set_i.intersection(set_j)
-                
-                # Subsets unique to i (in i, not in j, count 1)
-                # Subsets unique to j (in j, not in i, count 1)
-                # Subsets in inter with count 2
-                
-                # We need a block k that covers ALL these subsets.
-                # Let U be the set of these subsets.
-                # If |U| > C(k,t), skip.
-                
-                # Construct U
-                U = []
-                # Unique to i
-                for x in ts_i:
-                    if x not in set_j and cover_count[x] == 1:
-                        U.append(x)
-                # Unique to j
-                for x in ts_j:
-                    if x not in set_i and cover_count[x] == 1:
-                        U.append(x)
-                # Unique to pair
-                for x in inter:
-                    if cover_count[x] == 2:
-                        U.append(x)
-                
-                if len(U) > C(k, t):
-                    continue
-                
-                # Find blocks covering U
-                if not U:
-                    # Can remove both?
-                    # If no unique subsets, both are redundant?
-                    # If U is empty, it means all subsets in i and j are covered by other blocks.
-                    # So we can remove i and j.
-                    # But we need to update cover_count.
-                    np.subtract.at(cover_count, ts_i, 1)
-                    np.subtract.at(cover_count, ts_j, 1)
-                    # Remove i and j
-                    # Be careful with indices
-                    if i > j:
-                        i, j = j, i
-                    blocks.pop(i)
-                    block_ts_indices.pop(i)
-                    blocks.pop(j)
-                    block_ts_indices.pop(j)
-                    # Update sol_block_set
-                    idx_i = get_block_idx(blocks[i]) if i < len(blocks) else -1
-                    # This index shifting is tricky. Let's just rebuild sol_block_set later or use a different structure.
-                    # For now, just count improvements.
-                    improved_count += 2
-                    # Rebuild sol_block_set for safety
-                    sol_block_set.clear()
-                    for b in blocks:
-                        idx = get_block_idx(b)
-                        if idx >= 0:
-                            sol_block_set.add(idx)
-                    continue
+            # Try 1-exchange first
+            i = random.randint(0, len(blocks) - 1)
+            ts_arr_i = block_ts_indices[i]
 
-                # Find intersection of ts_to_blocks for all x in U
-                # Start with all blocks, intersect with ts_to_blocks[x]
-                # This is expensive if U is large.
-                # If U is small, it's fine.
-                if len(U) > 10:
-                    continue # Heuristic: too many constraints, unlikely to find a block
-                
-                candidates = set(range(num_k_blocks))
-                for x in U:
-                    candidates.intersection_update(ts_to_blocks[x])
-                    if not candidates:
-                        break
-                
-                if not candidates:
-                    continue
-                
-                # Check if any candidate is valid (not i, not j)
-                valid_cands = [c for c in candidates if c != get_block_idx(blocks[i]) and c != get_block_idx(blocks[j])]
-                if not valid_cands:
-                    continue
-                
-                new_idx = random.choice(valid_cands)
-                new_ts = block_to_ts_np[new_idx]
-                
-                # Check if new_ts covers U
-                # Since candidates came from intersection, it should.
-                
-                # Perform swap
-                # Remove i, j
-                # Add new_idx
-                # Update cover_count
-                np.subtract.at(cover_count, ts_i, 1)
-                np.subtract.at(cover_count, ts_j, 1)
-                np.add.at(cover_count, new_ts, 1)
-                
-                # Check validity: min(cover_count) >= 1
-                if np.min(cover_count) >= 1:
-                    # Update blocks list
-                    # Remove i, j
-                    if i > j:
-                        i, j = j, i
-                    blocks.pop(i)
-                    block_ts_indices.pop(i)
-                    blocks.pop(j)
-                    block_ts_indices.pop(j)
-                    
-                    # Add new block
-                    blocks.append(list(all_k_blocks[new_idx]))
-                    block_ts_indices.append(new_ts)
-                    
-                    # Update sol_block_set
-                    sol_block_set.discard(get_block_idx(blocks[i]) if i < len(blocks) else -1) # Approximate
-                    sol_block_set.discard(get_block_idx(blocks[j]) if j < len(blocks) else -1)
-                    sol_block_set.add(new_idx)
-                    
-                    improved_count += 1
-                else:
-                    # Rollback
-                    np.subtract.at(cover_count, new_ts, 1)
-                    np.add.at(cover_count, ts_i, 1)
-                    np.add.at(cover_count, ts_j, 1)
-            else:
-                # Standard 1-exchange
-                i = random.randint(0, len(blocks) - 1)
-                ts_arr_i = block_ts_indices[i]
+            unique_mask = cover_count[ts_arr_i] == 1
+            unique_ts = ts_arr_i[unique_mask]
 
-                unique_mask = cover_count[ts_arr_i] == 1
-                unique_ts = ts_arr_i[unique_mask]
-
-                if len(unique_ts) == 0:
-                    np.subtract.at(cover_count, ts_arr_i, 1)
-                    blocks.pop(i)
-                    block_ts_indices.pop(i)
-                    improved_count += 1
-                    continue
-
-                candidates = set(ts_to_blocks[int(unique_ts[0])])
-                for ts_idx in unique_ts[1:]:
-                    candidates.intersection_update(ts_to_blocks[int(ts_idx)])
-                    if not candidates:
-                        break
-
-                if not candidates:
-                    continue
-
-                valid_candidates = [c for c in candidates if c not in sol_block_set]
-                if not valid_candidates:
-                    continue
-
-                new_block_idx = random.choice(valid_candidates)
-                new_ts_arr = block_to_ts_np[new_block_idx]
-
+            if len(unique_ts) == 0:
                 np.subtract.at(cover_count, ts_arr_i, 1)
-                np.add.at(cover_count, new_ts_arr, 1)
+                blocks.pop(i)
+                block_ts_indices.pop(i)
+                improved_count += 1
+                continue
 
-                if np.min(cover_count) >= 1:
-                    blocks[i] = list(all_k_blocks[new_block_idx])
-                    block_ts_indices[i] = new_ts_arr
-                    old_idx = get_block_idx(blocks[i])
-                    if old_idx >= 0:
-                        sol_block_set.discard(old_idx)
-                    sol_block_set.add(new_block_idx)
-                    improved_count += 1
-                else:
-                    np.subtract.at(cover_count, new_ts_arr, 1)
-                    np.add.at(cover_count, ts_arr_i, 1)
+            candidates = set(ts_to_blocks[int(unique_ts[0])])
+            for ts_idx in unique_ts[1:]:
+                candidates.intersection_update(ts_to_blocks[int(ts_idx)])
+                if not candidates:
+                    break
+
+            if not candidates:
+                # Try 2-for-1: remove block i and add two new blocks
+                if len(blocks) >= 2:
+                    j = random.randint(0, len(blocks) - 1)
+                    if j == i:
+                        j = (j + 1) % len(blocks)
+                    
+                    ts_arr_j = block_ts_indices[j]
+                    unique_mask_j = cover_count[ts_arr_j] == 1
+                    unique_ts_j = ts_arr_j[unique_mask_j]
+                    
+                    if len(unique_ts_j) == 0:
+                        # Block j is fully redundant, just remove it
+                        np.subtract.at(cover_count, ts_arr_j, 1)
+                        blocks.pop(j)
+                        block_ts_indices.pop(j)
+                        if j < i:
+                            i -= 1
+                        improved_count += 1
+                        continue
+                    
+                    # Find blocks that cover unique_ts of both i and j
+                    all_unique = np.concatenate([unique_ts, unique_ts_j])
+                    all_unique = np.unique(all_unique)
+                    
+                    if len(all_unique) > 0:
+                        cand_set = set(ts_to_blocks[int(all_unique[0])])
+                        for ts_idx in all_unique[1:]:
+                            cand_set.intersection_update(ts_to_blocks[int(ts_idx)])
+                            if not cand_set:
+                                break
+                        
+                        if cand_set:
+                            valid_cands = [c for c in cand_set if c not in sol_block_set]
+                            if valid_cands:
+                                new_idx1 = random.choice(valid_cands)
+                                remaining = [c for c in valid_cands if c != new_idx1]
+                                if remaining:
+                                    new_idx2 = random.choice(remaining)
+                                else:
+                                    # Need two different blocks, pick another if possible
+                                    new_idx2 = new_idx1  # Will check validity below
+                                    
+                                if new_idx1 != new_idx2:
+                                    ts_arr_n1 = block_to_ts_np[new_idx1]
+                                    ts_arr_n2 = block_to_ts_np[new_idx2]
+                                    
+                                    np.subtract.at(cover_count, ts_arr_i, 1)
+                                    np.subtract.at(cover_count, ts_arr_j, 1)
+                                    np.add.at(cover_count, ts_arr_n1, 1)
+                                    np.add.at(cover_count, ts_arr_n2, 1)
+                                    
+                                    if np.min(cover_count) >= 1:
+                                        # Remove j first (higher index) to keep i stable
+                                        blocks.pop(j)
+                                        block_ts_indices.pop(j)
+                                        if j < i:
+                                            i -= 1
+                                        blocks.pop(i)
+                                        block_ts_indices.pop(i)
+                                        
+                                        blocks.append(list(all_k_blocks[new_idx1]))
+                                        block_ts_indices.append(ts_arr_n1)
+                                        blocks.append(list(all_k_blocks[new_idx2]))
+                                        block_ts_indices.append(ts_arr_n2)
+                                        
+                                        sol_block_set.discard(get_block_idx(blocks[-2]))
+                                        sol_block_set.discard(get_block_idx(blocks[-1]))
+                                        sol_block_set.add(new_idx1)
+                                        sol_block_set.add(new_idx2)
+                                        improved_count += 1
+                                    else:
+                                        np.subtract.at(cover_count, ts_arr_n1, 1)
+                                        np.subtract.at(cover_count, ts_arr_n2, 1)
+                                        np.add.at(cover_count, ts_arr_i, 1)
+                                        np.add.at(cover_count, ts_arr_j, 1)
+                continue
+
+            valid_candidates = [c for c in candidates if c not in sol_block_set]
+            if not valid_candidates:
+                continue
+
+            new_block_idx = random.choice(valid_candidates)
+            new_ts_arr = block_to_ts_np[new_block_idx]
+
+            np.subtract.at(cover_count, ts_arr_i, 1)
+            np.add.at(cover_count, new_ts_arr, 1)
+
+            if np.min(cover_count) >= 1:
+                blocks[i] = list(all_k_blocks[new_block_idx])
+                block_ts_indices[i] = new_ts_arr
+                old_idx = get_block_idx(blocks[i])
+                if old_idx >= 0:
+                    sol_block_set.discard(old_idx)
+                sol_block_set.add(new_block_idx)
+                improved_count += 1
+            else:
+                np.subtract.at(cover_count, new_ts_arr, 1)
+                np.add.at(cover_count, ts_arr_i, 1)
 
         return blocks, improved_count
 
@@ -380,9 +302,34 @@ def construct(v, k, t):
             best_solution = sol
 
     # Phase 2: Iterated Local Search
+    # We will perturb the solution and run local search again
     for _ in range(300):
         if time.time() > deadline - 5.0:
             break
+        
+        # Perturb: swap 1-2 blocks with random blocks
+        if len(best_solution) > 2:
+            # Pick 1 or 2 indices to swap
+            num_swaps = random.randint(1, 2)
+            for _ in range(num_swaps):
+                idx_to_swap = random.randint(0, len(best_solution) - 1)
+                # Pick a random new block
+                new_block_idx = random.randint(0, num_k_blocks - 1)
+                # Check if it's already in the set (if so, skip or pick another)
+                # For simplicity, just swap and let local search fix validity if it breaks? 
+                # No, local search requires valid input? 
+                # Actually, if we swap in a random block, we might lose coverage.
+                # Local search (Phase A) only removes. Phase B swaps.
+                # If we introduce a hole, Phase B might not fix it if it only looks at unique ts.
+                # So perturbation must be careful or we must restart greedy.
+                
+                # Better Perturbation: 
+                # Remove 2 random blocks and replace with 2 random blocks that cover the unique ts of the removed ones?
+                # This is complex.
+                
+                # Alternative: Just run Local Search on the current best.
+                # If no improvement, restart Greedy with a new seed.
+                pass
         
         best_solution, improved = local_search(best_solution, max_iters=2000)
         if len(best_solution) < best_len:
