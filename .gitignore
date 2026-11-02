@@ -1,0 +1,12 @@
+# Deny by default. Keep the page, its assets and the repository files only.
+*
+!/.gitignore
+!/.nojekyll
+!/README.md
+!/index.html
+!/favicon.svg
+!/apple-touch-icon.png
+!/og-card.png
+!/assets/
+!/assets/*.js
+!/assets/*.css
