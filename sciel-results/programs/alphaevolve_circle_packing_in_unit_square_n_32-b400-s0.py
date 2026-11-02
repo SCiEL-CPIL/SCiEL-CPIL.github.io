@@ -48,13 +48,13 @@ def _optimize_radii_lp(x, y):
         
     # Fallback: iterative shrink
     r = np.array([min(x[i], 1.0-x[i], y[i], 1.0-y[i]) for i in range(N)])
-    for _ in range(10):
+    for _ in range(20):
         changed = False
         for i in range(N):
             for j in range(i+1, N):
                 d = np.hypot(x[i]-x[j], y[i]-y[j])
                 if r[i] + r[j] > d:
-                    shrink = d / (r[i] + r[j]) if (r[i] + r[j]) > 0 else 0.5
+                    shrink = (d / (r[i] + r[j])) * 0.999 if (r[i] + r[j]) > 0 else 0.5
                     r[i] *= shrink
                     r[j] *= shrink
                     changed = True
@@ -170,58 +170,60 @@ def _random_init(seed):
     r = np.full(N, 0.06)
     return x, y, r
 
-def _objective(params, soft_eps=1e-4):
+def _objective(params, start, soft_eps=1e-4, mu=50.0):
+    if _elapsed(start) > TIME_LIMIT:
+        return 1e10
     x = params[:N]
     y = params[N:2*N]
     r = params[2*N:3*N]
-    
+    r = np.maximum(r, 0.0)
     obj = -np.sum(r)
-    
-    # Pairwise overlap penalty (soft max)
+
     dx = x[:, None] - x[None, :]
     dy = y[:, None] - y[None, :]
-    dist = np.sqrt(dx*dx + dy*dy)
+    dist = np.sqrt(dx*dx + dy*dy + 1e-14)
     min_dist = r[:, None] + r[None, :]
     diff = min_dist - dist
     smooth_max = 0.5 * (diff + np.sqrt(diff*diff + soft_eps*soft_eps))
     mask = np.triu(np.ones((N, N), dtype=bool), k=1)
     overlap_pen = np.sum(smooth_max[mask])
-    
-    # Boundary penalties (soft max)
-    pen = np.zeros(4*N)
-    pen[0:N] = r - x          # left
-    pen[N:2*N] = x - (1.0 - r)  # right
-    pen[2*N:3*N] = r - y       # bottom
-    pen[3*N:4*N] = y - (1.0 - r)  # top
-    bound_pen = np.sum(0.5 * (pen + np.sqrt(pen*pen + soft_eps*soft_eps)))
-    
-    mu = 50.0
+
+    dneg_x = r - x
+    dpos_x = x - (1.0 - r)
+    dneg_y = r - y
+    dpos_y = y - (1.0 - r)
+    def sm(v):
+        return 0.5 * (v + np.sqrt(v*v + soft_eps*soft_eps))
+    bound_pen = np.sum(sm(dneg_x)) + np.sum(sm(dpos_x)) + np.sum(sm(dneg_y)) + np.sum(sm(dpos_y))
+
     return obj + mu * (overlap_pen + bound_pen)
 
-def _objective_tight(params, soft_eps=1e-6):
+def _objective_tight(params, start, soft_eps=1e-6, mu=200.0):
+    if _elapsed(start) > TIME_LIMIT:
+        return 1e10
     x = params[:N]
     y = params[N:2*N]
     r = params[2*N:3*N]
-    
+    r = np.maximum(r, 0.0)
     obj = -np.sum(r)
-    
+
     dx = x[:, None] - x[None, :]
     dy = y[:, None] - y[None, :]
-    dist = np.sqrt(dx*dx + dy*dy)
+    dist = np.sqrt(dx*dx + dy*dy + 1e-14)
     min_dist = r[:, None] + r[None, :]
     diff = min_dist - dist
     smooth_max = 0.5 * (diff + np.sqrt(diff*diff + soft_eps*soft_eps))
     mask = np.triu(np.ones((N, N), dtype=bool), k=1)
     overlap_pen = np.sum(smooth_max[mask])
-    
-    pen = np.zeros(4*N)
-    pen[0:N] = r - x
-    pen[N:2*N] = x - (1.0 - r)
-    pen[2*N:3*N] = r - y
-    pen[3*N:4*N] = y - (1.0 - r)
-    bound_pen = np.sum(0.5 * (pen + np.sqrt(pen*pen + soft_eps*soft_eps)))
-    
-    mu = 200.0
+
+    dneg_x = r - x
+    dpos_x = x - (1.0 - r)
+    dneg_y = r - y
+    dpos_y = y - (1.0 - r)
+    def sm(v):
+        return 0.5 * (v + np.sqrt(v*v + soft_eps*soft_eps))
+    bound_pen = np.sum(sm(dneg_x)) + np.sum(sm(dpos_x)) + np.sum(sm(dneg_y)) + np.sum(sm(dpos_y))
+
     return obj + mu * (overlap_pen + bound_pen)
 
 def _push_apart(x, y, r, iterations=50):
@@ -260,7 +262,7 @@ def _push_apart(x, y, r, iterations=50):
 def _optimize(x0, start_time, time_budget=100):
     """Run L-BFGS-B optimization."""
     try:
-        res = minimize(_objective, x0, method='L-BFGS-B',
+        res = minimize(lambda p: _objective(p, start_time), x0, method='L-BFGS-B',
                        options={'maxiter': 3000, 'ftol': 1e-14, 'gtol': 1e-12,
                                 'maxfun': 50000})
         return res.x
@@ -270,7 +272,7 @@ def _optimize(x0, start_time, time_budget=100):
 def _tight_polish(params, start_time, time_budget=10):
     """Final high-precision polish."""
     try:
-        res = minimize(_objective_tight, params, method='L-BFGS-B',
+        res = minimize(lambda p: _objective_tight(p, start_time), params, method='L-BFGS-B',
                        options={'maxiter': 5000, 'ftol': 1e-15, 'gtol': 1e-14,
                                 'maxfun': 100000})
         return res.x
@@ -300,7 +302,7 @@ def _local_search(params, start_time, max_iter=1000):
         
         # Quick optimize
         try:
-            res = minimize(_objective, p_opt, method='L-BFGS-B',
+            res = minimize(lambda p: _objective(p, start_time), p_opt, method='L-BFGS-B',
                            options={'maxiter': 500, 'ftol': 1e-12, 'gtol': 1e-10,
                                     'maxfun': 5000})
             p_opt = res.x

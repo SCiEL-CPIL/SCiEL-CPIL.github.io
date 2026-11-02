@@ -1,0 +1,1 @@
+BET: {mechanism: "Improved local search with multi-pass deletion, smarter swap evaluation that counts enabled deletions, and a block-addition phase that finds net-positive additions; better time management allocates more time to local search where improvements occur", q: 0.65, delta: [0.005, 0.02]}
