@@ -1,0 +1,129 @@
+import numpy as np
+import time
+
+DIMENSIONS = [2, 3, 7]
+
+def construct():
+    n, m, p = DIMENSIONS
+    start_time = time.time()
+    time_limit = 140.0
+
+    nm, mp, pn = n * m, m * p, p * n
+
+    # Build the target tensor
+    T_target = np.zeros((nm, mp, pn))
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                u = i * m + j
+                v = j * p + k
+                w = k * n + i
+                T_target[u, v, w] = 1.0
+
+    def get_schoolbook():
+        rank = n * m * p
+        U = np.zeros((nm, rank))
+        V = np.zeros((mp, rank))
+        W = np.zeros((pn, rank))
+        col = 0
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    U[i * m + j, col] = 1.0
+                    V[j * p + k, col] = 1.0
+                    W[k * n + i, col] = 1.0
+                    col += 1
+        return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}
+
+    def check_decomposition(U, V, W, tol=1e-6):
+        T_full = np.einsum('ur,vr,wr->uvw', U, V, W)
+        return np.allclose(T_full, T_target, atol=tol)
+
+    def try_rank_1_peeling(max_rank=41, max_iter=50, n_restarts=3):
+        """
+        Try to find a decomposition of rank <= max_rank using rank-1 peeling.
+        """
+        best_result = None
+        best_rank = max_rank + 1
+
+        for restart in range(n_restarts):
+            if time.time() - start_time > time_limit - 5:
+                break
+
+            residual = T_target.copy()
+            U_list = []
+            V_list = []
+            W_list = []
+
+            for rank_idx in range(max_rank):
+                if time.time() - start_time > time_limit - 5:
+                    break
+
+                # Find best rank-1 approximation to residual
+                # Use alternating maximization
+                u = np.random.randn(nm)
+                v = np.random.randn(mp)
+                w = np.random.randn(pn)
+
+                best_norm = np.inf
+                best_uvw = None
+
+                for _ in range(max_iter):
+                    # Update u
+                    S_u = np.einsum('ijk,j,k->i', residual, v, w)
+                    u = S_u / (np.linalg.norm(S_u) + 1e-12)
+
+                    # Update v
+                    S_v = np.einsum('ijk,i,k->j', residual, u, w)
+                    v = S_v / (np.linalg.norm(S_v) + 1e-12)
+
+                    # Update w
+                    S_w = np.einsum('ijk,i,j->k', residual, u, v)
+                    w = S_w / (np.linalg.norm(S_w) + 1e-12)
+
+                    # Check convergence
+                    norm_uvw = np.linalg.norm(u) * np.linalg.norm(v) * np.linalg.norm(w)
+                    if norm_uvw < 1e-10:
+                        break
+
+                # Compute the rank-1 tensor u⊗v⊗w and subtract from residual
+                alpha = np.einsum('ijk,i,j,k', residual, u, v, w)
+                if abs(alpha) < 1e-10:
+                    break
+
+                residual = residual - alpha * np.einsum('i,j,k->ijk', u, v, w)
+
+                U_list.append(alpha * u)
+                V_list.append(v)
+                W_list.append(w)
+
+                # Check if residual is zero
+                if np.linalg.norm(residual) < 1e-8:
+                    break
+
+            R = len(U_list)
+            if R >= best_rank:
+                continue
+
+            if R <= max_rank:
+                U = np.column_stack(U_list)
+                V = np.column_stack(V_list)
+                W = np.column_stack(W_list)
+
+                # Verify
+                if check_decomposition(U, V, W, tol=1e-5):
+                    best_result = {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}
+                    best_rank = R
+                    if best_rank == 42:  # theoretical lower bound for 2x3x7
+                        break
+
+        return best_result
+
+    # Try rank-1 peeling for ranks 41 down to 40
+    for target_rank in [41, 40]:
+        result = try_rank_1_peeling(max_rank=target_rank, max_iter=30, n_restarts=3)
+        if result is not None:
+            return result
+
+    # Fallback to schoolbook
+    return get_schoolbook()

@@ -1,0 +1,273 @@
+import math
+import time
+import numpy as np
+
+N = 11
+_START_TIME = time.time()
+_DEADLINE = _START_TIME + 145.0
+_SQRT3 = math.sqrt(3)
+_INVSQRT3 = 1.0 / _SQRT3
+
+def _hex_vertices(cx, cy, angle_deg):
+    """Vertices of a unit regular hexagon centered at (cx,cy) with rotation angle_deg."""
+    a0 = math.radians(angle_deg)
+    angles = a0 + np.arange(6) * math.pi / 3.0
+    return np.column_stack([cx + np.cos(angles), cy + np.sin(angles)])
+
+def _min_enclosing_hex_side_geometric(verts, outer_angle_deg):
+    """
+    Find a valid enclosing regular hexagon side length using geometric projection.
+    Uses centroid as initial center and refines with a small local search.
+    Returns (cx, cy, side) or None.
+    """
+    base_angle = math.radians(outer_angle_deg + 30)
+    angles = base_angle + np.arange(6) * math.pi / 3.0
+    normals = np.column_stack([np.cos(angles), np.sin(angles)])
+    
+    # Initial center: centroid
+    cx, cy = np.mean(verts, axis=0)
+    
+    def get_side(cx, cy):
+        rel = verts - np.array([cx, cy])
+        projections = rel @ normals.T
+        max_proj = np.max(projections, axis=0)
+        min_proj = np.min(projections, axis=0)
+        # The hexagon must contain all points.
+        # Distance from center to side k is r.
+        # Max projection in direction n_k must be <= r.
+        # Min projection in direction n_k must be >= -r.
+        # So r >= max(max_proj) and r >= max(-min_proj) => r >= max(max_proj, -min_proj)
+        r = np.max(np.maximum(max_proj, -min_proj))
+        if r < 0: r = 0
+        side = r * 2.0 / _SQRT3
+        return side, r
+
+    best_side, best_r = get_side(cx, cy)
+    best_cx, best_cy = cx, cy
+    
+    # Small local search around centroid to minimize r
+    # Step size 0.1, 20x20 grid
+    step = 0.2
+    for dx in np.arange(-1.0, 1.1, step):
+        for dy in np.arange(-1.0, 1.1, step):
+            ncx = cx + dx
+            ncy = cy + dy
+            s, r = get_side(ncx, ncy)
+            if s < best_side:
+                best_side = s
+                best_r = r
+                best_cx = ncx
+                best_cy = ncy
+                
+    return best_cx, best_cy, best_side
+
+def _build_positions(layout_idx):
+    """Generate 11 positions for given layout index."""
+    sqrt3 = _SQRT3
+    scale = 1.01
+    u = (sqrt3*scale, 0.0)
+    v = (sqrt3/2*scale, 1.5*scale)
+    
+    # Pre-compute all (i,j) pairs in a reasonable range
+    coords = []
+    for i in range(-4, 5):
+        for j in range(-4, 5):
+            x = i*u[0] + j*v[0]
+            y = i*u[1] + j*v[1]
+            coords.append((x, y, i, j))
+    
+    if layout_idx == 0:
+        # Compact hexagonal: center + 6 ring + 4 from second ring
+        target = [(0,0)]
+        ring1 = [(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1)]
+        target.extend(ring1)
+        ring2 = [(2,0),(1,1),(0,2),(-1,2),(-2,1),(-2,0),(-1,-1),(0,-2),(1,-2),(2,-1)]
+        ring2_sorted = sorted(ring2, key=lambda p: p[0]**2 + p[1]**2)
+        target.extend(ring2_sorted[:4])
+        positions = []
+        for ti, tj in target:
+            x = ti*u[0] + tj*v[0]
+            y = ti*u[1] + tj*v[1]
+            positions.append((x,y))
+        return positions[:N]
+    elif layout_idx == 1:
+        # Row-based: 3-4-4 pattern
+        positions = []
+        y1 = -1.5*scale
+        for k in range(-1, 2):
+            x = k*sqrt3*scale + sqrt3/2*scale
+            positions.append((x, y1))
+        y2 = 0.0
+        for k in range(-1, 3):
+            x = k*sqrt3*scale
+            positions.append((x, y2))
+        y3 = 1.5*scale
+        for k in range(-1, 3):
+            x = k*sqrt3*scale + sqrt3/2*scale
+            positions.append((x, y3))
+        return positions[:N]
+    elif layout_idx == 2:
+        # 4-3-4 pattern
+        positions = []
+        y1 = -1.5*scale
+        for k in range(-2, 2):
+            x = k*sqrt3*scale
+            positions.append((x, y1))
+        y2 = 0.0
+        for k in range(-1, 2):
+            x = k*sqrt3*scale + sqrt3/2*scale
+            positions.append((x, y2))
+        y3 = 1.5*scale
+        for k in range(-2, 2):
+            x = k*sqrt3*scale
+            positions.append((x, y3))
+        return positions[:N]
+    elif layout_idx == 3:
+        # 2-4-2-3 pattern (more elongated)
+        positions = []
+        y1 = -3.0*scale
+        for k in range(0, 2):
+            x = k*sqrt3*scale - sqrt3/2*scale
+            positions.append((x, y1))
+        y2 = -1.5*scale
+        for k in range(-1, 3):
+            x = k*sqrt3*scale
+            positions.append((x, y2))
+        y3 = 0.0
+        for k in range(-1, 1):
+            x = k*sqrt3*scale + sqrt3/2*scale
+            positions.append((x, y3))
+        y4 = 1.5*scale
+        for k in range(-1, 2):
+            x = k*sqrt3*scale
+            positions.append((x, y4))
+        return positions[:N]
+    elif layout_idx == 4:
+        # 3-5-3 pattern
+        positions = []
+        y1 = -1.5*scale
+        for k in range(-1, 2):
+            x = k*sqrt3*scale + sqrt3/2*scale
+            positions.append((x, y1))
+        y2 = 0.0
+        for k in range(-2, 3):
+            x = k*sqrt3*scale
+            positions.append((x, y2))
+        y3 = 1.5*scale
+        for k in range(-1, 2):
+            x = k*sqrt3*scale + sqrt3/2*scale
+            positions.append((x, y3))
+        return positions[:N]
+    elif layout_idx == 5:
+        # Center + 6 ring + 4 more, but different selection
+        positions = []
+        positions.append((0, 0))
+        # Ring 1
+        ring1 = [(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1)]
+        for ti, tj in ring1:
+            x = ti*u[0] + tj*v[0]
+            y = ti*u[1] + tj*v[1]
+            positions.append((x, y))
+        # Ring 2: pick 4 that are more symmetric
+        ring2 = [(2,0),(1,1),(-1,2),(-2,0),(-1,-1),(0,-2)]
+        for ti, tj in ring2[:4]:
+            x = ti*u[0] + tj*v[0]
+            y = ti*u[1] + tj*v[1]
+            positions.append((x, y))
+        return positions[:N]
+    elif layout_idx == 6:
+        # 2-3-3-3 pattern
+        positions = []
+        y1 = -3.0*scale
+        for k in range(0, 2):
+            x = k*sqrt3*scale - sqrt3/2*scale
+            positions.append((x, y1))
+        y2 = -1.5*scale
+        for k in range(-1, 2):
+            x = k*sqrt3*scale
+            positions.append((x, y2))
+        y3 = 0.0
+        for k in range(-1, 2):
+            x = k*sqrt3*scale + sqrt3/2*scale
+            positions.append((x, y3))
+        y4 = 1.5*scale
+        for k in range(-1, 2):
+            x = k*sqrt3*scale
+            positions.append((x, y4))
+        return positions[:N]
+    elif layout_idx == 7:
+        # 4-4-3 pattern
+        positions = []
+        y1 = -1.5*scale
+        for k in range(-2, 2):
+            x = k*sqrt3*scale
+            positions.append((x, y1))
+        y2 = 0.0
+        for k in range(-2, 2):
+            x = k*sqrt3*scale + sqrt3/2*scale
+            positions.append((x, y2))
+        y3 = 1.5*scale
+        for k in range(-1, 2):
+            x = k*sqrt3*scale
+            positions.append((x, y3))
+        return positions[:N]
+    else:
+        coords_sorted = sorted(coords, key=lambda t: t[0]**2 + t[1]**2)
+        return [(x,y) for x,y,i,j in coords_sorted[:N]]
+
+
+
+def construct():
+    global _START_TIME, _DEADLINE
+    
+    if time.time() > _DEADLINE - 5.0:
+        inner = [[4.0*k, 0.0, 0.0] for k in range(-(N//2), N - N//2)]
+        return inner, (0.0, 0.0), 40.0, 0.0
+    
+    best_side = float('inf')
+    best_inner = None
+    best_center = (0.0, 0.0)
+    best_outer_angle = 0.0
+    
+    num_layouts = 8
+    layouts = [_build_positions(i) for i in range(num_layouts)]
+    
+    for layout_idx, positions in enumerate(layouts):
+        if time.time() > _DEADLINE - 10.0:
+            break
+        
+        # Use standard orientation for inner hexagons (flat top/bottom)
+        inner_angle = 30.0 
+        
+        # Vectorized vertex computation
+        all_vertices = np.vstack([_hex_vertices(px, py, inner_angle) for px, py in positions])
+        
+        best_local_side = float('inf')
+        best_local_center = (0.0, 0.0)
+        best_local_angle = 0.0
+        
+        # Try several outer angles
+        # Symmetry of hexagon is 60 degrees, but since inner are fixed, we check 0-30
+        for outer_angle_deg in np.arange(0, 30.0, 1.0):
+            if time.time() > _DEADLINE - 10.0:
+                break
+            
+            res = _min_enclosing_hex_side_geometric(all_vertices, outer_angle_deg)
+            if res:
+                cx, cy, side = res
+                if side < best_local_side:
+                    best_local_side = side
+                    best_local_center = (cx, cy)
+                    best_local_angle = outer_angle_deg
+        
+        if best_local_side < best_side:
+            best_side = best_local_side
+            best_inner = [[pos[0], pos[1], inner_angle] for pos in positions]
+            best_center = best_local_center
+            best_outer_angle = best_local_angle
+    
+    if best_inner is None:
+        inner = [[4.0*k, 0.0, 0.0] for k in range(-(N//2), N - N//2)]
+        return inner, (0.0, 0.0), 40.0, 0.0
+    
+    return best_inner, best_center, best_side, best_outer_angle

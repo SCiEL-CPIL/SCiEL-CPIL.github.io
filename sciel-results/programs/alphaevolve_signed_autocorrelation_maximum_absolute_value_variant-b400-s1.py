@@ -276,6 +276,73 @@ def _amplitude_optimize(x0, rng, iters=40, beta=50.0):
     
     return x_best, best_val
 
+def _peak_targeted_polish(x0, rng, max_iters=800, step_size=0.01):
+    """
+    Identify dominant autoconvolution lags and apply targeted perturbations
+    to reduce the peak absolute value. Vectorized contribution computation.
+    """
+    best_x = x0.copy()
+    best_val = _objective_only(x0)
+    ac = _autoconv_fft(best_x)
+    abs_ac = np.abs(ac)
+    
+    for it in range(max_iters):
+        if _check_deadline():
+            break
+        
+        # Recompute autoconvolution periodically to track peak shifts
+        if it % 20 == 0:
+            ac = _autoconv_fft(best_x)
+            abs_ac = np.abs(ac)
+        
+        # Find the top k lags contributing to the peak
+        top_k = 8
+        sorted_idx = np.argsort(-abs_ac)[:top_k]
+        
+        # For each dominant lag, try to reduce it
+        improved = False
+        for k in sorted_idx:
+            if _check_deadline():
+                break
+            
+            # Vectorized computation of d(ac[k])/dx
+            # d(ac[k])/dx[n] = 2*x[k-n] for 0<=k-n<N, with boundary handling
+            # For n in [0, N-1], k-n is valid when 0 <= k-n < N
+            # i.e., k-N+1 <= n <= k
+            n_lo = max(0, k - N + 1)
+            n_hi = min(k, N - 1)
+            
+            if n_hi >= n_lo:
+                # contrib[n] = 2*x[k-n] for n in [n_lo, n_hi]
+                # k-n ranges from k-n_lo to k-n_hi
+                idx_in_x = k - np.arange(n_lo, n_hi + 1)
+                contrib_segment = 2.0 * best_x[idx_in_x]
+                
+                # Build full contribution vector
+                contrib = np.zeros(N)
+                contrib[n_lo:n_hi+1] = contrib_segment
+                
+                norm_contrib = np.linalg.norm(contrib)
+                if norm_contrib > 1e-10:
+                    direction = -contrib / norm_contrib
+                    
+                    # Try a few step sizes
+                    for scale in [step_size, step_size * 0.5, step_size * 1.5, step_size * 2.0]:
+                        x_trial = best_x + scale * direction
+                        val = _objective_only(x_trial)
+                        if val < best_val:
+                            best_val = val
+                            best_x = x_trial.copy()
+                            improved = True
+                            break
+        
+        if improved:
+            step_size = max(0.001, step_size * 0.93)
+        else:
+            step_size = min(0.08, step_size * 1.03)
+    
+    return best_x, best_val
+
 def construct():
     best_x = np.ones(N)
     best_val = _objective_only(best_x)
@@ -365,8 +432,17 @@ def construct():
     if _check_deadline():
         return best_x
     
+    # Peak-targeted polish
+    x_peak, val_peak = _peak_targeted_polish(best_x, rng, max_iters=500, step_size=0.01)
+    if val_peak < best_val:
+        best_val = val_peak
+        best_x = x_peak.copy()
+    
+    if _check_deadline():
+        return best_x
+    
     # Polish with higher beta L-BFGS
-    for beta in [200.0, 400.0, 800.0]:
+    for beta in [200.0, 500.0, 1000.0, 2000.0, 4000.0]:
         if _check_deadline():
             break
         try:
@@ -374,7 +450,7 @@ def construct():
                 return _objective_and_grad(x, _beta)
             
             result = minimize(obj_and_grad_func, best_x, method='L-BFGS-B',
-                              jac=True, options={'maxiter': 200, 'gtol': 1e-10, 'ftol': 1e-13, 'maxls': 30})
+                              jac=True, options={'maxiter': 300, 'gtol': 1e-11, 'ftol': 1e-14, 'maxls': 40})
             
             if result.fun < best_val:
                 best_val = result.fun
@@ -389,58 +465,68 @@ def construct():
     # Coordinate descent refinement with structured perturbations
     step_size = 0.02
     no_improve = 0
-    max_no_improve = 8000
+    max_no_improve = 12000
     best_ever = best_val
+    t_arr = np.arange(N)
     
     while no_improve < max_no_improve and not _check_deadline():
         # Mix of random perturbations and structured ones
         r = rng.random()
-        if r < 0.3:
+        if r < 0.2:
             # Single coordinate
             idx = rng.integers(0, N)
             delta = step_size * rng.choice([-1, 1])
             x_trial = best_x.copy()
             x_trial[idx] += delta
-        elif r < 0.6:
+        elif r < 0.45:
             # Small random block
-            n_perturb = rng.integers(2, 8)
+            n_perturb = rng.integers(2, 10)
             indices = rng.choice(N, size=n_perturb, replace=False)
             perturbation = np.zeros(N)
             perturbation[indices] = rng.normal(0, step_size, size=n_perturb)
             x_trial = best_x + perturbation
-        elif r < 0.8:
+        elif r < 0.7:
             # Low-frequency structured perturbation
-            freq = rng.integers(1, 5)
+            freq = rng.integers(1, 8)
             phase = rng.uniform(0, 2 * np.pi)
-            t_arr = np.arange(N)
             perturbation = step_size * np.sin(2 * np.pi * freq * t_arr / N + phase)
+            x_trial = best_x + perturbation
+        elif r < 0.85:
+            # Multi-frequency structured perturbation
+            freq1 = rng.integers(1, 5)
+            freq2 = rng.integers(5, 15)
+            phase1 = rng.uniform(0, 2 * np.pi)
+            phase2 = rng.uniform(0, 2 * np.pi)
+            perturbation = step_size * (0.7 * np.sin(2 * np.pi * freq1 * t_arr / N + phase1) +
+                                        0.3 * np.sin(2 * np.pi * freq2 * t_arr / N + phase2))
             x_trial = best_x + perturbation
         else:
             # Random sparse large perturbation
-            n_perturb = rng.integers(5, 20)
+            n_perturb = rng.integers(5, 25)
             indices = rng.choice(N, size=n_perturb, replace=False)
             perturbation = np.zeros(N)
-            perturbation[indices] = rng.normal(0, step_size * 2, size=n_perturb)
+            perturbation[indices] = rng.normal(0, step_size * 2.5, size=n_perturb)
             x_trial = best_x + perturbation
         
         val = _objective_only(x_trial)
         if val < best_val:
             best_val = val
             best_x = x_trial.copy()
-            step_size = max(0.001, step_size * 0.97)
+            step_size = max(0.0005, step_size * 0.96)
             no_improve = 0
         else:
             no_improve += 1
-            step_size = min(0.05, step_size * 1.015)
+            step_size = min(0.1, step_size * 1.02)
         
         # Periodic restart from slightly perturbed best
-        if no_improve > 2000 and rng.random() < 0.01:
-            x_restart = best_x + rng.normal(0, 0.05, size=N)
+        if no_improve > 3000 and rng.random() < 0.02:
+            x_restart = best_x + rng.normal(0, 0.08, size=N)
             val_restart = _objective_only(x_restart)
             if val_restart < best_val:
                 best_val = val_restart
                 best_x = x_restart.copy()
                 no_improve = 0
+                step_size = 0.02
     
     return best_x
 # EVOLVE-BLOCK-END
