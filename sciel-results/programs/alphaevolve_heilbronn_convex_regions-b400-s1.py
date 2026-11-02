@@ -2,47 +2,92 @@ import numpy as np
 import time
 import scipy.optimize as opt
 from scipy.spatial import ConvexHull
-from itertools import combinations
 
 N = 13
 
 # EVOLVE-BLOCK-START
 def construct():
     start_time = time.time()
-    time_limit = 140.0  # Leave 10s margin
-    
-    def _min_triangle_area(points):
-        """Compute the minimum area of any triangle formed by 3 points."""
-        n = len(points)
-        min_area = float('inf')
-        for i in range(n):
-            for j in range(i + 1, n):
-                for k in range(j + 1, n):
-                    v1 = points[j] - points[i]
-                    v2 = points[k] - points[i]
-                    cross = v1[0] * v2[1] - v1[1] * v2[0]
-                    area = 0.5 * abs(cross)
-                    if area < min_area:
-                        min_area = area
-        return min_area
+    time_limit = 145.0  # Leave 5s margin for safety
 
-    def _convex_hull_area(points):
-        """Compute the area of the convex hull of the points."""
-        if len(points) < 3:
-            return 0.0
+    # Precompute indices for all triples
+    triples = [(i, j, k) for i in range(N) for j in range(i+1, N) for k in range(j+1, N)]
+    n_triples = len(triples)
+
+    def compute_score(points):
+        """Compute min triangle area / convex hull area for given points."""
         try:
             hull = ConvexHull(points)
-            return hull.volume  # In 2D, volume is area
+            area_hull = hull.volume
         except Exception:
-            return 0.0
+            return 0.0, 0.0
+            
+        if area_hull < 1e-9:
+            return 0.0, 0.0
 
-    def _score(points):
-        """Compute the score: min triangle area / convex hull area."""
-        hull_area = _convex_hull_area(points)
-        if hull_area <= 1e-12:
-            return 0.0
-        min_tri = _min_triangle_area(points)
-        return min_tri / hull_area
+        x = points[:, 0]
+        y = points[:, 1]
+        min_area = float('inf')
+        for i, j, k in triples:
+            v1x = x[j] - x[i]
+            v1y = y[j] - y[i]
+            v2x = x[k] - x[i]
+            v2y = y[k] - y[i]
+            cross = abs(v1x * v2y - v1y * v2x)
+            area = 0.5 * cross
+            if area < min_area:
+                min_area = area
+
+        score = min_area / area_hull
+        return score, area_hull
+
+    def _soft_min_score(points, beta=50.0):
+        """
+        Smooth surrogate: use log-sum-exp to approximate the minimum triangle area.
+        Returns negative soft-min score for minimization.
+        """
+        try:
+            hull = ConvexHull(points)
+            area_hull = hull.volume
+        except Exception:
+            return 1e6
+            
+        if area_hull < 1e-9:
+            return 1e6
+
+        x = points[:, 0]
+        y = points[:, 1]
+        
+        # Compute all triangle areas
+        areas = np.empty(n_triples)
+        for idx, (i, j, k) in enumerate(triples):
+            v1x = x[j] - x[i]
+            v1y = y[j] - y[i]
+            v2x = x[k] - x[i]
+            v2y = y[k] - y[i]
+            cross = abs(v1x * v2y - v1y * v2x)
+            areas[idx] = 0.5 * cross
+
+        # Soft-min via log-sum-exp: -log(sum(exp(-beta * a_i))) / beta approximates min(a_i)
+        # For stability, subtract max
+        neg_beta_areas = -beta * areas
+        max_val = np.max(neg_beta_areas)
+        log_sum_exp = max_val + np.log(np.sum(np.exp(neg_beta_areas - max_val)))
+        soft_min_area = -log_sum_exp / beta
+
+        score = soft_min_area / area_hull
+        return -score
+
+    def _hard_score_neg(points_flat):
+        """Negative hard score for final evaluation."""
+        points = points_flat.reshape(-1, 2)
+        score, _ = compute_score(points)
+        return -score
+
+    def _soft_objective(points_flat, beta=50.0):
+        """Soft-min objective for gradient-based optimization."""
+        points = points_flat.reshape(-1, 2)
+        return _soft_min_score(points, beta)
 
     def _regular_polygon(n, radius=1.0, center=(0.0, 0.0)):
         """Generate points of a regular n-gon."""
@@ -51,75 +96,45 @@ def construct():
         ys = center[1] + radius * np.sin(angles)
         return np.column_stack([xs, ys])
 
-    def _neg_score(points_flat):
-        """Negative score for minimization."""
-        points = points_flat.reshape(-1, 2)
-        return -_score(points)
-
-    def _optimize_from_start(start_points, max_iter=200, method='L-BFGS-B'):
-        """Optimize from a starting configuration."""
-        try:
-            result = opt.minimize(
-                _neg_score,
-                start_points.flatten(),
-                method=method,
-                options={'maxiter': max_iter, 'ftol': 1e-10, 'gtol': 1e-8}
-            )
-            if result.fun < 0:
-                return result.x.reshape(-1, 2)
-            return start_points
-        except Exception:
-            return start_points
-
     def _make_initial_configurations():
         """Create several diverse initial configurations."""
         configs = []
         
-        # Config 1: Regular 13-gon (all on hull)
         configs.append(_regular_polygon(13, radius=1.0))
         
-        # Config 2: Regular 12-gon with center point
         hull_pts = _regular_polygon(12, radius=1.0)
         center = np.array([[0.0, 0.0]])
         configs.append(np.vstack([hull_pts, center]))
         
-        # Config 3: Regular 11-gon + 2 interior points
         hull_pts = _regular_polygon(11, radius=1.0)
         interior1 = np.array([[0.3, 0.0]])
         interior2 = np.array([[-0.15, 0.26]])
         configs.append(np.vstack([hull_pts, interior1, interior2]))
         
-        # Config 4: Regular 10-gon + 3 interior points
         hull_pts = _regular_polygon(10, radius=1.0)
         interior = _regular_polygon(3, radius=0.3)
         configs.append(np.vstack([hull_pts, interior]))
         
-        # Config 5: Regular 9-gon + 4 interior points
         hull_pts = _regular_polygon(9, radius=1.0)
         interior = _regular_polygon(4, radius=0.35)
         configs.append(np.vstack([hull_pts, interior]))
         
-        # Config 6: Two concentric rings (7 outer + 6 inner)
         outer = _regular_polygon(7, radius=1.0)
         inner = _regular_polygon(6, radius=0.5)
         configs.append(np.vstack([outer, inner]))
         
-        # Config 7: 8 outer + 5 inner
         outer = _regular_polygon(8, radius=1.0)
         inner = _regular_polygon(5, radius=0.45)
         configs.append(np.vstack([outer, inner]))
         
-        # Config 8: 9 outer + 4 inner
         outer = _regular_polygon(9, radius=1.0)
         inner = _regular_polygon(4, radius=0.4)
         configs.append(np.vstack([outer, inner]))
         
-        # Config 9: 10 outer + 3 inner
         outer = _regular_polygon(10, radius=1.0)
         inner = _regular_polygon(3, radius=0.3)
         configs.append(np.vstack([outer, inner]))
         
-        # Config 10: 11 outer + 2 inner
         outer = _regular_polygon(11, radius=1.0)
         inner = _regular_polygon(2, radius=0.25)
         configs.append(np.vstack([outer, inner]))
@@ -132,56 +147,67 @@ def construct():
     configs = _make_initial_configurations()
     
     for i, config in enumerate(configs):
-        if time.time() > start_time + time_limit - 10:
+        if time.time() > start_time + time_limit - 15:
             break
         
         # Evaluate initial config
-        s = _score(config)
+        s, _ = compute_score(config)
         if s > best_score:
             best_score = s
             best_points = config.copy()
         
-        # Try to optimize with L-BFGS-B
-        if time.time() > start_time + time_limit - 10:
+        # Phase 1: L-BFGS-B with soft-min surrogate (multiple beta values for annealing)
+        if time.time() > start_time + time_limit - 15:
             break
         
-        try:
-            optimized = _optimize_from_start(config, max_iter=150, method='L-BFGS-B')
-            opt_score = _score(optimized)
-            if opt_score > best_score:
-                best_score = opt_score
-                best_points = optimized.copy()
-        except Exception:
-            pass
+        current = config.copy()
+        for beta in [20.0, 50.0, 100.0]:
+            if time.time() > start_time + time_limit - 15:
+                break
+            try:
+                result = opt.minimize(
+                    lambda x: _soft_objective(x, beta),
+                    current.flatten(),
+                    method='L-BFGS-B',
+                    options={'maxiter': 80, 'ftol': 1e-12, 'gtol': 1e-10}
+                )
+                optimized = result.x.reshape(-1, 2)
+                opt_score, _ = compute_score(optimized)
+                if opt_score > best_score:
+                    best_score = opt_score
+                    best_points = optimized.copy()
+                # Keep the soft-min optimized point for next beta
+                current = optimized
+            except Exception:
+                pass
         
-        # Try Nelder-Mead refinement on the best result so far
-        if time.time() > start_time + time_limit - 10:
+        # Phase 2: Nelder-Mead refinement with hard score
+        if time.time() > start_time + time_limit - 15:
             break
         
         if best_points is not None:
             try:
-                # Use Nelder-Mead for local refinement
                 res = opt.minimize(
-                    _neg_score,
+                    _hard_score_neg,
                     best_points.flatten(),
                     method='Nelder-Mead',
-                    options={'maxiter': 200, 'adaptive': True, 'xatol': 1e-8, 'fatol': 1e-10}
+                    options={'maxiter': 300, 'adaptive': True, 'xatol': 1e-10, 'fatol': 1e-12}
                 )
                 nm_points = res.x.reshape(-1, 2)
-                nm_score = _score(nm_points)
+                nm_score, _ = compute_score(nm_points)
                 if nm_score > best_score:
                     best_score = nm_score
                     best_points = nm_points.copy()
             except Exception:
                 pass
     
-    # If we have time, do a few more random restarts
-    if time.time() < start_time + time_limit - 10:
+    # Random restarts with soft-min optimization
+    if time.time() < start_time + time_limit - 15:
         np.random.seed(123)
-        for _ in range(5):
-            if time.time() > start_time + time_limit - 10:
+        n_restarts = 8
+        for _ in range(n_restarts):
+            if time.time() > start_time + time_limit - 15:
                 break
-            # Random convex-ish configuration
             n_outer = np.random.randint(6, 12)
             n_inner = N - n_outer
             outer = _regular_polygon(n_outer, radius=np.random.uniform(0.8, 1.2))
@@ -192,20 +218,83 @@ def construct():
                 config = outer
             config = config + np.random.normal(0, 0.1, config.shape)
             
-            s = _score(config)
+            s, _ = compute_score(config)
             if s > best_score:
                 best_score = s
                 best_points = config.copy()
             
-            if time.time() > start_time + time_limit - 10:
+            if time.time() > start_time + time_limit - 15:
                 break
             
+            current = config.copy()
+            for beta in [30.0, 80.0]:
+                if time.time() > start_time + time_limit - 15:
+                    break
+                try:
+                    result = opt.minimize(
+                        lambda x: _soft_objective(x, beta),
+                        current.flatten(),
+                        method='L-BFGS-B',
+                        options={'maxiter': 60, 'ftol': 1e-12, 'gtol': 1e-10}
+                    )
+                    optimized = result.x.reshape(-1, 2)
+                    opt_score, _ = compute_score(optimized)
+                    if opt_score > best_score:
+                        best_score = opt_score
+                        best_points = optimized.copy()
+                    current = optimized
+                except Exception:
+                    pass
+            
+            # Quick NM polish
+            if time.time() > start_time + time_limit - 15:
+                break
+            if best_points is not None:
+                try:
+                    res = opt.minimize(
+                        _hard_score_neg,
+                        best_points.flatten(),
+                        method='Nelder-Mead',
+                        options={'maxiter': 150, 'adaptive': True, 'xatol': 1e-10, 'fatol': 1e-12}
+                    )
+                    nm_points = res.x.reshape(-1, 2)
+                    nm_score, _ = compute_score(nm_points)
+                    if nm_score > best_score:
+                        best_score = nm_score
+                        best_points = nm_points.copy()
+                except Exception:
+                    pass
+    
+    # Final high-precision polish: run L-BFGS-B with very high beta, then NM
+    if best_points is not None and time.time() < start_time + time_limit - 5:
+        try:
+            result = opt.minimize(
+                lambda x: _soft_objective(x, 200.0),
+                best_points.flatten(),
+                method='L-BFGS-B',
+                options={'maxiter': 100, 'ftol': 1e-14, 'gtol': 1e-12}
+            )
+            polished = result.x.reshape(-1, 2)
+            pol_score, _ = compute_score(polished)
+            if pol_score > best_score:
+                best_score = pol_score
+                best_points = polished.copy()
+        except Exception:
+            pass
+        
+        if time.time() < start_time + time_limit - 2:
             try:
-                optimized = _optimize_from_start(config, max_iter=100, method='L-BFGS-B')
-                opt_score = _score(optimized)
-                if opt_score > best_score:
-                    best_score = opt_score
-                    best_points = optimized.copy()
+                res = opt.minimize(
+                    _hard_score_neg,
+                    best_points.flatten(),
+                    method='Nelder-Mead',
+                    options={'maxiter': 200, 'adaptive': True, 'xatol': 1e-12, 'fatol': 1e-14}
+                )
+                final_points = res.x.reshape(-1, 2)
+                final_score, _ = compute_score(final_points)
+                if final_score > best_score:
+                    best_score = final_score
+                    best_points = final_points.copy()
             except Exception:
                 pass
     

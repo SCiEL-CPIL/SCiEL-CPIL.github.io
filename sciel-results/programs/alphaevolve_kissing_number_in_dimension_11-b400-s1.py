@@ -5,110 +5,118 @@ D = 11
 import numpy as np
 import itertools
 import time
-
+import random
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 120.0  # safety margin before 150s limit
+    deadline = start_time + 115.0  # safety margin before 150s limit
     
-    # Generate all weight-4 vectors with ±1 entries
-    # C(11,4) = 330 positions, 2^4 = 16 sign combos -> 5280 vectors
+    # Generate Weight 3 and Weight 4 vectors
     candidates = []
+    norms_sq = []
+    
+    # Weight 3
+    for positions in itertools.combinations(range(D), 3):
+        for signs in itertools.product([1, -1], repeat=3):
+            v = [0] * D
+            for pos, s in zip(positions, signs):
+                v[pos] = s
+            candidates.append(v)
+            norms_sq.append(3)
+            
+    # Weight 4
     for positions in itertools.combinations(range(D), 4):
         for signs in itertools.product([1, -1], repeat=4):
             v = [0] * D
             for pos, s in zip(positions, signs):
                 v[pos] = s
             candidates.append(v)
-    
+            norms_sq.append(4)
+            
     candidates = np.array(candidates, dtype=np.int64)
+    norms_sq = np.array(norms_sq, dtype=np.int64)
     n_candidates = len(candidates)
     
-    # Norm squared of each candidate = 4
-    # Constraint: |u-v|^2 >= 4 for all pairs, i.e., u·v <= 2
+    # Compute dot products
+    dots = np.dot(candidates, candidates.T)
     
-    def greedy_select(order, time_limit):
-        """Greedy selection following the given order."""
-        selected = []
-        for idx in order:
-            if time.time() > time_limit:
-                break
-            v = candidates[idx]
-            if not selected:
-                selected.append(v)
-                continue
-            # Constraint: u·v <= 2 for all selected u
-            dots = np.dot(selected, v)
-            if np.all(dots <= 2):
-                selected.append(v)
-        return selected
+    # Determine conflicts
+    # R^2 = 4 (since we include W4, max norm is 2)
+    # dist_sq[i, j] = norms_sq[i] + norms_sq[j] - 2*dots[i, j]
+    # Conflict if dist_sq[i, j] < 4
+    dist_sq = norms_sq[:, None] + norms_sq[None, :] - 2 * dots
+    # We only care about i != j
+    # conflict[i, j] = dist_sq[i, j] < 4
+    conflicts = dist_sq < 4
+    np.fill_diagonal(conflicts, False)
     
-    def greedy_maxmin(order, time_limit):
-        """Greedy with max-min heuristic: pick vector maximizing min distance to selected."""
-        selected = []
-        remaining = set(order)
-        for _ in range(len(order)):
-            if time.time() > time_limit:
-                break
-            if not selected:
-                selected.append(candidates[order[0]])
-                remaining.discard(order[0])
-                continue
-            
-            best_idx = None
-            best_min_dist = -1
-            for idx in remaining:
-                v = candidates[idx]
-                dots = np.dot(selected, v)
-                # |v-u|^2 = 8 - 2*v·u, so max min dist = min(8-2*dots)
-                min_dist = np.min(8 - 2 * dots)
-                if min_dist >= 4 and min_dist > best_min_dist:
-                    best_min_dist = min_dist
-                    best_idx = idx
-            
-            if best_idx is None:
-                break
-            selected.append(candidates[best_idx])
-            remaining.discard(best_idx)
+    # Precompute neighbors for each node
+    # neighbors[i] is a set of j such that conflicts[i, j] is True
+    neighbors = [set() for _ in range(n_candidates)]
+    for i in range(n_candidates):
+        # Use numpy to find indices where conflicts[i] is True
+        neigh_indices = np.where(conflicts[i])[0]
+        neighbors[i] = set(neigh_indices.tolist())
         
+    def greedy_min_degree():
+        """
+        Greedy selection picking the vertex with the minimum number of 
+        conflicts with the *remaining* available vertices.
+        Uses random sampling to speed up the min-degree search.
+        """
+        available = set(range(n_candidates))
+        selected = []
+        
+        while available:
+            if time.time() > deadline:
+                break
+            
+            # Find vertex with min degree in available subgraph
+            # Sample if large
+            if len(available) > 200:
+                sample = random.sample(list(available), 200)
+            else:
+                sample = list(available)
+                
+            best_v = None
+            min_deg = float('inf')
+            for v in sample:
+                deg = len(neighbors[v] & available)
+                if deg < min_deg:
+                    min_deg = deg
+                    best_v = v
+            
+            if best_v is None:
+                break
+                
+            selected.append(best_v)
+            available.discard(best_v)
+            # Remove neighbors of best_v from available
+            for n in neighbors[best_v]:
+                if n in available:
+                    available.discard(n)
+                    
         return selected
-    
-    # Try multiple strategies
+
     best_selected = []
     np.random.seed(42)
+    random.seed(42)
     
-    # Strategy 1: Original fixed order
-    fixed_order = list(range(n_candidates))
-    sel = greedy_select(fixed_order, deadline - 10.0)
-    if len(sel) > len(best_selected):
-        best_selected = sel
-    
-    # Strategy 2: Multiple random orderings with simple greedy
-    time_per_trial = max(1.0, (deadline - time.time() - 10.0) / 50.0)
-    for trial in range(50):
-        if time.time() > deadline - 10.0:
+    # Run multiple trials
+    num_trials = 300
+    for trial in range(num_trials):
+        if time.time() > deadline - 5.0:
             break
-        perm = np.random.permutation(n_candidates)
-        sel = greedy_select(perm, deadline - 10.0)
+            
+        sel = greedy_min_degree()
         if len(sel) > len(best_selected):
             best_selected = sel
-    
-    # Strategy 3: Max-min greedy with random starts
-    if time.time() < deadline - 30.0:
-        for trial in range(10):
-            if time.time() > deadline - 10.0:
-                break
-            perm = np.random.permutation(n_candidates)
-            sel = greedy_maxmin(perm, deadline - 10.0)
-            if len(sel) > len(best_selected):
-                best_selected = sel
-    
+            
     if not best_selected:
-        # Fallback: return a minimal valid set
         v = [0] * D
         v[0] = 1
         v[1] = 1
         return np.array([v], dtype=np.int64)
     
-    return np.array(best_selected, dtype=np.int64)
+    return candidates[best_selected]
 # EVOLVE-BLOCK-END
