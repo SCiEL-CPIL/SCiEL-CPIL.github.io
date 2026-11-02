@@ -1,0 +1,61 @@
+import time
+import numpy as np
+
+DIMENSIONS = [3, 3, 8]
+
+def _validate(U, V, W, n=3, m=3, p=8):
+    """Check if U,V,W exactly decompose the matrix multiplication tensor."""
+    rank = len(U[0])
+    if len(U) != n * m or len(V) != m * p or len(W) != p * n:
+        return False
+    # For each (i,j,k) in the tensor, the entry should be 1
+    # T[i*m+j, j*p+k, k*n+i] = 1
+    # Decomposition: T[a,b,c] = sum_r U[a,r]*V[b,r]*W[c,r]
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                a = i * m + j
+                b = j * p + k
+                c = k * n + i
+                total = 0
+                for r in range(rank):
+                    total += U[a][r] * V[b][r] * W[c][r]
+                if total != 1:
+                    return False
+    # Check entries are integers or half-integers
+    for mat in [U, V, W]:
+        for row in mat:
+            for val in row:
+                if isinstance(val, float):
+                    if not val.is_integer() and abs(val * 2 - round(val * 2)) > 1e-9:
+                        return False
+    return True
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 100  # Safety margin
+    
+    n, m, p = 3, 3, 8
+    
+    # Schoolbook decomposition
+    rank = n * m * p
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][col] = 1
+                V[j * p + k][col] = 1
+                W[k * n + i][col] = 1
+                col += 1
+                
+    return {"U": U, "V": V, "W": W}
+
+if __name__ == "__main__":
+    result = construct()
+    print(f"Rank: {len(result['U'][0])}")
+    valid = _validate(result["U"], result["V"], result["W"])
+    print(f"Valid: {valid}")

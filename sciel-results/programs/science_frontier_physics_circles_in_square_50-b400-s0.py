@@ -1,614 +1,395 @@
-"""
-Optimized packing of 50 equal circles in a unit square.
-Combines Simulated Annealing for global search with high-precision L-BFGS polishing
-using a full-pairwise smooth violation objective, plus a soft-min epigraph approach
-for final polishing.
-"""
+"""Packing of 50 equal circles in a unit square via SLSQP refinement + Binary Search + Soft-Min Polish."""
 import numpy as np
 import time
-import scipy.optimize as opt
+from scipy.optimize import minimize
 
 N = 50
-DEADLINE = 147.0  # Safety margin before 150s kill
+HALF = 0.5
+IU = np.triu_indices(N, k=1)
+N_PAIRS = len(IU[0])
 
-# Precompute upper-triangle indices for pairwise operations
-_IU = np.triu_indices(N, k=1)
-_NPAIRS = len(_IU[0])
+# Global deadline guard
+_DEADLINE = 0.0
 
-def _compute_radius(centers):
-    """Compute the true maximum radius for a given configuration."""
-    centers = np.asarray(centers, dtype=np.float64)
-    if centers.shape != (N, 2) or not np.all(np.isfinite(centers)):
+def _compute_r(pts):
+    """Compute the feasible radius for a configuration (double precision)."""
+    if pts.shape != (N, 2):
         return 0.0
-    
-    # Wall distances
-    wall_dists_x = 0.5 - np.abs(centers[:, 0])
-    wall_dists_y = 0.5 - np.abs(centers[:, 1])
-    min_wall = np.min(np.minimum(wall_dists_x, wall_dists_y))
-    
-    if min_wall < 0:
+    if not np.all(np.isfinite(pts)):
         return 0.0
-    
-    # Pairwise distances
-    diff = centers[:, None, :] - centers[None, :, :]
-    dist_sq = np.sum(diff ** 2, axis=2)
-    np.fill_diagonal(dist_sq, np.inf)
-    min_pair = np.sqrt(np.min(dist_sq)) / 2.0
-    
-    return min(min_pair, min_wall)
-
-def _soft_violation_obj(x, r_target, beta):
-    """
-    Objective: Minimize smooth violation for target radius r_target.
-    """
-    centers = x.reshape(-1, 2)
-    
-    wall_dists_x = 0.5 - np.abs(centers[:, 0])
-    wall_dists_y = 0.5 - np.abs(centers[:, 1])
-    walls = np.minimum(wall_dists_x, wall_dists_y)
-    wall_viol = r_target - walls
-    
-    ci = centers[_IU[0]]
-    cj = centers[_IU[1]]
-    diff = ci - cj
-    dists = np.sqrt(np.sum(diff ** 2, axis=1))
-    pair_viol = 2.0 * r_target - dists
-    
-    z_wall = np.clip(beta * wall_viol, -50, 50)
-    z_pair = np.clip(beta * pair_viol, -50, 50)
-    
-    soft_wall = np.log1p(np.exp(z_wall)) / beta
-    soft_pair = np.log1p(np.exp(z_pair)) / beta
-    
-    return float(np.sum(soft_wall) + np.sum(soft_pair))
-
-def _soft_violation_grad(x, r_target, beta):
-    """
-    Gradient of the soft violation objective. Fully vectorized.
-    """
-    centers = x.reshape(-1, 2)
-    grad = np.zeros_like(x)
-    
-    wall_dists_x = 0.5 - np.abs(centers[:, 0])
-    wall_dists_y = 0.5 - np.abs(centers[:, 1])
-    walls = np.minimum(wall_dists_x, wall_dists_y)
-    wall_viol = r_target - walls
-    
-    z_wall = np.clip(beta * wall_viol, -50, 50)
-    sig_wall = 1.0 / (1.0 + np.exp(-z_wall))
-    
-    wx = wall_dists_x < wall_dists_y
-    wy = wall_dists_y < wall_dists_x
-    wt = ~(wx | wy)
-    
-    idx_wx = np.nonzero(wx)[0]
-    idx_wy = np.nonzero(wy)[0]
-    idx_wt = np.nonzero(wt)[0]
-    
-    if len(idx_wx) > 0:
-        grad[2*idx_wx] += sig_wall[wx] * np.sign(centers[idx_wx, 0])
-    if len(idx_wy) > 0:
-        grad[2*idx_wy+1] += sig_wall[wy] * np.sign(centers[idx_wy, 1])
-    if len(idx_wt) > 0:
-        grad[2*idx_wt] += 0.5 * sig_wall[wt] * np.sign(centers[idx_wt, 0])
-        grad[2*idx_wt+1] += 0.5 * sig_wall[wt] * np.sign(centers[idx_wt, 1])
-    
-    ci = centers[_IU[0]]
-    cj = centers[_IU[1]]
-    diff_vec = ci - cj
-    dists = np.sqrt(np.sum(diff_vec ** 2, axis=1))
-    dists_safe = np.maximum(dists, 1e-12)
-    pair_viol = 2.0 * r_target - dists
-    
-    z_pair = np.clip(beta * pair_viol, -50, 50)
-    sig_pair = 1.0 / (1.0 + np.exp(-z_pair))
-    
-    factor = sig_pair / dists_safe
-    contrib = factor[:, None] * diff_vec
-    
-    np.add.at(grad, 2 * _IU[0], -contrib[:, 0])
-    np.add.at(grad, 2 * _IU[0] + 1, -contrib[:, 1])
-    np.add.at(grad, 2 * _IU[1], contrib[:, 0])
-    np.add.at(grad, 2 * _IU[1] + 1, contrib[:, 1])
-    
-    return grad
+    d = np.minimum(np.minimum(HALF - pts[:, 0], HALF - pts[:, 1]),
+                   np.minimum(HALF + pts[:, 0], HALF + pts[:, 1]))
+    r = float(np.min(d))
+    diff = pts[:, None, :] - pts[None, :, :]
+    dist = np.sqrt(np.sum(diff ** 2, axis=2))
+    np.fill_diagonal(dist, np.inf)
+    r = min(r, float(np.min(dist)) / 2.0)
+    return r
 
 def _soft_min_obj(x, beta):
-    """
-    Epigraph-style soft-min objective: minimize the soft-min of all constraints.
-    The constraints are: pairwise distances >= 2r and wall distances >= r.
-    We use a fixed r_target that we try to maximize via outer loop.
-    """
-    centers = x.reshape(-1, 2)
+    """Objective: minimize -soft_min of all constraint distances (maximize the min)."""
+    p = x.reshape(N, 2)
+    d_wall = np.minimum(np.minimum(HALF - p[:, 0], HALF - p[:, 1]),
+                        np.minimum(HALF + p[:, 0], HALF + p[:, 1]))
+    diff = p[:, None, :] - p[None, :, :]
+    dist = np.sqrt(np.sum(diff ** 2, axis=2))
+    np.fill_diagonal(dist, np.inf)
+    pair_d = dist[IU] / 2.0
     
-    wall_dists_x = 0.5 - np.abs(centers[:, 0])
-    wall_dists_y = 0.5 - np.abs(centers[:, 1])
-    walls = np.minimum(wall_dists_x, wall_dists_y)
-    
-    ci = centers[_IU[0]]
-    cj = centers[_IU[1]]
-    diff = ci - cj
-    dists = np.sqrt(np.sum(diff ** 2, axis=1))
-    half_dists = dists / 2.0
-    
-    # All constraints values (we want them all >= 0, i.e. r <= min)
-    # Soft-min of all values: -logsumexp(-beta * values) / beta
-    all_vals = np.concatenate([walls, half_dists])
-    z = -beta * all_vals
-    z = np.clip(z, -50, 50)
-    logsumexp = np.max(z) + np.log(np.sum(np.exp(z - np.max(z))))
-    soft_min_val = -logsumexp / beta
-    
-    return float(-soft_min_val)  # minimize negative soft-min
+    all_d = np.concatenate([d_wall, pair_d])
+    m = np.max(all_d)
+    exp_terms = np.exp(-beta * (all_d - m))
+    log_sum = np.log(np.sum(exp_terms))
+    r_soft = m - log_sum / beta
+    return -r_soft
 
 def _soft_min_grad(x, beta):
-    """
-    Gradient of the soft-min objective.
-    """
-    centers = x.reshape(-1, 2)
-    grad = np.zeros_like(x)
+    """Gradient of -soft_min_r."""
+    p = x.reshape(N, 2)
+    d_wall = np.minimum(np.minimum(HALF - p[:, 0], HALF - p[:, 1]),
+                        np.minimum(HALF + p[:, 0], HALF + p[:, 1]))
+    diff = p[:, None, :] - p[None, :, :]
+    dist = np.sqrt(np.sum(diff ** 2, axis=2))
+    np.fill_diagonal(dist, np.inf)
+    pair_d = dist[IU] / 2.0
     
-    wall_dists_x = 0.5 - np.abs(centers[:, 0])
-    wall_dists_y = 0.5 - np.abs(centers[:, 1])
-    walls = np.minimum(wall_dists_x, wall_dists_y)
+    all_d = np.concatenate([d_wall, pair_d])
+    m = np.max(all_d)
+    exp_terms = np.exp(-beta * (all_d - m))
+    weights = exp_terms / np.sum(exp_terms)
     
-    ci = centers[_IU[0]]
-    cj = centers[_IU[1]]
-    diff = ci - cj
-    dists = np.sqrt(np.sum(diff ** 2, axis=1))
-    half_dists = dists / 2.0
-    
-    all_vals = np.concatenate([walls, half_dists])
-    z = -beta * all_vals
-    z = np.clip(z, -50, 50)
-    z_shifted = z - np.max(z)
-    exp_z = np.exp(z_shifted)
-    sum_exp = np.sum(exp_z)
-    weights = exp_z / sum_exp  # softmax weights
-    
-    # Gradient of -soft_min = -(-1/beta) * d(logsumexp)/dx = (1/beta) * sum_k weights_k * d(-val_k)/dx
-    # = -(1/beta) * sum_k weights_k * d(val_k)/dx
-    # Wait: soft_min = -logsumexp(-beta*vals)/beta
-    # d(soft_min)/dx = -1/beta * d(logsumexp(-beta*vals))/dx
-    # = -1/beta * sum_k exp(-beta*val_k)/sum_j exp(-beta*val_j) * (-beta) * d(val_k)/dx
-    # = sum_k weights_k * d(val_k)/dx
-    # We want to minimize -soft_min, so gradient is -sum_k weights_k * d(val_k)/dx
+    grad = np.zeros((N, 2))
     
     # Wall gradients
-    n_walls = N
-    w_weights = weights[:n_walls]
+    d_left = p[:, 0] + HALF
+    d_right = HALF - p[:, 0]
+    d_bottom = p[:, 1] + HALF
+    d_top = HALF - p[:, 1]
+    walls = np.stack([d_left, d_right, d_bottom, d_top], axis=1)
+    min_idx = np.argmin(walls, axis=1)
     
-    wx = wall_dists_x < wall_dists_y
-    wy = wall_dists_y < wall_dists_x
-    wt = ~(wx | wy)
-    
-    idx_wx = np.nonzero(wx)[0]
-    idx_wy = np.nonzero(wy)[0]
-    idx_wt = np.nonzero(wt)[0]
-    
-    # d(wall_i)/d(x_i) = -sign(x_i) if x is limiting, -sign(y_i) if y is limiting
-    if len(idx_wx) > 0:
-        grad[2*idx_wx] -= w_weights[idx_wx] * np.sign(centers[idx_wx, 0])
-    if len(idx_wy) > 0:
-        grad[2*idx_wy+1] -= w_weights[idx_wy] * np.sign(centers[idx_wy, 1])
-    if len(idx_wt) > 0:
-        grad[2*idx_wt] -= 0.5 * w_weights[idx_wt] * np.sign(centers[idx_wt, 0])
-        grad[2*idx_wt+1] -= 0.5 * w_weights[idx_wt] * np.sign(centers[idx_wt, 1])
+    for i in range(N):
+        w = weights[i]
+        if w > 1e-12:
+            if min_idx[i] == 0:
+                grad[i, 0] += w
+            elif min_idx[i] == 1:
+                grad[i, 0] -= w
+            elif min_idx[i] == 2:
+                grad[i, 1] += w
+            else:
+                grad[i, 1] -= w
     
     # Pair gradients
-    p_weights = weights[n_walls:]
-    dists_safe = np.maximum(dists, 1e-12)
-    # d(half_dist_ij)/d(c_i) = -(c_i - c_j) / dist_ij
-    # d(half_dist_ij)/d(c_j) = (c_i - c_j) / dist_ij
-    factor = p_weights / dists_safe
-    contrib = factor[:, None] * diff
+    for k in range(N_PAIRS):
+        i, j = IU[0][k], IU[1][k]
+        w = weights[N + k]
+        if w > 1e-12:
+            dij = p[i] - p[j]
+            dist_ij = np.linalg.norm(dij)
+            if dist_ij > 1e-12:
+                g = w * dij / (2.0 * dist_ij)
+                grad[i] += g
+                grad[j] -= g
     
-    np.add.at(grad, 2 * _IU[0], contrib[:, 0])
-    np.add.at(grad, 2 * _IU[0] + 1, contrib[:, 1])
-    np.add.at(grad, 2 * _IU[1], -contrib[:, 0])
-    np.add.at(grad, 2 * _IU[1] + 1, -contrib[:, 1])
-    
-    return grad
+    return -grad.ravel()
 
-def _initial_grid():
-    """Create initial grid layout with slight jitter."""
-    m = int(np.ceil(np.sqrt(N)))
+def _slsqp_max_radius(x0, deadline, maxiter=500):
+    """
+    Maximize radius r subject to constraints:
+    1. d_ij >= 2r
+    2. d_wall >= r
+    Variables: x (2N coords) + r (1 scalar)
+    """
+    def obj(v):
+        # Minimize -r
+        return -v[-1]
+    
+    def jac(v):
+        g = np.zeros_like(v)
+        g[-1] = -1.0
+        return g
+    
+    # Constraints: h(v) >= 0
+    # We define constraints as g(v) >= 0 in SLSQP
+    constraints = []
+    
+    # Pair constraints: dist_ij - 2r >= 0
+    for k in range(N_PAIRS):
+        i, j = IU[0][k], IU[1][k]
+        def c(v, i=i, j=j):
+            if time.time() > deadline:
+                raise RuntimeError("timeout")
+            xi = v[2*i]
+            yi = v[2*i+1]
+            xj = v[2*j]
+            yj = v[2*j+1]
+            d = np.sqrt((xi-xj)**2 + (yi-yj)**2)
+            r = v[-1]
+            return d - 2.0*r
+        def j_c(v, i=i, j=j):
+            if time.time() > deadline:
+                raise RuntimeError("timeout")
+            g = np.zeros_like(v)
+            xi = v[2*i]
+            yi = v[2*i+1]
+            xj = v[2*j]
+            yj = v[2*j+1]
+            d = np.sqrt((xi-xj)**2 + (yi-yj)**2)
+            if d < 1e-12:
+                return g
+            g[2*i] = (xi - xj) / d
+            g[2*i+1] = (yi - yj) / d
+            g[2*j] = (xj - xi) / d
+            g[2*j+1] = (yj - yi) / d
+            g[-1] = -2.0
+            return g
+        constraints.append({'type': 'ineq', 'fun': c, 'jac': j_c})
+        
+    # Wall constraints: d_wall - r >= 0
+    for i in range(N):
+        # Left: x_i + 0.5 - r >= 0
+        def c_l(v, i=i):
+            if time.time() > deadline:
+                raise RuntimeError("timeout")
+            return v[2*i] + HALF - v[-1]
+        def j_cl(v, i=i):
+            if time.time() > deadline:
+                raise RuntimeError("timeout")
+            g = np.zeros_like(v)
+            g[2*i] = 1.0
+            g[-1] = -1.0
+            return g
+        constraints.append({'type': 'ineq', 'fun': c_l, 'jac': j_cl})
+        
+        # Right: 0.5 - x_i - r >= 0
+        def c_r(v, i=i):
+            if time.time() > deadline:
+                raise RuntimeError("timeout")
+            return HALF - v[2*i] - v[-1]
+        def j_cr(v, i=i):
+            if time.time() > deadline:
+                raise RuntimeError("timeout")
+            g = np.zeros_like(v)
+            g[2*i] = -1.0
+            g[-1] = -1.0
+            return g
+        constraints.append({'type': 'ineq', 'fun': c_r, 'jac': j_cr})
+        
+        # Bottom: y_i + 0.5 - r >= 0
+        def c_b(v, i=i):
+            if time.time() > deadline:
+                raise RuntimeError("timeout")
+            return v[2*i+1] + HALF - v[-1]
+        def j_cb(v, i=i):
+            if time.time() > deadline:
+                raise RuntimeError("timeout")
+            g = np.zeros_like(v)
+            g[2*i+1] = 1.0
+            g[-1] = -1.0
+            return g
+        constraints.append({'type': 'ineq', 'fun': c_b, 'jac': j_cb})
+        
+        # Top: 0.5 - y_i - r >= 0
+        def c_t(v, i=i):
+            if time.time() > deadline:
+                raise RuntimeError("timeout")
+            return HALF - v[2*i+1] - v[-1]
+        def j_ct(v, i=i):
+            if time.time() > deadline:
+                raise RuntimeError("timeout")
+            g = np.zeros_like(v)
+            g[2*i+1] = -1.0
+            g[-1] = -1.0
+            return g
+        constraints.append({'type': 'ineq', 'fun': c_t, 'jac': j_ct})
+
+    x0_flat = x0.ravel()
+    r0 = 0.01 # Initial guess for r
+    v0 = np.append(x0_flat, r0)
+    
+    bounds = [(-HALF, HALF)] * (2*N) + [(0.0, HALF)]
+    
+    try:
+        res = minimize(obj, v0, method='SLSQP', jac=jac, bounds=bounds, 
+                       constraints=constraints, options={'maxiter': maxiter, 'ftol': 1e-12})
+        if res.success or res.fun < 0: # res.fun is -r, so smaller is better
+            pts = res.x[:2*N].reshape(N, 2)
+            r = res.x[-1]
+            # Ensure points are within bounds
+            pts = np.clip(pts, -HALF, HALF)
+            return pts, r
+    except Exception:
+        pass
+    return x0, _compute_r(x0)
+
+def _hex_init(rng, jitter=0.0):
+    """Hexagonal lattice initialization."""
+    pts = []
+    a = 0.12
+    dx = a
+    dy = a * np.sqrt(3) / 2
+    row = 0
+    while len(pts) < N:
+        offset = (dx / 2) if (row % 2) else 0.0
+        x = -HALF + a + offset
+        while len(pts) < N and x < HALF - a + 1e-9:
+            y = -HALF + a + row * dy
+            if y < HALF - a + 1e-9:
+                pts.append([x, y])
+            x += dx
+        row += 1
+    pts = np.array(pts[:N])
+    if jitter > 0:
+        pts = pts + rng.normal(0, jitter, size=pts.shape)
+    return np.clip(pts, -HALF, HALF)
+
+def _grid_init(rng, jitter=0.0):
+    """Grid initialization."""
+    m = 7
     ticks = (np.arange(m) + 0.5) / m - 0.5
     grid = np.array([(x, y) for y in ticks for x in ticks])
-    grid = grid[:N].copy()
-    
-    rng = np.random.default_rng(12345)
-    grid = grid + rng.normal(0, 0.005, grid.shape)
-    grid = np.clip(grid, -0.49, 0.49)
-    
-    return grid
+    extra = np.array([[0.0, 0.0]])
+    grid = np.vstack([grid, extra])[:N]
+    if jitter > 0:
+        grid = grid + rng.normal(0, jitter, size=grid.shape)
+    return np.clip(grid, -HALF, HALF)
 
-def _hex_init():
-    """Create a hexagonal packing initial layout."""
-    best_grid = None
-    best_r = 0
-    
-    rng = np.random.default_rng(42)
-    
-    for attempt in range(8):
-        rows = rng.integers(5, 9)
-        cols = int(np.ceil(N / rows))
-        
-        s_width = 1.0 / (cols + 0.5)
-        s_height = 1.0 / (rows * 0.866 + 0.5)
-        s = min(s_width, s_height)
-        
-        centers = []
-        for j in range(rows):
-            for i in range(cols):
-                x = (i - (cols - 1) / 2) * s
-                y = (j - (rows - 1) / 2) * s * 0.866
-                if j % 2 == 1:
-                    x += s / 2
-                centers.append([x, y])
-        
-        centers = np.array(centers[:N])
-        if len(centers) < N:
-            while len(centers) < N:
-                centers = np.vstack([centers, rng.uniform(-0.45, 0.45, 2)])
-        
-        centers = np.clip(centers, -0.49, 0.49)
-        r = _compute_radius(centers)
-        if r > best_r:
-            best_r = r
-            best_grid = centers.copy()
-    
-    return best_grid if best_grid is not None else _initial_grid()
-
-def _simulated_annealing(centers, rng, time_budget):
-    """
-    Simulated annealing to optimize the minimum radius directly.
-    Uses incremental distance updates for speed.
-    """
-    start_time = time.time()
-    current = centers.copy()
-    best = current.copy()
-    best_r = _compute_radius(current)
-    
-    T_start = 0.012
-    T_end = 0.00003
-    est_steps = int(time_budget / 0.00035)
-    n_steps = max(20000, min(80000, est_steps))
-    cooling = (T_end / T_start) ** (1.0 / max(n_steps, 1))
-    T = T_start
-    
-    iu = _IU
-    iu0, iu1 = iu[0], iu[1]
-    
-    # Precompute which pairs involve each point for incremental updates
-    # But for simplicity, we'll still do full min computation but faster
-    for step in range(n_steps):
-        if time.time() - start_time > time_budget:
-            break
-        
-        # Compute current radius (full for accuracy)
-        wall_x = 0.5 - np.abs(current[:, 0])
-        wall_y = 0.5 - np.abs(current[:, 1])
-        min_wall = np.min(np.minimum(wall_x, wall_y))
-        
-        ci = current[iu0]
-        cj = current[iu1]
-        diff = ci - cj
-        dist_sq = np.einsum('ij,ij->i', diff, diff)
-        min_pair = np.sqrt(np.min(dist_sq)) / 2.0
-        curr_r = min(min_pair, min_wall)
-        
-        i = rng.integers(0, N)
-        # Adaptive move size: larger early, smaller late
-        frac = T / T_start
-        move_size = 0.003 + 0.007 * frac
-        
-        # Occasionally do larger jumps
-        if rng.random() < 0.08:
-            move_size *= 2.5
-        
-        direction = rng.normal(size=2)
-        norm = np.linalg.norm(direction)
-        if norm > 1e-12:
-            direction /= norm
-        else:
-            direction = np.array([1.0, 0.0])
-            
-        old_pos = current[i].copy()
-        trial = current.copy()
-        trial[i] = old_pos + direction * move_size
-        trial[i] = np.clip(trial[i], -0.5, 0.5)
-        
-        # Compute trial radius
-        trial_wall_x = 0.5 - np.abs(trial[:, 0])
-        trial_wall_y = 0.5 - np.abs(trial[:, 1])
-        trial_min_wall = np.min(np.minimum(trial_wall_x, trial_wall_y))
-        
-        tci = trial[iu0]
-        tcj = trial[iu1]
-        tdiff = tci - tcj
-        tdist_sq = np.einsum('ij,ij->i', tdiff, tdiff)
-        trial_min_pair = np.sqrt(np.min(tdist_sq)) / 2.0
-        trial_r = min(trial_min_pair, trial_min_wall)
-        
-        delta_r = trial_r - curr_r
-        
-        if delta_r >= 0:
-            current = trial
-            if trial_r > best_r:
-                best_r = trial_r
-                best = trial.copy()
-        else:
-            # Accept with probability exp(delta_r / T)
-            if rng.random() < np.exp(delta_r / max(T, 1e-10)):
-                current = trial
-        
-        T *= cooling
-    
-    return best, best_r
-
-def _lbfgs_feasibility_polish(x0, r_target, beta, time_budget):
-    """
-    Run L-BFGS-B to minimize violation for a specific target radius r_target.
-    """
-    start_time = time.time()
-    
-    def obj_and_grad(x):
-        if time.time() - start_time > time_budget:
-            return 0.0, np.zeros_like(x)
-        f = _soft_violation_obj(x, r_target, beta)
-        g = _soft_violation_grad(x, r_target, beta)
-        return f, g
-    
-    try:
-        result = opt.minimize(
-            obj_and_grad, x0, jac=True, method='L-BFGS-B',
-            bounds=[(-0.5, 0.5)] * (2 * N),
-            options={'maxiter': 5000, 'ftol': 1e-18, 'gtol': 1e-14,
-                     'maxfun': 25000, 'disp': False, 'maxls': 50}
-        )
-        polished = result.x.reshape(-1, 2)
-        polished = np.clip(polished, -0.5, 0.5)
-        return polished
-    except Exception:
-        return x0.reshape(-1, 2)
-
-def _lbfgs_soft_min_polish(x0, beta, time_budget):
-    """
-    Run L-BFGS-B to maximize soft-min radius.
-    """
-    start_time = time.time()
-    
-    def obj_and_grad(x):
-        if time.time() - start_time > time_budget:
-            return 0.0, np.zeros_like(x)
-        f = _soft_min_obj(x, beta)
-        g = _soft_min_grad(x, beta)
-        return f, g
-    
-    try:
-        result = opt.minimize(
-            obj_and_grad, x0, jac=True, method='L-BFGS-B',
-            bounds=[(-0.5, 0.5)] * (2 * N),
-            options={'maxiter': 3000, 'ftol': 1e-16, 'gtol': 1e-13,
-                     'maxfun': 15000, 'disp': False}
-        )
-        polished = result.x.reshape(-1, 2)
-        polished = np.clip(polished, -0.5, 0.5)
-        return polished
-    except Exception:
-        return x0.reshape(-1, 2)
-
-def _refine_radius(centers, time_budget):
-    """
-    Binary search for the maximum feasible radius using L-BFGS polishing.
-    Uses progressive beta increase for tighter convergence.
-    """
-    start_time = time.time()
-    best = centers.copy()
-    best_r = _compute_radius(best)
-    
-    lo = best_r
-    hi = min(0.08, best_r * 1.05)
-    
-    search_steps = 22
-    for i in range(search_steps):
-        if time.time() - start_time > time_budget:
-            break
-            
-        mid = (lo + hi) / 2
-        # Progressive beta: start moderate, increase for later (tighter) searches
-        progress = i / max(search_steps - 1, 1)
-        beta = 200.0 + 800.0 * progress
-        x0 = best.flatten()
-        
-        remaining = time_budget - (time.time() - start_time)
-        if remaining < 5:
-            break
-        lbfgs_budget = min(18.0, remaining * 0.85)
-        
-        trial = _lbfgs_feasibility_polish(x0, mid, beta, lbfgs_budget)
-        trial_r = _compute_radius(trial)
-        
-        if trial_r >= mid - 1e-8:
-            lo = mid
-            best = trial
-            best_r = trial_r
-        else:
-            hi = mid
-            
-    return best, best_r
-
-def _high_precision_polish(centers, time_budget):
-    """
-    Final high-precision polish using multiple strategies:
-    1. Progressive sharpening with feasibility objective
-    2. Soft-min epigraph polish
-    3. Push phase targeting slightly above current best
-    4. Final ultra-tight polish
-    """
-    start_time = time.time()
-    best = centers.copy()
-    best_r = _compute_radius(best)
-    
-    # Phase 1: Progressive sharpening of violation objective
-    betas = [500, 1000, 2000, 4000, 8000, 12000]
-    
-    for beta in betas:
-        if time.time() - start_time > time_budget:
-            break
-            
-        r_target = best_r
-        x0 = best.flatten()
-        
-        remaining = time_budget - (time.time() - start_time)
-        if remaining < 4:
-            break
-        lbfgs_budget = min(14.0, remaining * 0.85)
-        
-        trial = _lbfgs_feasibility_polish(x0, r_target, beta, lbfgs_budget)
-        trial_r = _compute_radius(trial)
-        
-        if trial_r > best_r:
-            best_r = trial_r
-            best = trial
-            
-    # Phase 2: Soft-min epigraph polish
-    if time.time() - start_time < time_budget - 8:
-        sm_betas = [200, 500, 1000, 2000, 4000]
-        for beta in sm_betas:
-            if time.time() - start_time > time_budget - 4:
-                break
-            x0 = best.flatten()
-            remaining = time_budget - (time.time() - start_time)
-            if remaining < 4:
-                break
-            lbfgs_budget = min(14.0, remaining * 0.85)
-            
-            trial = _lbfgs_soft_min_polish(x0, beta, lbfgs_budget)
-            trial_r = _compute_radius(trial)
-            
-            if trial_r > best_r:
-                best_r = trial_r
-                best = trial
-            
-    # Phase 3: Push phase - target slightly above best_r
-    if time.time() - start_time < time_budget - 4:
-        for push_frac in [1.001, 1.003, 1.005, 1.008, 1.012, 1.018]:
-            if time.time() - start_time > time_budget - 3:
-                break
-            r_push = best_r * push_frac
-            if r_push > 0.08:
-                break
-            remaining = time_budget - (time.time() - start_time)
-            if remaining < 3:
-                break
-            lbfgs_budget = min(12.0, remaining * 0.85)
-            trial = _lbfgs_feasibility_polish(best.flatten(), r_push, 4000.0, lbfgs_budget)
-            trial_r = _compute_radius(trial)
-            if trial_r > best_r:
-                best_r = trial_r
-                best = trial
-    
-    # Phase 4: Ultra-tight final polish with very high beta
-    if time.time() - start_time < time_budget - 2:
-        for beta in [8000, 15000, 25000]:
-            if time.time() - start_time > time_budget - 1.5:
-                break
-            remaining = time_budget - (time.time() - start_time)
-            if remaining < 2:
-                break
-            lbfgs_budget = min(15.0, remaining * 0.9)
-            trial = _lbfgs_feasibility_polish(best.flatten(), best_r, beta, lbfgs_budget)
-            trial_r = _compute_radius(trial)
-            if trial_r > best_r:
-                best_r = trial_r
-                best = trial
-    
-    return best, best_r
+def _random_init(rng):
+    """Random initialization."""
+    return rng.uniform(-HALF + 0.05, HALF - 0.05, size=(N, 2))
 
 def construct():
-    start_time = time.time()
-    deadline = start_time + DEADLINE
-
-    rng = np.random.default_rng(777)
+    global _DEADLINE
+    start = time.time()
+    _DEADLINE = start + 145.0 # Safety margin
+    rng = np.random.default_rng(42)
     
-    # 1. Initialization - try multiple diverse starts
+    best_pts = None
+    best_r = 0.0
+    
+    # Phase 1: Multi-start SLSQP to find a good initial radius
     inits = [
-        _initial_grid(),
-        _hex_init(),
+        _hex_init(rng, jitter=0.0),
+        _hex_init(rng, jitter=0.01),
+        _grid_init(rng, jitter=0.0),
+        _grid_init(rng, jitter=0.02),
+        _random_init(rng),
+        _random_init(rng),
     ]
     
-    rng_init = np.random.default_rng(999)
-    random_init = rng_init.uniform(-0.45, 0.45, (N, 2))
-    inits.append(random_init)
-    
-    # Add a second random init with different seed
-    rng_init2 = np.random.default_rng(4242)
-    random_init2 = rng_init2.uniform(-0.45, 0.45, (N, 2))
-    inits.append(random_init2)
-    
-    best_centers = None
-    best_radius = 0
-    
     for init in inits:
-        r = _compute_radius(init)
-        if r > best_radius:
-            best_radius = r
-            best_centers = init.copy()
+        if time.time() > _DEADLINE - 30.0:
+            break
+        pts, r = _slsqp_max_radius(init, _DEADLINE - 5.0, maxiter=200)
+        r_actual = _compute_r(pts)
+        if r_actual > best_r:
+            best_r = r_actual
+            best_pts = pts.copy()
             
-    if best_centers is None:
-        best_centers = _initial_grid()
-        best_radius = _compute_radius(best_centers)
+    if best_pts is None:
+        m = int(np.ceil(np.sqrt(N)))
+        ticks = (np.arange(m) + 0.5) / m - 0.5
+        grid = np.array([(x, y) for y in ticks for x in ticks])
+        return grid[:N]
         
-    # 2. Simulated Annealing - multi-restart with tighter budget
-    sa_budget_total = min(35.0, (deadline - time.time()) * 0.30)
+    # Phase 2: Binary search on radius using SLSQP feasibility
+    # We check if we can place circles of radius r.
+    # We use SLSQP to minimize violation for a fixed r.
+    def _violation_obj(v, r_target):
+        # v is 2N coords
+        p = v.reshape(N, 2)
+        # Wall violations
+        d_wall = np.minimum(np.minimum(HALF - p[:, 0], HALF - p[:, 1]),
+                            np.minimum(HALF + p[:, 0], HALF + p[:, 1]))
+        wall_viol = np.maximum(0.0, r_target - d_wall)
+        # Pair violations
+        diff = p[:, None, :] - p[None, :, :]
+        dist = np.sqrt(np.sum(diff ** 2, axis=2))
+        np.fill_diagonal(dist, np.inf)
+        pair_viol = np.maximum(0.0, 2.0 * r_target - dist[IU])
+        return np.sum(wall_viol**2) + np.sum(pair_viol**2)
+        
+    def _violation_grad(v, r_target):
+        p = v.reshape(N, 2)
+        grad = np.zeros((N, 2))
+        # Wall grads
+        d_left = p[:, 0] + HALF
+        d_right = HALF - p[:, 0]
+        d_bottom = p[:, 1] + HALF
+        d_top = HALF - p[:, 1]
+        walls = np.stack([d_left, d_right, d_bottom, d_top], axis=1)
+        min_idx = np.argmin(walls, axis=1)
+        
+        for i in range(N):
+            viol = r_target - walls[i, min_idx[i]]
+            if viol > 0:
+                if min_idx[i] == 0: grad[i, 0] -= 2*viol
+                elif min_idx[i] == 1: grad[i, 0] += 2*viol
+                elif min_idx[i] == 2: grad[i, 1] -= 2*viol
+                else: grad[i, 1] += 2*viol
+                
+        # Pair grads
+        diff = p[:, None, :] - p[None, :, :]
+        dist = np.sqrt(np.sum(diff ** 2, axis=2))
+        np.fill_diagonal(dist, np.inf)
+        for k in range(N_PAIRS):
+            i, j = IU[0][k], IU[1][k]
+            viol = 2.0 * r_target - dist[i, j]
+            if viol > 0 and dist[i, j] > 1e-12:
+                dij = p[i] - p[j]
+                g = 2.0 * viol * dij / dist[i, j]
+                grad[i] += g
+                grad[j] -= g
+        return grad.ravel()
+
+    r_lo = best_r
+    r_hi = 0.0714
     
-    if sa_budget_total > 8:
-        sa1_budget = min(20.0, sa_budget_total * 0.55)
-        best_centers, best_radius = _simulated_annealing(best_centers, rng, sa1_budget)
+    for _ in range(10): # Binary search iterations
+        if time.time() > _DEADLINE - 10.0:
+            break
+        r_mid = (r_lo + r_hi) / 2.0
         
-        # Second SA restart from perturbed best
-        if time.time() < deadline - 35:
-            rng2 = np.random.default_rng(1234)
-            perturbed = best_centers + rng2.normal(0, 0.008, (N, 2))
-            perturbed = np.clip(perturbed, -0.49, 0.49)
-            sa2_budget = min(15.0, (deadline - time.time()) - 40)
-            if sa2_budget > 4:
-                c2, r2 = _simulated_annealing(perturbed, rng2, sa2_budget)
-                if r2 > best_radius:
-                    best_radius = r2
-                    best_centers = c2
-        
-    # 3. Feasibility-Driven Radius Refinement
-    if time.time() < deadline - 25:
-        refine_budget = min(45.0, deadline - time.time() - 12)
-        best_centers, best_radius = _refine_radius(
-            best_centers, time_budget=refine_budget
-        )
-        
-    # 4. High Precision Polish
-    if time.time() < deadline - 6:
-        polish_budget = min(30.0, deadline - time.time() - 2)
-        best_centers, best_radius = _high_precision_polish(
-            best_centers, time_budget=polish_budget
-        )
-        
-    # 5. Final micro-polish if time remains
-    if time.time() < deadline - 2:
-        final_budget = min(15.0, deadline - time.time() - 1)
-        if final_budget > 3:
-            cur_r = _compute_radius(best_centers)
-            trial = _lbfgs_feasibility_polish(
-                best_centers.flatten(), cur_r, 20000.0, final_budget
-            )
-            trial_r = _compute_radius(trial)
-            if trial_r > best_radius:
-                best_radius = trial_r
-                best_centers = trial
-        
-    # Final Validation
-    if not np.all(np.isfinite(best_centers)) or best_centers.shape != (N, 2):
-        return _initial_grid()
-        
-    return best_centers
+        # Try to find a configuration for r_mid
+        # Start from best_pts
+        x0 = best_pts.ravel()
+        try:
+            res = minimize(_violation_obj, x0, method='L-BFGS-B', jac=lambda v: _violation_grad(v, r_mid),
+                           bounds=[(-HALF, HALF)] * (2*N),
+                           options={'maxiter': 100, 'ftol': 1e-10})
+            pts_test = res.x.reshape(N, 2)
+            pts_test = np.clip(pts_test, -HALF, HALF)
+            r_achieved = _compute_r(pts_test)
+            
+            if r_achieved >= r_mid - 1e-6:
+                r_lo = r_mid
+                if r_achieved > best_r:
+                    best_r = r_achieved
+                    best_pts = pts_test.copy()
+            else:
+                r_hi = r_mid
+        except Exception:
+            r_hi = r_mid
+
+    # Phase 3: Final Polish with Soft-Min L-BFGS
+    # Use the best configuration found to polish with smooth objective
+    if time.time() < _DEADLINE - 5.0:
+        for beta in [50.0, 200.0, 800.0]:
+            if time.time() > _DEADLINE - 2.0:
+                break
+            try:
+                res = minimize(_soft_min_obj, best_pts.ravel(), method='L-BFGS-B',
+                               jac=_soft_min_grad, args=(beta,),
+                               bounds=[(-HALF, HALF)] * (2 * N),
+                               options={'maxiter': 200, 'ftol': 1e-16, 'gtol': 1e-12})
+                pts_soft = res.x.reshape(N, 2)
+                pts_soft = np.clip(pts_soft, -HALF, HALF)
+                r_soft = _compute_r(pts_soft)
+                if r_soft > best_r:
+                    best_r = r_soft
+                    best_pts = pts_soft
+            except Exception:
+                pass
+
+    return best_pts
