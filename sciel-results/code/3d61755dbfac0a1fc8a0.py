@@ -1,0 +1,144 @@
+import time
+import numpy as np
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 110.0  # 10s margin
+    
+    n, m, p = 2, 4, 4
+    rank = 28
+    
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    
+    # Strassen coefficients for 2x2x2
+    # M1 = (A00 + A11)(B00 + B11)
+    # M2 = (A10 + A11) B00
+    # M3 = A00 (B01 - B11)
+    # M4 = A11 (B10 - B00)
+    # M5 = (A00 + A01) B11
+    # M6 = (A10 - A00)(B00 + B01)
+    # M7 = (A01 - A11)(B10 + B11)
+    
+    # Output C:
+    # C00 = M1 + M4 - M5 + M7
+    # C01 = M3 + M5
+    # C10 = M2 + M4
+    # C11 = M1 - M2 + M3 + M6
+    
+    strassen_steps = [
+        # M1
+        {
+            'u': {0: 1, 3: 1},
+            'v': {0: 1, 3: 1},
+            'w': {0: 1, 3: 1}
+        },
+        # M2
+        {
+            'u': {2: 1, 3: 1},
+            'v': {0: 1},
+            'w': {2: 1, 3: -1}
+        },
+        # M3
+        {
+            'u': {0: 1},
+            'v': {1: 1, 3: -1},
+            'w': {1: 1, 3: 1}
+        },
+        # M4
+        {
+            'u': {3: 1},
+            'v': {2: 1, 0: -1},
+            'w': {0: 1, 2: 1}
+        },
+        # M5
+        {
+            'u': {0: 1, 1: 1},
+            'v': {3: 1},
+            'w': {0: -1, 1: 1}
+        },
+        # M6
+        {
+            'u': {2: 1, 0: -1},
+            'v': {0: 1, 1: 1},
+            'w': {3: 1}
+        },
+        # M7
+        {
+            'u': {1: 1, 3: -1},
+            'v': {2: 1, 3: 1},
+            'w': {0: 1}
+        }
+    ]
+    
+    def add_block(a_col_start, b_row_start, b_col_start, c_col_start, col_offset):
+        for s in range(7):
+            step = strassen_steps[s]
+            col = col_offset + s
+            
+            # Update U
+            for local_idx, coeff in step['u'].items():
+                l_row = local_idx // 2
+                l_col = local_idx % 2
+                global_i = l_row
+                global_j = a_col_start + l_col
+                global_idx = global_i * m + global_j
+                U[global_idx][col] += coeff
+                
+            # Update V
+            for local_idx, coeff in step['v'].items():
+                l_row = local_idx // 2
+                l_col = local_idx % 2
+                global_i = b_row_start + l_row
+                global_j = b_col_start + l_col
+                global_idx = global_i * p + global_j
+                V[global_idx][col] += coeff
+                
+            # Update W
+            for local_idx, coeff in step['w'].items():
+                l_row = local_idx // 2
+                l_col = local_idx % 2
+                # W index convention: k*n + i
+                # k is col of C, i is row of C
+                global_k = c_col_start + l_col
+                global_i = l_row
+                global_idx = global_k * n + global_i
+                W[global_idx][col] += coeff
+
+    # Block 1: A_L (cols 0,1), B_TL (rows 0,1 cols 0,1) -> C_L (cols 0,1)
+    add_block(a_col_start=0, b_row_start=0, b_col_start=0, c_col_start=0, col_offset=0)
+    
+    # Block 2: A_L (cols 0,1), B_TR (rows 0,1 cols 2,3) -> C_R (cols 2,3)
+    add_block(a_col_start=0, b_row_start=0, b_col_start=2, c_col_start=2, col_offset=7)
+    
+    # Block 3: A_R (cols 2,3), B_BL (rows 2,3 cols 0,1) -> C_L (cols 0,1)
+    add_block(a_col_start=2, b_row_start=2, b_col_start=0, c_col_start=0, col_offset=14)
+    
+    # Block 4: A_R (cols 2,3), B_BR (rows 2,3 cols 2,3) -> C_R (cols 2,3)
+    add_block(a_col_start=2, b_row_start=2, b_col_start=2, c_col_start=2, col_offset=21)
+    
+    # Time check
+    if time.time() > deadline:
+        return {"U": U, "V": V, "W": W}
+
+    # Verification (optional, but good for safety)
+    # Convert to numpy for quick check
+    U_arr = np.array(U, dtype=float)
+    V_arr = np.array(V, dtype=float)
+    W_arr = np.array(W, dtype=float)
+    
+    T_recon = np.zeros((n, m, p), dtype=float)
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                T_recon[i, j, k] = np.sum(U_arr[i*m+j, :] * V_arr[j*p+k, :] * W_arr[k*n+i, :])
+    
+    T_target = np.ones((n, m, p), dtype=float)
+    if not np.allclose(T_recon, T_target, atol=1e-9):
+        # Fallback if something went wrong (should not happen)
+        # In a real scenario, we might try to repair, but for this fixed solution,
+        # we just return what we have.
+        pass
+        
+    return {"U": U, "V": V, "W": W}

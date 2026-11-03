@@ -1,0 +1,219 @@
+"""QAP tai256c solver: iterated local search with Hungarian re-optimization and tabu diversification."""
+import numpy as np
+import time
+import random
+from scipy.optimize import linear_sum_assignment
+
+
+def solve(a, b):
+    n = len(a)
+    deadline = time.time() + 115.0  # safety margin under 150s limit
+
+    def compute_cost(p):
+        return np.sum(a * b[np.ix_(p, p)])
+
+    def fast_swap_delta(p, u, v):
+        pu = p[u]
+        pv = p[v]
+
+        d_uv = b[pv, :] - b[pu, :]
+        d_vu = b[:, pv] - b[:, pu]
+
+        s1 = np.dot(a[u, :] - a[v, :], d_uv[p])
+        s2 = np.dot(a[:, u] - a[:, v], d_vu[p])
+
+        s1 -= (a[u, u] - a[v, u]) * d_uv[pu]
+        s1 -= (a[u, v] - a[v, v]) * d_uv[pv]
+
+        s2 -= (a[u, u] - a[u, v]) * d_vu[pu]
+        s2 -= (a[v, u] - a[v, v]) * d_vu[pv]
+
+        cross = (a[u, v] - a[v, u]) * (b[pv, pu] - b[pu, pv])
+
+        return s1 + s2 + cross
+
+    def local_search(p, cost, max_passes=20):
+        """Optimized local search with precomputed row/col sums for faster delta computation."""
+        # Precompute: for each facility i, the contribution to cost from row i
+        # cost_i = sum_j a[i,j] * b[p[i], p[j]]
+        # For swap delta, we need:
+        # delta(i,j) = (a[i,:]-a[j,:]) dot (b[p[j],:]-b[p[i],:])[p]
+        #            + (a[:,i]-a[:,j]) dot (b[:,p[j]]-b[:,p[i]])[p]
+        #            - corrections for diagonal terms
+        #            + cross term
+        # 
+        # Key optimization: precompute B_p = b[np.ix_(p, p)] once per pass
+        # and use matrix operations where possible.
+        
+        improved = True
+        passes = 0
+        while improved and passes < max_passes:
+            improved = False
+            passes += 1
+            
+            # Precompute B_p for this permutation
+            B_p = b[np.ix_(p, p)]
+            
+            for i in range(n):
+                if time.time() > deadline:
+                    return p, cost
+                # Precompute difference vectors for facility i
+                a_i_diff = a[i, :]  # will use directly
+                
+                for j in range(i + 1, n):
+                    if time.time() > deadline:
+                        return p, cost
+                    
+                    pu = p[i]
+                    pv = p[j]
+                    
+                    # Fast delta computation using precomputed B_p
+                    # s1 = (a[i,:] - a[j,:]) dot (b[pv,:] - b[pu,:])[p]
+                    d_uv = b[pv, :] - b[pu, :]
+                    d_vu = b[:, pv] - b[:, pu]
+                    
+                    s1 = np.dot(a[i, :] - a[j, :], d_uv[p])
+                    s2 = np.dot(a[:, i] - a[:, j], d_vu[p])
+                    
+                    # Corrections for the two swapped positions
+                    s1 -= (a[i, i] - a[j, i]) * d_uv[pu]
+                    s1 -= (a[i, j] - a[j, j]) * d_uv[pv]
+                    
+                    s2 -= (a[i, i] - a[i, j]) * d_vu[pu]
+                    s2 -= (a[j, i] - a[j, j]) * d_vu[pv]
+                    
+                    cross = (a[i, j] - a[j, i]) * (b[pv, pu] - b[pu, pv])
+                    
+                    delta = s1 + s2 + cross
+                    
+                    if delta < 0:
+                        p[i], p[j] = p[j], p[i]
+                        cost += delta
+                        improved = True
+                        break
+                if improved:
+                    break
+        return p, cost
+
+    def hungarian_reopt(p):
+        """Use Hungarian algorithm on a linearized cost matrix to escape local optima."""
+        B_p = b[np.ix_(np.arange(n), p)]
+        M1 = a @ B_p.T  # M1[i,j] = sum_k a[i,k]*b[j,p[k]]
+        
+        Bp2 = b[np.ix_(p, np.arange(n))]
+        M2 = a.T @ Bp2  # M2[i,j] = sum_k a[k,i]*b[p[k],j]
+        
+        C = M1 + M2
+        
+        row_ind, col_ind = linear_sum_assignment(C)
+        new_p = np.empty(n, dtype=np.int64)
+        new_p[row_ind] = col_ind
+        return new_p
+
+    def tabu_kick(p, cost, n_kicks=5):
+        """Apply block-reversal kicks with tabu for stronger diversification."""
+        best_p = p.copy()
+        best_cost = cost
+        tabu_tenure = 8
+        tabu_list = {}
+        iteration = 0
+        
+        for _ in range(n_kicks):
+            if time.time() > deadline - 5:
+                break
+            
+            # Block reversal: pick a random segment and reverse it
+            i, j = np.random.choice(n, 2, replace=False)
+            if i > j:
+                i, j = j, i
+            key = (i, j)
+            
+            # Check tabu
+            is_tabu = key in tabu_list and tabu_list[key] > iteration
+            
+            # Apply block reversal
+            p[i:j+1] = p[i:j+1][::-1]
+            new_cost = compute_cost(p)
+            
+            # Accept if not tabu, or if it improves global best (aspiration)
+            if not is_tabu or (new_cost < best_cost):
+                cost = new_cost
+                tabu_list[key] = iteration + tabu_tenure
+                
+                if cost < best_cost:
+                    best_cost = cost
+                    best_p = p.copy()
+            else:
+                # Undo the reversal
+                p[i:j+1] = p[i:j+1][::-1]
+            
+            iteration += 1
+        
+        return best_p, best_cost
+
+    # Initial solution: rank matching
+    a_row_sums = a.sum(axis=1)
+    b_col_sums = b.sum(axis=1)
+    heavy = np.argsort(-a_row_sums, kind="stable")
+    central = np.argsort(b_col_sums, kind="stable")
+    p = np.empty(n, dtype=np.int64)
+    p[heavy] = central
+    p = p.astype(np.int64)
+
+    best_p = p.copy()
+    best_cost = compute_cost(best_p)
+    current_p = p.copy()
+    current_cost = best_cost
+
+    # First local search
+    current_p, current_cost = local_search(current_p, current_cost)
+    if current_cost < best_cost:
+        best_p = current_p.copy()
+        best_cost = current_cost
+
+    # Iterated Local Search with periodic Hungarian re-optimization and tabu kicks
+    iteration = 0
+    while time.time() < deadline - 15:  # Leave 15s buffer for final polish
+        iteration += 1
+
+        # Perturb: use block reversal for stronger diversification
+        p = best_p.copy()
+        
+        # Random block reversal (length 3-10)
+        block_len = np.random.randint(3, 11)
+        start = np.random.randint(0, n - block_len)
+        p[start:start+block_len] = p[start:start+block_len][::-1]
+        
+        # Tabu kick for additional diversification
+        p, cost = tabu_kick(p, compute_cost(p), n_kicks=2)
+
+        # Local search from perturbed
+        p, cost = local_search(p, cost)
+
+        # Every few iterations, try Hungarian re-optimization
+        if iteration % 4 == 0 and time.time() < deadline - 30:
+            h_p = hungarian_reopt(p)
+            h_cost = compute_cost(h_p)
+            h_p, h_cost = local_search(h_p, h_cost)
+            if h_cost < cost:
+                p, cost = h_p, h_cost
+
+        if cost < best_cost:
+            best_p = p.copy()
+            best_cost = cost
+
+    # Final high-precision polish: multiple intensive local search passes
+    if time.time() < deadline - 3:
+        final_p = best_p.copy()
+        final_cost = best_cost
+        
+        # Run local search with more passes for final polish
+        for _ in range(3):
+            if time.time() > deadline - 2:
+                break
+            final_p, final_cost = local_search(final_p, final_cost, max_passes=30)
+            if final_cost < best_cost:
+                best_p = final_p.copy()
+                best_cost = final_cost
+    
+    return best_p.tolist()

@@ -1,0 +1,248 @@
+"""Matrix multiplication 3,5,7 - rank-minimal exact tensor decomposition."""
+import time
+import numpy as np
+
+DIMENSIONS = [3, 5, 7]
+
+# EVOLVE-BLOCK-START
+
+def construct():
+    deadline = time.time() + 130  # safety margin before 150s limit
+    
+    n, m, p = DIMENSIONS  # 3, 5, 7
+    
+    # Schoolbook decomposition
+    def schoolbook():
+        rank = n * m * p
+        U = np.zeros((n * m, rank), dtype=float)
+        V = np.zeros((m * p, rank), dtype=float)
+        W = np.zeros((p * n, rank), dtype=float)
+        for c in range(rank):
+            i = c // (m * p)
+            j = (c // p) % m
+            k = c % p
+            U[i * m + j, c] = 1.0
+            V[j * p + k, c] = 1.0
+            W[k * n + i, c] = 1.0
+        return U, V, W, rank
+
+    U_sb, V_sb, W_sb, rank_sb = schoolbook()
+    
+    # Verify schoolbook is correct
+    def verify(U, V, W):
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    lhs = 1.0
+                    rhs = 0.0
+                    for c in range(U.shape[1]):
+                        rhs += U[i * m + j, c] * V[j * p + k, c] * W[k * n + i, c]
+                    if abs(lhs - rhs) > 1e-6:
+                        return False
+        return True
+
+    # Try to find a lower-rank decomposition using Strassen on 2x2x2 blocks
+    # We want to find the maximum number of disjoint 2x2x2 blocks.
+    # Each block replaces 8 schoolbook terms with 7 Strassen terms (saving 1).
+    # Total rank = 105 - number_of_blocks.
+    
+    # Generate all possible 2x2x2 blocks
+    all_blocks = []
+    for i0 in range(n-1):
+        for j0 in range(m-1):
+            for k0 in range(p-1):
+                I = frozenset([i0, i0+1])
+                J = frozenset([j0, j0+1])
+                K = frozenset([k0, k0+1])
+                all_blocks.append((I, J, K))
+    
+    # Greedy: pick blocks that don't overlap with already picked blocks
+    # Two blocks overlap if they share any (i,j,k) index
+    def blocks_overlap(b1, b2):
+        I1, J1, K1 = b1
+        I2, J2, K2 = b2
+        for i in I1:
+            for j in J1:
+                for k in K1:
+                    if i in I2 and j in J2 and k in K2:
+                        return True
+        return False
+    
+    # Greedy selection with multiple random orderings to find good solutions
+    import random
+    best_blocks = []
+    best_count = 0
+    
+    # Try multiple random orderings
+    for trial in range(50):
+        random.seed(trial)
+        shuffled = all_blocks[:]
+        random.shuffle(shuffled)
+        
+        selected = []
+        for block in shuffled:
+            if all(not blocks_overlap(block, sel) for sel in selected):
+                selected.append(block)
+        
+        if len(selected) > best_count:
+            best_count = len(selected)
+            best_blocks = selected[:]
+    
+    # Sort blocks for determinism
+    best_blocks.sort()
+    blocks = best_blocks
+    
+    U = []
+    V = []
+    W = []
+    
+    def add_strassen_block(I, J, K):
+        # Map local indices 0,1 to global indices
+        i0, i1 = sorted(I)
+        j0, j1 = sorted(J)
+        k0, k1 = sorted(K)
+        
+        # Strassen 7 terms for 2x2x2
+        # Local indices: i, j, k in {0, 1}
+        # A[i,j], B[j,k], C[i,k]
+        
+        # M1 = (A00+A11)(B00+B11)
+        # M2 = (A10+A11)B00
+        # M3 = A00(B01-B11)
+        # M4 = A11(B10-B00)
+        # M5 = (A00+A01)B11
+        # M6 = (A10-A00)(B00+B01)
+        # M7 = (A01-A11)(B10+B11)
+        
+        # Results:
+        # C00 = M1 + M4 - M5 + M7
+        # C01 = M3 + M5
+        # C10 = M2 + M4
+        # C11 = M1 - M2 + M6
+        
+        terms = []
+        
+        # M1: (A00+A11)(B00+B11) -> contributes to C00 (+1) and C11 (+1)
+        u1 = np.zeros(n*m)
+        v1 = np.zeros(m*p)
+        w1 = np.zeros(p*n)
+        u1[i0*m + j0] = 1.0
+        u1[i1*m + j1] = 1.0
+        v1[j0*p + k0] = 1.0
+        v1[j1*p + k1] = 1.0
+        w1[k0*n + i0] = 1.0   # C00
+        w1[k1*n + i1] = 1.0   # C11
+        terms.append((u1, v1, w1))
+        
+        # M2: (A10+A11)B00 -> contributes to C10 (+1) and C11 (-1)
+        u2 = np.zeros(n*m)
+        v2 = np.zeros(m*p)
+        w2 = np.zeros(p*n)
+        u2[i1*m + j0] = 1.0
+        u2[i1*m + j1] = 1.0
+        v2[j0*p + k0] = 1.0
+        w2[k0*n + i1] = 1.0   # C10
+        w2[k1*n + i1] = -1.0  # C11
+        terms.append((u2, v2, w2))
+        
+        # M3: A00(B01-B11) -> contributes to C01 (+1) and C11 (+1)
+        u3 = np.zeros(n*m)
+        v3 = np.zeros(m*p)
+        w3 = np.zeros(p*n)
+        u3[i0*m + j0] = 1.0
+        v3[j0*p + k1] = 1.0
+        v3[j1*p + k1] = -1.0
+        w3[k1*n + i0] = 1.0   # C01
+        w3[k1*n + i1] = 1.0   # C11
+        terms.append((u3, v3, w3))
+        
+        # M4: A11(B10-B00) -> contributes to C00 (+1) and C10 (+1)
+        u4 = np.zeros(n*m)
+        v4 = np.zeros(m*p)
+        w4 = np.zeros(p*n)
+        u4[i1*m + j1] = 1.0
+        v4[j1*p + k0] = 1.0
+        v4[j0*p + k0] = -1.0
+        w4[k0*n + i0] = 1.0   # C00
+        w4[k0*n + i1] = 1.0   # C10
+        terms.append((u4, v4, w4))
+        
+        # M5: (A00+A01)B11 -> contributes to C00 (-1) and C01 (+1)
+        u5 = np.zeros(n*m)
+        v5 = np.zeros(m*p)
+        w5 = np.zeros(p*n)
+        u5[i0*m + j0] = 1.0
+        u5[i0*m + j1] = 1.0
+        v5[j1*p + k1] = 1.0
+        w5[k0*n + i0] = -1.0  # C00
+        w5[k1*n + i0] = 1.0   # C01
+        terms.append((u5, v5, w5))
+        
+        # M6: (A10-A00)(B00+B01) -> contributes to C11 (+1)
+        u6 = np.zeros(n*m)
+        v6 = np.zeros(m*p)
+        w6 = np.zeros(p*n)
+        u6[i1*m + j0] = 1.0
+        u6[i0*m + j0] = -1.0
+        v6[j0*p + k0] = 1.0
+        v6[j0*p + k1] = 1.0
+        w6[k1*n + i1] = 1.0   # C11
+        terms.append((u6, v6, w6))
+        
+        # M7: (A01-A11)(B10+B11) -> contributes to C00 (+1)
+        u7 = np.zeros(n*m)
+        v7 = np.zeros(m*p)
+        w7 = np.zeros(p*n)
+        u7[i0*m + j1] = 1.0
+        u7[i1*m + j1] = -1.0
+        v7[j1*p + k0] = 1.0
+        v7[j1*p + k1] = 1.0
+        w7[k0*n + i0] = 1.0   # C00
+        terms.append((u7, v7, w7))
+        
+        for u, v, w in terms:
+            U.append(u)
+            V.append(v)
+            W.append(w)
+
+    # Add Strassen blocks
+    for I, J, K in blocks:
+        add_strassen_block(I, J, K)
+        
+    # Add remaining schoolbook terms
+    # We need to identify which (i,j,k) are NOT covered by the blocks.
+    # Covered if (i,j,k) is in the union of the blocks' index sets.
+    covered = set()
+    for I, J, K in blocks:
+        for i in I:
+            for j in J:
+                for k in K:
+                    covered.add((i, j, k))
+                    
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                if (i, j, k) not in covered:
+                    u = np.zeros(n*m)
+                    v = np.zeros(m*p)
+                    w = np.zeros(p*n)
+                    u[i*m + j] = 1.0
+                    v[j*p + k] = 1.0
+                    w[k*n + i] = 1.0
+                    U.append(u)
+                    V.append(v)
+                    W.append(w)
+                    
+    U_mat = np.array(U).T # Shape (rank, n*m) -> transpose to (n*m, rank)
+    V_mat = np.array(V).T
+    W_mat = np.array(W).T
+    
+    rank_achieved = U_mat.shape[1]
+    
+    if verify(U_mat, V_mat, W_mat):
+        return {"U": U_mat.tolist(), "V": V_mat.tolist(), "W": W_mat.tolist()}
+    else:
+        # Fallback to schoolbook
+        return {"U": U_sb.tolist(), "V": V_sb.tolist(), "W": W_sb.tolist()}
+
+# EVOLVE-BLOCK-END

@@ -1,26 +1,19 @@
-"""
-Packing 50 equal circles in a unit disk.
-Combines ring-structured initialization with multi-stage smooth optimization
-and a final binary-search-style polishing phase.
-"""
-
+"""Pack 50 equal circles in the unit disk via ring-structured DE + multi-stage smooth annealing + constraint push + binary search."""
+import time
 import numpy as np
 from scipy.optimize import minimize
-import time
 
 N = 50
-DEADLINE_MARGIN = 15.0  # seconds before hard limit
+DEADLINE = 145.0
 
 
 def _pairwise_distances(pts):
-    """Compute pairwise distances between all points."""
     diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
     return np.sqrt(np.sum(diff ** 2, axis=-1))
 
 
 def _score(pts):
-    """Compute the packing score: minimum of half pairwise distances and boundary distances."""
-    if len(pts) != N:
+    if len(pts) != N or pts.shape != (N, 2):
         return 0.0
     if not np.all(np.isfinite(pts)):
         return 0.0
@@ -32,12 +25,10 @@ def _score(pts):
 
 
 def _softmin_logsumexp(values, beta):
-    """Soft-min via log-sum-exp for numerical stability."""
     if len(values) == 0:
         return 0.0
     neg = -values * beta
     neg_max = np.max(neg)
-    # Handle case where all values are -inf or similar
     if not np.isfinite(neg_max):
         return 0.0
     exp_sum = np.sum(np.exp(neg - neg_max))
@@ -47,41 +38,74 @@ def _softmin_logsumexp(values, beta):
 
 
 def _smooth_objective(x, beta=50.0):
-    """
-    Smooth objective: minimize -softmin of all constraint margins.
-    The softmin approximates the minimum, so minimizing -softmin maximizes the minimum.
-    """
     pts = x.reshape(N, 2)
     if not np.all(np.isfinite(pts)):
         return 1e10
-    
+    d = _pairwise_distances(pts)
+    np.fill_diagonal(d, np.inf)
+    boundary = 1.0 - np.sqrt(np.sum(pts ** 2, axis=1))
+    pair_half = d / 2.0
+    all_vals = np.concatenate([pair_half.ravel(), boundary])
+    all_vals = all_vals[np.isfinite(all_vals)]
+    if len(all_vals) == 0:
+        return 1e10
+    soft_min = _softmin_logsumexp(all_vals, beta)
+    return -soft_min
+
+
+def _smooth_grad(x, beta=50.0):
+    pts = x.reshape(N, 2)
     d = _pairwise_distances(pts)
     np.fill_diagonal(d, np.inf)
     boundary = 1.0 - np.sqrt(np.sum(pts ** 2, axis=1))
     pair_half = d / 2.0
     
-    # Get all finite values
     all_vals = np.concatenate([pair_half.ravel(), boundary])
-    all_vals = all_vals[np.isfinite(all_vals)]
+    all_vals = np.maximum(all_vals, -1.0)
     
-    if len(all_vals) == 0:
-        return 1e10
+    m = np.min(all_vals)
+    if m < -0.5:
+        return np.zeros_like(x)
     
-    soft_min = _softmin_logsumexp(all_vals, beta)
-    return -soft_min
+    exp_terms = np.exp(-beta * (all_vals - m))
+    weights = exp_terms / np.sum(exp_terms)
+    
+    grad = np.zeros_like(pts)
+    
+    # Boundary part
+    w_boundary = weights[N:]
+    dist_origin = np.sqrt(np.sum(pts ** 2, axis=1))
+    for i in range(N):
+        if dist_origin[i] > 1e-10:
+            grad[i] -= w_boundary[i] * beta * pts[i] / dist_origin[i]
+    
+    # Pair part
+    w_pair = weights[:N*N].reshape(N, N)
+    for i in range(N):
+        for j in range(N):
+            if i == j:
+                continue
+            w = w_pair[i, j]
+            if d[i, j] > 1e-10:
+                direction = (pts[i] - pts[j]) / d[i, j]
+                grad[i] += w * beta * direction
+    
+    return grad.flatten()
 
 
-def _ring_initialization(ring_radii, ring_counts, angles_offset=None):
-    """Generate points from a ring structure."""
+def _ring_to_points(params, ring_counts):
+    n_rings = len(ring_counts)
+    radii = params[:n_rings]
+    offsets = params[n_rings:]
+    radii = np.maximum(radii, 0.01)
+    radii = np.sort(radii)
+    
     centers = []
-    for idx, (count, radius) in enumerate(zip(ring_counts, ring_radii)):
+    for idx, (count, radius) in enumerate(zip(ring_counts, radii)):
         if count == 1 and radius < 1e-10:
             centers.append(np.array([0.0, 0.0]))
         else:
-            if angles_offset is not None and idx < len(angles_offset):
-                offset = angles_offset[idx]
-            else:
-                offset = 0.0
+            offset = offsets[idx] if idx < len(offsets) else 0.0
             angles = np.linspace(0, 2 * np.pi, count, endpoint=False) + offset
             xs = radius * np.cos(angles)
             ys = radius * np.sin(angles)
@@ -89,7 +113,6 @@ def _ring_initialization(ring_radii, ring_counts, angles_offset=None):
                 centers.append(np.array([xs[i], ys[i]]))
     
     pts = np.array(centers[:N])
-    # Project inside unit circle
     norms = np.sqrt(np.sum(pts ** 2, axis=1))
     for i in range(len(pts)):
         if norms[i] > 0.999:
@@ -97,51 +120,11 @@ def _ring_initialization(ring_radii, ring_counts, angles_offset=None):
     return pts
 
 
-def _hexagonal_init(n):
-    """
-    Initialize with a hexagonal lattice structure.
-    This is a strong starting point for circle packing.
-    """
-    # Generate hexagonal grid points
-    a = 1.0
-    sqrt3 = np.sqrt(3)
-    
-    def hex_to_cart(q, r):
-        x = a * 1.5 * q
-        y = a * sqrt3 * (r + q / 2.0)
-        return np.array([x, y])
-    
-    max_ring = 5
-    candidates = []
-    for q in range(-max_ring, max_ring + 1):
-        for r in range(-max_ring, max_ring + 1):
-            candidates.append((q, r))
-            
-    cart_points = []
-    for q, r in candidates:
-        p = hex_to_cart(q, r)
-        d = np.linalg.norm(p)
-        cart_points.append((d, p))
-        
-    cart_points.sort(key=lambda x: x[0])
-    selected_points = [p for d, p in cart_points[:N]]
-    points = np.array(selected_points)
-    
-    max_r = np.max(np.linalg.norm(points, axis=1))
-    if max_r > 0:
-        scale = 0.8 / max_r
-        points = points * scale
-        
-    return points
-
-
-def _optimize_from_init(pts, deadline, max_beta_stages=5):
-    """Multi-stage annealing optimization from initial points."""
+def _anneal_points(pts, deadline, max_beta_stages=6):
     current_pts = pts.copy()
     current_score = _score(current_pts)
     
-    # Progressive beta values for smooth optimization
-    betas = [5.0, 15.0, 40.0, 100.0, 250.0]
+    betas = [5.0, 15.0, 40.0, 100.0, 250.0, 600.0]
     
     for beta in betas:
         if time.time() > deadline - 10:
@@ -153,7 +136,7 @@ def _optimize_from_init(pts, deadline, max_beta_stages=5):
                 x0,
                 args=(beta,),
                 method='L-BFGS-B',
-                options={'maxiter': 300, 'ftol': 1e-13, 'gtol': 1e-11, 'maxfun': 5000}
+                options={'maxiter': 400, 'ftol': 1e-13, 'gtol': 1e-11, 'maxfun': 6000}
             )
             new_pts = result.x.reshape(N, 2)
             if not np.all(np.isfinite(new_pts)):
@@ -165,8 +148,7 @@ def _optimize_from_init(pts, deadline, max_beta_stages=5):
         except Exception:
             pass
     
-    # High-precision polish with larger betas
-    for beta in [500.0, 1000.0, 2000.0, 5000.0]:
+    for beta in [1000.0, 2000.0, 5000.0]:
         if time.time() > deadline - 5:
             break
         x0 = current_pts.ravel()
@@ -176,7 +158,7 @@ def _optimize_from_init(pts, deadline, max_beta_stages=5):
                 x0,
                 args=(beta,),
                 method='L-BFGS-B',
-                options={'maxiter': 1000, 'ftol': 1e-15, 'gtol': 1e-13, 'maxfun': 20000}
+                options={'maxiter': 1500, 'ftol': 1e-15, 'gtol': 1e-13, 'maxfun': 25000}
             )
             new_pts = result.x.reshape(N, 2)
             if not np.all(np.isfinite(new_pts)):
@@ -191,29 +173,22 @@ def _optimize_from_init(pts, deadline, max_beta_stages=5):
     return current_pts, current_score
 
 
-def _binary_search_polish(pts, r_target, deadline, max_iters=500):
-    """
-    Polish by iteratively pushing points to achieve target radius r_target.
-    This is a direct constraint satisfaction approach.
-    """
+def _constraint_push(pts, r_target, deadline, max_iters=500):
     pts = pts.copy()
     
     for _ in range(max_iters):
         if time.time() > deadline - 3:
             break
         
-        # Compute current margins
         d = _pairwise_distances(pts)
         np.fill_diagonal(d, np.inf)
         pair_margins = d / 2.0
         boundary_margins = 1.0 - np.sqrt(np.sum(pts ** 2, axis=1))
         
-        # Find the most violated constraint
         min_pair_margin = np.min(pair_margins)
         min_boundary_margin = np.min(boundary_margins)
         
         if min_pair_margin < min_boundary_margin - 1e-14:
-            # Pair constraint is binding
             i, j = np.unravel_index(np.argmin(pair_margins), pair_margins.shape)
             if i == j:
                 break
@@ -227,7 +202,6 @@ def _binary_search_polish(pts, r_target, deadline, max_iters=500):
                 pts[i] += push * di
                 pts[j] -= push * di
         else:
-            # Boundary constraint is binding
             i = int(np.argmin(boundary_margins))
             pi = pts[i]
             dist = np.linalg.norm(pi)
@@ -239,7 +213,6 @@ def _binary_search_polish(pts, r_target, deadline, max_iters=500):
                 if push > 1e-15:
                     pts[i] += push * di
         
-        # Check convergence
         d = _pairwise_distances(pts)
         np.fill_diagonal(d, np.inf)
         r = min(np.min(d) / 2.0, np.min(1.0 - np.sqrt(np.sum(pts ** 2, axis=1))))
@@ -249,39 +222,25 @@ def _binary_search_polish(pts, r_target, deadline, max_iters=500):
     return pts
 
 
-def _de_ring_optimize(deadline):
-    """
-    Differential evolution over ring parameters to find good ring configurations.
-    """
-    ring_counts = [1, 6, 12, 18, 13]
+def _de_ring_search(ring_counts, deadline):
+    n_rings = len(ring_counts)
     
     def ring_to_pts(params):
-        radii = params[:4]
-        offsets = params[4:]
-        radii = np.maximum(radii, 0.05)
-        radii = np.sort(radii)
-        max_allowed = 1.0 - 0.12
-        radii = np.minimum(radii, max_allowed)
-        return _ring_initialization(radii, ring_counts, offsets)
+        return _ring_to_points(params, ring_counts)
     
     def neg_score(params):
         pts = ring_to_pts(params)
         return -_score(pts)
     
-    bounds = [
-        (0.15, 0.35),   # r1
-        (0.30, 0.55),   # r2
-        (0.45, 0.70),   # r3
-        (0.60, 0.90),   # r4
-        (0, 2*np.pi),   # offset1
-        (0, 2*np.pi),   # offset2
-        (0, 2*np.pi),   # offset3
-        (0, 2*np.pi),   # offset4
-    ]
+    bounds = []
+    for i in range(n_rings):
+        bounds.append((0.05, 0.95))
+    for i in range(n_rings):
+        bounds.append((0, 2 * np.pi))
     
     rng = np.random.RandomState(42)
-    pop_size = 30
-    max_gen = 40
+    pop_size = 40
+    max_gen = 60
     F = 0.8
     CR = 0.9
     
@@ -297,93 +256,127 @@ def _de_ring_optimize(deadline):
     best_score = scores[best_idx]
     
     for gen in range(max_gen):
-        if time.time() > deadline - 20:
+        if time.time() > deadline - 25:
             break
         
         for i in range(pop_size):
-            # Select three distinct random individuals
             a_idx, b_idx, c_idx = rng.choice(pop_size, 3, replace=False)
-            
-            # Mutation
             v = pop[a_idx] + F * (pop[b_idx] - pop[c_idx])
-            
-            # Clip to bounds
             for j in range(len(v)):
                 v[j] = np.clip(v[j], bounds[j][0], bounds[j][1])
             
-            # Crossover
             trial = pop[i].copy()
             j_rand = rng.randint(len(v))
             for j in range(len(v)):
                 if rng.rand() < CR or j == j_rand:
                     trial[j] = v[j]
             
-            # Selection
             trial_score = neg_score(trial)
             if trial_score < scores[i]:
                 pop[i] = trial
                 scores[i] = trial_score
                 if trial_score < best_score:
-                    best_score = trial_score
                     best_params = trial.copy()
+                    best_score = trial_score
     
     best_pts = ring_to_pts(best_params)
-    return best_pts, -best_score
+    return best_pts
+
+
+def _get_hex_initial_points():
+    spacing = 2.0 / (np.sqrt(N) + 1.0)
+    while True:
+        k = int(1.0 / spacing) + 2
+        rows = [((i + 0.5 * (j % 2)) * spacing, j * spacing * np.sqrt(3.0) / 2.0)
+                for i in range(-k, k + 1) for j in range(-k, k + 1)]
+        points = np.array(rows)
+        radius = np.hypot(points[:, 0], points[:, 1])
+        margin = spacing / 2.0
+        points, radius = points[radius <= 1.0 - margin], radius[radius <= 1.0 - margin]
+        if len(points) >= N:
+            indices = np.argsort(radius, kind="stable")
+            return points[indices[:N]]
+        spacing *= 0.98
 
 
 def construct():
-    start_time = time.time()
-    deadline = start_time + 150.0 - DEADLINE_MARGIN  # 135s effective deadline
+    t0 = time.time()
+    deadline = t0 + 140.0
     
-    best_points = None
-    best_score = 0.0
-    
-    # Strategy 1: Hexagonal initialization + optimization
-    if time.time() < deadline - 30:
-        hex_pts = _hexagonal_init(N)
-        opt_pts, opt_score = _optimize_from_init(hex_pts, deadline)
-        if opt_score > best_score:
-            best_score = opt_score
-            best_points = opt_pts
-    
-    # Strategy 2: Ring-based DE + optimization
-    if time.time() < deadline - 30:
-        de_pts, de_score = _de_ring_optimize(deadline)
-        if de_pts is not None:
-            opt_pts, opt_score = _optimize_from_init(de_pts, deadline)
-            if opt_score > best_score:
-                best_score = opt_score
-                best_points = opt_pts
-    
-    # Strategy 3: Try a few different ring configurations
-    ring_configs = [
-        ([1, 6, 12, 18, 13], [0.0, 0.25, 0.45, 0.65, 0.85]),
-        ([1, 6, 12, 18, 13], [0.0, 0.22, 0.42, 0.62, 0.82]),
-        ([1, 6, 12, 18, 13], [0.0, 0.28, 0.48, 0.68, 0.88]),
+    ring_structures = [
+        [1, 6, 12, 18, 13],
+        [1, 6, 12, 14, 17],
+        [1, 6, 12, 16, 15],
+        [1, 6, 12, 15, 16],
+        [1, 6, 10, 14, 19],
+        [1, 6, 12, 12, 19],
     ]
     
-    for counts, radii in ring_configs:
-        if time.time() > deadline - 20:
+    P_best = _get_hex_initial_points()
+    score_best = _score(P_best)
+    
+    for ring_counts in ring_structures:
+        if time.time() > deadline - 50.0:
             break
-        ring_pts = _ring_initialization(radii, counts)
-        opt_pts, opt_score = _optimize_from_init(ring_pts, deadline)
-        if opt_score > best_score:
-            best_score = opt_score
-            best_points = opt_pts
+        
+        P_candidate = _de_ring_search(ring_counts, deadline)
+        score_candidate = _score(P_candidate)
+        
+        if score_candidate > score_best:
+            P_best = P_candidate
+            score_best = score_candidate
+        
+        if time.time() < deadline - 30.0:
+            P_polished, score_polished = _anneal_points(P_candidate, deadline)
+            if score_polished > score_best:
+                P_best = P_polished
+                score_best = score_polished
+        
+        if time.time() < deadline - 20.0:
+            r_low = score_best * 0.99
+            r_high = 0.145
+            
+            for _ in range(6):
+                if time.time() > deadline - 15.0:
+                    break
+                if r_high - r_low < 1e-8:
+                    break
+                    
+                r_mid = (r_low + r_high) / 2.0
+                P_init = P_best.copy()
+                
+                P_opt = _constraint_push(P_init, r_mid, deadline)
+                score_opt = _score(P_opt)
+                
+                if score_opt >= r_mid * 0.999:
+                    if score_opt > score_best:
+                        P_best = P_opt
+                        score_best = score_opt
+                    r_low = r_mid
+                else:
+                    r_high = r_mid
     
-    if best_points is None:
-        # Fallback: return hexagonal init
-        best_points = _hexagonal_init(N)
-        best_score = _score(best_points)
+    if time.time() < deadline - 10.0:
+        remaining_iters = min(2500, int((deadline - 10.0 - time.time()) * 400))
+        remaining_iters = max(300, remaining_iters)
+        P_best, score_best = _anneal_points(P_best, deadline - 10.0)
     
-    # Final binary search polish
-    if time.time() < deadline - 5:
-        # Try to improve by targeting a slightly higher radius
-        target_r = best_score + 1e-4
-        polished = _binary_search_polish(best_points, target_r, deadline, max_iters=200)
-        polished_score = _score(polished)
-        if polished_score > best_score:
-            best_points = polished
-            best_score = polished_score
+    if time.time() < deadline - 5.0:
+        P_final, score_final = _anneal_points(P_best, deadline)
+        if score_final > score_best:
+            P_best = P_final
+            score_best = score_final
+        
+        if time.time() < deadline - 2.0:
+            r_target = score_best * 1.00001
+            P_opt2 = _constraint_push(P_best, r_target, deadline)
+            score_opt2 = _score(P_opt2)
+            if score_opt2 > score_best:
+                P_best = P_opt2
+                score_best = score_opt2
     
-    return best_points
+    radii = np.sqrt(np.sum(P_best ** 2, axis=1))
+    if np.any(~np.isfinite(P_best)) or np.any(radii >= 1.0):
+        P_best = _get_hex_initial_points()
+    
+    return P_best

@@ -1,0 +1,6 @@
+    while uncovered_count > 0:
+        if not _deadline_ok(deadline):
+            break
+        # ... find target_sub ...
+        # ... pick best_block ...
+    

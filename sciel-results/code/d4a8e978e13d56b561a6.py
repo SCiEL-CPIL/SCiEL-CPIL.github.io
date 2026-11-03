@@ -1,0 +1,348 @@
+"""
+Combined sphere packing: vectorized smooth surrogate + subgradient + coordinate descent.
+Uses log-sum-exp soft-min with exact analytic gradients, beta-annealing, and a direct
+polish pass.  BCC and grid initialisations are used as multi-start seeds.
+"""
+import numpy as np
+import time
+import scipy.optimize as opt
+import scipy.special as sp
+
+N = 50
+CUBE_HALF = 0.5
+DEADLINE_SECONDS = 145.0  # Safety margin before 150 s kill
+
+
+def construct():
+    start_time = time.time()
+
+    def elapsed():
+        return time.time() - start_time
+
+    def remaining():
+        return DEADLINE_SECONDS - elapsed()
+
+    # ------------------------------------------------------------------
+    # Exact radius
+    # ------------------------------------------------------------------
+    def compute_radius(positions):
+        positions = np.asarray(positions, dtype=np.float64).reshape(N, 3)
+        if not np.all(np.isfinite(positions)):
+            return 0.0
+        if np.any(np.abs(positions) > 0.5 + 1e-9):
+            return 0.0
+        diff = positions[:, None, :] - positions[None, :, :]
+        d = np.linalg.norm(diff, axis=2)
+        np.fill_diagonal(d, np.inf)
+        min_pair = np.min(d) / 2.0
+        walls = np.min(0.5 - np.abs(positions), axis=1)
+        min_wall = np.min(walls)
+        return float(min(min_pair, min_wall))
+
+    # ------------------------------------------------------------------
+    # Smooth surrogate with analytic gradient
+    # ------------------------------------------------------------------
+    tri_i, tri_j = np.triu_indices(N, k=1)
+    n_pairs = len(tri_i)
+
+    def smooth_obj_grad(x_flat, beta):
+        """Return (value, grad_flat) for  -soft_min(g)."""
+        c = x_flat.reshape(N, 3)
+
+        # Pairwise distances / 2
+        diff = c[tri_i] - c[tri_j]
+        norms = np.linalg.norm(diff, axis=1)
+        norms_safe = np.where(norms < 1e-12, 1e-12, norms)
+        g_pairs = 0.5 * norms_safe
+
+        # Wall distances (6 per point)
+        g_walls = np.concatenate([
+            0.5 - c[:, 0], c[:, 0] + 0.5,
+            0.5 - c[:, 1], c[:, 1] + 0.5,
+            0.5 - c[:, 2], c[:, 2] + 0.5,
+        ])
+
+        g_all = np.concatenate([g_pairs, g_walls])
+
+        # Soft min  f = -(1/beta) log sum exp(-beta g)
+        log_sum_exp = sp.logsumexp(-beta * g_all)
+        val = -log_sum_exp / beta
+
+        # Weights  w_k = exp(-beta g_k) / sum exp(-beta g)
+        log_w = -beta * g_all - log_sum_exp
+        weights = np.exp(log_w)
+
+        # Gradient of f w.r.t. c
+        grad_c = np.zeros_like(c)
+
+        # Pairwise part:  df/dc_i = -w_k * 0.5 * (c_i - c_j)/||c_i-c_j||
+        #                 df/dc_j = +w_k * 0.5 * (c_i - c_j)/||c_i-c_j||
+        for k in range(n_pairs):
+            w = weights[k]
+            if w < 1e-14:
+                continue
+            i = tri_i[k]
+            j = tri_j[k]
+            factor = 0.5 * w / norms_safe[k]
+            grad_c[i] -= factor * diff[k]
+            grad_c[j] += factor * diff[k]
+
+        # Wall part
+        ws = weights[n_pairs:]
+        grad_c[:, 0] -= ws[0:N]      # d(0.5-cx)/dcx = -1
+        grad_c[:, 0] += ws[N:2*N]    # d(cx+0.5)/dcx = +1
+        grad_c[:, 1] -= ws[2*N:3*N]
+        grad_c[:, 1] += ws[3*N:4*N]
+        grad_c[:, 2] -= ws[4*N:5*N]
+        grad_c[:, 2] += ws[5*N:6*N]
+
+        # We minimise  -soft_min  =>  objective = -val,  grad = -grad_c
+        return -val, (-grad_c).flatten()
+
+    # ------------------------------------------------------------------
+    # Subgradient of the exact min-radius (for fine tuning)
+    # ------------------------------------------------------------------
+    def subgradient_radius(positions):
+        positions = np.asarray(positions, dtype=np.float64).reshape(N, 3)
+        diff = positions[:, None, :] - positions[None, :, :]
+        d = np.linalg.norm(diff, axis=2)
+        np.fill_diagonal(d, np.inf)
+        min_pair_val = np.min(d) / 2.0
+        walls = 0.5 - np.abs(positions)
+        min_wall_val = np.min(walls)
+
+        grad = np.zeros_like(positions)
+
+        if min_pair_val < min_wall_val:
+            idx = np.argmin(d)
+            i, j = np.unravel_index(idx, (N, N))
+            if i == j:
+                d2 = d.copy()
+                np.fill_diagonal(d2, np.inf)
+                idx = np.argmin(d2)
+                i, j = np.unravel_index(idx, (N, N))
+            dv = positions[i] - positions[j]
+            dn = np.linalg.norm(dv)
+            if dn > 1e-12:
+                u = dv / dn
+                grad[i] += 0.5 * u
+                grad[j] -= 0.5 * u
+            r = min_pair_val
+        else:
+            idx = np.argmin(walls)
+            i, dim = np.unravel_index(idx, (N, 3))
+            if positions[i, dim] > 0:
+                grad[i, dim] -= 1.0
+            else:
+                grad[i, dim] += 1.0
+            r = min_wall_val
+
+        return r, grad
+
+    # ------------------------------------------------------------------
+    # Local optimisation routines
+    # ------------------------------------------------------------------
+    bounds = [(-0.499999, 0.499999)] * (N * 3)
+
+    def local_smooth(c_init, beta, maxiter=200):
+        if remaining() < 5:
+            return c_init
+        x0 = c_init.flatten()
+
+        def f(x):
+            v, _ = smooth_obj_grad(x, beta)
+            return v
+
+        def g(x):
+            _, gr = smooth_obj_grad(x, beta)
+            return gr
+
+        try:
+            res = opt.minimize(f, x0, jac=g, method='L-BFGS-B',
+                               bounds=bounds,
+                               options={'maxiter': maxiter, 'ftol': 1e-12, 'gtol': 1e-8})
+            return np.clip(res.x.reshape(N, 3), -0.499999, 0.499999)
+        except Exception:
+            return c_init
+
+    def local_direct(c_init, maxiter=300):
+        if remaining() < 5:
+            return c_init
+        x0 = c_init.flatten()
+
+        def f(x):
+            return -compute_radius(x.reshape(N, 3))
+
+        try:
+            res = opt.minimize(f, x0, method='L-BFGS-B',
+                               bounds=bounds,
+                               options={'maxiter': maxiter, 'ftol': 1e-14, 'gtol': 1e-8})
+            return np.clip(res.x.reshape(N, 3), -0.499999, 0.499999)
+        except Exception:
+            return c_init
+
+    def subgradient_ascent(c_init, maxiter=200, lr_start=0.005, lr_end=0.0001):
+        if remaining() < 5:
+            return c_init
+        pos = c_init.copy()
+        best = pos.copy()
+        best_r = compute_radius(pos)
+        for it in range(maxiter):
+            if remaining() < 3:
+                break
+            lr = lr_start * (lr_end / lr_start) ** (it / max(1, maxiter - 1))
+            r, grad = subgradient_radius(pos)
+            if r > best_r:
+                best_r = r
+                best = pos.copy()
+            pos = np.clip(pos + lr * grad, -0.499999, 0.499999)
+            if it > 20 and np.linalg.norm(grad) < 1e-8:
+                break
+        return best
+
+    def coordinate_descent(c_init, maxiter=60):
+        if remaining() < 3:
+            return c_init
+        pos = c_init.copy()
+        step = 0.006
+        for _ in range(maxiter):
+            if remaining() < 2:
+                break
+            improved = False
+            for i in range(N):
+                for dim in range(3):
+                    old = pos[i, dim]
+                    r_cur = compute_radius(pos)
+                    pos[i, dim] = min(0.499999, old + step)
+                    r_p = compute_radius(pos)
+                    pos[i, dim] = max(-0.499999, old - step)
+                    r_n = compute_radius(pos)
+                    pos[i, dim] = old
+                    if r_p > r_cur + 1e-13:
+                        pos[i, dim] = min(0.499999, old + step)
+                        improved = True
+                    elif r_n > r_cur + 1e-13:
+                        pos[i, dim] = max(-0.499999, old - step)
+                        improved = True
+            if not improved:
+                step *= 0.85
+                if step < 1e-6:
+                    break
+        return pos
+
+    # ------------------------------------------------------------------
+    # Initialisation helpers
+    # ------------------------------------------------------------------
+    def make_bcc():
+        pts = []
+        for x in range(4):
+            for y in range(4):
+                for z in range(4):
+                    pts.append([x, y, z])
+        for x in range(3):
+            for y in range(3):
+                for z in range(3):
+                    pts.append([x + 0.5, y + 0.5, z + 0.5])
+        arr = np.array(pts) - np.array([1.5, 1.5, 1.5])
+        d = np.linalg.norm(arr, axis=1)
+        sel = arr[np.argsort(d)[:N]]
+        mx = np.max(np.linalg.norm(sel, axis=1))
+        if mx > 0:
+            sel *= 0.45 / mx
+        return sel
+
+    def make_grid():
+        m = 4
+        t = (np.arange(m) + 0.5) / m - 0.5
+        grid = np.array([(x, y, z) for z in t for y in t for x in t])
+        return grid[:N].copy()
+
+    def make_random(seed):
+        return np.random.RandomState(seed).uniform(-0.45, 0.45, size=(N, 3))
+
+    # ------------------------------------------------------------------
+    # Main search loop
+    # ------------------------------------------------------------------
+    best_pos = None
+    best_r = -1.0
+
+    def update(pos):
+        nonlocal best_pos, best_r
+        r = compute_radius(pos)
+        if r > best_r:
+            best_r = r
+            best_pos = pos.copy()
+        return r
+
+    # --- Multi-start with smooth + direct + subgradient + CD ---
+    inits = [make_bcc(), make_grid(),
+             make_random(0), make_random(42), make_random(123), make_random(777)]
+
+    for init in inits:
+        if remaining() < 15:
+            break
+        pos = np.clip(init, -0.499999, 0.499999)
+
+        # Beta-annealed smooth optimisation
+        if remaining() > 30:
+            for beta in [3.0, 8.0, 15.0, 30.0]:
+                if remaining() < 8:
+                    break
+                pos = local_smooth(pos, beta, maxiter=150)
+
+        # Direct L-BFGS-B polish
+        if remaining() > 15:
+            pos = local_direct(pos, maxiter=300)
+
+        # Subgradient fine-tune
+        if remaining() > 8:
+            pos = subgradient_ascent(pos, maxiter=150, lr_start=0.004, lr_end=0.0001)
+
+        # Coordinate descent
+        if remaining() > 5:
+            pos = coordinate_descent(pos, maxiter=40)
+
+        update(pos)
+
+    # --- Perturbation refinement around best ---
+    if best_pos is not None and remaining() > 25:
+        for k in range(5):
+            if remaining() < 8:
+                break
+            rng = np.random.RandomState(2000 + k)
+            scale = 0.015 * (1.0 - k / 6.0)
+            pert = np.clip(best_pos + rng.normal(0, scale, size=best_pos.shape),
+                           -0.499999, 0.499999)
+
+            if remaining() > 18:
+                for beta in [10.0, 25.0]:
+                    if remaining() < 6:
+                        break
+                    pert = local_smooth(pert, beta, maxiter=100)
+
+            if remaining() > 10:
+                pert = local_direct(pert, maxiter=200)
+
+            if remaining() > 6:
+                pert = subgradient_ascent(pert, maxiter=100, lr_start=0.002, lr_end=0.00005)
+
+            if remaining() > 4:
+                pert = coordinate_descent(pert, maxiter=30)
+
+            update(pert)
+
+    # --- Final high-precision polish ---
+    if best_pos is not None and remaining() > 15:
+        try:
+            fp = local_direct(best_pos, maxiter=400)
+            fp = subgradient_ascent(fp, maxiter=200, lr_start=0.002, lr_end=0.00001)
+            fp = coordinate_descent(fp, maxiter=50)
+            update(fp)
+        except Exception:
+            pass
+
+    # --- Fallback ---
+    if best_pos is None:
+        best_pos = np.clip(make_bcc(), -0.499999, 0.499999)
+
+    return best_pos

@@ -1,0 +1,35 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+DIMENSIONS = [3, 4, 4]
+
+# EVOLVE-BLOCK-START
+import time
+
+_START_TIME = time.time()
+_DEADLINE = _START_TIME + 140.0  # safety margin before 150s kill
+
+def _check_deadline():
+    return time.time() >= _DEADLINE
+
+def construct():
+    """
+    Construct the rank-minimal exact tensor decomposition for 3x4 x 4x4 matrix multiplication.
+    Uses schoolbook decomposition with rank 48.
+    """
+    n, m, p = DIMENSIONS  # 3, 4, 4
+    
+    rank = n * m * p
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    
+    column = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][column] = 1
+                V[j * p + k][column] = 1
+                W[k * n + i][column] = 1
+                column += 1
+                
+    return {"U": U, "V": V, "W": W}
+# EVOLVE-BLOCK-END

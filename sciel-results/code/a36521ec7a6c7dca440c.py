@@ -1,0 +1,369 @@
+import numpy as np
+import time
+import scipy.optimize
+
+N = 50
+_T0 = time.time()
+_DEADLINE = 118.0  # safety margin below the 150s wall-clock limit
+
+def _score(pts):
+    """Radius for a centre array: min(pair_dist/2, wall_dist)."""
+    d = pts[:, None, :] - pts[None, :, :]
+    d = np.sqrt(np.sum(d * d, axis=2))
+    np.fill_diagonal(d, np.inf)
+    min_pair = np.min(d)
+    min_wall = np.min(0.5 - np.abs(pts))
+    return min(min_pair * 0.5, min_wall)
+
+def _softmin_objective(pts, beta):
+    """
+    Returns the negative of the soft-min radius.
+    Minimizing this maximizes the radius.
+    Uses log-sum-exp for stability.
+    """
+    # Pairwise distances
+    d = pts[:, None, :] - pts[None, :, :]
+    dists = np.sqrt(np.sum(d * d, axis=2))
+    # Take upper triangle to avoid double counting and self-distance
+    iu = np.triu_indices(N, k=1)
+    pair_dists = dists[iu] / 2.0
+    
+    # Wall distances
+    wall_dists = 0.5 - np.abs(pts)
+    wall_dists_flat = wall_dists.flatten()
+    
+    # Combine all constraints
+    vals = np.concatenate([pair_dists, wall_dists_flat])
+    
+    # Soft min: -1/beta * log(sum(exp(-beta * vals)))
+    # To avoid underflow, subtract max
+    max_val = np.max(vals)
+    exp_vals = np.exp(-beta * (vals - max_val))
+    log_sum = np.log(np.sum(exp_vals))
+    soft_min_val = max_val - log_sum / beta
+    
+    # We want to maximize soft_min_val, so minimize -soft_min_val
+    return -soft_min_val
+
+def _softmin_gradient(pts, beta):
+    """
+    Gradient of the soft-min objective.
+    """
+    d = pts[:, None, :] - pts[None, :, :]
+    dists = np.sqrt(np.sum(d * d, axis=2))
+    iu = np.triu_indices(N, k=1)
+    pair_dists = dists[iu] / 2.0
+    
+    wall_dists = 0.5 - np.abs(pts)
+    wall_dists_flat = wall_dists.flatten()
+    
+    vals = np.concatenate([pair_dists, wall_dists_flat])
+    
+    max_val = np.max(vals)
+    exp_vals = np.exp(-beta * (vals - max_val))
+    sum_exp = np.sum(exp_vals)
+    
+    # Probabilities
+    probs = exp_vals / sum_exp
+    
+    grad = np.zeros_like(pts)
+    
+    # Gradient of pair distances
+    # d/dx_k (dist(i,j)/2) = (x_i - x_j) / (2 * dist(i,j))
+    # Note: pair_dists[k] corresponds to (i,k), (j,k) in iu
+    # We need to accumulate gradients for each point
+    
+    # This is a bit slow in pure python/numpy loops for 50 points (1225 pairs), 
+    # but acceptable if we do it carefully or use vectorized ops where possible.
+    # Actually, let's just compute the gradient of the softmin w.r.t vals, then chain rule.
+    
+    # d(softmin)/d(vals_m) = -probs[m]
+    # d(pair_dist)/d(pts) and d(wall_dist)/d(pts)
+    
+    # For pairs:
+    # val_k = dist(i,j)/2
+    # d(val_k)/d(x_i) = (x_i - x_j) / (2 * dist(i,j))
+    # d(val_k)/d(x_j) = (x_j - x_i) / (2 * dist(i,j))
+    
+    # Let's vectorize the pair gradient part.
+    # We have pairs (i, j). 
+    # diff = pts[i] - pts[j]
+    # dist = norm(diff)
+    # grad_xi = diff / (2 * dist)
+    # grad_xj = -diff / (2 * dist)
+    
+    # Since N=50, 1225 pairs is small. We can loop over pairs or use fancy indexing.
+    i_idx, j_idx = iu
+    diffs = pts[i_idx] - pts[j_idx]
+    dists_pair = np.linalg.norm(diffs, axis=1)
+    # Avoid division by zero
+    dists_pair_safe = np.where(dists_pair < 1e-8, 1e-8, dists_pair)
+    coeffs = probs[:len(i_idx)] / (2.0 * dists_pair_safe)
+    
+    # grad_xi = sum of coeffs * diffs for each i
+    # grad_xj = sum of -coeffs * diffs for each j
+    grad_pairs_i = np.zeros_like(pts)
+    grad_pairs_j = np.zeros_like(pts)
+    np.add.at(grad_pairs_i, i_idx, coeffs[:, None] * diffs)
+    np.add.at(grad_pairs_j, j_idx, -coeffs[:, None] * diffs)
+    
+    grad += grad_pairs_i + grad_pairs_j
+    
+    # For walls:
+    # val = 0.5 - |x_k|
+    # d(val)/d(x_k) = -sign(x_k)
+    wall_probs = probs[len(i_idx):]
+    wall_grad = -np.sign(pts) * wall_probs.reshape(N, 3)
+    grad += wall_grad
+    
+    # The objective is -softmin, so gradient is -d(softmin)/dx
+    # d(softmin)/dx = sum_m (d softmin/d val_m) * (d val_m/dx)
+    # d softmin/d val_m = -probs[m]
+    # So d(softmin)/dx = - sum_m probs[m] * (d val_m/dx)
+    # Objective = -softmin
+    # d Obj/dx = sum_m probs[m] * (d val_m/dx)
+    
+    # Wait, let's re-verify signs.
+    # f(x) = - S(x) where S(x) = softmin(vals)
+    # S(x) = max_val - (1/beta) log(sum exp(-beta(vals - max_val)))
+    # d S / d vals_m = - exp(-beta(vals_m - max_val)) / sum exp(...) = -prob_m
+    # d f / d vals_m = - d S / d vals_m = prob_m
+    # d f / d x = sum_m prob_m * (d vals_m / d x)
+    
+    # So the gradient we computed (sum probs * dval/dx) is correct for the objective f.
+    return grad
+
+def _polish(pts, beta_init=50.0, beta_final=2000.0, steps=80):
+    """
+    Polishes the configuration using L-BFGS-B on the soft-min objective,
+    followed by a high-precision final polish.
+    """
+    cur = pts.copy()
+    best_pts = cur.copy()
+    best_radius = _score(cur)
+    
+    # Phase 1: Coarse-to-fine soft-min optimization
+    for i in range(steps):
+        if time.time() > _DEADLINE - 10:  # Leave 10s for final polish
+            break
+        beta = beta_init * (beta_final / beta_init) ** (i / steps)
+        
+        # Use L-BFGS-B with more iterations at higher beta
+        maxiter = 8 if beta > 500 else 12
+        res = scipy.optimize.minimize(
+            _softmin_objective, 
+            cur, 
+            args=(beta,), 
+            method='L-BFGS-B', 
+            jac=_softmin_gradient,
+            bounds=[(-0.5, 0.5)] * (N * 3),
+            options={'maxiter': maxiter, 'ftol': 1e-14, 'gtol': 1e-10}
+        )
+        
+        if res.success:
+            cur = res.x
+            cur = np.clip(cur, -0.5 + 1e-9, 0.5 - 1e-9)
+            
+            r = _score(cur)
+            if r > best_radius:
+                best_radius = r
+                best_pts = cur.copy()
+            
+            # Check for improvement stall
+            if i > 10 and abs(r - best_radius) < 1e-12:
+                continue
+    
+    # Phase 2: High-precision final polish with very high beta
+    if time.time() < _DEADLINE - 2:
+        for beta_final_pass in [5000, 10000, 20000]:
+            if time.time() > _DEADLINE - 2:
+                break
+            res = scipy.optimize.minimize(
+                _softmin_objective, 
+                best_pts, 
+                args=(beta_final_pass,), 
+                method='L-BFGS-B', 
+                jac=_softmin_gradient,
+                bounds=[(-0.5, 0.5)] * (N * 3),
+                options={'maxiter': 20, 'ftol': 1e-15, 'gtol': 1e-12}
+            )
+            if res.success:
+                cur = np.clip(res.x, -0.5 + 1e-9, 0.5 - 1e-9)
+                r = _score(cur)
+                if r > best_radius:
+                    best_radius = r
+                    best_pts = cur.copy()
+    
+    return best_pts, best_radius
+
+def _anneal(pts, T0, T1, steps, rng):
+    """Simulated annealing with targeted moves on most constrained pairs."""
+    cur = pts.copy()
+    cur_r = _score(cur)
+    best = cur.copy()
+    best_r = cur_r
+    
+    # Precompute pair indices for efficiency
+    iu = np.triu_indices(N, k=1)
+    
+    for i in range(steps):
+        T = T0 * (T1 / T0) ** (i / steps)
+        
+        # Get current pairwise distances and wall distances
+        d = cur[:, None, :] - cur[None, :, :]
+        dists = np.sqrt(np.sum(d * d, axis=2))
+        pair_dists = dists[iu] / 2.0
+        wall_dists = (0.5 - np.abs(cur)).flatten()
+        
+        # Find the most constrained pairs (smallest distances)
+        n_pairs = len(pair_dists)
+        n_walls = len(wall_dists)
+        
+        # Mix of strategies: sometimes move a random subset, sometimes target constrained pairs
+        strategy = rng.random()
+        
+        if strategy < 0.4:
+            # Move a random subset
+            kick = 0.015 * (T / T0 + 0.1)
+            idx = rng.choice(N, size=max(2, N // 3), replace=False)
+            cand = cur.copy()
+            cand[idx] += rng.normal(0.0, kick, size=(len(idx), 3))
+        elif strategy < 0.7:
+            # Target the most constrained pair: push them apart
+            min_idx = np.argmin(pair_dists)
+            i_idx, j_idx = iu
+            pi, pj = i_idx[min_idx], j_idx[min_idx]
+            
+            # Push apart along the connecting vector
+            diff = cur[pi] - cur[pj]
+            dist = np.linalg.norm(diff)
+            if dist < 1e-8:
+                diff = rng.normal(size=3)
+                dist = np.linalg.norm(diff)
+            direction = diff / dist
+            
+            kick = 0.02 * (T / T0 + 0.1)
+            cand = cur.copy()
+            cand[pi] += direction * kick
+            cand[pj] -= direction * kick
+            
+            # Also add small random noise to both
+            cand[pi] += rng.normal(0.0, kick * 0.3, size=3)
+            cand[pj] += rng.normal(0.0, kick * 0.3, size=3)
+        else:
+            # Target the closest wall: push inward
+            min_wall_idx = np.argmin(wall_dists)
+            wi = min_wall_idx // 3
+            wj = min_wall_idx % 3
+            
+            # Determine which wall and push inward
+            pos = cur[wi, wj]
+            if pos > 0:
+                direction = np.zeros(3)
+                direction[wj] = -1.0
+            else:
+                direction = np.zeros(3)
+                direction[wj] = 1.0
+            
+            kick = 0.02 * (T / T0 + 0.1)
+            cand = cur.copy()
+            cand[wi] += direction * kick
+            cand[wi] += rng.normal(0.0, kick * 0.3, size=3)
+        
+        cand = np.clip(cand, -0.5 + 1e-9, 0.5 - 1e-9)
+        
+        cand_r = _score(cand)
+        if cand_r > cur_r or rng.random() < np.exp((cand_r - cur_r) / max(T, 1e-9)):
+            cur = cand
+            cur_r = cand_r
+            if cur_r > best_r:
+                best_r = cur_r
+                best = cur.copy()
+        
+        if i % 50 == 0 and time.time() > _DEADLINE:
+            break
+    return best, best_r
+
+def _fcc_lattice(n_per_axis):
+    """Generate FCC lattice points in [-0.5, 0.5]^3."""
+    a = 1.0 / n_per_axis
+    points = []
+    for i in range(n_per_axis + 1):
+        for j in range(n_per_axis + 1):
+            for k in range(n_per_axis + 1):
+                x = -0.5 + i * a
+                y = -0.5 + j * a
+                z = -0.5 + k * a
+                # FCC: corners and face centers
+                if (i % 2 == 0 and j % 2 == 0) or \
+                   (i % 2 == 0 and k % 2 == 0) or \
+                   (j % 2 == 0 and k % 2 == 0):
+                    points.append([x, y, z])
+    return np.array(points[:N])
+
+def construct():
+    global _T0
+    rng = np.random.default_rng(12345)
+    
+    # Multiple diverse starting configurations
+    starts = []
+    
+    # 1. Simple cubic grid
+    m = 4
+    ticks = (np.arange(m) + 0.5) / m - 0.5
+    grid = np.array([(x, y, z) for z in ticks for y in ticks for x in ticks])
+    base_grid = grid[:N].copy()
+    starts.append(base_grid)
+    
+    # 2. FCC-like lattice
+    fcc = _fcc_lattice(4)
+    if len(fcc) >= N:
+        starts.append(fcc.copy())
+    
+    # 3. Jittered grid variants
+    for _ in range(4):
+        s = base_grid + rng.normal(0.0, 0.04, size=base_grid.shape)
+        s = np.clip(s, -0.5 + 1e-6, 0.5 - 1e-6)
+        starts.append(s)
+    
+    # 4. Random start
+    s_rand = rng.uniform(-0.4, 0.4, size=(N, 3))
+    starts.append(s_rand)
+    
+    # Sort starts by initial score (best first)
+    start_scores = [(s, _score(s)) for s in starts]
+    start_scores.sort(key=lambda x: -x[1])
+    
+    best = start_scores[0][0].copy()
+    best_r = start_scores[0][1]
+    
+    # Track time budget allocation
+    time_per_start = min(20.0, (_DEADLINE - (time.time() - _T0)) / max(1, len(starts)))
+    
+    for s, s_r in start_scores:
+        elapsed = time.time() - _T0
+        if elapsed > _DEADLINE - 5:  # Leave 5s safety margin
+            break
+        
+        # Phase 1: Annealing to escape local minima
+        # Scale steps based on remaining time
+        remaining = _DEADLINE - 5 - elapsed
+        anneal_steps = max(500, min(3000, int(remaining * 50)))
+        
+        a, ar = _anneal(s, T0=0.04, T1=0.0005, steps=anneal_steps, rng=rng)
+        if ar > best_r:
+            best_r, best = ar, a
+        
+        elapsed = time.time() - _T0
+        if elapsed > _DEADLINE - 10:
+            break
+        
+        # Phase 2: Polish with soft-min gradient ascent
+        p, pr = _polish(a, beta_init=20.0, beta_final=2000.0, steps=60)
+        if pr > best_r:
+            best_r, best = pr, p
+    
+    # Final validation: ensure all points are strictly inside the cube
+    best = np.clip(best, -0.5 + 1e-10, 0.5 - 1e-10)
+    
+    return best

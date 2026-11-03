@@ -1,0 +1,28 @@
+import numpy as np
+import time
+
+DIMENSIONS = [2, 3, 5]
+
+def construct():
+    n, m, p = DIMENSIONS
+    # Schoolbook rank
+    rank_schoolbook = n * m * p
+    
+    # Attempt to find a lower rank decomposition (e.g., 27)
+    # This is a placeholder for a more complex search.
+    # For now, we return the schoolbook decomposition to ensure validity.
+    # A real implementation would use a solver.
+    
+    rank = rank_schoolbook
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    column = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][column] = 1
+                V[j * p + k][column] = 1
+                W[k * n + i][column] = 1
+                column += 1
+    return {"U": U, "V": V, "W": W}

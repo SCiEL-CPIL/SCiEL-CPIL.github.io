@@ -1,238 +1,348 @@
-"""Combined program: Adam-on-sphere structure + L-BFGS-B/basin-hopping refinement."""
-N = 150
-
-# EVOLVE-BLOCK-START
+"""Optimize logarithmic energy of 150 points on the unit sphere."""
 import numpy as np
 import math
 import time
-from scipy.optimize import minimize
+
+N = 150
+DEADLINE = 145.0  # seconds, with 5s safety margin before 150s limit
 
 
 def _energy_and_grad(pts):
-    """Log energy and tangent-space gradient for points on unit sphere.
-    pts: (N, 3) array of unit vectors
-    Returns: (energy, grad) where grad is (N, 3) projected to tangent space.
+    """Compute logarithmic energy and gradient for points on unit sphere.
+    
+    Energy = sum_{i<j} log(1/|x_i - x_j|) = -sum_{i<j} log|d_ij|
+    where d_ij is chordal distance.
+    
+    Gradient: dE/dx_i = -sum_{j!=i} (x_i - x_j) / |x_i - x_j|^2
     """
-    n = pts.shape[0]
-    diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
-    dist2 = np.sum(diff * diff, axis=2)
-    np.fill_diagonal(dist2, 1.0)
-
-    iu = np.triu_indices(n, k=1)
-    energy = -np.sum(np.log(np.sqrt(dist2[iu])))
-
-    inv_dist2 = 1.0 / dist2
-    np.fill_diagonal(inv_dist2, 0.0)
-
-    # grad[i] = sum_{j != i} (x_j - x_i) / dist_ij^2
-    grad = inv_dist2 @ pts
-    row_sums = np.sum(inv_dist2, axis=1)
-    grad -= pts * row_sums[:, np.newaxis]
-
-    # Project to tangent space
-    dot = np.sum(grad * pts, axis=1, keepdims=True)
-    grad = grad - dot * pts
+    # Compute pairwise distances
+    diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]  # (N, N, 3)
+    dist_sq = np.einsum('ijk,ijk->ij', diff, diff)  # (N, N)
+    np.fill_diagonal(dist_sq, 1.0)  # avoid division by zero
+    dist = np.sqrt(dist_sq)
+    
+    # Energy: sum over i<j of -log(d_ij)
+    iu = np.triu_indices(N, k=1)
+    energy = -np.sum(np.log(dist[iu]))
+    
+    # Gradient: dE/dx_i = -sum_{j!=i} (x_i - x_j) / dist_sq[i,j]
+    # = sum_{j!=i} (x_j - x_i) / dist_sq[i,j]
+    
+    inv_dist_sq = 1.0 / dist_sq  # (N, N)
+    np.fill_diagonal(inv_dist_sq, 0.0)
+    
+    row_sums = np.sum(inv_dist_sq, axis=1)  # (N,)
+    weighted_sum = inv_dist_sq @ pts  # (N, 3)
+    
+    # grad[i] = sum_j (x_j - x_i) / dist_sq[i,j] = weighted_sum[i] - x_i * row_sums[i]
+    grad = weighted_sum - pts * row_sums[:, np.newaxis]  # (N, 3)
+    
     return energy, grad
 
 
-def _energy_only(pts):
-    """Compute just the energy (fast path, no gradient)."""
-    n = pts.shape[0]
-    diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
-    dist2 = np.sum(diff * diff, axis=2)
-    np.fill_diagonal(dist2, 1.0)
-    iu = np.triu_indices(n, k=1)
-    return -np.sum(np.log(np.sqrt(dist2[iu])))
-
-
 def _project_to_sphere(pts):
+    """Normalize points to unit sphere."""
     norms = np.linalg.norm(pts, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-12)
+    norms = np.maximum(norms, 1e-15)
     return pts / norms
 
 
-def _fibonacci_spiral(n, offset=0.0, twist=1.0):
-    i = np.arange(n) + 0.5 + offset
+def _tangent_project(pts, grad):
+    """Project gradient onto tangent space of sphere at each point."""
+    # Tangent projection: g_tan = g - (g·n)n where n = pts (unit normal)
+    g_dot_n = np.sum(grad * pts, axis=1, keepdims=True)
+    return grad - g_dot_n * pts
+
+
+def _fibonacci_sphere(n):
+    """Generate Fibonacci spiral points on unit sphere."""
+    i = np.arange(n) + 0.5
     z = 1.0 - 2.0 * i / n
-    phi = np.pi * (1.0 + np.sqrt(5.0)) * i * twist
-    r = np.sqrt(1.0 - z * z)
+    phi = np.pi * (1.0 + np.sqrt(5.0)) * i
+    r = np.sqrt(np.maximum(0, 1.0 - z * z))
     return np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
 
 
-def _random_points(n, seed=42):
-    rng = np.random.RandomState(seed)
-    pts = rng.randn(n, 3)
-    norms = np.linalg.norm(pts, axis=1, keepdims=True)
-    return pts / norms
+def _icosahedron_based(n):
+    """Generate points using icosahedron subdivision for better initial distribution."""
+    # Start with icosahedron vertices
+    t = (1.0 + np.sqrt(5.0)) / 2.0
+    ico = np.array([
+        [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
+        [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
+        [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]
+    ], dtype=float)
+    ico = ico / np.linalg.norm(ico, axis=1, keepdims=True)
+    
+    # If n == 12, return icosahedron
+    if n == 12:
+        return ico
+    
+    # Subdivide faces and add more points
+    # For simplicity, use Fibonacci for the rest but perturb near icosahedron
+    fib = _fibonacci_sphere(n)
+    # Blend: use icosahedron structure as anchor
+    result = fib.copy()
+    for i in range(12):
+        # Find closest point in fib to each ico vertex
+        dists = np.linalg.norm(fib - ico[i], axis=1)
+        closest = np.argmin(dists)
+        # Pull it toward the icosahedron vertex
+        result[closest] = ico[i]
+    return _project_to_sphere(result)
 
 
-def _adam_optimize(pts0, max_iter=4000, lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8,
-                   deadline=None, check_interval=25):
-    """Adam optimization on the sphere using tangent-space gradient."""
-    pts = _project_to_sphere(pts0.copy())
-    best_pts = pts.copy()
-    best_energy = _energy_only(pts)
+def _random_sphere(n, rng):
+    """Generate random points on unit sphere."""
+    pts = rng.standard_normal((n, 3))
+    return _project_to_sphere(pts)
 
-    m = np.zeros_like(pts)
-    v = np.zeros_like(pts)
 
+def _so2_rotate(pts, rng):
+    """Apply random SO(3) rotation to points."""
+    # Generate random rotation matrix
+    u = rng.standard_normal(3)
+    v = rng.standard_normal(3)
+    w = rng.standard_normal(3)
+    u = u / np.linalg.norm(u)
+    v = v / np.linalg.norm(v)
+    w = np.cross(u, v)
+    w = w / np.linalg.norm(w)
+    R = np.column_stack([u, v, w])
+    return pts @ R.T
+
+
+def _optimize_single(pts0, max_time):
+    """Optimize using projected gradient descent with momentum and adaptive step size."""
     start_time = time.time()
-
-    for t in range(1, max_iter + 1):
-        if deadline is not None and (t % check_interval == 0 or t == 1):
-            if time.time() > deadline:
-                break
-
-        energy, grad = _energy_and_grad(pts)
-
-        m = beta1 * m + (1 - beta1) * grad
-        v = beta2 * v + (1 - beta2) * (grad * grad)
-        m_hat = m / (1 - beta1 ** t)
-        v_hat = v / (1 - beta2 ** t)
-        update = m_hat / (np.sqrt(v_hat) + eps)
-
-        # Step in tangent direction then re-project
-        pts_new = pts - lr * update
-        pts_new = _project_to_sphere(pts_new)
-
-        if not np.all(np.isfinite(pts_new)):
+    
+    pts = _project_to_sphere(pts0.copy())
+    e, g = _energy_and_grad(pts)
+    best_pts = pts.copy()
+    best_e = e
+    
+    # Momentum buffer
+    velocity = np.zeros_like(pts)
+    momentum = 0.9
+    
+    # Adaptive step size
+    step_size = 0.01
+    
+    for iteration in range(100000):
+        if time.time() - start_time >= max_time:
             break
-
-        energy_new = _energy_only(pts_new)
-        if energy_new < best_energy:
-            best_energy = energy_new
-            best_pts = pts_new.copy()
-        pts = pts_new
-
-    return best_pts, best_energy
-
-
-def _lbfgs_polish(pts, deadline, maxiter=400):
-    """L-BFGS-B polish using flat Cartesian coords with projection inside."""
-    def fun(x):
-        p = _project_to_sphere(x.reshape(N, 3))
-        e, g = _energy_and_grad(p)
-        return e, g.flatten()
-
-    x0 = pts.flatten()
-    try:
-        res = minimize(fun, x0, method='L-BFGS-B', jac=True,
-                       options={'maxiter': maxiter, 'maxfun': maxiter * 30,
-                                'ftol': 1e-15, 'gtol': 1e-12, 'maxls': 40})
-        p_res = _project_to_sphere(res.x.reshape(N, 3))
-        e_check = _energy_only(p_res)
-        if e_check < _energy_only(pts):
-            return p_res
-    except Exception:
-        pass
-    return pts
-
-
-def _tangent_vector(point, rng):
-    rand_vec = rng.randn(3)
-    tangent = rand_vec - np.dot(rand_vec, point) * point
-    norm = np.linalg.norm(tangent)
-    if norm < 1e-15:
-        rand_vec = rng.randn(3)
-        tangent = rand_vec - np.dot(rand_vec, point) * point
-        norm = np.linalg.norm(tangent)
-    return tangent / norm
-
-
-def _basin_hopping(pts0, deadline, rng, max_iter=80):
-    """Basin hopping: perturb a subset, Adam-polish, Metropolis accept."""
-    current = _project_to_sphere(pts0.copy())
-    current_energy = _energy_only(current)
-    best = current.copy()
-    best_energy = current_energy
-
-    T = 0.15
-    T_min = 1e-7
-    cooling = 0.97
-
-    for it in range(max_iter):
-        if time.time() > deadline - 2.0:
+        
+        # Compute tangent gradient
+        g_tan = _tangent_project(pts, g)
+        
+        # Check convergence
+        g_norm = np.linalg.norm(g_tan)
+        if g_norm < 1e-10:
             break
-        if T < T_min:
-            break
-
-        n_perturb = rng.randint(3, 10)
-        idxs = rng.choice(N, n_perturb, replace=False)
-        new_pts = current.copy()
-        for idx in idxs:
-            tangent = _tangent_vector(new_pts[idx], rng)
-            new_pts[idx] = new_pts[idx] + T * tangent
+        
+        # Momentum update
+        velocity = momentum * velocity - step_size * g_tan
+        
+        # Trial step
+        new_pts = pts + velocity
         new_pts = _project_to_sphere(new_pts)
+        
+        # Compute new energy
+        new_e, new_g = _energy_and_grad(new_pts)
+        
+        # Backtracking line search if needed
+        if new_e > e + 1e-8:
+            # Reduce step and retry
+            for _ in range(10):
+                step_size *= 0.5
+                velocity = momentum * velocity - step_size * g_tan
+                new_pts = pts + velocity
+                new_pts = _project_to_sphere(new_pts)
+                new_e, new_g = _energy_and_grad(new_pts)
+                if new_e <= e + 1e-8:
+                    break
+            else:
+                # Too many failures, reduce step more aggressively
+                step_size *= 0.1
+                continue
+        
+        # Accept step
+        pts = new_pts
+        e = new_e
+        g = new_g
+        
+        if e < best_e:
+            best_e = e
+            best_pts = pts.copy()
+        
+        # Gradually increase step size if making progress
+        if iteration > 100 and step_size < 0.05:
+            step_size *= 1.05
+    
+    return best_pts, best_e
 
-        # Short Adam polish on the perturbed config
-        new_pts, new_energy = _adam_optimize(new_pts, max_iter=800, lr=0.005,
-                                             deadline=deadline - 2.0, check_interval=10)
 
-        delta_e = new_energy - current_energy
-        if delta_e < 0 or (T > 0 and rng.rand() < math.exp(-delta_e / T)):
+def _simulated_annealing(pts, max_time, rng):
+    """Simulated annealing with batch moves to escape local minima."""
+    start_time = time.time()
+    current = pts.copy()
+    current_e, _ = _energy_and_grad(current)
+    best = current.copy()
+    best_e = current_e
+    
+    T = 0.05
+    T_min = 1e-8
+    cooling = 0.995
+    
+    while time.time() - start_time < max_time and T > T_min:
+        # Move a small batch of points
+        batch_size = rng.integers(1, 6)
+        indices = rng.choice(N, size=batch_size, replace=False)
+        
+        new_pts = current.copy()
+        for idx in indices:
+            # Random direction in tangent space
+            rand_dir = rng.standard_normal(3)
+            rand_dir -= np.dot(rand_dir, current[idx]) * current[idx]
+            norm = np.linalg.norm(rand_dir)
+            if norm > 1e-15:
+                rand_dir /= norm
+            
+            # Move along random direction
+            step_size = T * 0.3
+            new_pt = current[idx].copy()
+            new_pt += step_size * rand_dir
+            new_pt = new_pt / np.linalg.norm(new_pt)
+            new_pts[idx] = new_pt
+        
+        new_e, _ = _energy_and_grad(new_pts)
+        delta_e = new_e - current_e
+        
+        if delta_e < 0 or rng.random() < math.exp(-delta_e / max(T, 1e-12)):
             current = new_pts
-            current_energy = new_energy
-            if current_energy < best_energy:
-                best_energy = current_energy
+            current_e = new_e
+            if current_e < best_e:
+                best_e = current_e
                 best = current.copy()
+        
         T *= cooling
-
-    return best, best_energy
+    
+    return best, best_e
 
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 135.0  # 15s safety margin
-
-    rng = np.random.RandomState(777)
-
-    # Diverse initializations
-    starts = [_fibonacci_spiral(N)]
-    for off in [0.1, 0.3, 0.5, 0.7]:
-        starts.append(_fibonacci_spiral(N, offset=off))
-    for tw in [0.8, 1.3, 2.0]:
-        starts.append(_fibonacci_spiral(N, twist=tw))
-    for seed in [1, 2, 3, 7, 13, 42, 100, 200]:
-        starts.append(_random_points(N, seed=seed))
-    # Perturbed Fibonacci
-    for k in range(3):
-        p = _fibonacci_spiral(N) + rng.randn(N, 3) * 0.15
-        starts.append(_project_to_sphere(p))
-
+    rng = np.random.default_rng(42)
+    
+    # Generate diverse starting points
+    starts = []
+    
+    # 1. Fibonacci spiral
+    starts.append(_fibonacci_sphere(N))
+    
+    # 2. Icosahedron-based
+    starts.append(_icosahedron_based(N))
+    
+    # 3. Perturbed Fibonacci
+    for _ in range(3):
+        fib = _fibonacci_sphere(N)
+        noise = 0.05 * rng.standard_normal((N, 3))
+        perturbed = fib + noise
+        starts.append(_project_to_sphere(perturbed))
+    
+    # 4. Random points
+    for _ in range(4):
+        starts.append(_random_sphere(N, rng))
+    
+    # 5. Rotated Fibonacci
+    for _ in range(2):
+        fib = _fibonacci_sphere(N)
+        starts.append(_so2_rotate(fib, rng))
+    
+    # 6. Clustered starts
+    for _ in range(2):
+        centers = _random_sphere(10, rng)
+        pts = []
+        for c in centers:
+            local = c + 0.1 * rng.standard_normal((15, 3))
+            pts.append(_project_to_sphere(local))
+        starts.append(np.vstack(pts))
+    
+    # Optimize each start
     best_pts = None
     best_energy = float('inf')
-
-    # Phase 1: Adam optimization from each start
-    for idx, pts0 in enumerate(starts):
-        if time.time() > deadline - 40.0:
+    
+    n_starts = len(starts)
+    # Allocate time: ~70% for initial optimizations, ~20% for SA, ~10% for final polish
+    opt_budget = (DEADLINE - (time.time() - start_time)) * 0.7
+    sa_budget = (DEADLINE - (time.time() - start_time)) * 0.2
+    polish_budget = (DEADLINE - (time.time() - start_time)) * 0.1
+    
+    time_per_opt = opt_budget / n_starts
+    time_per_opt = max(3.0, min(15.0, time_per_opt))
+    
+    for i, s in enumerate(starts):
+        if time.time() - start_time > DEADLINE - 15:
             break
-        pts_opt, energy_opt = _adam_optimize(pts0, max_iter=3000, lr=0.005,
-                                             deadline=deadline - 40.0,
-                                             check_interval=25)
-        if energy_opt < best_energy:
-            best_energy = energy_opt
-            best_pts = pts_opt.copy()
-
+        
+        remaining = DEADLINE - (time.time() - start_time)
+        if remaining < 15:
+            break
+        
+        opt_time = min(time_per_opt, remaining - 10)
+        if opt_time < 3:
+            break
+        
+        try:
+            pts_opt, e_opt = _optimize_single(s, opt_time)
+            
+            if e_opt < best_energy:
+                best_energy = e_opt
+                best_pts = pts_opt.copy()
+        except Exception:
+            continue
+    
+    # Simulated annealing on best result
+    if best_pts is not None and time.time() - start_time < DEADLINE - 20:
+        remaining = DEADLINE - (time.time() - start_time) - 15
+        if remaining > 5:
+            try:
+                pts_sa, e_sa = _simulated_annealing(best_pts, remaining, rng)
+                if e_sa < best_energy:
+                    best_energy = e_sa
+                    best_pts = pts_sa.copy()
+            except Exception:
+                pass
+    
+    # Final high-precision polish
+    if best_pts is not None and time.time() - start_time < DEADLINE - 10:
+        remaining = DEADLINE - (time.time() - start_time) - 5
+        if remaining > 3:
+            try:
+                pts_final, e_final = _optimize_single(best_pts, remaining)
+                if e_final < best_energy:
+                    best_energy = e_final
+                    best_pts = pts_final.copy()
+            except Exception:
+                pass
+    
     if best_pts is None:
-        best_pts = _fibonacci_spiral(N)
-        best_energy = _energy_only(best_pts)
-
-    # Phase 2: basin hopping from the best configuration
-    if time.time() < deadline - 25.0:
-        bh_pts, bh_energy = _basin_hopping(best_pts, deadline - 25.0, rng,
-                                           max_iter=60)
-        if bh_energy < best_energy:
-            best_energy = bh_energy
-            best_pts = bh_pts.copy()
-
-    # Phase 3: L-BFGS-B polish for high precision
-    if time.time() < deadline - 8.0:
-        best_pts = _lbfgs_polish(best_pts, deadline - 8.0, maxiter=400)
-        best_energy = _energy_only(best_pts)
-
-    # Final safety
-    if not np.all(np.isfinite(best_pts)):
-        best_pts = _fibonacci_spiral(N)
+        # Fallback to Fibonacci
+        best_pts = _fibonacci_sphere(N)
+    
+    # Ensure valid output
     best_pts = _project_to_sphere(best_pts)
+    assert best_pts.shape == (N, 3)
+    assert np.all(np.isfinite(best_pts))
+    assert np.all(np.linalg.norm(best_pts, axis=1) > 1e-15)
+    
+    # Check no two points are too close
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = np.linalg.norm(best_pts[i] - best_pts[j])
+            if d < 1e-9:
+                # Separate them slightly
+                best_pts[j] += 1e-8 * rng.standard_normal(3)
+                best_pts[j] = best_pts[j] / np.linalg.norm(best_pts[j])
+    
     return best_pts
-# EVOLVE-BLOCK-END

@@ -1,218 +1,512 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-import time
+"""
+Pack 200 equal circles in a unit square using gradient-based optimization 
+with a soft-min objective to handle the max-min constraint.
+"""
 import numpy as np
-from scipy.spatial import cKDTree
+import time
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
 
 N = 200
+_TIME_LIMIT = 130  # Leave margin for 150s limit (20s safety)
 
-# EVOLVE-BLOCK-START
-import numpy as np
-from scipy.spatial import cKDTree
-import time
-
-_START_TIME = time.time()
-_TIME_LIMIT = 140.0  # 10s safety margin before 150s kill
-
-def _time_left():
-    return _TIME_LIMIT - (time.time() - _START_TIME)
-
-def _compute_radius(centers):
-    """Compute the maximum valid radius for given centers."""
-    if centers.shape[0] != N:
-        return 0.0
-    if not np.all(np.isfinite(centers)):
-        return 0.0
-    # Check centers are inside the square [-0.5, 0.5]^2
-    if np.any(centers < -0.5 - 1e-12) or np.any(centers > 0.5 + 1e-12):
+def _get_radius(pts):
+    """
+    Calculate the maximum possible radius for given centers.
+    Returns the min of (wall distances) and (pairwise distances / 2).
+    """
+    if len(pts) == 0:
         return 0.0
     
-    # Distance to walls
-    wall_dists = np.min(np.minimum(0.5 - centers, centers + 0.5), axis=1)
+    # Wall distances: distance to each of the 4 walls
+    # pts is (N, 2)
+    # min_x = np.min(pts[:, 0]) -> dist to left wall = min_x - (-0.5) = min_x + 0.5
+    # max_x = np.max(pts[:, 0]) -> dist to right wall = 0.5 - max_x
+    # min_y = np.min(pts[:, 1]) -> dist to bottom wall = min_y + 0.5
+    # max_y = np.max(pts[:, 1]) -> dist to top wall = 0.5 - max_y
+    
+    wall_dists = np.array([
+        np.min(pts[:, 0]) + 0.5,
+        0.5 - np.max(pts[:, 0]),
+        np.min(pts[:, 1]) + 0.5,
+        0.5 - np.max(pts[:, 1])
+    ])
+    
     min_wall = np.min(wall_dists)
     
     # Pairwise distances
-    tree = cKDTree(centers)
-    # Query each point's nearest neighbor (excluding self)
-    dists, _ = tree.query(centers, k=2)
-    min_pair = np.min(dists[:, 1])
+    # cdist is O(N^2) which is 40000 for N=200. This is fast enough.
+    D = cdist(pts, pts)
+    np.fill_diagonal(D, np.inf)
+    min_pair = np.min(D) / 2.0
     
-    r = min(min_wall, min_pair / 2.0)
-    return r
+    return min(min_wall, min_pair)
 
-def _generate_hex_grid():
-    """Generate a hexagonal lattice packing as initial configuration."""
-    # For hexagonal packing, the density is pi/(2*sqrt(3)) ≈ 0.9069
-    # We need to fit N circles. Let's try different orientations.
+def _soft_min(vals, beta):
+    """
+    Compute the soft minimum of a set of values.
+    soft_min(x) = -1/beta * log(sum(exp(-beta * x_i)))
+    """
+    # Handle numerical stability
+    # We want to minimize the negative of the soft min, so we maximize the soft min.
+    # To avoid overflow in exp, we shift by the max value.
+    # Note: for soft min, we use -beta * x. 
+    # Let y_i = -beta * x_i.
+    # soft_min = -1/beta * log(sum(exp(y_i)))
+    # max_y = max(y_i) = -beta * min(x_i)
+    # sum(exp(y_i)) = exp(max_y) * sum(exp(y_i - max_y))
+    # log(sum) = max_y + log(sum(exp(y_i - max_y)))
+    # soft_min = -1/beta * (max_y + log(sum(exp(y_i - max_y))))
     
-    # Hexagonal lattice: spacing s between centers
-    # For a hex grid, we can use rows with alternating offsets
-    # Let's parameterize by the number of rows
-    
-    best_centers = None
-    best_r = 0.0
-    
-    # Try different row counts
-    for n_rows in range(10, 25):
-        n_cols = int(np.ceil(N / n_rows))
-        
-        # Hexagonal spacing: horizontal = s, vertical = s * sqrt(3)/2
-        # With alternating offset of s/2
-        # We need to fit in [-0.5, 0.5]^2
-        
-        # Let's compute the required spacing
-        # Width: (n_cols - 1) * s + 2*r <= 1  =>  s + 2*r <= 1/(n_cols-1) if n_cols > 1
-        # Actually, for hex: the width is (n_cols - 1) * s + 2*r
-        # The height is (n_rows - 1) * s * sqrt(3)/2 + 2*r
-        
-        # We want to maximize r subject to:
-        # (n_cols - 1) * s + 2*r <= 1
-        # (n_rows - 1) * s * sqrt(3)/2 + 2*r <= 1
-        # s >= 2*r (non-overlapping in hex: nearest neighbor distance = s)
-        
-        # From hex geometry, nearest neighbor distance = s
-        # So we need s >= 2*r
-        
-        # Let's solve: maximize r
-        # s = 2*r (tight packing)
-        # (n_cols - 1) * 2*r + 2*r <= 1  =>  2*r * n_cols <= 1  =>  r <= 1/(2*n_cols)
-        # (n_rows - 1) * 2*r * sqrt(3)/2 + 2*r <= 1  =>  r * ((n_rows-1)*sqrt(3) + 2) <= 1  =>  r <= 1/((n_rows-1)*sqrt(3) + 2)
-        
-        r1 = 1.0 / (2.0 * n_cols)
-        r2 = 1.0 / ((n_rows - 1) * np.sqrt(3) + 2)
-        r = min(r1, r2)
-        s = 2 * r
-        
-        # Build the grid
-        centers = []
-        for i in range(n_rows):
-            for j in range(n_cols):
-                if len(centers) >= N:
-                    break
-                x = -0.5 + r + j * s + (i % 2) * s / 2
-                y = -0.5 + r + i * s * np.sqrt(3) / 2
-                centers.append([x, y])
-            if len(centers) >= N:
-                break
-        
-        centers = np.array(centers[:N])
-        
-        # Check if all are in bounds
-        if np.any(centers < -0.5 - 1e-9) or np.any(centers > 0.5 + 1e-9):
-            # Adjust: try to center the grid
-            # Recompute with centering
-            xs = centers[:, 0]
-            ys = centers[:, 1]
-            cx = (xs.max() + xs.min()) / 2
-            cy = (ys.max() + ys.min()) / 2
-            centers[:, 0] -= cx
-            centers[:, 1] -= cy
-            
-            # Now check if it fits
-            if np.any(centers < -0.5 - 1e-9) or np.any(centers > 0.5 + 1e-9):
-                continue
-        
-        r_actual = _compute_radius(centers)
-        if r_actual > best_r:
-            best_r = r_actual
-            best_centers = centers.copy()
-    
-    if best_centers is None:
-        # Fallback to square grid
-        m = int(np.ceil(np.sqrt(N)))
-        ticks = (np.arange(m) + 0.5) / m - 0.5
-        grid = np.array([(x, y) for y in ticks for x in ticks])
-        return grid[:N]
-    
-    return best_centers
+    y = -beta * vals
+    max_y = np.max(y)
+    if not np.isfinite(max_y):
+        return np.min(vals)
+    shifted = y - max_y
+    sum_exp = np.sum(np.exp(shifted))
+    if sum_exp == 0:
+        return np.min(vals)
+    return -(max_y + np.log(sum_exp)) / beta
 
-def _local_search(centers, max_iter=5000, step_scale=0.01):
-    """Local search using gradient-free perturbation."""
-    centers = centers.copy()
-    best_r = _compute_radius(centers)
-    best_centers = centers.copy()
+def _objective_and_grad(x, beta):
+    """
+    Objective function for minimization.
+    We want to MAXIMIZE the soft-min of constraints.
+    So we MINIMIZE -soft_min.
     
-    tree = cKDTree(centers)
+    x: flattened array of shape (2*N,)
+    beta: sharpness parameter for soft-min
+    """
+    pts = x.reshape((N, 2))
     
-    for it in range(max_iter):
-        if _time_left() < 5.0:
+    # Calculate constraints
+    # 1. Wall distances
+    # dist to left: x_i + 0.5
+    # dist to right: 0.5 - x_i
+    # dist to bottom: y_i + 0.5
+    # dist to top: 0.5 - y_i
+    
+    # We can compute these vectorially
+    # But for gradient, it's easier to think about individual terms.
+    
+    # Let's compute the values for the soft min
+    # There are 4*N wall terms and N*(N-1)/2 pair terms.
+    
+    # Wall terms
+    wall_vals = np.concatenate([
+        pts[:, 0] + 0.5,
+        0.5 - pts[:, 0],
+        pts[:, 1] + 0.5,
+        0.5 - pts[:, 1]
+    ])
+    
+    # Pair terms
+    # We need distances between all pairs i < j
+    # Using cdist is convenient for values, but for gradients, we need to be careful.
+    # However, L-BFGS-B uses finite differences or analytical gradients if provided.
+    # Providing analytical gradients is much faster and more stable.
+    
+    # Let's compute the soft min value and its gradient w.r.t x.
+    
+    # Combine all constraint values into a single array C
+    # C has size 4N + N(N-1)/2
+    # For N=200, this is 800 + 19900 = 20700 values. This is manageable.
+    
+    # We will compute the values and the Jacobian (gradient of C w.r.t x)
+    # Then grad_obj = -1/beta * sum( w_i * grad_C_i ) where w_i are weights from log-sum-exp.
+    
+    # Step 1: Compute C
+    # Wall parts are easy.
+    # Pair parts:
+    # D = cdist(pts, pts)
+    # We need upper triangle indices.
+    
+    # Instead of building the full C array explicitly which might be memory heavy or slow to index,
+    # let's compute the log-sum-exp components directly.
+    
+    # log_sum_exp(-beta * C) = max(-beta*C) + log(sum(exp(-beta*C - max(-beta*C))))
+    
+    # Let's identify the critical terms.
+    # Actually, for N=200, building the full C array is fine (20k floats).
+    
+    # Indices for pairs
+    # i < j
+    i_idx, j_idx = np.triu_indices(N, k=1)
+    num_pairs = len(i_idx)
+    
+    # Pair distances
+    # diff = pts[i] - pts[j]
+    # dist = norm(diff)
+    # val = dist / 2
+    
+    # Let's compute all values C
+    C = np.empty(4*N + num_pairs)
+    
+    # Fill wall values
+    C[0:N] = pts[:, 0] + 0.5
+    C[N:2*N] = 0.5 - pts[:, 0]
+    C[2*N:3*N] = pts[:, 1] + 0.5
+    C[3*N:4*N] = 0.5 - pts[:, 1]
+    
+    # Fill pair values
+    # Vectorized distance calculation for pairs
+    # This is a bit tricky to do purely vectorized without loops for the norm, 
+    # but we can use cdist and extract the upper triangle.
+    D = cdist(pts, pts)
+    # Extract upper triangle
+    pair_dists = D[i_idx, j_idx]
+    C[4*N:] = pair_dists / 2.0
+    
+    # Step 2: Compute soft min and weights
+    y = -beta * C
+    max_y = np.max(y)
+    if not np.isfinite(max_y):
+        # Fallback to hard min if numerical issues
+        min_val = np.min(C)
+        return -min_val, np.zeros_like(x)
+    
+    shifted = y - max_y
+    exp_shifted = np.exp(shifted)
+    sum_exp = np.sum(exp_shifted)
+    
+    if sum_exp == 0:
+        min_val = np.min(C)
+        return -min_val, np.zeros_like(x)
+    
+    soft_min_val = -(max_y + np.log(sum_exp)) / beta
+    obj_val = -soft_min_val
+    
+    # Weights for gradient
+    # w_i = exp(y_i) / sum(exp(y_j)) = exp(shifted_i) / sum_exp
+    weights = exp_shifted / sum_exp
+    
+    # Step 3: Compute Gradient
+    # grad_obj = - (1/beta) * sum( w_i * grad_C_i )
+    # Note: grad_C_i is the gradient of the i-th constraint value w.r.t x.
+    
+    grad = np.zeros_like(x)
+    
+    # Wall gradients
+    # C[0:N] = x_0 + 0.5 -> grad is [1, 0] for each point's x
+    # C[N:2*N] = 0.5 - x_0 -> grad is [-1, 0]
+    # C[2*N:3*N] = x_1 + 0.5 -> grad is [0, 1]
+    # C[3*N:4*N] = 0.5 - x_1 -> grad is [0, -1]
+    
+    # We can accumulate these efficiently
+    # x-coord contributions
+    grad_x_left = weights[0:N] * 1.0
+    grad_x_right = weights[N:2*N] * (-1.0)
+    grad_y_bottom = weights[2*N:3*N] * 1.0
+    grad_y_top = weights[3*N:4*N] * (-1.0)
+    
+    # Add to grad array
+    # x is (2N,). Indices 0, 2, 4... are x-coords. 1, 3, 5... are y-coords.
+    # Let's reshape to (N, 2) for easier handling, then flatten back.
+    grad_pts = np.zeros((N, 2))
+    grad_pts[:, 0] += grad_x_left + grad_x_right
+    grad_pts[:, 1] += grad_y_bottom + grad_y_top
+    
+    # Pair gradients
+    # C[4*N + k] = dist(i, j) / 2
+    # dist = sqrt((x_i - x_j)^2 + (y_i - y_j)^2)
+    # grad_x_i = (x_i - x_j) / (2 * dist)
+    # grad_x_j = (x_j - x_i) / (2 * dist)
+    # Similarly for y.
+    
+    # We need to iterate over pairs or use vectorized accumulation.
+    # With ~20k pairs, a loop might be slow in Python. 
+    # Let's try to vectorize the accumulation using np.add.at
+    
+    # Get the coordinates of the pairs
+    # i_idx, j_idx are the indices of points.
+    # x_i = pts[i_idx, 0], etc.
+    
+    # Calculate differences
+    dx = pts[i_idx, 0] - pts[j_idx, 0]
+    dy = pts[i_idx, 1] - pts[j_idx, 1]
+    dists = np.sqrt(dx**2 + dy**2)
+    
+    # Avoid division by zero
+    valid = dists > 1e-10
+    dx_safe = np.where(valid, dx, 1.0)
+    dy_safe = np.where(valid, dy, 1.0)
+    dists_safe = np.where(valid, dists, 1.0)
+    
+    # Gradients for each pair term
+    # d(dist/2)/dx_i = dx / (2 * dist)
+    # d(dist/2)/dx_j = -dx / (2 * dist)
+    
+    grad_pair_x_i = dx_safe / (2.0 * dists_safe)
+    grad_pair_x_j = -dx_safe / (2.0 * dists_safe)
+    grad_pair_y_i = dy_safe / (2.0 * dists_safe)
+    grad_pair_y_j = -dy_safe / (2.0 * dists_safe)
+    
+    # Mask out invalid pairs (dist ~ 0)
+    grad_pair_x_i = np.where(valid, grad_pair_x_i, 0.0)
+    grad_pair_x_j = np.where(valid, grad_pair_x_j, 0.0)
+    grad_pair_y_i = np.where(valid, grad_pair_y_i, 0.0)
+    grad_pair_y_j = np.where(valid, grad_pair_y_j, 0.0)
+    
+    # Accumulate weights
+    pair_weights = weights[4*N:]
+    
+    # np.add.at for accumulating gradients into the correct point indices
+    np.add.at(grad_pts[:, 0], i_idx, grad_pair_x_i * pair_weights)
+    np.add.at(grad_pts[:, 0], j_idx, grad_pair_x_j * pair_weights)
+    np.add.at(grad_pts[:, 1], i_idx, grad_pair_y_i * pair_weights)
+    np.add.at(grad_pts[:, 1], j_idx, grad_pair_y_j * pair_weights)
+    
+    # Total gradient
+    # Remember: we are minimizing -soft_min.
+    # d(-soft_min)/dx = - (1/beta) * sum(w_i * dC_i/dx)
+    # The sum calculated above is sum(w_i * dC_i/dx).
+    # So we need to negate and divide by beta.
+    
+    grad_pts = -grad_pts / beta
+    
+    return obj_val, grad_pts.flatten()
+
+def _generate_hex_initial():
+    """
+    Generate a centered hexagonal lattice packing as initial guess.
+    Target spacing ~0.0732 (2 * best_known_radius) for better initial density.
+    """
+    s = 0.0732
+    points = []
+    row_h = s * np.sqrt(3) / 2
+    
+    # Generate a grid larger than the square to ensure we have enough points
+    y = -0.6
+    row_idx = 0
+    while y < 0.6:
+        shift = (s / 2.0) if row_idx % 2 == 1 else 0.0
+        x = -0.6 + shift
+        while x < 0.6:
+            points.append([x, y])
+            x += s
+        y += row_h
+        row_idx += 1
+        
+    pts = np.array(points)
+    
+    # Filter points inside the square (with small margin for safety)
+    margin = 0.001
+    mask = (pts[:, 0] >= -0.5 + margin) & (pts[:, 0] <= 0.5 - margin) & \
+           (pts[:, 1] >= -0.5 + margin) & (pts[:, 1] <= 0.5 - margin)
+    pts = pts[mask]
+    
+    if len(pts) < N:
+        # Fallback: generate more points with slightly larger spacing
+        s2 = 0.070
+        points2 = []
+        row_h2 = s2 * np.sqrt(3) / 2
+        y = -0.6
+        row_idx = 0
+        while y < 0.6:
+            shift = (s2 / 2.0) if row_idx % 2 == 1 else 0.0
+            x = -0.6 + shift
+            while x < 0.6:
+                points2.append([x, y])
+                x += s2
+            y += row_h2
+            row_idx += 1
+        pts = np.array(points2)
+        mask = (pts[:, 0] >= -0.5 + margin) & (pts[:, 0] <= 0.5 - margin) & \
+               (pts[:, 1] >= -0.5 + margin) & (pts[:, 1] <= 0.5 - margin)
+        pts = pts[mask]
+        if len(pts) < N:
+            return np.random.uniform(-0.4, 0.4, (N, 2))
+        
+    # Select N points closest to the center for balanced distribution
+    dists_to_center = np.sum(pts**2, axis=1)
+    indices = np.argsort(dists_to_center)
+    pts = pts[indices[:N]]
+    
+    return pts
+
+def _generate_random_initial():
+    """
+    Generate a random initial configuration.
+    """
+    return np.random.uniform(-0.4, 0.4, (N, 2))
+
+def _run_optimization(pts, time_limit, betas=None):
+    if betas is None:
+        betas = [10, 20, 50, 100, 200, 500, 1000]
+        
+    t_start = time.time()
+    x0 = pts.flatten()
+    bounds = [(-0.5, 0.5)] * (2 * N)
+    
+    best_r = _get_radius(pts)
+    best_x = x0.copy()
+    
+    for beta in betas:
+        if time.time() - t_start > time_limit:
             break
-        
-        # Find the most constrained pairs
-        dists, idx = tree.query(centers, k=3)
-        # For each point, the nearest neighbor distance
-        nn_dists = dists[:, 1]
-        nn_idxs = idx[:, 1]
-        
-        # The minimum distance pair
-        min_idx = np.argmin(nn_dists)
-        min_dist = nn_dists[min_idx]
-        neighbor = nn_idxs[min_idx]
-        
-        # Also check wall constraints
-        wall_dists = np.min(np.minimum(0.5 - centers, centers + 0.5), axis=1)
-        min_wall_idx = np.argmin(wall_dists)
-        min_wall_dist = wall_dists[min_wall_idx]
-        
-        # Determine which constraint is tighter
-        # Effective radius is min(min_pair/2, min_wall)
-        # If min_pair/2 < min_wall, the pair constraint is active
-        # Otherwise the wall constraint is active
-        
-        # Perturb the most constrained points
-        # Pick 2-3 points to move
-        n_perturb = 2 + (it % 2)
-        
-        # Select points: the ones with smallest nn_dist and smallest wall_dist
-        candidates = np.concatenate([
-            np.argsort(nn_dists)[:n_perturb],
-            np.argsort(wall_dists)[:n_perturb]
-        ])
-        candidates = np.unique(candidates[:n_perturb])
-        
-        # Generate random perturbations
-        improvements = 0
-        for _ in range(10):  # Try multiple perturbations per iteration
-            trial = centers.copy()
-            for idx in candidates:
-                # Random direction
-                angle = np.random.uniform(0, 2 * np.pi)
-                # Step size proportional to current constraint tightness
-                step = step_scale * (0.5 + np.random.rand())
-                trial[idx, 0] += step * np.cos(angle)
-                trial[idx, 1] += step * np.sin(angle)
             
-            # Keep in bounds
-            trial[:, 0] = np.clip(trial[:, 0], -0.5, 0.5)
-            trial[:, 1] = np.clip(trial[:, 1], -0.5, 0.5)
+        def fun_and_grad(x):
+            val, g = _objective_and_grad(x, beta)
+            return val, g
             
-            r_trial = _compute_radius(trial)
-            if r_trial > best_r + 1e-12:
-                best_r = r_trial
-                best_centers = trial.copy()
-                centers = trial.copy()
-                tree = cKDTree(centers)
-                step_scale *= 0.95  # Reduce step size on improvement
-                improvements += 1
-        
-        if improvements == 0:
-            step_scale *= 0.99  # Slightly reduce step size
-            if step_scale < 1e-6:
-                break
-    
-    return best_centers, best_r
+        try:
+            # Use more iterations for higher betas (finer optimization)
+            # L-BFGS-B is fast, so we can try more iterations
+            maxiter = 300 if beta >= 100 else 150
+            res = minimize(
+                fun_and_grad, 
+                x0, 
+                jac=True, 
+                method='L-BFGS-B', 
+                bounds=bounds,
+                options={'maxiter': maxiter, 'ftol': 1e-15, 'gtol': 1e-15, 'maxls': 50}
+            )
+            x0 = res.x
+            pts_curr = x0.reshape((N, 2))
+            pts_curr = np.clip(pts_curr, -0.5, 0.5)
+            
+            r = _get_radius(pts_curr)
+            if r > best_r:
+                best_r = r
+                best_x = x0.copy()
+                
+        except Exception:
+            pass
+            
+    return best_r, best_x.reshape((N, 2))
+
+def _generate_hex_initial_with_spacing(s):
+    points = []
+    row_h = s * np.sqrt(3) / 2
+    y = -0.5 + row_h/2
+    row_idx = 0
+    while y < 0.5:
+        shift = (s / 2.0) if row_idx % 2 == 1 else 0.0
+        x = -0.5 + s/2 + shift
+        while x < 0.5:
+            points.append([x, y])
+            x += s
+        y += row_h
+        row_idx += 1
+    pts = np.array(points)
+    if len(pts) >= N:
+        return pts[:N]
+    else:
+        # Fallback to random if hex grid fails
+        return np.random.uniform(-0.4, 0.4, (N, 2))
 
 def construct():
-    """Construct 200 circle centers in [-0.5, 0.5]^2 maximizing the minimum radius."""
-    # Start with hexagonal grid
-    centers = _generate_hex_grid()
-    r = _compute_radius(centers)
+    t0 = time.time()
+    np.random.seed(42)
     
-    # Local search
-    if _time_left() > 10.0:
-        centers, r = _local_search(centers, max_iter=8000)
+    best_r = 0.0
+    best_pts = None
     
-    # Final verification and clipping
-    centers = np.clip(centers, -0.5, 0.5)
+    # Define multiple initializations
+    inits = []
     
-    return centers
-# EVOLVE-BLOCK-END
+    # Init 1: Standard Hex
+    pts_hex1 = _generate_hex_initial()
+    if pts_hex1 is not None and len(pts_hex1) == N:
+        inits.append(pts_hex1)
+        
+    # Init 2: Shifted Hex
+    s = 0.0732
+    points = []
+    row_h = s * np.sqrt(3) / 2
+    y = -0.6 + row_h / 2
+    row_idx = 0
+    while y < 0.6:
+        shift = (s / 2.0) if row_idx % 2 == 0 else 0.0
+        x = -0.6 + shift
+        while x < 0.6:
+            points.append([x, y])
+            x += s
+        y += row_h
+        row_idx += 1
+    pts_shifted = np.array(points)
+    margin = 0.001
+    mask = (pts_shifted[:, 0] >= -0.5 + margin) & (pts_shifted[:, 0] <= 0.5 - margin) & \
+           (pts_shifted[:, 1] >= -0.5 + margin) & (pts_shifted[:, 1] <= 0.5 - margin)
+    pts_shifted = pts_shifted[mask]
+    if len(pts_shifted) >= N:
+        dists_to_center = np.sum(pts_shifted**2, axis=1)
+        indices = np.argsort(dists_to_center)
+        pts_shifted = pts_shifted[indices[:N]]
+        inits.append(pts_shifted)
+        
+    # Init 3: Slightly denser Hex (will have overlaps, but optimizer can fix)
+    s3 = 0.070
+    points3 = []
+    row_h3 = s3 * np.sqrt(3) / 2
+    y3 = -0.6 + row_h3 / 2
+    row_idx3 = 0
+    while y3 < 0.6:
+        shift3 = (s3 / 2.0) if row_idx3 % 2 == 1 else 0.0
+        x3 = -0.6 + shift3
+        while x3 < 0.6:
+            points3.append([x3, y3])
+            x3 += s3
+        y3 += row_h3
+        row_idx3 += 1
+    pts_dense = np.array(points3)
+    mask3 = (pts_dense[:, 0] >= -0.5 + margin) & (pts_dense[:, 0] <= 0.5 - margin) & \
+            (pts_dense[:, 1] >= -0.5 + margin) & (pts_dense[:, 1] <= 0.5 - margin)
+    pts_dense = pts_dense[mask3]
+    if len(pts_dense) >= N:
+        dists_to_center3 = np.sum(pts_dense**2, axis=1)
+        indices3 = np.argsort(dists_to_center3)
+        pts_dense = pts_dense[indices3[:N]]
+        inits.append(pts_dense)
+
+    # Run optimization on each init, allocating time
+    # Total usable time: _TIME_LIMIT (130s)
+    # Reserve 20s for polish.
+    # Remaining 110s for inits.
+    # If 3 inits, ~35s each.
+    
+    num_inits = len(inits)
+    if num_inits == 0:
+        # Fallback
+        best_pts = np.random.uniform(-0.4, 0.4, (N, 2))
+        best_r = _get_radius(best_pts)
+        inits = [best_pts]
+        num_inits = 1
+        
+    time_per_init = (_TIME_LIMIT - 25) / num_inits
+    
+    for i, init_pts in enumerate(inits):
+        elapsed = time.time() - t0
+        remaining_for_phase = _TIME_LIMIT - 25 - elapsed
+        if remaining_for_phase <= 5:
+            break
+            
+        # Allocate time for this init, but not exceeding the per-init budget
+        t_limit = min(time_per_init, remaining_for_phase)
+        
+        r_opt, pts_opt = _run_optimization(init_pts, time_limit=t_limit)
+        
+        if r_opt > best_r:
+            best_r = r_opt
+            best_pts = pts_opt
+            
+    # Phase: Polish the best configuration
+    if best_pts is not None:
+        elapsed = time.time() - t0
+        remaining_time = _TIME_LIMIT - 5 - elapsed
+        if remaining_time > 5:
+            betas_polish = [500, 1000, 2000, 5000]
+            r_polish, pts_polish = _run_optimization(best_pts, time_limit=remaining_time, betas=betas_polish)
+            if r_polish > best_r:
+                best_r = r_polish
+                best_pts = pts_polish
+                
+    if best_pts is None:
+        best_pts = np.random.uniform(-0.4, 0.4, (N, 2))
+        
+    return best_pts
+
+if __name__ == "__main__":
+    pts = construct()
+    r = _get_radius(pts)
+    print(f"Best Radius: {r}")

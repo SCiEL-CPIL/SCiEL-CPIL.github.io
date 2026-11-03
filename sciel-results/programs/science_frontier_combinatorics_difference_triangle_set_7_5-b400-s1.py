@@ -1,345 +1,447 @@
-"""Difference triangle set (7,5) solver with Simulated Annealing and efficient diff tracking."""
+"""Difference triangle set (7,5) solver - rewritten with structured search and aggressive local search."""
 import time
 import random
-import sys
+import math
 
-# Deadline guard: return best result before 145s (5s safety margin under 150s kill)
-_DEADLINE = 145.0
+_DEADLINE = 142.0
 _START_TIME = time.time()
 
 def _elapsed():
     return time.time() - _START_TIME
 
 def _row_diffs(row):
-    """Return the list of all positive differences in a row."""
-    diffs = []
     n = len(row)
-    for i in range(n):
-        for j in range(i + 1, n):
-            diffs.append(row[j] - row[i])
-    return diffs
+    return [row[j] - row[i] for i in range(n) for j in range(i+1, n)]
 
 def _max_entry(rows):
     return max(max(r) for r in rows) if rows else 0
 
 def _is_valid(rows, k):
-    """Check that all positive differences across all rows are distinct."""
+    if not rows:
+        return False
     seen = set()
     for row in rows:
-        if len(row) != k + 1:
+        if len(row) != k + 1 or row[0] != 0:
             return False
-        if row[0] != 0:
-            return False
-        for i in range(len(row)):
-            for j in range(i + 1, len(row)):
+        for i in range(k+1):
+            for j in range(i+1, k+1):
                 d = row[j] - row[i]
                 if d in seen:
                     return False
                 seen.add(d)
     return True
 
-def _greedy_row(used, k, rng, max_val=None):
-    """Build one row greedily, choosing the smallest available next mark.
-    used: set of forbidden differences.
-    max_val: optional upper bound for entries.
-    """
+def _build_row_given_used(used, k, rng, cap=None, jitter=0.0):
+    """Build a row of k+1 numbers starting at 0, avoiding used differences."""
     row = [0]
     x = 0
+    attempts = 0
     while len(row) < k + 1:
         x += 1
-        if max_val is not None and x > max_val:
-            break
-        # Occasionally jump ahead to create diversity
-        if rng.random() < 0.1:
+        if cap is not None and x > cap:
+            return None
+        # Add randomness
+        if jitter > 0 and rng.random() < jitter:
             x += rng.randint(1, 3)
-            if max_val is not None and x > max_val:
-                break
+            if cap is not None and x > cap:
+                return None
         
         new_diffs = {x - a for a in row}
-        if not new_diffs & used:
+        if not (new_diffs & used):
             row.append(x)
-            used |= new_diffs
+            used = used | new_diffs
     return row
 
-def _greedy_full(n_rows, k, rng, max_val=None):
-    """Build all rows greedily with randomization."""
-    used = set()
-    rows = []
-    for _ in range(n_rows):
-        row = _greedy_row(used, k, rng, max_val)
-        if len(row) < k + 1:
-            return None
-        rows.append(row)
-    return rows
+def _initial_construction(n_rows, k, rng, diversity_base=0.04):
+    """Build initial valid set with varied diversity parameters."""
+    best = None
+    best_score = float('inf')
+    
+    for attempt in range(500):
+        if _elapsed() > _DEADLINE - 25:
+            break
+        used = set()
+        rows = []
+        ok = True
+        for r in range(n_rows):
+            div = diversity_base * (0.5 + rng.random())
+            row = _build_row_given_used(used, k, rng, jitter=div)
+            if row is None:
+                ok = False
+                break
+            rows.append(row)
+            used = used | set(_row_diffs(row))
+        
+        if ok and len(rows) == n_rows:
+            if _is_valid(rows, k):
+                score = _max_entry(rows)
+                if score < best_score:
+                    best_score = score
+                    best = [list(r) for r in rows]
+    
+    return best, best_score
 
-def _sa_optimize(rows, k, rng, time_budget=60):
-    """Simulated Annealing to minimize the scope (max entry)."""
+def _compute_all_diffs(rows):
+    """Return flat list of all differences."""
+    all_d = []
+    for row in rows:
+        all_d.extend(_row_diffs(row))
+    return all_d
+
+def _count_conflicts(rows):
+    """Count number of differences that appear more than once."""
+    from collections import Counter
+    all_d = _compute_all_diffs(rows)
+    c = Counter(all_d)
+    return sum(max(0, v - 1) for v in c.values())
+
+def _sa_main(rows, k, rng, time_budget=100):
+    """Simulated annealing with better move set."""
     n_rows = len(rows)
-    # Initial state
-    best_rows = [list(r) for r in rows]
-    current_rows = [list(r) for r in best_rows]
+    cur = [list(r) for r in rows]
+    best = [list(r) for r in rows]
     
-    # Track used differences globally for fast conflict checking
-    # We need to be able to add/remove row diffs quickly.
-    # Since k is small (5), each row has 15 diffs.
-    # Total diffs is manageable.
-    
-    def get_diffs(row):
-        return _row_diffs(row)
-
-    # Initialize global diff counts
-    diff_counts = {}
-    for row in current_rows:
-        for d in get_diffs(row):
-            diff_counts[d] = diff_counts.get(d, 0) + 1
-            
-    def count_conflicts():
-        c = 0
-        for cnt in diff_counts.values():
-            if cnt > 1:
-                c += cnt - 1
+    # Track diff usage for fast conflict counting
+    from collections import Counter
+    def diff_counter(rows):
+        c = Counter()
+        for row in rows:
+            for d in _row_diffs(row):
+                c[d] += 1
         return c
-
-    def get_scope():
-        return _max_entry(current_rows)
-
-    # Objective: Minimize scope + Penalty * Conflicts
-    # We want valid solutions (0 conflicts) with low scope.
-    # If invalid, we prioritize reducing conflicts first.
     
-    current_scope = get_scope()
-    current_conflicts = count_conflicts()
-    current_cost = current_scope + 1000 * current_conflicts
+    def conflict_count(c):
+        return sum(max(0, v - 1) for v in c.values())
     
-    best_scope = current_scope
-    best_conflicts = current_conflicts
-    best_cost = current_cost
+    dc = diff_counter(cur)
+    cur_conf = conflict_count(dc)
+    cur_scope = _max_entry(cur)
+    cur_cost = cur_scope + 500 * cur_conf
     
-    start_time = time.time()
+    best_scope = cur_scope
+    best_conf = cur_conf
+    best_cost = cur_cost
+    best = [list(r) for r in cur]
+    
+    t0 = time.time()
     temp = 10.0
-    cooling = 0.999
+    cool = 0.99985
     
-    while time.time() - start_time < time_budget:
+    while time.time() - t0 < time_budget:
         if _elapsed() > _DEADLINE - 5:
             break
-            
-        # Pick a random move
-        move_type = rng.random()
         
-        if move_type < 0.7:
-            # Move: Rebuild a random row
-            ri = rng.randrange(n_rows)
-            old_row = current_rows[ri]
-            
-            # Remove old row diffs from counts
-            for d in get_diffs(old_row):
-                diff_counts[d] -= 1
-                if diff_counts[d] == 0:
-                    del diff_counts[d]
-            
-            # Rebuild row with some randomness, trying to stay within current scope
-            # Use a greedy approach with a slight bias towards smaller numbers
-            used = set(diff_counts.keys())
-            max_limit = current_scope + rng.randint(0, 5) # Allow slight expansion to escape
-            new_row = _greedy_row(used, k, rng, max_limit)
-            
-            if len(new_row) < k + 1:
-                # Restore old row
-                for d in get_diffs(old_row):
-                    diff_counts[d] = diff_counts.get(d, 0) + 1
-                continue
-            
-            # Add new row diffs
-            for d in get_diffs(new_row):
-                diff_counts[d] = diff_counts.get(d, 0) + 1
-            
-            current_rows[ri] = new_row
-            
-        else:
-            # Move: Shift an entry in a random row
-            ri = rng.randrange(n_rows)
-            row = current_rows[ri]
-            if len(row) < 2:
-                continue
-            
-            # Pick a random index > 0
-            idx = rng.randint(1, len(row) - 1)
-            old_val = row[idx]
-            
-            # Try to reduce value to compress scope
-            # Or randomly perturb
-            if rng.random() < 0.6:
-                # Try to reduce
-                reduction = rng.randint(1, 3)
-                new_val = old_val - reduction
-                if new_val <= 0:
-                    continue
-                # Check strictly increasing
-                if idx > 1 and new_val <= row[idx - 1]:
-                    continue
-                if idx < len(row) - 1 and new_val >= row[idx + 1]:
-                    continue
-            else:
-                # Random small change
-                delta = rng.randint(-3, 3)
-                new_val = old_val + delta
-                if new_val <= 0:
-                    continue
-                if idx > 1 and new_val <= row[idx - 1]:
-                    continue
-                if idx < len(row) - 1 and new_val >= row[idx + 1]:
-                    continue
-            
-            # If new_val == old_val, skip
-            if new_val == old_val:
-                continue
-                
-            # Calculate diff changes
-            old_diffs = get_diffs(row)
+        move_type = rng.random()
+        ri = rng.randrange(n_rows)
+        
+        if move_type < 0.45:
+            # Rebuild row ri
+            old_row = cur[ri]
+            old_diffs = _row_diffs(old_row)
             
             # Remove old diffs
             for d in old_diffs:
-                diff_counts[d] -= 1
-                if diff_counts[d] == 0:
-                    del diff_counts[d]
+                dc[d] -= 1
+                if dc[d] <= 0:
+                    del dc[d]
+            new_conf = conflict_count(dc)
             
-            # Apply change
-            row[idx] = new_val
-            new_row = row
-            new_diffs = get_diffs(new_row)
+            # Try to rebuild with tighter cap
+            used = set(dc.keys())
+            cap = cur_scope + rng.randint(0, 3)
+            new_row = _build_row_given_used(used, k, rng, cap=cap, jitter=0.06)
             
-            # Add new diffs
-            for d in new_diffs:
-                diff_counts[d] = diff_counts.get(d, 0) + 1
-            
-            # Check validity of the row itself (strictly increasing is already checked)
-            # But we need to ensure no internal duplicates in the new row?
-            # The problem says "increasing integers", so strictly increasing is required.
-            # Our check `new_val <= row[idx-1]` etc ensures that.
-            
-            # Evaluate cost
-            new_scope = get_scope()
-            new_conflicts = count_conflicts()
-            new_cost = new_scope + 1000 * new_conflicts
-            
-            delta_cost = new_cost - current_cost
-            
-            # Acceptance criterion
-            if delta_cost < 0 or (temp > 0 and rng.random() < pow(2.718281828, -delta_cost / temp)):
-                current_scope = new_scope
-                current_conflicts = new_conflicts
-                current_cost = new_cost
-                
-                if current_cost < best_cost:
-                    best_cost = current_cost
-                    best_scope = current_scope
-                    best_conflicts = current_conflicts
-                    best_rows = [list(r) for r in current_rows]
-            else:
-                # Reject: Revert changes
-                for d in new_diffs:
-                    diff_counts[d] -= 1
-                    if diff_counts[d] == 0:
-                        del diff_counts[d]
-                
+            if new_row is None or len(new_row) < k + 1:
+                # Restore
                 for d in old_diffs:
-                    diff_counts[d] = diff_counts.get(d, 0) + 1
-                    
+                    dc[d] = dc.get(d, 0) + 1
+                continue
+            
+            new_diffs = _row_diffs(new_row)
+            for d in new_diffs:
+                dc[d] = dc.get(d, 0) + 1
+            new_conf = conflict_count(dc)
+            new_scope = _max_entry(cur)
+            new_cost = new_scope + 500 * new_conf
+            delta = new_cost - cur_cost
+            
+            if delta < 0 or (temp > 0.01 and rng.random() < math.exp(-delta / temp)):
+                cur[ri] = new_row
+                cur_conf = new_conf
+                cur_scope = new_scope
+                cur_cost = new_cost
+                if cur_cost < best_cost:
+                    best_cost = cur_cost
+                    best_scope = cur_scope
+                    best_conf = cur_conf
+                    best = [list(r) for r in cur]
+            else:
+                # Revert
+                for d in new_diffs:
+                    dc[d] -= 1
+                    if dc[d] <= 0:
+                        del dc[d]
+                for d in old_diffs:
+                    dc[d] = dc.get(d, 0) + 1
+                cur[ri] = old_row
+                cur_conf = new_conf  # will be recomputed properly
+                # Recompute
+                dc2 = diff_counter(cur)
+                dc = dc2
+                cur_conf = conflict_count(dc)
+                cur_scope = _max_entry(cur)
+                cur_cost = cur_scope + 500 * cur_conf
+        
+        elif move_type < 0.75:
+            # Shift one entry
+            row = cur[ri]
+            idx = rng.randint(1, len(row) - 1)
+            old_val = row[idx]
+            
+            # Try to reduce
+            if rng.random() < 0.65:
+                new_val = old_val - rng.randint(1, 4)
+            else:
+                new_val = old_val + rng.randint(-3, 3)
+            
+            if new_val <= 0 or new_val == old_val:
+                continue
+            if idx > 1 and new_val <= row[idx-1]:
+                continue
+            if idx < len(row) - 1 and new_val >= row[idx+1]:
+                continue
+            
+            old_diffs = _row_diffs(row)
+            for d in old_diffs:
+                dc[d] -= 1
+                if dc[d] <= 0:
+                    del dc[d]
+            
+            row[idx] = new_val
+            new_diffs = _row_diffs(row)
+            for d in new_diffs:
+                dc[d] = dc.get(d, 0) + 1
+            
+            new_conf = conflict_count(dc)
+            new_scope = _max_entry(cur)
+            new_cost = new_scope + 500 * new_conf
+            delta = new_cost - cur_cost
+            
+            if delta < 0 or (temp > 0.01 and rng.random() < math.exp(-delta / temp)):
+                cur_conf = new_conf
+                cur_scope = new_scope
+                cur_cost = new_cost
+                if cur_cost < best_cost:
+                    best_cost = cur_cost
+                    best_scope = cur_scope
+                    best_conf = new_conf
+                    best = [list(r) for r in cur]
+            else:
                 row[idx] = old_val
-                # current_rows[ri] is already updated to new_val, so revert it
-                current_rows[ri][idx] = old_val
+                for d in new_diffs:
+                    dc[d] -= 1
+                    if dc[d] <= 0:
+                        del dc[d]
+                for d in old_diffs:
+                    dc[d] = dc.get(d, 0) + 1
+        
+        else:
+            # Swap two entries within a row (maintaining order)
+            row = cur[ri]
+            if len(row) < 3:
+                temp *= cool
+                continue
+            i = rng.randint(1, len(row) - 2)
+            j = rng.randint(i + 1, len(row) - 1)
+            if row[j] - row[i] < 2:
+                temp *= cool
+                continue
+            # Try swapping is hard with ordering; instead, try a small perturbation of two entries
+            di = rng.randint(-2, 2)
+            dj = rng.randint(-2, 2)
+            ni = row[i] + di
+            nj = row[j] + dj
+            if ni <= 0 or nj <= 0 or ni == row[i] and nj == row[j]:
+                temp *= cool
+                continue
+            if i > 1 and ni <= row[i-1]:
+                temp *= cool
+                continue
+            if j < len(row) - 1 and nj >= row[j+1]:
+                temp *= cool
+                continue
+            if ni >= nj:
+                temp *= cool
+                continue
+            
+            old_diffs = _row_diffs(row)
+            for d in old_diffs:
+                dc[d] -= 1
+                if dc[d] <= 0:
+                    del dc[d]
+            
+            row[i] = ni
+            row[j] = nj
+            new_diffs = _row_diffs(row)
+            for d in new_diffs:
+                dc[d] = dc.get(d, 0) + 1
+            
+            new_conf = conflict_count(dc)
+            new_scope = _max_entry(cur)
+            new_cost = new_scope + 500 * new_conf
+            delta = new_cost - cur_cost
+            
+            if delta < 0 or (temp > 0.01 and rng.random() < math.exp(-delta / temp)):
+                cur_conf = new_conf
+                cur_scope = new_scope
+                cur_cost = new_cost
+                if cur_cost < best_cost:
+                    best_cost = cur_cost
+                    best_scope = cur_scope
+                    best_conf = new_conf
+                    best = [list(r) for r in cur]
+            else:
+                row[i] = row[i] - di  # restore
+                row[j] = row[j] - dj
+                for d in new_diffs:
+                    dc[d] -= 1
+                    if dc[d] <= 0:
+                        del dc[d]
+                for d in old_diffs:
+                    dc[d] = dc.get(d, 0) + 1
+        
+        temp = max(0.01, temp * cool)
+    
+    if _is_valid(best, k):
+        return best
+    if _is_valid(cur, k):
+        return cur
+    return best
 
-        # Cool down
-        temp *= cooling
-        if temp < 0.01:
-            temp = 0.01
-
-    # Return the best valid solution found, or the best overall if no valid found
-    # The task requires a valid solution.
-    # If best_conflicts > 0, we should try to return a valid one from history if possible,
-    # or just return the best_rows and hope it's valid? No, it must be valid.
-    # Let's check if best_rows is valid.
-    if _is_valid(best_rows, k):
-        return best_rows
-    else:
-        # Fallback: try to find any valid solution from the process?
-        # Or just return current if valid?
-        if _is_valid(current_rows, k):
-            return current_rows
-        # If neither is valid, return best_rows (which might be invalid, but we hope the greedy init was valid)
-        return best_rows
+def _aggressive_polish(rows, k, rng, time_budget=8):
+    """Aggressive final polish: try many single-entry reductions."""
+    best = [list(r) for r in rows]
+    best_scope = _max_entry(best)
+    
+    t0 = time.time()
+    improved = True
+    while improved and time.time() - t0 < time_budget:
+        if _elapsed() > _DEADLINE - 2:
+            break
+        improved = False
+        all_diffs = set()
+        for row in best:
+            for d in _row_diffs(row):
+                all_diffs.add(d)
+        
+        for ri in range(len(best)):
+            if _elapsed() > _DEADLINE - 2:
+                break
+            row = best[ri]
+            for idx in range(1, len(row)):
+                if _elapsed() > _DEADLINE - 2:
+                    break
+                old_val = row[idx]
+                for red in range(1, 8):
+                    new_val = old_val - red
+                    if new_val <= 0:
+                        break
+                    if idx > 1 and new_val <= row[idx-1]:
+                        break
+                    if idx < len(row) - 1 and new_val >= row[idx+1]:
+                        break
+                    
+                    # Check conflicts
+                    old_d = _row_diffs(row)
+                    row[idx] = new_val
+                    new_d = _row_diffs(row)
+                    
+                    temp_set = set(all_diffs)
+                    for d in old_d:
+                        temp_set.discard(d)
+                    ok = True
+                    for d in new_d:
+                        if d in temp_set:
+                            ok = False
+                            break
+                        temp_set.add(d)
+                    
+                    if ok:
+                        all_diffs = temp_set
+                        new_scope = _max_entry(best)
+                        if new_scope < best_scope:
+                            best_scope = new_scope
+                            improved = True
+                        break
+                    else:
+                        row[idx] = old_val
+                        continue
+                # Restore if we didn't break
+                # (row[idx] is already correct)
+    
+    if _is_valid(best, k):
+        return best
+    return [list(r) for r in rows]
 
 def construct(n_rows, k):
     global _START_TIME
     _START_TIME = time.time()
+    rng = random.Random(20250705)
     
-    rng = random.Random(42)
+    # Phase 1: Initial construction
+    rows, score = _initial_construction(n_rows, k, rng)
     
-    # Phase 1: Multiple randomized greedy restarts to find a valid start
-    best_rows = None
-    best_score = float('inf')
-    
-    n_restarts = 100
-    for i in range(n_restarts):
-        if _elapsed() > _DEADLINE - 20:
-            break
-        rng2 = random.Random(12345 + i * 7919)
-        rows = _greedy_full(n_rows, k, rng2)
-        if rows is None:
-            continue
-        if not _is_valid(rows, k):
-            continue
-        score = _max_entry(rows)
-        if score < best_score:
-            best_score = score
-            best_rows = [list(r) for r in rows]
-    
-    if best_rows is None:
-        # Fallback: pure greedy without randomization jumps
+    if rows is None:
+        # Fallback greedy
         used = set()
-        best_rows = []
+        rows = []
         for _ in range(n_rows):
             row = [0]
             x = 0
             while len(row) < k + 1:
                 x += 1
-                new = {x - a for a in row}
-                if not new & used:
+                nd = {x - a for a in row}
+                if not (nd & used):
                     row.append(x)
-                    used |= new
-            best_rows.append(row)
-        best_score = _max_entry(best_rows)
+                    used |= nd
+            rows.append(row)
+        score = _max_entry(rows)
     
-    # Phase 2: Simulated Annealing
-    if _elapsed() < _DEADLINE - 10:
-        time_left = _DEADLINE - 10 - _elapsed()
-        # Limit SA time to ensure we return in time
-        sa_time = min(60, time_left)
-        improved_rows = _sa_optimize(best_rows, k, rng, time_budget=sa_time)
-        
-        if improved_rows and _is_valid(improved_rows, k):
-            new_score = _max_entry(improved_rows)
-            if new_score < best_score:
-                best_rows = improved_rows
-                best_score = new_score
-            else:
-                # Keep original if SA didn't improve scope
-                pass
+    # Phase 2: SA optimization
+    if _elapsed() < _DEADLINE - 12:
+        tb = min(105, _DEADLINE - 12 - _elapsed())
+        if tb > 5:
+            opt = _sa_main(rows, k, rng, time_budget=tb)
+            if opt and _is_valid(opt, k):
+                ns = _max_entry(opt)
+                if ns < score:
+                    rows = opt
+                    score = ns
+    
+    # Phase 3: Aggressive polish
+    if _elapsed() < _DEADLINE - 2:
+        tb = min(8, _DEADLINE - 2 - _elapsed())
+        if tb > 0.5:
+            pol = _aggressive_polish(rows, k, rng, time_budget=tb)
+            if pol and _is_valid(pol, k):
+                ns = _max_entry(pol)
+                if ns < score:
+                    rows = pol
+                    score = ns
     
     # Final validation
-    if not _is_valid(best_rows, k):
-        # Shouldn't happen, but fallback to a known valid greedy
+    if not _is_valid(rows, k):
         used = set()
-        best_rows = []
+        rows = []
         for _ in range(n_rows):
             row = [0]
             x = 0
             while len(row) < k + 1:
                 x += 1
-                new = {x - a for a in row}
-                if not new & used:
+                nd = {x - a for a in row}
+                if not (nd & used):
                     row.append(x)
-                    used |= new
-            best_rows.append(row)
+                    used |= nd
+            rows.append(row)
     
-    return best_rows
+    return rows

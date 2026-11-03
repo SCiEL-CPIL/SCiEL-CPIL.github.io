@@ -1,0 +1,435 @@
+"""Vectorized flip search + multi-flip moves + continuous optimization."""
+import numpy as np
+import time
+from scipy.optimize import minimize
+
+N = 400
+
+# EVOLVE-BLOCK-START
+
+_FSIZE = 1
+while _FSIZE < 2 * N - 1:
+    _FSIZE *= 2
+_FSIZE3 = 1
+while _FSIZE3 < 3 * N:
+    _FSIZE3 *= 2
+
+
+def _autoconv(h):
+    H = np.fft.rfft(h, _FSIZE)
+    ac = np.fft.irfft(H * H, _FSIZE)
+    return ac[:2 * N - 1]
+
+
+def _raw_value(h):
+    s = np.sum(h)
+    if abs(s) < 1e-12:
+        return 1e10
+    ac = _autoconv(h)
+    return float(np.max(np.abs(ac))) / (s * s)
+
+
+def _soft_max_abs(ac, beta=50.0):
+    a = np.abs(ac)
+    m = np.max(a)
+    if m < 1e-15:
+        return 0.0, None
+    scaled = beta * (a - m)
+    scaled = np.clip(scaled, -60, 60)
+    e = np.exp(scaled)
+    log_sum = np.log(np.sum(e))
+    weights = e / np.sum(e)
+    return m + log_sum / beta, weights
+
+
+def _smooth_objective(h, beta=50.0):
+    s = np.sum(h)
+    if abs(s) < 1e-12:
+        return 1e10
+    ac = _autoconv(h)
+    sm, _ = _soft_max_abs(ac, beta)
+    return sm / (s * s)
+
+
+def _smooth_gradient(h, beta=50.0):
+    s = np.sum(h)
+    if abs(s) < 1e-12:
+        return np.zeros_like(h)
+    ac = _autoconv(h)
+    sm, weights = _soft_max_abs(ac, beta)
+    if weights is None:
+        return np.zeros_like(h)
+    g_ac = weights * np.sign(ac)
+    V = np.fft.rfft(g_ac, _FSIZE3)
+    H = np.fft.rfft(h, _FSIZE3)
+    C = np.fft.irfft(V * np.conj(H), _FSIZE3)
+    grad_S = 2.0 * C[:N]
+    df = (grad_S * s - 2.0 * sm) / (s ** 3)
+    return df
+
+
+def _lbfgs(h0, beta=50.0, max_iter=200, deadline=None):
+    def fun(x):
+        if deadline is not None and time.time() > deadline:
+            return 1e10
+        return _smooth_objective(x, beta)
+
+    def jac(x):
+        if deadline is not None and time.time() > deadline:
+            return np.zeros_like(x)
+        return _smooth_gradient(x, beta)
+
+    try:
+        res = minimize(fun, h0, method='L-BFGS-B', jac=jac,
+                       options={'maxiter': max_iter, 'gtol': 1e-7, 'maxfun': 600})
+        return res.x, float(res.fun)
+    except Exception:
+        return h0, _smooth_objective(h0, beta)
+
+
+def _vectorized_single_flip_search(h, max_passes=2000, deadline=None):
+    """Vectorized single-flip ground-state search using FFT-based autoconv updates."""
+    h = h.copy()
+    s = float(np.sum(h))
+    ac = _autoconv(h)
+    best_val = float(np.max(np.abs(ac))) / (s * s)
+    
+    # Precompute the structure for fast flip evaluation
+    # When we flip index i, delta_ac[k] = -2*h[i]*(h[k-i] + h[i-k]) for valid k
+    # We can vectorize over all i simultaneously using the autoconv structure
+    
+    for _ in range(max_passes):
+        if deadline is not None and time.time() > deadline:
+            break
+        improved = False
+        
+        # For each index i, compute the new value if we flip it
+        # We need to find the best flip to apply
+        best_i = -1
+        best_new_val = best_val
+        
+        # Process in batches to manage memory
+        batch_size = 50
+        for batch_start in range(0, N, batch_size):
+            if deadline is not None and time.time() > deadline:
+                break
+            batch_end = min(batch_start + batch_size, N)
+            
+            for i in range(batch_start, batch_end):
+                hi = h[i]
+                s_new = s - 2.0 * hi
+                if abs(s_new) < 1e-12:
+                    continue
+                
+                # Compute delta_ac efficiently
+                # delta_ac[k] = -2*hi*(h[(k-i) mod N] + h[(i-k) mod N]) for k in [0, 2N-2]
+                # But we only care about the max |ac + delta_ac|
+                
+                # Quick estimate: compute the change in the peak
+                # The peak of ac is at some index p. After flip, ac[p] changes by delta_ac[p]
+                # We can approximate by checking a few peak locations
+                
+                # For efficiency, compute the full delta_ac for this flip
+                delta_ac = np.zeros(2 * N - 1)
+                
+                # First term: h[k-i] for k >= i
+                k1_start = i
+                k1_end = min(i + N, 2 * N - 1)
+                if k1_start < k1_end:
+                    delta_ac[k1_start:k1_end] -= 2.0 * hi * h[0:k1_end - k1_start]
+                
+                # Second term: h[i-k] for k <= i
+                k2_start = max(0, i - N + 1)
+                k2_end = i + 1
+                if k2_start < k2_end:
+                    idx = i - np.arange(k2_start, k2_end)
+                    delta_ac[k2_start:k2_end] -= 2.0 * hi * h[idx]
+                
+                ac_new = ac + delta_ac
+                new_val = float(np.max(np.abs(ac_new))) / (s_new * s_new)
+                
+                if new_val < best_new_val:
+                    best_new_val = new_val
+                    best_i = i
+        
+        if best_i >= 0 and best_new_val < best_val:
+            h[best_i] *= -1
+            s = float(np.sum(h))
+            ac = _autoconv(h)
+            best_val = best_new_val
+            improved = True
+        
+        if not improved:
+            break
+    
+    return h, best_val
+
+
+def _multi_flip_search(h, num_flips=2, max_passes=500, deadline=None):
+    """Search over combinations of multiple flips to escape local minima."""
+    h = h.copy()
+    s = float(np.sum(h))
+    ac = _autoconv(h)
+    best_val = float(np.max(np.abs(ac))) / (s * s)
+    
+    for _ in range(max_passes):
+        if deadline is not None and time.time() > deadline:
+            break
+        improved = False
+        
+        # Try flipping pairs of indices
+        # Sample a subset of pairs to keep computation manageable
+        rng = np.random.default_rng()
+        n_samples = min(200, N * (N - 1) // 2)
+        
+        for _ in range(n_samples):
+            if deadline is not None and time.time() > deadline:
+                break
+            
+            # Sample two distinct indices
+            i, j = rng.choice(N, size=2, replace=False)
+            
+            if h[i] == h[j]:
+                # Flipping both doesn't change s
+                s_new = s
+            else:
+                s_new = s - 2.0 * h[i] + 2.0 * h[j]
+            
+            if abs(s_new) < 1e-12:
+                continue
+            
+            # Compute the new autoconvolution
+            h_trial = h.copy()
+            h_trial[i] *= -1
+            h_trial[j] *= -1
+            ac_new = _autoconv(h_trial)
+            new_val = float(np.max(np.abs(ac_new))) / (s_new * s_new)
+            
+            if new_val < best_val * 0.999:  # Require meaningful improvement
+                h = h_trial
+                s = s_new
+                ac = ac_new
+                best_val = new_val
+                improved = True
+        
+        if not improved:
+            break
+    
+    return h, best_val
+
+
+def _block_flip_search(h, block_sizes=None, max_passes=5, deadline=None):
+    if block_sizes is None:
+        block_sizes = [64, 32, 16, 8, 4, 2, 1]
+    h = h.copy()
+    best_val = _raw_value(h)
+    for _ in range(max_passes):
+        if deadline is not None and time.time() > deadline:
+            break
+        improved = False
+        for bs in block_sizes:
+            if deadline is not None and time.time() > deadline:
+                break
+            for start in range(0, N, bs):
+                if deadline is not None and time.time() > deadline:
+                    break
+                end = min(start + bs, N)
+                h[start:end] *= -1
+                nv = _raw_value(h)
+                if nv < best_val:
+                    best_val = nv
+                    improved = True
+                else:
+                    h[start:end] *= -1
+        if not improved:
+            break
+    return h, best_val
+
+
+def _gen_gaussian(n, sigma_ratio=0.25):
+    x = np.arange(n)
+    mu = n / 2
+    sigma = n * sigma_ratio
+    return np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+
+
+def _gen_chirp(n):
+    i = np.arange(n)
+    return np.cos(np.pi * i**2 / n)
+
+
+def _gen_barker_like(n):
+    h = np.ones(n)
+    for i in range(1, n):
+        h[i] = 1.0 if ((i * 7 + 3) % 11) < 5 else -1.0
+    return h
+
+
+def _gen_random_smoothed(n, seed=42, kernel_size=10):
+    rng = np.random.default_rng(seed)
+    noise = rng.standard_normal(n)
+    kernel = np.ones(kernel_size) / kernel_size
+    return np.convolve(noise, kernel, mode='same')
+
+
+def _gen_sparse_support(n, k, seed=42, spacing='uniform'):
+    rng = np.random.default_rng(seed)
+    if spacing == 'uniform':
+        base = np.linspace(0, n - 1, k, endpoint=False).astype(int)
+        jitter = rng.integers(-n // k // 2, n // k // 2 + 1, size=k)
+        positions = np.sort((base + jitter) % n)
+    elif spacing == 'clustered':
+        n_clusters = max(2, k // 10)
+        centers = rng.choice(n, size=n_clusters, replace=False)
+        positions = np.sort(rng.choice(n, size=k, replace=False))
+        for c in centers:
+            idx = np.argmin(np.abs(positions - c))
+            positions[idx] = (c + rng.integers(-5, 5)) % n
+        positions = np.sort(positions % n)
+    else:
+        positions = np.sort(rng.choice(n, size=k, replace=False))
+    return positions
+
+
+def _optimize_sparse_amplitudes(support, init_amplitudes, beta=100.0, deadline=None):
+    h = np.zeros(N)
+    h[support] = init_amplitudes
+    s0 = np.sum(h)
+    if abs(s0) < 1e-9:
+        return h, 1e10
+    h = h / s0
+
+    def obj(x):
+        h_x = np.zeros(N)
+        h_x[support] = x
+        sx = np.sum(h_x)
+        if abs(sx) < 1e-9:
+            return 1e10
+        return _smooth_objective(h_x / sx, beta)
+
+    x0 = h[support].copy()
+    try:
+        res = minimize(obj, x0, method='L-BFGS-B',
+                       options={'maxiter': 80, 'disp': False, 'gtol': 1e-5,
+                                'maxfun': 400})
+        h_opt = np.zeros(N)
+        h_opt[support] = res.x
+        s_opt = np.sum(h_opt)
+        if abs(s_opt) > 1e-9:
+            h_opt = h_opt / s_opt
+            return h_opt, _raw_value(h_opt)
+    except Exception:
+        pass
+    return h, _raw_value(h)
+
+
+def construct():
+    t_start = time.time()
+    deadline = t_start + 145.0  # Safety margin for 150s limit
+
+    best_score = np.inf
+    best_h = np.ones(N) / N
+    best_score = _raw_value(best_h)
+
+    # ---- Phase 1: sparse combinatorial + amplitude optimization ----
+    phase1_deadline = t_start + 50.0
+    sparsity_configs = [
+        (N // 4, 'uniform', 42),
+        (N // 4, 'uniform', 123),
+        (N // 4, 'clustered', 42),
+        (N // 3, 'uniform', 77),
+        (N // 3, 'clustered', 156),
+        (N // 5, 'uniform', 42),
+        (N // 5, 'random', 42),
+        (N // 2, 'uniform', 42),
+        (N // 6, 'uniform', 99),
+    ]
+    for k, spacing, seed in sparsity_configs:
+        if time.time() > phase1_deadline - 8:
+            break
+        support = _gen_sparse_support(N, k, seed=seed, spacing=spacing)
+        rng = np.random.default_rng(seed + 1000)
+        amplitudes = rng.choice([-1.0, 1.0], size=k)
+        h_opt, val_opt = _optimize_sparse_amplitudes(
+            support, amplitudes, beta=100.0, deadline=phase1_deadline - 5)
+        if val_opt < best_score:
+            best_score = val_opt
+            best_h = h_opt.copy()
+
+    # ---- Phase 2: dense continuous optimization with analytic gradient ----
+    phase2_deadline = t_start + 90.0
+    x = np.arange(N)
+    inits = [
+        np.ones(N),
+        _gen_gaussian(N),
+        _gen_chirp(N),
+        _gen_barker_like(N),
+        _gen_random_smoothed(N, seed=1),
+        _gen_random_smoothed(N, seed=2),
+        _gen_random_smoothed(N, seed=3),
+        np.cos(np.pi * x / N),
+        _gen_gaussian(N, sigma_ratio=0.3) * np.where(x % 2 == 0, 1.0, -1.0),
+        _gen_gaussian(N, sigma_ratio=0.15) * np.where(x % 3 == 0, 1.0, -1.0),
+        np.sin(np.pi * x / N) * np.where(x % 2 == 0, 1.0, -1.0),
+    ]
+    for h_init in inits:
+        if time.time() > phase2_deadline - 10:
+            break
+        s0 = np.sum(h_init)
+        if abs(s0) < 1e-6:
+            continue
+        h_norm = h_init / s0
+        try:
+            current_h = h_norm.copy()
+            for beta in [40, 80, 150]:
+                if time.time() > phase2_deadline - 8:
+                    break
+                h_opt, _ = _lbfgs(current_h, beta=beta, max_iter=150,
+                                  deadline=phase2_deadline - 5)
+                if abs(np.sum(h_opt)) < 1e-6:
+                    continue
+                val = _raw_value(h_opt)
+                if val < best_score:
+                    best_score = val
+                    best_h = h_opt.copy()
+                current_h = h_opt.copy()
+        except Exception:
+            pass
+
+    # ---- Phase 3: block-flip structural refinement ----
+    if time.time() < deadline - 35:
+        h_ref, val_ref = _block_flip_search(best_h, max_passes=4,
+                                            deadline=deadline - 33)
+        if val_ref < best_score:
+            best_score = val_ref
+            best_h = h_ref.copy()
+
+    # ---- Phase 4: multi-flip search to escape local minima ----
+    if time.time() < deadline - 20:
+        h_ref, val_ref = _multi_flip_search(best_h, num_flips=2, max_passes=200,
+                                            deadline=deadline - 18)
+        if val_ref < best_score:
+            best_score = val_ref
+            best_h = h_ref.copy()
+
+    # ---- Phase 5: ground-state single-flip refinement ----
+    if time.time() < deadline - 10:
+        h_ref, val_ref = _vectorized_single_flip_search(best_h, max_passes=1500,
+                                                        deadline=deadline - 8)
+        if val_ref < best_score:
+            best_score = val_ref
+            best_h = h_ref.copy()
+
+    # ---- Phase 6: final polish with tighter search ----
+    if time.time() < deadline - 3:
+        h_fin, val_fin = _vectorized_single_flip_search(best_h, max_passes=1000,
+                                                        deadline=deadline - 1)
+        if val_fin < best_score:
+            best_score = val_fin
+            best_h = h_fin.copy()
+
+    if not np.all(np.isfinite(best_h)):
+        return np.ones(N) / N
+    return best_h
+
+# EVOLVE-BLOCK-END

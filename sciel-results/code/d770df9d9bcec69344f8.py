@@ -1,0 +1,385 @@
+import numpy as np
+import time
+from scipy.optimize import minimize
+
+N = 50
+DEADLINE = 145.0  # Safety margin before 150s limit
+
+
+def _true_score(centers):
+    """Compute the true packing radius for a given configuration."""
+    if centers.shape != (N, 2) or not np.all(np.isfinite(centers)):
+        return 0.0
+    if np.any(np.abs(centers) > 0.5):
+        return 0.0
+    boundary = (0.5 - np.abs(centers)).min()
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists_sq = (diffs ** 2).sum(axis=2)
+    np.fill_diagonal(dists_sq, np.inf)
+    min_dist = np.sqrt(dists_sq.min())
+    return min(boundary, min_dist / 2.0)
+
+
+def _soft_min(values, beta=50.0):
+    """Soft minimum using log-sum-exp for differentiability."""
+    v = np.asarray(values, dtype=np.float64)
+    v_min = v.min()
+    shifted = v - v_min
+    shifted = np.clip(shifted, 0, 100.0 / beta)
+    log_sum = np.log(np.sum(np.exp(-beta * shifted))) / beta
+    return v_min - log_sum
+
+
+def _soft_radius(centers, beta=50.0):
+    """Differentiable soft approximation of the packing radius."""
+    boundary_dists = 0.5 - np.abs(centers)
+    diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists_sq = (diffs ** 2).sum(axis=2)
+    np.fill_diagonal(dists_sq, np.inf)
+    iu = np.triu_indices(N, k=1)
+    pair_dists = np.sqrt(dists_sq[iu]) / 2.0
+    all_dists = np.concatenate([boundary_dists.ravel(), pair_dists])
+    return _soft_min(all_dists, beta)
+
+
+def _negative_soft_radius(x, beta=50.0):
+    """Negative soft radius for minimization."""
+    centers = x.reshape(-1, 2)
+    return -_soft_radius(centers, beta)
+
+
+def _init_grid():
+    """Grid initialization trying multiple configurations."""
+    best_pts = None
+    best_r = -1
+
+    for rows, cols in [(7, 8), (8, 7), (5, 10), (10, 5), (6, 9), (9, 6), (7, 7)]:
+        total = rows * cols
+        if total < N:
+            continue
+
+        xs = (np.arange(cols) + 0.5) / cols - 0.5
+        ys = (np.arange(rows) + 0.5) / rows - 0.5
+        grid = np.array([(x, y) for y in ys for x in xs])
+
+        if total == N:
+            pts = grid
+        else:
+            dists_to_center = np.sqrt((grid ** 2).sum(axis=1))
+            indices = np.argsort(dists_to_center)[:N]
+            pts = grid[indices]
+
+        r = _true_score(pts)
+        if r > best_r:
+            best_r = r
+            best_pts = pts.copy()
+
+    return best_pts if best_pts is not None else (np.random.rand(N, 2) - 0.5) * 0.9
+
+
+def _init_hexagonal():
+    """Hexagonal initialization."""
+    s = 1.0 / 7.0
+    pts = []
+    for i in range(9):
+        for j in range(9):
+            x = j * s + (i % 2) * s / 2 - 0.5 + s / 4
+            y = i * s * np.sqrt(3) / 2 - 0.5 + s * np.sqrt(3) / 4
+            if abs(x) <= 0.5 and abs(y) <= 0.5:
+                pts.append([x, y])
+
+    pts = np.array(pts)
+    if len(pts) >= N:
+        selected = []
+        remaining = pts.copy()
+        for _ in range(N):
+            if len(remaining) == 0:
+                break
+            if len(selected) == 0:
+                idx = 0
+            else:
+                sel = np.array(selected)
+                dists = np.min(np.linalg.norm(remaining[:, np.newaxis, :] - sel[np.newaxis, :, :], axis=2), axis=1)
+                idx = np.argmax(dists)
+            selected.append(remaining[idx])
+            remaining = np.delete(remaining, idx, axis=0)
+
+        if len(selected) == N:
+            return np.array(selected)
+
+    return _init_grid()
+
+
+def _force_relax(centers, n_steps=300, lr_init=0.01, lr_decay=0.999):
+    """Force-directed relaxation to resolve overlaps and keep in bounds."""
+    centers = centers.copy()
+    n = len(centers)
+    lr = lr_init
+
+    for step in range(n_steps):
+        forces = np.zeros_like(centers)
+
+        for k in range(2):
+            mask_r = centers[:, k] > 0.45
+            forces[mask_r, k] -= (centers[mask_r, k] - 0.45) * 20
+            mask_l = centers[:, k] < -0.45
+            forces[mask_l, k] += ((-0.45) - centers[mask_l, k]) * 20
+
+        diffs = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+        dists = np.sqrt((diffs ** 2).sum(axis=2))
+        np.fill_diagonal(dists, np.inf)
+
+        threshold = 0.12
+        mask = dists < threshold
+        np.fill_diagonal(mask, False)
+
+        force_mag = np.zeros_like(dists)
+        force_mag[mask] = (threshold - dists[mask]) / (dists[mask] + 1e-10) ** 2
+        force_mag = np.minimum(force_mag, 50)
+
+        forces += (force_mag[:, :, np.newaxis] * diffs).sum(axis=1)
+
+        centers += forces * lr
+        centers = np.clip(centers, -0.5, 0.5)
+
+        lr *= lr_decay
+
+    return centers
+
+
+def _optimize_lbfgsb(centers, time_budget=15.0):
+    """Optimize using L-BFGS-B with soft-min surrogate and progressive beta."""
+    start_time = time.time()
+
+    x0 = centers.ravel()
+    best_x = x0.copy()
+    best_score = _true_score(centers)
+
+    # Progressive beta schedule: start smooth, end sharp
+    betas = [20, 40, 80, 150, 300, 500]
+
+    for beta in betas:
+        elapsed = time.time() - start_time
+        remaining = time_budget - elapsed
+        if remaining < 2:
+            break
+
+        def objective(x):
+            return _negative_soft_radius(x, beta)
+
+        try:
+            maxiter = 500 if beta < 100 else 800
+            ftol = 1e-12
+            gtol = 1e-10
+
+            result = minimize(
+                objective,
+                x0,
+                method='L-BFGS-B',
+                bounds=[(-0.5, 0.5)] * (2 * N),
+                options={'maxiter': maxiter, 'ftol': ftol, 'gtol': gtol}
+            )
+
+            new_centers = result.x.reshape(-1, 2)
+            new_score = _true_score(new_centers)
+            if new_score > best_score:
+                best_score = new_score
+                best_x = result.x.copy()
+            x0 = result.x.copy()
+        except Exception:
+            pass
+
+    # Final high-precision polish with very sharp beta
+    elapsed = time.time() - start_time
+    if elapsed < time_budget - 3:
+        try:
+            def objective_sharp(x):
+                return _negative_soft_radius(x, 1000.0)
+
+            result = minimize(
+                objective_sharp,
+                x0,
+                method='L-BFGS-B',
+                bounds=[(-0.5, 0.5)] * (2 * N),
+                options={'maxiter': 1000, 'ftol': 1e-14, 'gtol': 1e-12}
+            )
+
+            new_centers = result.x.reshape(-1, 2)
+            new_score = _true_score(new_centers)
+            if new_score > best_score:
+                best_score = new_score
+                best_x = result.x.copy()
+        except Exception:
+            pass
+
+    return best_x.reshape(-1, 2), best_score
+
+
+def _optimize_sa(centers, time_budget=10.0):
+    """Simulated annealing refinement with adaptive step size."""
+    start_time = time.time()
+    centers = centers.copy()
+    best_centers = centers.copy()
+    best_score = _true_score(centers)
+
+    T = 0.005
+    T_min = 0.00005
+    cooling = 0.995
+    step_scale = 0.3
+
+    while time.time() - start_time < time_budget and T > T_min:
+        # Propose a move with adaptive step size
+        idx = np.random.randint(N)
+        delta = np.random.randn(2) * T * step_scale
+        new_centers = centers.copy()
+        new_centers[idx] = np.clip(centers[idx] + delta, -0.5, 0.5)
+
+        new_score = _true_score(new_centers)
+        delta_score = new_score - best_score
+
+        if delta_score > 0 or np.random.rand() < np.exp(delta_score / T):
+            centers = new_centers
+            if new_score > best_score:
+                best_score = new_score
+                best_centers = new_centers.copy()
+
+        T *= cooling
+
+    return best_centers, best_score
+
+
+def _local_refine(centers, time_budget=20.0):
+    """Local refinement with small perturbations (hill climbing)."""
+    start_time = time.time()
+    best_centers = centers.copy()
+    best_score = _true_score(best_centers)
+
+    step_sizes = [0.001, 0.0005, 0.0002, 0.0001]
+
+    for step in step_sizes:
+        if time.time() - start_time > time_budget:
+            break
+
+        improved = True
+        while improved and time.time() - start_time < time_budget:
+            improved = False
+            for i in range(N):
+                for dx in [-step, 0, step]:
+                    for dy in [-step, 0, step]:
+                        if dx == 0 and dy == 0:
+                            continue
+                        new_c = best_centers.copy()
+                        new_c[i, 0] += dx
+                        new_c[i, 1] += dy
+                        if np.any(np.abs(new_c) > 0.5):
+                            continue
+                        s = _true_score(new_c)
+                        if s > best_score + 1e-12:
+                            best_centers = new_c
+                            best_score = s
+                            improved = True
+            if time.time() - start_time > time_budget:
+                break
+
+    return best_centers, best_score
+
+
+def construct():
+    """Main entry point combining multiple optimization strategies."""
+    start_time = time.time()
+    np.random.seed(42)
+
+    # 1. Generate multiple initial configurations
+    inits = []
+    for _ in range(3):
+        init = _init_hexagonal()
+        inits.append(init)
+    inits.append(_init_grid())
+    inits.append((np.random.rand(N, 2) - 0.5) * 0.9)
+
+    best_centers = None
+    best_score = -1
+
+    # 2. For each init, do force relax + L-BFGS-B + SA + local refine
+    for init in inits:
+        elapsed = time.time() - start_time
+        if elapsed > DEADLINE - 30:
+            break
+
+        # Force relax
+        relaxed = _force_relax(init, n_steps=200)
+        score_relaxed = _true_score(relaxed)
+        if score_relaxed > best_score:
+            best_score = score_relaxed
+            best_centers = relaxed.copy()
+
+        # L-BFGS-B optimization
+        elapsed = time.time() - start_time
+        remaining = DEADLINE - elapsed
+        if remaining > 20:
+            t_lbfgs = min(remaining * 0.4, 40.0)
+            centers_lbfgs, score_lbfgs = _optimize_lbfgs(relaxed, time_budget=t_lbfgs)
+            if score_lbfgs > best_score:
+                best_score = score_lbfgs
+                best_centers = centers_lbfgs.copy()
+
+        # Simulated annealing
+        elapsed = time.time() - start_time
+        remaining = DEADLINE - elapsed
+        if remaining > 15 and best_centers is not None:
+            t_sa = min(remaining * 0.25, 15.0)
+            centers_sa, score_sa = _optimize_sa(best_centers, time_budget=t_sa)
+            if score_sa > best_score:
+                best_score = score_sa
+                best_centers = centers_sa.copy()
+
+        # Local refinement
+        elapsed = time.time() - start_time
+        remaining = DEADLINE - elapsed
+        if remaining > 10 and best_centers is not None:
+            t_lr = min(remaining * 0.3, 20.0)
+            centers_lr, score_lr = _local_refine(best_centers, time_budget=t_lr)
+            if score_lr > best_score:
+                best_score = score_lr
+                best_centers = centers_lr.copy()
+
+    # 3. Final global L-BFGS-B polish on best solution
+    elapsed = time.time() - start_time
+    remaining = DEADLINE - elapsed
+    if remaining > 15 and best_centers is not None:
+        t_final = min(remaining * 0.5, 30.0)
+        centers_final, score_final = _optimize_lbfgs(best_centers, time_budget=t_final)
+        if score_final > best_score:
+            best_score = score_final
+            best_centers = centers_final.copy()
+
+    # 4. Final local refinement
+    elapsed = time.time() - start_time
+    remaining = DEADLINE - elapsed
+    if remaining > 5 and best_centers is not None:
+        t_final_lr = min(remaining * 0.6, 10.0)
+        centers_final_lr, score_final_lr = _local_refine(best_centers, time_budget=t_final_lr)
+        if score_final_lr > best_score:
+            best_score = score_final_lr
+            best_centers = centers_final_lr.copy()
+
+    # Ensure validity
+    if best_centers is None:
+        best_centers = _init_grid()
+    best_centers = np.clip(best_centers, -0.5, 0.5)
+
+    return best_centers
+
+
+def _optimize_lbfgs(centers, time_budget=15.0):
+    """Alias for _optimize_lbfgsb."""
+    return _optimize_lbfgsb(centers, time_budget=time_budget)
+
+
+if __name__ == "__main__":
+    # Quick test
+    t0 = time.time()
+    c = construct()
+    print(f"Time: {time.time()-t0:.2f}s")
+    print(f"Score: {_true_score(c)}")
+    print(f"Shape: {c.shape}")

@@ -1,0 +1,227 @@
+import numpy as np
+import random
+import time
+from itertools import combinations
+
+DIMENSIONS = [2, 3, 10]
+
+def _verify_fast(U, V, W, n, m, p, tol=1e-9):
+    U = np.array(U, dtype=np.float64)
+    V = np.array(V, dtype=np.float64)
+    W = np.array(W, dtype=np.float64)
+    rank = U.shape[1]
+    
+    U_mat = U.reshape(n, m, rank)
+    V_mat = V.reshape(m, p, rank)
+    W_mat = W.reshape(p, n, rank)
+    
+    for i in range(n):
+        for k in range(p):
+            Uw = U_mat[i] * W_mat[k, i]
+            M_ik = Uw @ V_mat[:, k].T
+            if not np.allclose(M_ik, np.eye(m), atol=tol):
+                return False
+    return True
+
+def _is_valid_entries(U, V, W):
+    for matrix in [U, V, W]:
+        for row in matrix:
+            for val in row:
+                if abs(val * 2 - round(val * 2)) > 1e-9:
+                    return False
+    return True
+
+def _build_strassen55(n, m, p):
+    rank = 55
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+
+    col = 0
+    for i in range(n):
+        for k in range(p):
+            u_idx = i * m + 0
+            v_idx = 0 * p + k
+            w_idx = k * n + i
+            U[u_idx][col] = 1
+            V[v_idx][col] = 1
+            W[w_idx][col] = 1
+            col += 1
+
+    for b in range(5):
+        k0 = 2 * b
+        k1 = 2 * b + 1
+
+        u_11 = 0 * m + 1
+        u_12 = 0 * m + 2
+        u_21 = 1 * m + 1
+        u_22 = 1 * m + 2
+
+        v_11 = 1 * p + k0
+        v_12 = 1 * p + k1
+        v_21 = 2 * p + k0
+        v_22 = 2 * p + k1
+
+        w_00 = k0 * n + 0
+        w_01 = k1 * n + 0
+        w_10 = k0 * n + 1
+        w_11 = k1 * n + 1
+
+        U[u_11][col] += 1
+        U[u_22][col] += 1
+        V[v_11][col] += 1
+        V[v_22][col] += 1
+        W[w_00][col] += 1
+        W[w_11][col] += 1
+        col += 1
+
+        U[u_21][col] += 1
+        U[u_22][col] += 1
+        V[v_11][col] += 1
+        W[w_10][col] += 1
+        W[w_11][col] += -1
+        col += 1
+
+        U[u_11][col] += 1
+        V[v_12][col] += 1
+        V[v_22][col] += -1
+        W[w_01][col] += 1
+        W[w_11][col] += 1
+        col += 1
+
+        U[u_22][col] += 1
+        V[v_21][col] += 1
+        V[v_11][col] += -1
+        W[w_00][col] += 1
+        W[w_10][col] += 1
+        col += 1
+
+        U[u_11][col] += 1
+        U[u_12][col] += 1
+        V[v_22][col] += 1
+        W[w_00][col] += -1
+        W[w_01][col] += 1
+        col += 1
+
+        U[u_21][col] += 1
+        U[u_11][col] += -1
+        V[v_11][col] += 1
+        V[v_12][col] += 1
+        W[w_11][col] += 1
+        col += 1
+
+        U[u_12][col] += 1
+        U[u_22][col] += -1
+        V[v_21][col] += 1
+        V[v_22][col] += 1
+        W[w_00][col] += 1
+        col += 1
+
+    assert col == rank, f"Expected {rank} columns, got {col}"
+    return U, V, W
+
+def _build_schoolbook(n, m, p):
+    rank = n * m * p
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][col] = 1
+                V[j * p + k][col] = 1
+                W[k * n + i][col] = 1
+                col += 1
+    return U, V, W
+
+def _try_drop_terms(U55, V55, W55, n, m, p, drop_indices, deadline):
+    rank55 = 55
+    keep_idx = [i for i in range(rank55) if i not in drop_indices]
+    num_keep = len(keep_idx)
+    
+    U_keep = U55[:, keep_idx]
+    V_keep = V55[:, keep_idx]
+    W_keep = W55[:, keep_idx]
+    
+    eqs = []
+    b_vec = []
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                a = i * m + j
+                b = j * p + k
+                c = k * n + i
+                row = []
+                for r in range(num_keep):
+                    row.append(U_keep[a, r] * V_keep[b, r] * W_keep[c, r])
+                eqs.append(row)
+                b_vec.append(1.0)
+    
+    A = np.array(eqs, dtype=np.float64)
+    b = np.array(b_vec, dtype=np.float64)
+    
+    try:
+        coeffs, residuals, rank_A, sv = np.linalg.lstsq(A, b, rcond=None)
+    except Exception:
+        return None
+    
+    if len(residuals) > 0 and residuals[0] > 1e-8:
+        return None
+    
+    valid = True
+    for cv in coeffs:
+        if abs(cv * 2 - round(cv * 2)) > 1e-6:
+            valid = False
+            break
+    if not valid:
+        return None
+    
+    U_new = U_keep * coeffs
+    V_new = V_keep * coeffs
+    W_new = W_keep * coeffs
+    
+    if _verify_fast(U_new, V_new, W_new, n, m, p):
+        if _is_valid_entries(U_new.tolist(), V_new.tolist(), W_new.tolist()):
+            return U_new.tolist(), V_new.tolist(), W_new.tolist()
+    
+    return None
+
+def construct():
+    n, m, p = DIMENSIONS
+    deadline = time.time() + 140
+
+    U_best, V_best, W_best = _build_strassen55(n, m, p)
+    best_rank = 55
+
+    if not (_verify_fast(U_best, V_best, W_best, n, m, p) and _is_valid_entries(U_best, V_best, W_best)):
+        U_best, V_best, W_best = _build_schoolbook(n, m, p)
+        best_rank = n * m * p
+
+    U55 = np.array(U_best, dtype=np.float64)
+    V55 = np.array(V_best, dtype=np.float64)
+    W55 = np.array(W_best, dtype=np.float64)
+
+    # Try to drop 2 terms (rank 53)
+    if time.time() < deadline - 30:
+        for drop_idx in combinations(range(55), 2):
+            if time.time() > deadline:
+                break
+            result = _try_drop_terms(U55, V55, W55, n, m, p, drop_idx, deadline)
+            if result is not None:
+                U_best, V_best, W_best = result
+                best_rank = 53
+                return {"U": U_best, "V": V_best, "W": W_best}
+
+    # Try to drop 1 term (rank 54)
+    if time.time() < deadline - 10:
+        for i in range(55):
+            if time.time() > deadline:
+                break
+            result = _try_drop_terms(U55, V55, W55, n, m, p, (i,), deadline)
+            if result is not None:
+                U_best, V_best, W_best = result
+                best_rank = 54
+                return {"U": U_best, "V": V_best, "W": W_best}
+
+    return {"U": U_best, "V": V_best, "W": W_best}

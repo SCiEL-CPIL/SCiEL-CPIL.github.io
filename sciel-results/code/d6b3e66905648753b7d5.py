@@ -1,0 +1,172 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.optimize import minimize
+import time
+from math import factorial, sqrt, pi
+
+def _hermite_val(n, x):
+    """Compute physicists' Hermite polynomial H_n(x) at scalar x."""
+    if n == 0:
+        return 1.0
+    elif n == 1:
+        return 2.0 * x
+    H_prev = 1.0
+    H_curr = 2.0 * x
+    for k in range(2, n + 1):
+        H_next = 2.0 * x * H_curr - 2.0 * (k - 1) * H_prev
+        H_prev = H_curr
+        H_curr = H_next
+    return H_curr
+
+# Basis indices: 0, 4, 8, 12
+indices = [0, 4, 8, 12]
+
+# Orthogonality: int H_n H_m exp(-x^2) dx = sqrt(pi) 2^n n! delta_nm
+M_diag = np.array([sqrt(pi) * (2**n) * factorial(n) for n in indices])
+
+# N_ij = int x^2 H_i H_j exp(-x^2) dx
+# For this basis, N is diagonal: N_ii = i * M_ii
+N_diag = np.array([n * m for n, m in zip(indices, M_diag)])
+
+# c12 is determined by c0, c4, c8 to satisfy g(0)=0
+H0_0 = _hermite_val(0, 0)   # 1
+H4_0 = _hermite_val(4, 0)   # -12
+H8_0 = _hermite_val(8, 0)   # 1680
+H12_0 = _hermite_val(12, 0) # -40320
+
+def _compute_bound(c0, c4, c8):
+    """Compute the uncertainty bound for given coefficients."""
+    c12 = -(c0 * H0_0 + c4 * H4_0 + c8 * H8_0) / H12_0
+    coeffs = np.array([c0, c4, c8, c12])
+    
+    norm_sq = np.sum(coeffs**2 * M_diag)
+    if norm_sq <= 1e-12:
+        return 1e10
+        
+    x2_expectation = np.sum(coeffs**2 * N_diag)
+    return x2_expectation / norm_sq
+
+def _objective_2d(params):
+    """
+    Parameterize using two angles to define a point on the unit sphere in 3D.
+    This handles scale invariance naturally.
+    theta, phi -> (c0, c4, c8) on unit sphere
+    """
+    theta, phi = params
+    c0 = np.sin(theta) * np.cos(phi)
+    c4 = np.sin(theta) * np.sin(phi)
+    c8 = np.cos(theta)
+    return _compute_bound(c0, c4, c8)
+
+def construct():
+    """Find optimal coefficients for H0, H4, H8."""
+    start_time = time.time()
+    deadline = start_time + 170.0  # safety margin
+    
+    # Start with the known good point
+    best_x = np.array([-113.0/100.0, 1.0/25.0, 1.0/3240.0])
+    best_val = _compute_bound(*best_x)
+    
+    # Convert to spherical coordinates for the initial best
+    norm_best = np.linalg.norm(best_x)
+    if norm_best > 1e-12:
+        best_unit = best_x / norm_best
+        theta_best = np.arccos(np.clip(best_unit[2], -1, 1))
+        phi_best = np.arctan2(best_unit[1], best_unit[0])
+        if phi_best < 0:
+            phi_best += 2 * np.pi
+    else:
+        theta_best, phi_best = np.pi/2, 0
+    
+    # Strategy: Coarse-to-fine grid search in spherical coordinates,
+    # then local refinement from multiple starting points.
+    
+    # Phase 1: Coarse grid search
+    n_theta = 50
+    n_phi = 100
+    theta_grid = np.linspace(0, np.pi, n_theta)
+    phi_grid = np.linspace(0, 2*np.pi, n_phi)
+    
+    grid_best_val = best_val
+    grid_best_theta = theta_best
+    grid_best_phi = phi_best
+    
+    for t in theta_grid:
+        if time.time() > deadline - 30:
+            break
+        for p in phi_grid:
+            val = _objective_2d([t, p])
+            if val < grid_best_val:
+                grid_best_val = val
+                grid_best_theta = t
+                grid_best_phi = p
+    
+    # Update best if grid found something better
+    if grid_best_val < best_val:
+        best_val = grid_best_val
+        c0 = np.sin(grid_best_theta) * np.cos(grid_best_phi)
+        c4 = np.sin(grid_best_theta) * np.sin(grid_best_phi)
+        c8 = np.cos(grid_best_theta)
+        best_x = np.array([c0, c4, c8])
+    
+    # Phase 2: Local refinement from multiple starting points
+    # Starting points: grid best, original best, and several random points
+    start_points = []
+    
+    # Add grid best
+    start_points.append([grid_best_theta, grid_best_phi])
+    
+    # Add original best
+    start_points.append([theta_best, phi_best])
+    
+    # Add random points
+    rng = np.random.RandomState(42)
+    for _ in range(20):
+        t = rng.uniform(0, np.pi)
+        p = rng.uniform(0, 2*np.pi)
+        start_points.append([t, p])
+    
+    # Local refinement using Nelder-Mead
+    for sp in start_points:
+        if time.time() > deadline - 10:
+            break
+        try:
+            res = minimize(
+                _objective_2d,
+                sp,
+                method='Nelder-Mead',
+                options={'maxiter': 3000, 'xatol': 1e-12, 'fatol': 1e-14}
+            )
+            if res.fun < best_val:
+                best_val = res.fun
+                theta_opt, phi_opt = res.x
+                c0 = np.sin(theta_opt) * np.cos(phi_opt)
+                c4 = np.sin(theta_opt) * np.sin(phi_opt)
+                c8 = np.cos(theta_opt)
+                best_x = np.array([c0, c4, c8])
+        except Exception:
+            continue
+    
+    # Phase 3: Additional refinement with BFGS if available
+    if time.time() < deadline - 5:
+        try:
+            theta_opt, phi_opt = res.x if 'res' in dir() else [grid_best_theta, grid_best_phi]
+            res_bfgs = minimize(
+                _objective_2d,
+                [theta_opt, phi_opt],
+                method='BFGS',
+                options={'maxiter': 1000, 'gtol': 1e-12}
+            )
+            if res_bfgs.fun < best_val:
+                best_val = res_bfgs.fun
+                theta_opt, phi_opt = res_bfgs.x
+                c0 = np.sin(theta_opt) * np.cos(phi_opt)
+                c4 = np.sin(theta_opt) * np.sin(phi_opt)
+                c8 = np.cos(theta_opt)
+                best_x = np.array([c0, c4, c8])
+        except Exception:
+            pass
+    
+    return best_x
+# EVOLVE-BLOCK-END

@@ -1,0 +1,274 @@
+import numpy as np
+import time
+from fractions import Fraction
+
+DIMENSIONS = [3, 5, 5]
+
+def _verify_exact(U, V, W, n, m, p):
+    """Verify exact decomposition using rational arithmetic."""
+    r = len(U[0])
+    Uf = [[Fraction(U[i][c]) for c in range(r)] for i in range(n*m)]
+    Vf = [[Fraction(V[j][c]) for c in range(r)] for j in range(m*p)]
+    Wf = [[Fraction(W[k][c]) for c in range(r)] for k in range(p*n)]
+    
+    for i in range(n):
+        for k in range(p):
+            for j1 in range(m):
+                for j2 in range(m):
+                    s = Fraction(0)
+                    for c in range(r):
+                        s += Wf[k*n+i][c] * Uf[i*m+j1][c] * Vf[j2*p+k][c]
+                    target = 1 if j1 == j2 else 0
+                    if s != target:
+                        return False
+    return True
+
+def _verify_float(U, V, W, n, m, p, tol=1e-8):
+    """Quick float verification."""
+    U = np.asarray(U, dtype=float)
+    V = np.asarray(V, dtype=float)
+    W = np.asarray(W, dtype=float)
+    r = U.shape[1]
+    for i in range(n):
+        for k in range(p):
+            for j1 in range(m):
+                for j2 in range(m):
+                    s = 0.0
+                    for c in range(r):
+                        s += W[k*n+i, c] * U[i*m+j1, c] * V[j2*p+k, c]
+                    target = 1.0 if j1 == j2 else 0.0
+                    if abs(s - target) > tol:
+                        return False
+    return True
+
+def _compute_residual_fast(U, V, W, n, m, p):
+    """Compute max residual using vectorized ops."""
+    U = np.asarray(U, dtype=float)
+    V = np.asarray(V, dtype=float)
+    W = np.asarray(W, dtype=float)
+    r = U.shape[1]
+    max_err = 0.0
+    for i in range(n):
+        for k in range(p):
+            # Compute all j1, j2 products for this (i,k)
+            U_i = U[i*m:(i+1)*m, :]  # (m, r)
+            V_k = V[k::p, :]          # (m, r)
+            W_ik = W[k*n+i, :]        # (r,)
+            # Product: (j1, j2) -> sum_c W_ik[c] * U_i[j1,c] * V_k[j2,c]
+            prod = np.einsum('c,ic,jc->ij', W_ik, U_i, V_k)
+            target = np.eye(m)
+            err = np.abs(prod - target).max()
+            max_err = max(max_err, err)
+    return max_err
+
+def _als_optimize_fast(U, V, W, n, m, p, r, max_iters=50, deadline=None, tol=1e-10):
+    """Faster ALS optimization using vectorized operations."""
+    U = np.array(U, dtype=float)
+    V = np.array(V, dtype=float)
+    W = np.array(W, dtype=float)
+    
+    prev_residual = np.inf
+    
+    for it in range(max_iters):
+        if deadline is not None and time.time() > deadline:
+            break
+        
+        # Update W: for each (k,i), solve least squares
+        for k in range(p):
+            for i in range(n):
+                U_i = U[i*m:(i+1)*m, :]  # (m, r)
+                V_k = V[k::p, :]          # (m, r)
+                # A_W[j1*m+j2, c] = U_i[j1,c] * V_k[j2,c]
+                A_W = np.einsum('ic,jc->ijc', U_i, V_k).reshape(m*m, r)
+                b = np.zeros(m*m)
+                b[::m+1] = 1.0
+                w, *_ = np.linalg.lstsq(A_W, b, rcond=None)
+                W[k*n+i, :] = w
+        
+        # Update U: for each (i,j1)
+        for i in range(n):
+            for j1 in range(m):
+                A_U = np.zeros((p*m, r))
+                b = np.zeros(p*m)
+                for k in range(p):
+                    W_ik = W[k*n+i, :]
+                    V_k = V[k::p, :]
+                    A_U[k*m:(k+1)*m, :] = W_ik[None, :] * V_k
+                    b[k*m+j1] = 1.0
+                u, *_ = np.linalg.lstsq(A_U, b, rcond=None)
+                U[i*m+j1, :] = u
+        
+        # Update V: for each (j2,k)
+        for j2 in range(m):
+            for k in range(p):
+                A_V = np.zeros((n*m, r))
+                b = np.zeros(n*m)
+                for i in range(n):
+                    W_ik = W[k*n+i, :]
+                    U_i = U[i*m:(i+1)*m, :]
+                    A_V[i*m:(i+1)*m, :] = W_ik[None, :] * U_i
+                    b[i*m+j2] = 1.0
+                v, *_ = np.linalg.lstsq(A_V, b, rcond=None)
+                V[j2*p+k, :] = v
+        
+        # Check convergence
+        residual = _compute_residual_fast(U, V, W, n, m, p)
+        if abs(residual - prev_residual) < tol:
+            break
+        prev_residual = residual
+    
+    return U, V, W
+
+def _round_to_rational(arr, max_denom=32):
+    """Round array entries to rationals with small denominators."""
+    result = []
+    for i in range(len(arr)):
+        row = []
+        for c in range(len(arr[0])):
+            val = arr[i][c]
+            best = round(val)
+            best_err = abs(val - best)
+            if max_denom > 1:
+                for d in range(2, max_denom+1):
+                    num = round(val * d)
+                    cand = num / d
+                    err = abs(val - cand)
+                    if err < best_err:
+                        best = cand
+                        best_err = err
+            row.append(best)
+        result.append(row)
+    return result
+
+def _structured_init(n, m, p, r, rng):
+    """Create structured initialization from schoolbook with random merges."""
+    U = np.zeros((n*m, r))
+    V = np.zeros((m*p, r))
+    W = np.zeros((p*n, r))
+    
+    # Start with schoolbook pattern and randomly assign to r columns
+    assignments = []
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                assignments.append((i, j, k))
+    
+    # Randomly assign each schoolbook term to one of r columns
+    col_assign = rng.integers(0, r, size=len(assignments))
+    
+    for idx, (i, j, k) in enumerate(assignments):
+        c = col_assign[idx]
+        U[i*m+j, c] += 1.0
+        V[j*p+k, c] += 1.0
+        W[k*n+i, c] += 1.0
+    
+    # Add small random noise to break symmetry
+    U += rng.normal(0, 0.1, size=(n*m, r))
+    V += rng.normal(0, 0.1, size=(m*p, r))
+    W += rng.normal(0, 0.1, size=(p*n, r))
+    
+    return U, V, V
+
+def _random_init(n, m, p, r, rng):
+    """Pure random initialization."""
+    U = rng.normal(0, 1, size=(n*m, r))
+    V = rng.normal(0, 1, size=(m*p, r))
+    W = rng.normal(0, 1, size=(p*n, r))
+    return U, V, W
+
+def _try_rank_search(n, m, p, r, deadline, n_restarts=10):
+    """Try to find a valid decomposition at rank r."""
+    for restart in range(n_restarts):
+        if time.time() > deadline:
+            break
+        
+        seed = 42 + r * 1000 + restart
+        rng = np.random.default_rng(seed)
+        
+        # Alternate between structured and random initialization
+        if restart % 2 == 0:
+            U, V, W = _structured_init(n, m, p, r, rng)
+        else:
+            U, V, W = _random_init(n, m, p, r, rng)
+        
+        # First pass: coarse optimization
+        U, V, W = _als_optimize_fast(U, V, W, n, m, p, r, max_iters=30, deadline=deadline)
+        
+        residual = _compute_residual_fast(U, V, W, n, m, p)
+        
+        if residual < 0.1:
+            # Second pass: fine optimization
+            U, V, W = _als_optimize_fast(U, V, W, n, m, p, r, max_iters=50, deadline=deadline, tol=1e-12)
+            residual = _compute_residual_fast(U, V, W, n, m, p)
+            
+            if residual < 1e-4:
+                # Try to find exact rational solution
+                for max_denom in [1, 2, 4, 8, 16, 32, 64]:
+                    U_r = _round_to_rational(U.tolist(), max_denom=max_denom)
+                    V_r = _round_to_rational(V.tolist(), max_denom=max_denom)
+                    W_r = _round_to_rational(W.tolist(), max_denom=max_denom)
+                    
+                    if _verify_exact(U_r, V_r, W_r, n, m, p):
+                        return U_r, V_r, W_r
+                
+                # If rounding didn't work, try with larger denominators
+                for max_denom in [128, 256]:
+                    U_r = _round_to_rational(U.tolist(), max_denom=max_denom)
+                    V_r = _round_to_rational(V.tolist(), max_denom=max_denom)
+                    W_r = _round_to_rational(W.tolist(), max_denom=max_denom)
+                    
+                    if _verify_exact(U_r, V_r, W_r, n, m, p):
+                        return U_r, V_r, W_r
+    
+    return None
+
+def construct():
+    n, m, p = DIMENSIONS
+    t0 = time.time()
+    deadline = t0 + 135.0
+    
+    # Schoolbook baseline
+    rank0 = n * m * p
+    U0 = [[0]*rank0 for _ in range(n*m)]
+    V0 = [[0]*rank0 for _ in range(m*p)]
+    W0 = [[0]*rank0 for _ in range(p*n)]
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U0[i*m+j][col] = 1
+                V0[j*p+k][col] = 1
+                W0[k*n+i][col] = 1
+                col += 1
+    
+    best_rank = rank0
+    best_U, best_V, best_W = U0, V0, W0
+    
+    lower_bound = max(n*m, m*p, n*p)
+    
+    # Try ranks from lower_bound up to rank0-1
+    ranks_to_try = list(range(lower_bound, min(rank0, lower_bound + 40)))
+    ranks_to_try.sort(key=lambda r: abs(r - lower_bound))
+    
+    for r in ranks_to_try:
+        if time.time() > deadline - 3:
+            break
+        
+        if r <= lower_bound + 5:
+            n_restarts = 40
+        elif r <= lower_bound + 15:
+            n_restarts = 25
+        else:
+            n_restarts = 15
+        
+        result = _try_rank_search(n, m, p, r, deadline, n_restarts=n_restarts)
+        
+        if result is not None:
+            U_r, V_r, W_r = result
+            if r < best_rank:
+                best_rank = r
+                best_U, best_V, best_W = U_r, V_r, W_r
+                if r == lower_bound:
+                    break
+    
+    return {"U": best_U, "V": best_V, "W": best_W}
