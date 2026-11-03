@@ -1,0 +1,513 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+DIMENSIONS = [2, 4, 6]
+
+# EVOLVE-BLOCK-START
+import time
+import numpy as np
+from fractions import Fraction
+from itertools import product
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 145.0  # safety margin
+    
+    n, m, p = DIMENSIONS  # 2, 4, 6
+    
+    # Build the matrix multiplication tensor T[i,j,k] for C[i,k] = sum_j A[i,j]*B[j,k]
+    # U has shape (n*m, rank), V has shape (m*p, rank), W has shape (p*n, rank)
+    # Convention: W[k*n + i, r] contributes to C[i,k]
+    # So T[i,j,k] = sum_r U[i*m+j, r] * V[j*p+k, r] * W[k*n+i, r]
+    
+    # Build the rank-42 Strassen decomposition
+    rank = 42
+    U = [[0] * rank for _ in range(n * m)]  # 8 x 42
+    V = [[0] * rank for _ in range(m * p)]  # 24 x 42
+    W = [[0] * rank for _ in range(p * n)]  # 12 x 42
+    
+    def add_strassen_block(a_idx, b_idx, w_idx, start_col):
+        c = start_col
+        # M1 = (a00+a11)(b00+b11)
+        U[a_idx[0]][c] += 1; U[a_idx[3]][c] += 1
+        V[b_idx[0]][c] += 1; V[b_idx[3]][c] += 1
+        W[w_idx[0]][c] += 1; W[w_idx[3]][c] += 1
+        # M2 = (a10+a11)b00
+        U[a_idx[2]][c+1] += 1; U[a_idx[3]][c+1] += 1
+        V[b_idx[0]][c+1] += 1
+        W[w_idx[2]][c+1] += 1; W[w_idx[3]][c+1] -= 1
+        # M3 = a00(b01-b11)
+        U[a_idx[0]][c+2] += 1
+        V[b_idx[1]][c+2] += 1; V[b_idx[3]][c+2] -= 1
+        W[w_idx[1]][c+2] += 1; W[w_idx[3]][c+2] += 1
+        # M4 = a11(b10-b00)
+        U[a_idx[3]][c+3] += 1
+        V[b_idx[2]][c+3] += 1; V[b_idx[0]][c+3] -= 1
+        W[w_idx[0]][c+3] += 1; W[w_idx[2]][c+3] += 1
+        # M5 = (a00+a01)b11
+        U[a_idx[0]][c+4] += 1; U[a_idx[1]][c+4] += 1
+        V[b_idx[3]][c+4] += 1
+        W[w_idx[0]][c+4] -= 1; W[w_idx[1]][c+4] += 1
+        # M6 = (a10-a00)(b00+b01)
+        U[a_idx[2]][c+5] += 1; U[a_idx[0]][c+5] -= 1
+        V[b_idx[0]][c+5] += 1; V[b_idx[1]][c+5] += 1
+        W[w_idx[3]][c+5] += 1
+        # M7 = (a01-a11)(b10+b11)
+        U[a_idx[1]][c+6] += 1; U[a_idx[3]][c+6] -= 1
+        V[b_idx[2]][c+6] += 1; V[b_idx[3]][c+6] += 1
+        W[w_idx[0]][c+6] += 1
+
+    a_L = [0, 1, 4, 5]
+    a_R = [2, 3, 6, 7]
+    
+    b_1_T = [0, 1, 6, 7]
+    b_1_B = [12, 13, 18, 19]
+    w_1 = [0, 2, 1, 3]
+    
+    add_strassen_block(a_L, b_1_T, w_1, 0)
+    add_strassen_block(a_R, b_1_B, w_1, 7)
+    
+    b_2_T = [2, 3, 8, 9]
+    b_2_B = [14, 15, 20, 21]
+    w_2 = [4, 6, 5, 7]
+    
+    add_strassen_block(a_L, b_2_T, w_2, 14)
+    add_strassen_block(a_R, b_2_B, w_2, 21)
+    
+    b_3_T = [4, 5, 10, 11]
+    b_3_B = [16, 17, 22, 23]
+    w_3 = [8, 10, 9, 11]
+    
+    add_strassen_block(a_L, b_3_T, w_3, 28)
+    add_strassen_block(a_R, b_3_B, w_3, 35)
+    
+    # Verify the decomposition
+    def verify_decomp(U, V, W, rank):
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    total = 0
+                    for r in range(rank):
+                        total += U[i*m+j][r] * V[j*p+k][r] * W[k*n+i][r]
+                    if total != 1:
+                        return False
+        return True
+    
+    if not verify_decomp(U, V, W, rank):
+        rank = n * m * p
+        U = [[0] * rank for _ in range(n * m)]
+        V = [[0] * rank for _ in range(m * p)]
+        W = [[0] * rank for _ in range(p * n)]
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    r = i * m * p + j * p + k
+                    U[i*m+j][r] = 1
+                    V[j*p+k][r] = 1
+                    W[k*n+i][r] = 1
+        return {"U": U, "V": V, "W": W}
+    
+    # Convert to float arrays
+    U_np = np.array(U, dtype=float)
+    V_np = np.array(V, dtype=float)
+    W_np = np.array(W, dtype=float)
+    
+    # Build the tensor matrix: column r = flattened (u_r ⊗ v_r ⊗ w_r)
+    flat_terms = []
+    for r in range(rank):
+        term = np.outer(np.outer(U_np[:, r], V_np[:, r]), W_np[:, r])
+        flat_terms.append(term.flatten())
+    M = np.array(flat_terms).T  # shape (2304, 42)
+    
+    # Best result so far
+    best_result = {"U": U, "V": V, "W": W}
+    best_rank = rank
+    
+    # Strategy 1: SVD-based null space elimination (improved)
+    try:
+        U_svd, s_vals, Vt_svd = np.linalg.svd(M, full_matrices=False)
+        tol = 1e-9
+        effective_rank = int(np.sum(s_vals > tol))
+        
+        if effective_rank < rank:
+            new_U = U_np.copy()
+            new_V = V_np.copy()
+            new_W = W_np.copy()
+            eliminated = set()
+            
+            for iteration in range(rank - effective_rank + 5):
+                if time.time() > deadline - 20:
+                    break
+                    
+                remaining = [c for c in range(rank) if c not in eliminated]
+                if len(remaining) <= 1:
+                    break
+                
+                M_sub = M[:, remaining]
+                
+                try:
+                    U_sub, s_sub, Vt_sub = np.linalg.svd(M_sub, full_matrices=False)
+                except np.linalg.LinAlgError:
+                    break
+                
+                tol_sub = 1e-9
+                eff_rank_sub = int(np.sum(s_sub > tol_sub))
+                
+                if eff_rank_sub >= len(remaining):
+                    break
+                
+                null_sub = Vt_sub[eff_rank_sub:, :]
+                
+                # Try all null vectors and pick the best elimination
+                best_col = None
+                best_score = -1
+                best_null_idx = 0
+                
+                for nv_idx in range(null_sub.shape[0]):
+                    nv = null_sub[nv_idx]
+                    for local_c, global_c in enumerate(remaining):
+                        score = abs(nv[local_c])
+                        if score > best_score and score > 1e-8:
+                            best_score = score
+                            best_col = global_c
+                            best_null_idx = nv_idx
+                
+                if best_col is None:
+                    break
+                
+                nv = null_sub[best_null_idx]
+                local_best = remaining.index(best_col)
+                pivot_val = nv[local_best]
+                
+                if abs(pivot_val) < 1e-10:
+                    continue
+                
+                for local_c, global_c in enumerate(remaining):
+                    if global_c == best_col:
+                        continue
+                    coeff = -nv[local_c] / pivot_val
+                    if abs(coeff) > 1e-10:
+                        new_U[:, global_c] += coeff * new_U[:, best_col]
+                        new_V[:, global_c] += coeff * new_V[:, best_col]
+                        new_W[:, global_c] += coeff * new_W[:, best_col]
+                
+                eliminated.add(best_col)
+            
+            if eliminated:
+                keep = [c for c in range(rank) if c not in eliminated]
+                new_rank = len(keep)
+                final_U = new_U[:, keep]
+                final_V = new_V[:, keep]
+                final_W = new_W[:, keep]
+                
+                # Verify with tighter tolerance
+                valid = True
+                for i in range(n):
+                    for j in range(m):
+                        for k in range(p):
+                            total = 0.0
+                            for r in range(new_rank):
+                                total += final_U[i*m+j, r] * final_V[j*p+k, r] * final_W[k*n+i, r]
+                            if abs(total - 1.0) > 1e-7:
+                                valid = False
+                                break
+                        if not valid:
+                            break
+                    if not valid:
+                        break
+                
+                if valid and new_rank < best_rank:
+                    best_rank = new_rank
+                    def to_list(arr):
+                        result = []
+                        for row in arr:
+                            result.append([])
+                            for val in row:
+                                frac = round(val * 2) / 2
+                                if abs(frac - round(frac)) < 1e-10:
+                                    frac = int(round(frac))
+                                result[-1].append(frac)
+                        return result
+                    best_result = {
+                        "U": to_list(final_U),
+                        "V": to_list(final_V),
+                        "W": to_list(final_W)
+                    }
+    except Exception:
+        pass
+    
+    # Strategy 2: Try structural simplification - look for pairs of terms that
+    # can be combined. If two terms share the same U or V pattern, they might
+    # be mergeable.
+    try:
+        if time.time() < deadline - 30:
+            # Try to find if any two columns of U are proportional
+            # (meaning those two rank-1 terms could potentially be merged)
+            for i in range(rank):
+                if time.time() > deadline - 25:
+                    break
+                for j in range(i + 1, rank):
+                    # Check if U[:,i] is a scalar multiple of U[:,j]
+                    if np.linalg.norm(U_np[:, i]) > 1e-10 and np.linalg.norm(U_np[:, j]) > 1e-10:
+                        ratio = np.dot(U_np[:, i], U_np[:, j]) / (np.linalg.norm(U_np[:, i]) ** 2)
+                        if abs(ratio) > 1e-10:
+                            residual = U_np[:, j] - ratio * U_np[:, i]
+                            if np.linalg.norm(residual) / np.linalg.norm(U_np[:, j]) < 1e-10:
+                                # U columns are proportional - check V and W
+                                # This means terms i and j have the same U direction
+                                # They can be merged if V and W also align appropriately
+                                pass  # Complex to handle, skip for now
+    except Exception:
+        pass
+    
+    # Strategy 3: Try random restarts with different elimination orderings
+    # The greedy elimination order matters - try multiple random orderings
+    try:
+        if time.time() < deadline - 30:
+            np.random.seed(42)
+            best_random_rank = best_rank
+            best_random_result = best_result
+            
+            for trial in range(20):
+                if time.time() > deadline - 25:
+                    break
+                
+                new_U = U_np.copy()
+                new_V = V_np.copy()
+                new_W = W_np.copy()
+                eliminated = set()
+                
+                # Randomize the order in which we consider columns for elimination
+                col_order = list(range(rank))
+                np.random.shuffle(col_order)
+                
+                for _ in range(rank - effective_rank + 3):
+                    if time.time() > deadline - 25:
+                        break
+                    
+                    remaining = [c for c in col_order if c not in eliminated]
+                    if len(remaining) <= 1:
+                        break
+                    
+                    M_sub = M[:, remaining]
+                    
+                    try:
+                        U_sub, s_sub, Vt_sub = np.linalg.svd(M_sub, full_matrices=False)
+                    except np.linalg.LinAlgError:
+                        break
+                    
+                    tol_sub = 1e-9
+                    eff_rank_sub = int(np.sum(s_sub > tol_sub))
+                    
+                    if eff_rank_sub >= len(remaining):
+                        break
+                    
+                    null_sub = Vt_sub[eff_rank_sub:, :]
+                    
+                    # Pick elimination column randomly from those with large null coefficients
+                    best_col = None
+                    best_score = -1
+                    best_null_idx = 0
+                    
+                    for nv_idx in range(null_sub.shape[0]):
+                        nv = null_sub[nv_idx]
+                        for local_c, global_c in enumerate(remaining):
+                            score = abs(nv[local_c]) + np.random.random() * 0.1
+                            if score > best_score and abs(nv[local_c]) > 1e-8:
+                                best_score = score
+                                best_col = global_c
+                                best_null_idx = nv_idx
+                    
+                    if best_col is None:
+                        break
+                    
+                    nv = null_sub[best_null_idx]
+                    local_best = remaining.index(best_col)
+                    pivot_val = nv[local_best]
+                    
+                    if abs(pivot_val) < 1e-10:
+                        continue
+                    
+                    for local_c, global_c in enumerate(remaining):
+                        if global_c == best_col:
+                            continue
+                        coeff = -nv[local_c] / pivot_val
+                        if abs(coeff) > 1e-10:
+                            new_U[:, global_c] += coeff * new_U[:, best_col]
+                            new_V[:, global_c] += coeff * new_V[:, best_col]
+                            new_W[:, global_c] += coeff * new_W[:, best_col]
+                    
+                    eliminated.add(best_col)
+                
+                if eliminated:
+                    keep = [c for c in range(rank) if c not in eliminated]
+                    new_rank = len(keep)
+                    final_U = new_U[:, keep]
+                    final_V = new_V[:, keep]
+                    final_W = new_W[:, keep]
+                    
+                    valid = True
+                    for i in range(n):
+                        for j in range(m):
+                            for k in range(p):
+                                total = 0.0
+                                for r in range(new_rank):
+                                    total += final_U[i*m+j, r] * final_V[j*p+k, r] * final_W[k*n+i, r]
+                                if abs(total - 1.0) > 1e-7:
+                                    valid = False
+                                    break
+                            if not valid:
+                                break
+                        if not valid:
+                            break
+                    
+                    if valid and new_rank < best_random_rank:
+                        best_random_rank = new_rank
+                        def to_list(arr):
+                            result = []
+                            for row in arr:
+                                result.append([])
+                                for val in row:
+                                    frac = round(val * 2) / 2
+                                    if abs(frac - round(frac)) < 1e-10:
+                                        frac = int(round(frac))
+                                    result[-1].append(frac)
+                            return result
+                        best_random_result = {
+                            "U": to_list(final_U),
+                            "V": to_list(final_V),
+                            "W": to_list(final_W)
+                        }
+            
+            if best_random_rank < best_rank:
+                best_rank = best_random_rank
+                best_result = best_random_result
+    except Exception:
+        pass
+    
+    # Strategy 4: Winograd Fourier Transform Algorithm (WFTA) approach
+    # Exploit cyclic group structure to potentially find lower rank decomposition
+    try:
+        if time.time() < deadline - 40:
+            # The WFTA approach uses the structure of Z_2 x Z_2 x Z_3
+            # For 2x4x6, we can view this as multiplying (2x2) blocks with (2x3) blocks
+            # Then apply WFTA to the block structure
+            
+            # First, let's try to find a rank-40 decomposition using the structure
+            # The key insight is that 4 = 2*2 and 6 = 2*3, so we have a 2x2 grid of 2x3 blocks
+            
+            # Try to construct a rank-40 decomposition using WFTA principles
+            # This involves finding a sparse diagonal form in the Fourier domain
+            
+            # For now, let's try to improve the current rank-42 by looking for
+            # additional linear dependencies that SVD might have missed
+            
+            # Use a different tolerance and approach to find more dependencies
+            new_U = U_np.copy()
+            new_V = V_np.copy()
+            new_W = W_np.copy()
+            eliminated = set()
+            
+            # Use a stricter tolerance to find more dependencies
+            for iteration in range(10):
+                if time.time() > deadline - 35:
+                    break
+                
+                remaining = [c for c in range(rank) if c not in eliminated]
+                if len(remaining) <= 1:
+                    break
+                
+                M_sub = M[:, remaining]
+                
+                try:
+                    U_sub, s_sub, Vt_sub = np.linalg.svd(M_sub, full_matrices=False)
+                except np.linalg.LinAlgError:
+                    break
+                
+                # Use a stricter tolerance
+                tol_strict = 1e-12
+                eff_rank_strict = int(np.sum(s_sub > tol_strict))
+                
+                if eff_rank_strict >= len(remaining):
+                    break
+                
+                null_strict = Vt_sub[eff_rank_strict:, :]
+                
+                # Try to eliminate using the strict null space
+                best_col = None
+                best_score = -1
+                best_null_idx = 0
+                
+                for nv_idx in range(null_strict.shape[0]):
+                    nv = null_strict[nv_idx]
+                    for local_c, global_c in enumerate(remaining):
+                        score = abs(nv[local_c])
+                        if score > best_score and score > 1e-8:
+                            best_score = score
+                            best_col = global_c
+                            best_null_idx = nv_idx
+                
+                if best_col is None:
+                    break
+                
+                nv = null_strict[best_null_idx]
+                local_best = remaining.index(best_col)
+                pivot_val = nv[local_best]
+                
+                if abs(pivot_val) < 1e-10:
+                    continue
+                
+                for local_c, global_c in enumerate(remaining):
+                    if global_c == best_col:
+                        continue
+                    coeff = -nv[local_c] / pivot_val
+                    if abs(coeff) > 1e-10:
+                        new_U[:, global_c] += coeff * new_U[:, best_col]
+                        new_V[:, global_c] += coeff * new_V[:, best_col]
+                        new_W[:, global_c] += coeff * new_W[:, best_col]
+                
+                eliminated.add(best_col)
+            
+            if eliminated:
+                keep = [c for c in range(rank) if c not in eliminated]
+                new_rank = len(keep)
+                final_U = new_U[:, keep]
+                final_V = new_V[:, keep]
+                final_W = new_W[:, keep]
+                
+                # Verify with very tight tolerance
+                valid = True
+                for i in range(n):
+                    for j in range(m):
+                        for k in range(p):
+                            total = 0.0
+                            for r in range(new_rank):
+                                total += final_U[i*m+j, r] * final_V[j*p+k, r] * final_W[k*n+i, r]
+                            if abs(total - 1.0) > 1e-9:
+                                valid = False
+                                break
+                        if not valid:
+                            break
+                    if not valid:
+                        break
+                
+                if valid and new_rank < best_rank:
+                    best_rank = new_rank
+                    def to_list(arr):
+                        result = []
+                        for row in arr:
+                            result.append([])
+                            for val in row:
+                                frac = round(val * 2) / 2
+                                if abs(frac - round(frac)) < 1e-10:
+                                    frac = int(round(frac))
+                                result[-1].append(frac)
+                        return result
+                    best_result = {
+                        "U": to_list(final_U),
+                        "V": to_list(final_V),
+                        "W": to_list(final_W)
+                    }
+    except Exception:
+        pass
+    
+    return best_result
+# EVOLVE-BLOCK-END

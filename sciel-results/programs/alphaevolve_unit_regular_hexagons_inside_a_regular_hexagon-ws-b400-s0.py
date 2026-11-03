@@ -7,8 +7,9 @@ N = 11
 APOTHEM = math.sqrt(3) / 2.0
 START_TIME = time.time()
 TIME_LIMIT = 150.0
-SAFETY_MARGIN = 10.0
+SAFETY_MARGIN = 12.0
 EPS = 1e-9
+MIN_DIST = 2.0 * APOTHEM
 
 def construct():
     if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
@@ -22,100 +23,122 @@ def construct():
             pts.append((x, y))
         return np.array(pts)
 
-    # Generate candidate configurations
+    # Generate a much larger set of candidate hexagonal configurations
+    # These are all 11-hexagon polyhexes on a hexagonal lattice
     candidates = []
-
-    # Standard hexagonal cluster
-    candidates.append([(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(1,1),(-1,2),(-2,1),(2,-1)])
-    # Cross
-    candidates.append([(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,0),(-2,0),(0,2),(0,-2)])
-    # 3x3 block + 2
-    candidates.append([(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(0,2),(1,2),(2,2),(-1,1),(3,1)])
-    # 4x3 minus corners
-    candidates.append([(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(3,1),(1,2),(2,2),(3,2)])
-    # Staircase
-    candidates.append([(0,0),(1,0),(0,1),(1,1),(2,1),(0,2),(1,2),(2,2),(0,3),(1,3),(2,3)])
-    # Compact 3x3+2
-    candidates.append([(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(0,2),(1,2),(2,2),(0,3),(1,3)])
-    # Star
-    candidates.append([(0,0),(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(2,0),(-2,0),(0,2),(0,-2)])
-    # Elongated
-    candidates.append([(0,0),(1,0),(2,0),(3,0),(4,0),(0,1),(1,1),(2,1),(3,1),(4,1),(5,1)])
-    # Asymmetric star
-    candidates.append([(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,1),(-2,2),(-1,3),(1,-2)])
-    # Compact with top
-    candidates.append([(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(0,2),(1,2),(2,2),(1,3),(2,3)])
-    # Wide base
-    candidates.append([(0,0),(1,0),(0,1),(1,1),(2,1),(3,1),(0,2),(1,2),(2,2),(3,2),(1,3)])
-    # Tall narrow
-    candidates.append([(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(0,2),(1,2),(0,3),(1,3),(0,4)])
-    # Star with asymmetric outer
-    candidates.append([(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,0),(-2,0),(0,2),(1,2)])
-    # Star with diagonal
-    candidates.append([(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,0),(-2,0),(1,1),(-1,-1)])
-    # Dense cluster
-    candidates.append([(0,0),(1,0),(2,0),(1,1),(2,1),(0,2),(1,2),(2,2),(-1,1),(3,1),(0,-1)])
-    # Zigzag
-    candidates.append([(0,0),(1,0),(0,1),(1,1),(2,1),(1,2),(2,2),(0,3),(1,3),(2,3),(3,2)])
-    # Star with top cluster
-    candidates.append([(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,1),(1,2),(-1,2),(0,3)])
-    # Trapezoid
-    candidates.append([(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(1,2),(2,2),(3,2)])
-    # Wide top
-    candidates.append([(0,0),(1,0),(0,1),(1,1),(2,1),(1,2),(2,2),(0,3),(1,3),(2,3),(3,3)])
-    # Star with inner diagonal
-    candidates.append([(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,0),(-2,0),(1,1),(-1,1)])
-    # 4x3 variant
-    candidates.append([(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(3,1),(0,2),(1,2),(2,2)])
-    # Wide with top
-    candidates.append([(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(3,1),(0,2),(1,2),(2,2),(1,3)])
-    # Symmetric star
-    candidates.append([(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,0),(-2,0),(0,2),(0,-2)])
-    # Very tall
-    candidates.append([(0,0),(1,0),(0,1),(1,1),(0,2),(1,2),(2,2),(0,3),(1,3),(0,4)])
-    # 3x3+row
-    candidates.append([(0,0),(1,0),(2,0),(0,1),(1,1),(0,2),(1,2),(2,2),(0,3),(1,3),(2,3)])
-    # Dense 4-wide
-    candidates.append([(0,0),(1,0),(2,0),(3,0),(1,1),(2,1),(3,1),(0,2),(1,2),(2,2),(3,2),(1,3),(2,3)])
-    # Star with asymmetric bottom
-    candidates.append([(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,0),(-2,0),(0,2),(1,-2)])
-    # Tall with top row
-    candidates.append([(0,0),(1,0),(0,1),(1,1),(2,1),(0,2),(1,2),(0,3),(1,3),(2,3),(1,4),(2,4)])
-    # Additional
-    candidates.append([(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(3,1),(0,2),(1,2),(2,2),(1,3),(2,3)])
-    candidates.append([(0,0),(1,0),(2,0),(1,1),(2,1),(0,2),(1,2),(2,2),(1,3),(2,3),(0,-1),(3,1)])
-    candidates.append([(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(3,1),(0,2),(1,2),(2,2)])
-    candidates.append([(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,0),(-2,0),(1,1),(-1,-1)])
-    candidates.append([(0,0),(1,0),(0,1),(1,1),(2,1),(1,2),(2,2),(0,3),(1,3),(2,3),(1,4),(2,4)])
-    candidates.append([(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(0,2),(1,2),(2,2),(0,3),(1,3)])
-    candidates.append([(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(1,2),(2,2),(0,3),(1,3)])
+    
+    # Core configurations (from original)
+    base_configs = [
+        [(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(1,1),(-1,2),(-2,1),(2,-1)],
+        [(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,0),(-2,0),(0,2),(0,-2)],
+        [(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(0,2),(1,2),(2,2),(-1,1),(3,1)],
+        [(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(3,1),(1,2),(2,2),(3,2)],
+        [(0,0),(1,0),(0,1),(1,1),(2,1),(0,2),(1,2),(2,2),(0,3),(1,3),(2,3)],
+        [(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(0,2),(1,2),(2,2),(0,3),(1,3)],
+        [(0,0),(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(2,0),(-2,0),(0,2),(0,-2)],
+        [(0,0),(1,0),(2,0),(3,0),(4,0),(0,1),(1,1),(2,1),(3,1),(4,1),(5,1)],
+        [(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,1),(-2,2),(-1,3),(1,-2)],
+        [(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(0,2),(1,2),(2,2),(1,3),(2,3)],
+        [(0,0),(1,0),(0,1),(1,1),(2,1),(3,1),(0,2),(1,2),(2,2),(3,2),(1,3)],
+        [(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(1,2),(2,2),(3,2),(0,3),(1,3)],
+        [(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,0),(-2,0),(0,2),(1,2)],
+        [(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,0),(-2,0),(1,1),(-1,-1)],
+        [(0,0),(1,0),(2,0),(1,1),(2,1),(0,2),(1,2),(2,2),(-1,1),(3,1),(0,-1)],
+        [(0,0),(1,0),(0,1),(1,1),(2,1),(1,2),(2,2),(0,3),(1,3),(2,3),(3,2)],
+        [(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,1),(1,2),(-1,2),(0,3)],
+        [(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(1,2),(2,2),(3,2)],
+        [(0,0),(1,0),(0,1),(1,1),(2,1),(1,2),(2,2),(0,3),(1,3),(2,3),(3,3)],
+        [(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,0),(-2,0),(1,1),(-1,1)],
+        [(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(3,1),(0,2),(1,2),(2,2)],
+        [(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(3,1),(0,2),(1,2),(2,2),(1,3)],
+        [(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,0),(-2,0),(0,2),(0,-2)],
+        [(0,0),(1,0),(0,1),(1,1),(0,2),(1,2),(2,2),(0,3),(1,3),(0,4)],
+        [(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(0,2),(1,2),(2,2),(0,3),(1,3)],
+        [(0,0),(1,0),(2,0),(3,0),(1,1),(2,1),(3,1),(0,2),(1,2),(2,2),(3,2),(1,3),(2,3)],
+        [(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,0),(-2,0),(0,2),(1,-2)],
+        [(0,0),(1,0),(0,1),(1,1),(2,1),(0,2),(1,2),(0,3),(1,3),(2,3),(1,4),(2,4)],
+        [(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(3,1),(0,2),(1,2),(2,2),(1,3),(2,3)],
+        [(0,0),(1,0),(2,0),(1,1),(2,1),(0,2),(1,2),(2,2),(1,3),(2,3),(0,-1),(3,1)],
+        [(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(3,1),(0,2),(1,2),(2,2)],
+        [(0,0),(1,0),(0,1),(-1,1),(-1,0),(0,-1),(1,-1),(2,0),(-2,0),(1,1),(-1,-1)],
+        [(0,0),(1,0),(0,1),(1,1),(2,1),(1,2),(2,2),(0,3),(1,3),(2,3),(1,4),(2,4)],
+        [(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(0,2),(1,2),(2,2),(0,3),(1,3)],
+        [(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(1,2),(2,2),(0,3),(1,3)],
+        [(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(3,1),(1,2),(2,2),(0,-1)],
+        [(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(1,2),(2,2),(3,2),(0,3),(1,3)],
+        [(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(1,2),(2,2),(3,2),(0,-1)],
+        [(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(3,1),(0,2),(1,2),(2,2),(3,2)],
+        [(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(0,2),(1,2),(2,2),(3,2),(0,3)],
+        [(0,0),(1,0),(2,0),(3,0),(0,1),(1,1),(2,1),(3,1),(1,2),(2,2),(0,2)],
+        [(0,0),(1,0),(2,0),(3,0),(1,1),(2,1),(3,1),(1,2),(2,2),(3,2),(0,2),(0,3)],
+    ]
+    
+    # Add more diverse configurations
+    additional_configs = [
+        # More compact configurations
+        [(0,0),(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(2,0),(-2,0),(1,-1),(-1,-1)],
+        [(0,0),(1,0),(2,0),(-1,0),(-2,0),(0,1),(1,1),(-1,1),(0,-1),(1,-1),(-1,-1)],
+        [(0,0),(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(2,1),(-2,1),(2,-1),(-2,-1)],
+        
+        # Elongated configurations
+        [(0,0),(1,0),(2,0),(3,0),(4,0),(0,1),(1,1),(2,1),(0,-1),(1,-1),(2,-1)],
+        [(0,0),(1,0),(2,0),(3,0),(4,0),(5,0),(0,1),(1,1),(2,1),(3,1),(4,1)],
+        [(0,0),(1,0),(2,0),(3,0),(4,0),(0,1),(1,1),(2,1),(3,1),(4,1),(5,1)],
+        
+        # Diamond-like
+        [(0,0),(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(1,-1),(-1,-1),(2,0),(-2,0)],
+        
+        # Star-like
+        [(0,0),(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(2,0),(-2,0),(0,2),(0,-2)],
+        
+        # More varied shapes
+        [(0,0),(1,0),(2,0),(0,1),(1,1),(2,1),(3,1),(0,2),(1,2),(2,2),(3,2)],
+        [(0,0),(1,0),(2,0),(3,0),(4,0),(0,1),(1,1),(2,1),(1,2),(2,2),(3,2)],
+        [(0,0),(1,0),(2,0),(3,0),(4,0),(0,1),(1,1),(2,1),(3,1),(4,1),(0,2)],
+        
+        # Irregular but compact
+        [(0,0),(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(2,1),(-2,1),(1,-1),(-1,-1)],
+        [(0,0),(1,0),(2,0),(-1,0),(-2,0),(0,1),(1,1),(-1,1),(2,1),(-2,1),(0,-1)],
+        [(0,0),(1,0),(-1,0),(0,1),(0,-1),(1,1),(-1,1),(1,-1),(-1,-1),(2,1),(-2,1)],
+    ]
+    
+    for cfg in base_configs + additional_configs:
+        if len(cfg) == 11:
+            # Normalize: translate so that the centroid is at origin
+            cfg_arr = np.array(cfg, dtype=float)
+            centroid = cfg_arr.mean(axis=0)
+            cfg_normalized = [tuple(c - centroid) for c in cfg]
+            candidates.append(cfg_normalized)
+    
+    # Remove duplicates by comparing sorted tuples
+    seen = set()
+    unique_candidates = []
+    for c in candidates:
+        key = tuple(sorted(c))
+        if key not in seen:
+            seen.add(key)
+            unique_candidates.append(c)
+    candidates = unique_candidates
 
     def calc_S_for_beta(pts, beta):
-        """Vectorized LP for minimum enclosing hexagon with given rotation."""
         if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
             return float('inf'), None, None
 
         angles = beta + math.pi / 6.0 + np.arange(6) * math.pi / 3.0
         normals = np.column_stack([np.cos(angles), np.sin(angles)])
-
         n_pts = len(pts)
-        # For each normal and point: two constraints
-        # Total: 12 * n_pts
         n_constraints = 12 * n_pts
         A_ub = np.zeros((n_constraints, 3))
         b_ub = np.zeros(n_constraints)
 
-        # Vectorize: for each normal k, project all points
         for k in range(6):
             nx, ny = normals[k]
-            projs = pts[:, 0] * nx + pts[:, 1] * ny  # (n_pts,)
+            projs = pts[:, 0] * nx + pts[:, 1] * ny
             start = 2 * k * n_pts
-            # Constraint 1: -nx*cx - ny*cy - D <= -proj_i
             A_ub[start:start+n_pts, 0] = -nx
             A_ub[start:start+n_pts, 1] = -ny
             A_ub[start:start+n_pts, 2] = -1.0
             b_ub[start:start+n_pts] = -projs
-            # Constraint 2: nx*cx + ny*cy - D <= proj_i
             A_ub[start+n_pts:start+2*n_pts, 0] = nx
             A_ub[start+n_pts:start+2*n_pts, 1] = ny
             A_ub[start+n_pts:start+2*n_pts, 2] = -1.0
@@ -123,7 +146,6 @@ def construct():
 
         c_obj = np.array([0.0, 0.0, 1.0])
         bounds = [(None, None), (None, None), (0, None)]
-
         try:
             res = linprog(c_obj, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
             if res.status == 0:
@@ -138,20 +160,18 @@ def construct():
             return float('inf'), None, None
 
     def exact_S(pts, cx, cy, beta):
-        """Exact computation of S for given center and rotation."""
         angles = beta + math.pi / 6.0 + np.arange(6) * math.pi / 3.0
         normals = np.column_stack([np.cos(angles), np.sin(angles)])
         pts_centered = pts - np.array([cx, cy])
-        projs = pts_centered @ normals.T  # (n_pts, 6)
+        projs = pts_centered @ normals.T
         D = np.max(np.abs(projs))
         return (D + APOTHEM) / APOTHEM
 
     def smooth_calc_S(pts, cx, cy, beta, temperature=0.05):
-        """Smooth surrogate using log-sum-exp."""
         angles = beta + math.pi / 6.0 + np.arange(6) * math.pi / 3.0
         normals = np.column_stack([np.cos(angles), np.sin(angles)])
         pts_centered = pts - np.array([cx, cy])
-        projs = pts_centered @ normals.T  # (n_pts, 6)
+        projs = pts_centered @ normals.T
         all_projs = np.concatenate([projs.ravel(), (-projs).ravel()])
         max_val = np.max(all_projs)
         if max_val > 200:
@@ -162,8 +182,26 @@ def construct():
         D = temperature * log_sum
         return (D + APOTHEM) / APOTHEM
 
+    def check_overlap(pts):
+        n = len(pts)
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.linalg.norm(pts[i] - pts[j])
+                if d < MIN_DIST - 1e-6:
+                    return False
+        return True
+
+    def collision_penalty(pts, min_dist=MIN_DIST):
+        n = len(pts)
+        penalty = 0.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = np.linalg.norm(pts[i] - pts[j])
+                if d < min_dist:
+                    penalty += (min_dist - d) ** 2
+        return penalty
+
     def optimize_shape(pts):
-        """Multi-stage optimization for a fixed point configuration."""
         best_S = float('inf')
         best_beta = 0.0
         best_center = None
@@ -171,8 +209,8 @@ def construct():
         if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
             return float('inf'), 0.0, None
 
-        # Stage 1: Grid search over beta in [0, pi/6]
-        n_grid = 49
+        # Stage 1: Dense grid search over beta (80 points for better coverage)
+        n_grid = 80
         for i in range(n_grid):
             if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
                 break
@@ -191,7 +229,7 @@ def construct():
             if time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN:
                 res = minimize_scalar(lambda b: calc_S_for_beta(pts, b)[0],
                                      bounds=(0, math.pi / 6), method='bounded',
-                                     options={'maxiter': 300, 'xatol': 1e-11})
+                                     options={'maxiter': 400, 'xatol': 1e-12})
                 if res.fun < best_S:
                     best_S = res.fun
                     best_beta = res.x
@@ -199,10 +237,10 @@ def construct():
         except Exception:
             pass
 
-        # Stage 3: Joint (cx, cy, beta) optimization with smooth surrogate
+        # Stage 3: Joint (cx, cy, beta) with smooth surrogate - more temperatures and starts
         try:
             if time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN:
-                temperatures = [0.1, 0.05, 0.02, 0.01]
+                temperatures = [0.15, 0.08, 0.04, 0.02, 0.01]
                 for temp in temperatures:
                     if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
                         break
@@ -212,14 +250,18 @@ def construct():
                         beta = ((beta % (math.pi / 6)) + math.pi / 6) % (math.pi / 6)
                         return smooth_calc_S(pts, cx, cy, beta, temperature=t)
 
-                    start_betas = [best_beta, best_beta + 0.04, best_beta - 0.04, 0.0, math.pi / 12]
+                    # More diverse starting points
+                    start_betas = [best_beta, best_beta + 0.05, best_beta - 0.05,
+                                   0.0, math.pi / 12, math.pi / 24, 5*math.pi/24,
+                                   best_beta + 0.1, best_beta - 0.1,
+                                   best_beta + 0.15, best_beta - 0.15]
                     for sb in start_betas:
                         if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
                             break
                         init = [best_center[0], best_center[1], sb]
                         try:
                             res = minimize(smooth_obj, init, method='Nelder-Mead',
-                                         options={'maxiter': 500, 'xatol': 1e-11, 'fatol': 1e-11})
+                                         options={'maxiter': 800, 'xatol': 1e-12, 'fatol': 1e-12, 'adaptive': True})
                             if res.fun < 1e10:
                                 cx_r, cy_r, beta_r = res.x
                                 beta_r = ((beta_r % (math.pi / 6)) + math.pi / 6) % (math.pi / 6)
@@ -233,7 +275,7 @@ def construct():
         except Exception:
             pass
 
-        # Stage 4: High-precision polish with exact objective
+        # Stage 4: High-precision polish with exact objective - more starts
         try:
             if time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN:
                 def exact_obj(params):
@@ -241,16 +283,27 @@ def construct():
                     beta = ((beta % (math.pi / 6)) + math.pi / 6) % (math.pi / 6)
                     return exact_S(pts, cx, cy, beta)
 
+                delta = 0.005
                 polish_starts = [
                     [best_center[0], best_center[1], best_beta],
-                    [best_center[0], best_center[1], best_beta + 0.01],
-                    [best_center[0], best_center[1], best_beta - 0.01],
-                    [best_center[0] + 0.01, best_center[1], best_beta],
-                    [best_center[0] - 0.01, best_center[1], best_beta],
-                    [best_center[0], best_center[1] + 0.01, best_beta],
-                    [best_center[0], best_center[1] - 0.01, best_beta],
-                    [best_center[0] + 0.005, best_center[1] + 0.005, best_beta],
-                    [best_center[0] - 0.005, best_center[1] - 0.005, best_beta],
+                    [best_center[0], best_center[1], best_beta + delta],
+                    [best_center[0], best_center[1], best_beta - delta],
+                    [best_center[0] + delta, best_center[1], best_beta],
+                    [best_center[0] - delta, best_center[1], best_beta],
+                    [best_center[0], best_center[1] + delta, best_beta],
+                    [best_center[0], best_center[1] - delta, best_beta],
+                    [best_center[0] + delta*0.5, best_center[1] + delta*0.5, best_beta],
+                    [best_center[0] - delta*0.5, best_center[1] - delta*0.5, best_beta],
+                    [best_center[0] + delta*0.5, best_center[1] - delta*0.5, best_beta],
+                    [best_center[0] - delta*0.5, best_center[1] + delta*0.5, best_beta],
+                    [best_center[0], best_center[1], best_beta + delta*0.5],
+                    [best_center[0], best_center[1], best_beta - delta*0.5],
+                    [best_center[0], best_center[1], best_beta + delta*2.0],
+                    [best_center[0], best_center[1], best_beta - delta*2.0],
+                    [best_center[0] + delta*1.5, best_center[1] + delta*1.5, best_beta + delta*0.5],
+                    [best_center[0] - delta*1.5, best_center[1] - delta*1.5, best_beta - delta*0.5],
+                    [best_center[0] + delta*1.5, best_center[1] - delta*1.5, best_beta + delta*0.5],
+                    [best_center[0] - delta*1.5, best_center[1] + delta*1.5, best_beta - delta*0.5],
                 ]
 
                 for init in polish_starts:
@@ -258,7 +311,7 @@ def construct():
                         break
                     try:
                         res = minimize(exact_obj, init, method='Nelder-Mead',
-                                     options={'maxiter': 5000, 'xatol': 1e-13, 'fatol': 1e-13})
+                                     options={'maxiter': 8000, 'xatol': 1e-14, 'fatol': 1e-14, 'adaptive': True})
                         if res.fun < best_S:
                             best_S = res.fun
                             best_center = (res.x[0], res.x[1])
@@ -268,15 +321,115 @@ def construct():
         except Exception:
             pass
 
+        # Stage 5: Final LP-based center refinement
+        try:
+            if time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN:
+                S_final, center_final, D_final = calc_S_for_beta(pts, best_beta)
+                if S_final < best_S:
+                    best_S = S_final
+                    best_center = center_final
+        except Exception:
+            pass
+
         return best_S, best_beta, best_center
 
-    # Evaluate all candidates
+    def optimize_positions_continuous(pts0, beta, center):
+        if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
+            return None
+
+        n_pts = len(pts0)
+        x0 = pts0.ravel()
+
+        def obj(params):
+            if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
+                return 1e10
+            pts = params.reshape(n_pts, 2)
+            pen = collision_penalty(pts)
+            if pen > 1e-3:
+                return 1e6 + pen
+            S = exact_S(pts, center[0], center[1], beta)
+            return S + 500.0 * pen
+
+        best_S = float('inf')
+        best_pts = None
+
+        rng = np.random.default_rng(42)
+        perturbations = [0.0]
+        for _ in range(16):
+            perturbations.append(rng.uniform(-0.15, 0.15, size=2 * n_pts))
+
+        for pert in perturbations:
+            if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
+                break
+            init = x0 + pert
+            try:
+                res = minimize(obj, init, method='Nelder-Mead',
+                              options={'maxiter': 3000, 'xatol': 1e-12, 'fatol': 1e-12, 'adaptive': True})
+                if res.fun < best_S and res.fun < 1e5:
+                    best_S = res.fun
+                    best_pts = res.x.reshape(n_pts, 2)
+            except Exception:
+                pass
+
+        if best_pts is None or not check_overlap(best_pts):
+            return None
+
+        best_S2 = float('inf')
+        best_beta2 = beta
+        best_center2 = center
+        for i in range(50):
+            b2 = i * (math.pi / 6) / 49
+            S2, c2, _ = calc_S_for_beta(best_pts, b2)
+            if S2 < best_S2:
+                best_S2 = S2
+                best_beta2 = b2
+                best_center2 = c2
+
+        try:
+            res = minimize_scalar(lambda b: calc_S_for_beta(best_pts, b)[0],
+                                 bounds=(0, math.pi / 6), method='bounded',
+                                 options={'maxiter': 300, 'xatol': 1e-12})
+            if res.fun < best_S2:
+                best_S2 = res.fun
+                best_beta2 = res.x
+                _, best_center2, _ = calc_S_for_beta(best_pts, best_beta2)
+        except Exception:
+            pass
+
+        try:
+            def exact_obj2(params):
+                cx, cy, b = params
+                b = ((b % (math.pi / 6)) + math.pi / 6) % (math.pi / 6)
+                return exact_S(best_pts, cx, cy, b)
+            for _ in range(8):
+                init = [best_center2[0], best_center2[1], best_beta2 + rng.uniform(-0.02, 0.02)]
+                res = minimize(exact_obj2, init, method='Nelder-Mead',
+                              options={'maxiter': 5000, 'xatol': 1e-14, 'fatol': 1e-14, 'adaptive': True})
+                if res.fun < best_S2:
+                    best_S2 = res.fun
+                    best_center2 = (res.x[0], res.x[1])
+                    best_beta2 = ((res.x[2] % (math.pi / 6)) + math.pi / 6) % (math.pi / 6)
+        except Exception:
+            pass
+
+        if best_S2 < best_S - 1e-9:
+            return best_S2, best_pts, best_beta2, best_center2
+        return None
+
     best_global_S = float('inf')
     best_global_pts = None
     best_global_beta = 0.0
     best_global_center = None
 
-    for idx, axial in enumerate(candidates):
+    def quick_bbox_score(axial_list):
+        pts = axial_to_cartesian(axial_list)
+        return np.max(pts[:, 0]) - np.min(pts[:, 0]) + np.max(pts[:, 1]) - np.min(pts[:, 1])
+
+    # Sort by bounding box score (smaller is better) to prioritize compact shapes
+    sorted_candidates = sorted(candidates, key=quick_bbox_score)
+
+    # Process candidates, spending more time on the most promising ones
+    for idx, axial in enumerate(sorted_candidates):
         if time.time() - START_TIME > TIME_LIMIT - SAFETY_MARGIN:
             break
         pts = axial_to_cartesian(axial)
@@ -286,6 +439,17 @@ def construct():
             best_global_pts = pts
             best_global_beta = beta
             best_global_center = center
+
+        # Only do continuous optimization for candidates that are close to the best
+        if S < best_global_S + 0.05 and time.time() - START_TIME < TIME_LIMIT - SAFETY_MARGIN - 30:
+            result = optimize_positions_continuous(pts, beta, center)
+            if result is not None:
+                S_c, pts_c, beta_c, center_c = result
+                if S_c < best_global_S:
+                    best_global_S = S_c
+                    best_global_pts = pts_c
+                    best_global_beta = beta_c
+                    best_global_center = center_c
 
     if best_global_center is None or best_global_S == float('inf'):
         best_global_pts = axial_to_cartesian(candidates[0])
@@ -302,7 +466,6 @@ def construct():
     cx, cy = best_global_center
     angle_deg = math.degrees(best_global_beta)
 
-    # Final: compute side length with tiny safety scale
     SCALE = 1.0 + 1e-14
     pts_scaled = best_global_pts.copy()
     for i in range(len(pts_scaled)):

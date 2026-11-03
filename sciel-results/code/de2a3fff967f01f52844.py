@@ -1,0 +1,251 @@
+import time
+import numpy as np
+from itertools import product
+
+DIMENSIONS = [3, 3, 8]
+DEADLINE = 145.0
+_START = time.time()
+
+def _time_left():
+    return DEADLINE - (time.time() - _START)
+
+def _strassen_2x2_2():
+    """Return U, V, W for 2x2 * 2x2 with rank 7 (Strassen)."""
+    n, m, p = 2, 2, 2
+    rank = 7
+    U = [[0]*rank for _ in range(n*m)]
+    V = [[0]*rank for _ in range(m*p)]
+    W = [[0]*rank for _ in range(p*n)]
+    
+    # P1 = (a+d)(e+h)
+    U[0][0] = 1; U[3][0] = 1
+    V[0][0] = 1; V[3][0] = 1
+    W[0][0] = 1; W[3][0] = 1
+    
+    # P2 = (c+d)e
+    U[2][1] = 1; U[3][1] = 1
+    V[0][1] = 1
+    W[1][1] = 1; W[3][1] = -1
+    
+    # P3 = a(f-h)
+    U[0][2] = 1
+    V[1][2] = 1; V[3][2] = -1
+    W[2][2] = 1; W[3][2] = 1
+    
+    # P4 = d(g-e)
+    U[3][3] = 1
+    V[2][3] = 1; V[0][3] = -1
+    W[0][3] = 1; W[1][3] = 1
+    
+    # P5 = (a+b)h
+    U[0][4] = 1; U[1][4] = 1
+    V[3][4] = 1
+    W[0][4] = -1; W[2][4] = 1
+    
+    # P6 = (c-a)(e+f)
+    U[2][5] = 1; U[0][5] = -1
+    V[0][5] = 1; V[1][5] = 1
+    W[3][5] = 1
+    
+    # P7 = (b-d)(g+h)
+    U[1][6] = 1; U[3][6] = -1
+    V[2][6] = 1; V[3][6] = 1
+    W[0][6] = 1
+    
+    return U, V, W
+
+def _verify_fast(U, V, W, n, m, p, tol=1e-6):
+    """Verify decomposition is exact using numpy."""
+    rank = len(U[0])
+    U_np = np.array(U)
+    V_np = np.array(V)
+    W_np = np.array(W)
+    
+    # Reshape to 3D tensors for easier manipulation?
+    # U is (n*m, rank) -> (n, m, rank)
+    # V is (m*p, rank) -> (m, p, rank)
+    # W is (p*n, rank) -> (p, n, rank)
+    
+    U_3d = U_np.reshape(n, m, rank)
+    V_3d = V_np.reshape(m, p, rank)
+    W_3d = W_np.reshape(p, n, rank)
+    
+    # We need to check if sum_c U[i,j,c] * V[j,k,c] * W[k,i,c] == 1
+    # for all i,j,k.
+    
+    # Iterate over i, j, k
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                # Sum over c
+                # U[i,j,:] * V[j,k,:] * W[k,i,:]
+                s = np.sum(U_3d[i, j, :] * V_3d[j, k, :] * W_3d[k, i, :])
+                if abs(s - 1.0) > tol:
+                    return False
+    return True
+
+def _schoolbook(n, m, p):
+    """Schoolbook decomposition of rank n*m*p."""
+    rank = n * m * p
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    column = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][column] = 1
+                V[j * p + k][column] = 1
+                W[k * n + i][column] = 1
+                column += 1
+    return U, V, W
+
+def _build_decomposition(n, m, p, blocks):
+    """
+    Build decomposition using Strassen on specified 2x2x2 blocks.
+    Overlapping blocks are allowed; contributions are summed.
+    Uncovered positions use schoolbook.
+    """
+    covered = set()
+    for (i0, j0, k0) in blocks:
+        for di in range(2):
+            for dj in range(2):
+                for dk in range(2):
+                    covered.add((i0+di, j0+dj, k0+dk))
+    
+    n_school = n*m*p - len(covered)
+    rank = 7 * len(blocks) + n_school
+    U = [[0]*rank for _ in range(n*m)]
+    V = [[0]*rank for _ in range(m*p)]
+    W = [[0]*rank for _ in range(p*n)]
+    
+    col = 0
+    for (i0, j0, k0) in blocks:
+        sU, sV, sW = _strassen_2x2_2()
+        for c in range(7):
+            for di in range(2):
+                for dj in range(2):
+                    U[(i0+di)*m + (j0+dj)][col+c] += sU[di*2+dj][c]
+            for dj in range(2):
+                for dk in range(2):
+                    V[(j0+dj)*p + (k0+dk)][col+c] += sV[dj*2+dk][c]
+            for dk in range(2):
+                for di in range(2):
+                    W[(k0+dk)*n + (i0+di)][col+c] += sW[dk*2+di][c]
+        col += 7
+    
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                if (i, j, k) not in covered:
+                    U[i*m + j][col] = 1
+                    V[j*p + k][col] = 1
+                    W[k*n + i][col] = 1
+                    col += 1
+    
+    return U, V, W
+
+def _find_best_block_placements(n, m, p, max_blocks=8, deadline_check=None):
+    """
+    Systematically search for optimal non-overlapping 2x2x2 block placements.
+    Returns list of best configurations to try.
+    """
+    if deadline_check and deadline_check() < 10:
+        return []
+    
+    # All possible 2x2x2 block positions
+    all_positions = [(i, j, k) for i in range(n-1) for j in range(m-1) for k in range(p-1)]
+    
+    def blocks_overlap(b1, b2):
+        """Check if two 2x2x2 blocks overlap."""
+        return (abs(b1[0]-b2[0]) < 2 and 
+                abs(b1[1]-b2[1]) < 2 and 
+                abs(b1[2]-b2[2]) < 2)
+    
+    def is_non_overlapping(block_list):
+        """Check if all blocks in the list are non-overlapping."""
+        for i in range(len(block_list)):
+            for j in range(i+1, len(block_list)):
+                if blocks_overlap(block_list[i], block_list[j]):
+                    return False
+        return True
+    
+    # Generate all non-overlapping configurations of size 1 to max_blocks
+    configs = []
+    
+    # Size 1
+    for pos in all_positions:
+        configs.append([pos])
+    
+    # Size 2
+    for i in range(len(all_positions)):
+        for j in range(i+1, len(all_positions)):
+            if not blocks_overlap(all_positions[i], all_positions[j]):
+                configs.append([all_positions[i], all_positions[j]])
+    
+    # Size 3+ (limit search for time)
+    if deadline_check and deadline_check() < 20:
+        return configs[:100]  # Return early with what we have
+    
+    # For size 3, be more selective
+    for i in range(len(all_positions)):
+        for j in range(i+1, len(all_positions)):
+            if blocks_overlap(all_positions[i], all_positions[j]):
+                continue
+            for k in range(j+1, len(all_positions)):
+                if (blocks_overlap(all_positions[i], all_positions[k]) or 
+                    blocks_overlap(all_positions[j], all_positions[k])):
+                    continue
+                configs.append([all_positions[i], all_positions[j], all_positions[k]])
+    
+    # Sort by coverage (prefer configurations that cover more cells)
+    def coverage_score(config):
+        covered = set()
+        for (i0, j0, k0) in config:
+            for di in range(2):
+                for dj in range(2):
+                    for dk in range(2):
+                        covered.add((i0+di, j0+dj, k0+dk))
+        return len(covered)
+    
+    configs.sort(key=coverage_score, reverse=True)
+    
+    # Limit to reasonable number
+    return configs[:500]
+
+def construct():
+    n, m, p = DIMENSIONS
+    
+    # Start with known good configuration
+    blocks4 = [(0, 0, 0), (0, 0, 2), (0, 0, 4), (0, 0, 6)]
+    U, V, W = _build_decomposition(n, m, p, blocks4)
+    if _verify_fast(U, V, W, n, m, p):
+        best_U, best_V, best_W = U, V, W
+        best_rank = len(U[0])
+    else:
+        best_U, best_V, best_W = None, None, None
+        best_rank = n*m*p
+    
+    # Systematic search for better configurations
+    search_configs = _find_best_block_placements(n, m, p, max_blocks=4, deadline_check=_time_left)
+    
+    for config in search_configs:
+        if _time_left() < 5:
+            break
+        
+        # Skip if we already tested this exact config
+        config_key = tuple(sorted(config))
+        
+        U, V, W = _build_decomposition(n, m, p, config)
+        if _verify_fast(U, V, W, n, m, p):
+            r = len(U[0])
+            if r < best_rank:
+                best_rank = r
+                best_U, best_V, best_W = U, V, W
+    
+    if best_U is not None:
+        return {"U": best_U, "V": best_V, "W": best_W}
+    
+    # Fallback to schoolbook
+    U, V, W = _schoolbook(n, m, p)
+    return {"U": U, "V": V, "W": W}

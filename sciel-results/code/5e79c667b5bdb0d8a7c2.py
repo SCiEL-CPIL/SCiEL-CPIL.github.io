@@ -1,0 +1,247 @@
+import numpy as np
+import time
+import scipy.optimize as opt
+
+N = 600
+W = 1.0 / 1200.0
+X = np.linspace(-0.25, 0.25, N, endpoint=False)
+
+# Precompute fine grid for fast convolution ratio
+FINE_N = 6000
+X_FINE = np.linspace(-0.25, 0.25, FINE_N, endpoint=False)
+DX = 0.5 / FINE_N
+CELL = np.clip(((X_FINE + 0.25) / W).astype(np.int64), 0, N - 1)
+N_FFT = 1 << (2 * FINE_N - 1).bit_length()
+
+def ratio_from_h(h):
+    """Compute max(autoconv) / ||h||_2^2 using FFT on fine grid."""
+    h = np.asarray(h, dtype=np.float64)
+    if h.size != N:
+        h = np.resize(h, N)
+    h = np.clip(h, 0.0, None)
+    s = h.sum()
+    if s < 1e-15:
+        return float('inf')
+    f = h[CELL]
+    F = np.fft.rfft(f, N_FFT)
+    conv = np.fft.irfft(F * F, N_FFT)[:2 * FINE_N - 1] * DX
+    l2 = np.sum(f * f) * DX
+    if l2 < 1e-15:
+        return float('inf')
+    return float(np.max(conv) / l2)
+
+def quick_ratio(h):
+    """Fast ratio computation."""
+    f = h[CELL]
+    F = np.fft.rfft(f, N_FFT)
+    conv = np.fft.irfft(F * F, N_FFT)[:2 * FINE_N - 1] * DX
+    l2 = np.sum(f * f) * DX
+    if l2 < 1e-15:
+        return float('inf')
+    return float(np.max(conv) / l2)
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 145.0
+    
+    best_h = np.ones(N)
+    best_val = ratio_from_h(best_h)
+    
+    def update_best(h, val):
+        nonlocal best_h, best_val
+        if val < best_val:
+            best_val = val
+            best_h = h.copy()
+    
+    # === Phase 1: Low-dimensional smooth parametric models ===
+    # Instead of Fourier coefficients (which produce oscillatory, potentially non-smooth h),
+    # use smooth basis functions: Gaussians, Lorentzians, cosines, polynomials.
+    
+    def smooth_model_to_h(params):
+        """Convert smooth model parameters to step heights.
+        params[0] = base level
+        params[1::3] = amplitude
+        params[2::3] = center (for location-based basis)
+        params[3::3] = width (for location-based basis)
+        """
+        base = params[0]
+        h = np.full(N, base)
+        for k in range(1, len(params), 3):
+            amp = params[k]
+            mu = params[k+1]
+            sig = max(params[k+2], 1e-4)
+            # Gaussian basis
+            h += amp * np.exp(-0.5 * ((X - mu) / sig) ** 2)
+        return np.clip(h, 0.0, None)
+    
+    def smooth_ratio(params):
+        h = smooth_model_to_h(params)
+        return ratio_from_h(h)
+    
+    rng = np.random.default_rng(12345)
+    
+    # Try different numbers of Gaussian components
+    for n_comp in [1, 2, 3]:
+        n_starts = 20
+        for start in range(n_starts):
+            if time.time() > deadline - 50.0:
+                break
+            
+            base = float(rng.uniform(0.0, 0.2))
+            params = np.array([base])
+            for _ in range(n_comp):
+                amp = float(rng.uniform(0.5, 4.0))
+                mu = float(rng.uniform(-0.2, 0.2))
+                sig = float(rng.uniform(0.03, 0.12))
+                params = np.append(params, [amp, mu, sig])
+            
+            try:
+                result = opt.minimize(
+                    smooth_ratio,
+                    params,
+                    method='Nelder-Mead',
+                    options={'maxiter': 300, 'xatol': 1e-5, 'fatol': 1e-7, 'adaptive': True}
+                )
+                if result.fun < best_val:
+                    h_opt = smooth_model_to_h(result.x)
+                    update_best(h_opt, result.fun)
+            except Exception:
+                pass
+    
+    # === Phase 2: Cosine-based smooth models ===
+    # h(x) = c0 + sum c_k * cos(2*pi*k*x / (1/2)) for k=1..K
+    # This gives smooth, periodic-like profiles on [-1/4, 1/4]
+    
+    def cosine_model_to_h(coeffs):
+        """coeffs[0] = DC, coeffs[k] = coefficient for cos(2*pi*k*x/0.5)"""
+        h = np.zeros(N)
+        for k in range(len(coeffs)):
+            if k == 0:
+                h += coeffs[0]
+            else:
+                h += coeffs[k] * np.cos(2 * np.pi * k * X / 0.5)
+        return np.clip(h, 0.0, None)
+    
+    def cosine_ratio(coeffs):
+        h = cosine_model_to_h(coeffs)
+        return ratio_from_h(h)
+    
+    n_cos_starts = 25
+    max_k = 8
+    
+    for start in range(n_cos_starts):
+        if time.time() > deadline - 35.0:
+            break
+        
+        coeffs = np.zeros(max_k + 1)
+        coeffs[0] = float(rng.uniform(0.5, 2.0))
+        for k in range(1, max_k + 1):
+            coeffs[k] = float(rng.uniform(-1.0, 1.0))
+        
+        try:
+            result = opt.minimize(
+                cosine_ratio,
+                coeffs,
+                method='Nelder-Mead',
+                options={'maxiter': 250, 'xatol': 1e-5, 'fatol': 1e-7, 'adaptive': True}
+            )
+            if result.fun < best_val:
+                h_opt = cosine_model_to_h(result.x)
+                update_best(h_opt, result.fun)
+        except Exception:
+            pass
+    
+    # === Phase 3: Differential Evolution for moderate-dimensional smooth models ===
+    # Use DE on Gaussian superposition with 2-3 components
+    
+    def de_smooth_ratio(params):
+        h = smooth_model_to_h(params)
+        val = ratio_from_h(h)
+        if not np.isfinite(val):
+            return 1e10
+        return val
+    
+    for n_comp in [2, 3]:
+        if time.time() > deadline - 20.0:
+            break
+        dim = 1 + 3 * n_comp
+        bounds = [(0.0, 0.3)] + [(-4.0, 4.0), (-0.25, 0.25), (0.02, 0.15)] * n_comp
+        
+        x0 = np.array([0.1])
+        for _ in range(n_comp):
+            x0 = np.append(x0, [2.0, 0.0, 0.05])
+        
+        try:
+            result = opt.differential_evolution(
+                de_smooth_ratio,
+                bounds=bounds,
+                x0=x0,
+                seed=42,
+                maxiter=50,
+                tol=1e-6,
+                polish=True,
+                update_interval=1
+            )
+            if result.fun < best_val:
+                h_opt = smooth_model_to_h(result.x)
+                update_best(h_opt, result.fun)
+        except Exception:
+            pass
+    
+    # === Phase 4: Fine-grained coordinate refinement on best found ===
+    if time.time() < deadline - 10.0:
+        cur_h = best_h.copy()
+        cur_val = best_val
+        rng2 = np.random.default_rng(999)
+        
+        n_iter = 20000
+        for it in range(n_iter):
+            if time.time() > deadline - 3.0:
+                break
+            
+            # Adaptive step size based on progress
+            progress = min(it / n_iter, 1.0)
+            step_frac = 0.1 * (1.0 - 0.7 * progress) + 0.02
+            
+            n_coords = int(rng2.integers(1, 8))
+            idxs = rng2.choice(N, size=n_coords, replace=False)
+            
+            h_try = cur_h.copy()
+            for idx in idxs:
+                factor = float(rng2.uniform(1.0 - step_frac, 1.0 + step_frac))
+                h_try[idx] = max(0.0, cur_h[idx] * factor)
+            
+            v = quick_ratio(h_try)
+            if v < cur_val:
+                cur_val = v
+                cur_h = h_try
+                update_best(cur_h, cur_val)
+    
+    # === Phase 5: Hand-crafted smooth shapes ===
+    if time.time() < deadline - 3.0:
+        x_norm = np.linspace(-1.0, 1.0, N)
+        crafted = [
+            np.exp(-3.0 * x_norm**2),
+            np.exp(-1.5 * x_norm**2),
+            0.3 + 0.7 * np.exp(-5.0 * x_norm**2),
+            np.exp(-15.0 * (x_norm - 0.35)**2) + np.exp(-15.0 * (x_norm + 0.35)**2),
+            0.1 + np.exp(-20.0 * (x_norm - 0.45)**2) + np.exp(-20.0 * (x_norm + 0.45)**2),
+            1.0 - 0.4 * np.exp(-6.0 * x_norm**2),
+            0.5 + 0.5 * np.cos(np.pi * x_norm),
+            0.5 + 0.3 * np.cos(2 * np.pi * x_norm) + 0.2 * np.cos(4 * np.pi * x_norm),
+            np.exp(-4.0 * x_norm**2) + 0.3 * np.exp(-12.0 * (x_norm - 0.5)**2),
+            np.exp(-4.0 * x_norm**2) + 0.3 * np.exp(-12.0 * (x_norm + 0.5)**2),
+            1.0 / (1.0 + 10.0 * x_norm**2),
+            np.sinc(3.0 * x_norm),
+        ]
+        
+        for h in crafted:
+            if time.time() > deadline - 2.0:
+                break
+            h = np.clip(h, 0, None)
+            if h.sum() < 1e-12:
+                continue
+            v = ratio_from_h(h)
+            update_best(h, v)
+    
+    return list(best_h)

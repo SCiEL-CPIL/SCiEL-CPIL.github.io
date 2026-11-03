@@ -1,237 +1,446 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-N = 100
-
-# EVOLVE-BLOCK-START
 import numpy as np
 import time
 from scipy.optimize import minimize
 
-def _score(points):
-    """Largest common radius: min of half pairwise distances and wall clearance."""
-    # points is (N, 3)
-    d = points[:, None, :] - points[None, :, :]
-    dists = np.sqrt(np.sum(d * d, axis=2))
-    # Get unique pairs
-    iu = np.triu_indices(N, k=1)
-    min_pair = dists[iu].min()
-    clearance = (0.5 - np.abs(points)).min()
-    return min(min_pair * 0.5, clearance)
+N = 100
+HALF = 0.5
 
-def _energy_and_grad(x, target_r):
+def _compute_radius(centers):
     """
-    Energy function for BFGS optimization.
-    x is a flat array of length 3N.
-    target_r is the desired radius.
-    Returns (energy, gradient).
+    Computes the maximum common radius for a given set of centers.
+    Centers: (N, 3) array.
+    Cube: [-0.5, 0.5]^3.
     """
-    c = x.reshape(N, 3)
+    if centers.shape != (N, 3):
+        return 0.0
+    if not np.all(np.isfinite(centers)):
+        return 0.0
+        
+    # Wall constraints: distance from center to nearest wall
+    max_abs = np.max(np.abs(centers), axis=1)
+    wall_dists = 0.5 - max_abs
+    min_wall_dist = np.min(wall_dists)
     
-    # --- Pairwise Part ---
-    # diff[i, j] = c[i] - c[j]
-    diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
-    # dists[i, j] = ||c[i] - c[j]||
+    if min_wall_dist < 0:
+        return 0.0
+
+    # Pairwise constraints
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
     dists = np.sqrt(np.sum(diff**2, axis=2))
     
-    # Avoid division by zero on diagonal
-    np.fill_diagonal(dists, 1.0)
+    # Set diagonal to infinity to exclude self-distance
+    np.fill_diagonal(dists, np.inf)
+    min_pair_dist = np.min(dists)
     
-    # Active pairs: those closer than 2 * target_r
-    active = dists < 2.0 * target_r
-    # Ensure diagonal is not active
-    active[np.diag_indices_from(active)] = False
-    
-    # Violations: (2r - d) for active pairs, 0 otherwise
-    violations = np.where(active, 2.0 * target_r - dists, 0.0)
-    
-    # Energy is sum of squared violations (0.5 factor for clean gradient)
-    energy_pair = 0.5 * np.sum(violations**2)
-    
-    # Gradient calculation for pairs
-    # d/dx_i [ 0.5 * (2r - ||x_i - x_j||)^2 ]
-    # = (2r - d) * d/dx_i (2r - d)
-    # = (2r - d) * (-(x_i - x_j) / d)
-    # = - (2r - d) / d * (x_i - x_j)
-    # Note: violations[i,j] = 2r - d. So we need - violations[i,j] / d * (x_i - x_j)
-    # To avoid division by zero, we use safe_dists
-    safe_dists = np.where(dists > 1e-12, dists, 1.0)
-    unit_vecs = diff / safe_dists[:, :, np.newaxis]
-    
-    # weights[i,j] = violations[i,j]
-    # grad_i = - sum_j weights[i,j] * unit_vecs[i,j]
-    grad_pair = -np.sum(violations[:, :, np.newaxis] * unit_vecs, axis=1)
-    
-    # --- Wall Part ---
-    # Distance to each wall
-    # Walls are at -0.5 and 0.5 for each dimension
-    # dist_wall_k = 0.5 - |c_k|
-    wall_dists = 0.5 - np.abs(c)
-    
-    # Violations: target_r - wall_dist if positive
-    wall_violations = np.maximum(0.0, target_r - wall_dists)
-    
-    energy_wall = np.sum(wall_violations**2)
-    
-    # Gradient for walls
-    # d/dc [ (r - (0.5 - |c|))^2 ]
-    # = 2 * (r - (0.5 - |c|)) * d/dc (0.5 - |c|)
-    # = 2 * wall_violation * (-sign(c))
-    signs = np.sign(c)
-    # Handle c=0 case: sign(0)=0, which is fine, gradient is 0 at center
-    grad_wall = 2.0 * wall_violations * signs
-    
-    total_energy = energy_pair + energy_wall
-    total_grad = (grad_pair + grad_wall).flatten()
-    
-    return total_energy, total_grad
+    # The radius is half the minimum pairwise distance, limited by wall distance
+    r = min(min_pair_dist / 2.0, min_wall_dist)
+    return r
 
-def _optimize_bfgs(init_pts, target_r, max_iter=1000, gtol=1e-9, time_limit=50.0):
+def _energy_and_gradient(x, R):
     """
-    Run BFGS optimization with a time limit.
-    Returns (optimized_pts, success).
+    Calculates the repulsion energy and gradient for a target radius R.
+    Energy is the sum of squared violations of the distance constraints.
     """
-    t_start = time.time()
+    centers = x.reshape(-1, 3)
+    n = len(centers)
     
-    def objective(x):
-        if time.time() - t_start > time_limit:
-            raise TimeoutError()
-        return _energy_and_grad(x, target_r)
+    energy = 0.0
+    grad = np.zeros_like(centers)
+    
+    # 1. Pairwise terms
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2) + 1e-15)
+    np.fill_diagonal(dists, np.inf)
+    
+    # Mask for pairs closer than 2R
+    mask = dists < 2.0 * R
+    if np.any(mask):
+        i_idx, j_idx = np.triu_indices(n, k=1)
+        
+        d_ij = dists[i_idx, j_idx]
+        mask_pairs = d_ij < 2.0 * R
+        
+        if np.any(mask_pairs):
+            v_ij = 2.0 * R - d_ij[mask_pairs]
+            d_valid = d_ij[mask_pairs]
+            i_valid = i_idx[mask_pairs]
+            j_valid = j_idx[mask_pairs]
+            
+            energy += np.sum(v_ij**2)
+            
+            factors = 2.0 * v_ij / d_valid
+            vecs = centers[i_valid] - centers[j_valid]
+            forces = factors[:, np.newaxis] * vecs
+            
+            np.add.at(grad, i_valid, -forces)
+            np.add.at(grad, j_valid, forces)
+
+    # 2. Wall terms (vectorized)
+    abs_centers = np.abs(centers)
+    max_abs = np.max(abs_centers, axis=1)
+    wall_dists = 0.5 - max_abs
+    
+    mask_wall = wall_dists < R
+    if np.any(mask_wall):
+        violations_wall = R - wall_dists[mask_wall]
+        i_valid_wall = np.where(mask_wall)[0]
+        
+        energy += np.sum(violations_wall**2)
+        
+        # For each violating sphere, the gradient points away from the nearest wall
+        # Find the axis with the maximum absolute coordinate
+        max_k = np.argmax(abs_centers[i_valid_wall], axis=1)
+        signs = np.sign(centers[i_valid_wall, max_k])
+        grad_vals = 2.0 * violations_wall * signs
+        
+        # Scatter the gradient contributions
+        np.add.at(grad, (i_valid_wall, max_k), grad_vals)
+        
+    return energy, grad.flatten()
+
+def _soft_min_obj_grad(flat_pos, beta=100.0):
+    """
+    Soft-min objective: maximize the soft-minimum of all effective distances.
+    soft_min = -logsumexp(-beta * all_eff_dists) / beta
+    This approximates the minimum as beta -> infinity.
+    We minimize -soft_min.
+    """
+    pos = flat_pos.reshape(N, 3)
+    
+    # Pairwise distances
+    diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
+    dists_sq = np.sum(diff**2, axis=2)
+    np.fill_diagonal(dists_sq, np.inf)
+    dists = np.sqrt(dists_sq)
+    
+    # Get upper triangle indices
+    iu = np.triu_indices(N, k=1)
+    pair_dists = dists[iu]
+    
+    # Wall distances
+    d_walls = HALF - np.abs(pos)
+    wall_dists = d_walls.flatten()
+    
+    # All effective distances (pair distances divided by 2, wall distances as-is)
+    # Note: pair dist d corresponds to radius d/2. Wall dist d corresponds to radius d.
+    all_eff_dists = np.concatenate([pair_dists / 2.0, wall_dists])
+    
+    # Soft-min: -logsumexp(-beta * x) / beta
+    scaled = -beta * all_eff_dists
+    max_scaled = np.max(scaled)
+    log_sum_exp = max_scaled + np.log(np.sum(np.exp(scaled - max_scaled)))
+    soft_min_val = -log_sum_exp / beta
+    
+    # Gradient of soft-min w.r.t. positions
+    weights = np.exp(scaled - max_scaled)
+    weights /= np.sum(weights)
+    
+    grad_pos = np.zeros_like(pos)
+    
+    # Pair gradient
+    # d(soft_min)/d(pos_i) = sum_j w_j * d(d_ij/2)/d(pos_i)
+    # d(d_ij)/d(pos_i) = (pos_i - pos_j) / d_ij
+    # So d(soft_min)/d(pos_i) = sum_j w_j * (pos_i - pos_j) / (2 * d_ij)
+    
+    n_pairs = len(iu[0])
+    pair_weights = weights[:n_pairs]
+    
+    # Vectorized accumulation
+    # i_idx, j_idx
+    i_idx = iu[0]
+    j_idx = iu[1]
+    d_vals = pair_dists
+    
+    # Avoid division by zero
+    valid = d_vals > 1e-14
+    if np.any(valid):
+        i_v = i_idx[valid]
+        j_v = j_idx[valid]
+        d_v = d_vals[valid]
+        w_v = pair_weights[valid]
+        
+        vecs = pos[i_v] - pos[j_v]  # shape (n_valid, 3)
+        coeffs = w_v / (2.0 * d_v) # shape (n_valid,)
+        
+        # grad_pos[i] += coeff * vec
+        np.add.at(grad_pos, i_v, coeffs[:, np.newaxis] * vecs)
+        # grad_pos[j] -= coeff * vec
+        np.add.at(grad_pos, j_v, -coeffs[:, np.newaxis] * vecs)
+    
+    # Wall gradient
+    # d(soft_min)/d(pos_ik) = w_k * d(d_wall_ik)/d(pos_ik)
+    # d_wall_ik = HALF - |pos_ik|
+    # d(d_wall)/d(pos_ik) = -sign(pos_ik)
+    # So d(soft_min)/d(pos_ik) = -w_k * sign(pos_ik)
+    
+    wall_weights = weights[n_pairs:]
+    signs = np.sign(pos)
+    # Handle zero sign
+    signs[signs == 0] = 1.0
+    
+    # grad_pos[i, k] += -w_k * sign(pos_ik)
+    # wall_weights is flattened (N*3)
+    grad_wall = -wall_weights.reshape(N, 3) * signs
+    grad_pos += grad_wall
+    
+    # We want to MAXIMIZE the soft-min, so we minimize -soft_min
+    # Gradient of -soft_min is -grad(soft_min)
+    return -soft_min_val, -grad_pos.flatten()
+
+def _minimize_energy(init_centers, target_R, max_iter=500, ftol=1e-14, gtol=1e-12):
+    """
+    Minimizes the energy for a given target radius.
+    """
+    def objective_and_grad(x):
+        val, g = _energy_and_gradient(x, target_R)
+        return val, g
+
+    bounds = [(-0.5, 0.5)] * (N * 3)
     
     try:
-        result = minimize(
-            objective,
-            init_pts.flatten(),
-            method='BFGS',
+        res = minimize(
+            objective_and_grad,
+            init_centers.flatten(),
             jac=True,
-            options={'maxiter': max_iter, 'gtol': gtol, 'disp': False}
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': max_iter, 'ftol': ftol, 'gtol': gtol, 'disp': False}
         )
-        opt_pts = result.x.reshape(N, 3)
-        return opt_pts, result.success
-    except TimeoutError:
-        # Return current best if timeout? minimize doesn't easily return intermediate state.
-        # We rely on the outer loop checking time.
-        return init_pts, False
+        new_centers = res.x.reshape(N, 3)
+        final_energy, _ = _energy_and_gradient(new_centers, target_R)
+        return new_centers, final_energy, res.success
     except Exception:
-        return init_pts, False
+        return init_centers, np.inf, False
+
+def _minimize_soft_min(init_centers, beta, max_iter=300, ftol=1e-14, gtol=1e-12):
+    """
+    Minimizes the negative soft-min objective.
+    """
+    def objective_and_grad(x):
+        val, g = _soft_min_obj_grad(x, beta)
+        return val, g
+
+    bounds = [(-0.5, 0.5)] * (N * 3)
+    
+    try:
+        res = minimize(
+            objective_and_grad,
+            init_centers.flatten(),
+            jac=True,
+            method='L-BFGS-B',
+            bounds=bounds,
+            options={'maxiter': max_iter, 'ftol': ftol, 'gtol': gtol, 'disp': False}
+        )
+        new_centers = res.x.reshape(N, 3)
+        return new_centers, res.success
+    except Exception:
+        return init_centers, False
+
+def _generate_initial_positions():
+    """
+    Generate initial positions using an FCC lattice structure.
+    FCC is denser than simple cubic, providing a better starting point.
+    """
+    # FCC unit cell has 4 atoms. We need 100 spheres.
+    # 25 unit cells * 4 = 100.
+    # Let's create a grid of unit cells.
+    # 5x5x1 grid of FCC unit cells? Or 4x4x2?
+    # Let's use a 5x5x1 grid of FCC cells to fill the cube roughly.
+    # Actually, let's just generate a large FCC lattice and take the first 100 points
+    # that fit inside the cube, or generate a grid of FCC points.
+    
+    # Simple approach: Generate a grid of points with FCC offsets.
+    # FCC points in a unit cube of side 'a':
+    # (0,0,0), (0.5a, 0.5a, 0), (0.5a, 0, 0.5a), (0, 0.5a, 0.5a)
+    
+    # We want to fill [-0.5, 0.5]^3.
+    # Let's use a lattice constant 'a' such that we get roughly 100 points.
+    # Volume = 1.0. Density of FCC = 4/a^3.
+    # 100 = 4/a^3 => a^3 = 0.04 => a = 0.3419.
+    # Let's try a = 0.35.
+    
+    a = 0.35
+    # Generate grid indices
+    # We need to cover [-0.5, 0.5].
+    # Range is 1.0. Number of cells = 1.0 / a = 2.85.
+    # Let's iterate over cell indices -1 to 2 or so.
+    
+    points = []
+    for ix in range(-2, 4):
+        for iy in range(-2, 4):
+            for iz in range(-2, 4):
+                base_x = ix * a
+                base_y = iy * a
+                base_z = iz * a
+                
+                # FCC offsets
+                offsets = [
+                    (0, 0, 0),
+                    (0.5*a, 0.5*a, 0),
+                    (0.5*a, 0, 0.5*a),
+                    (0, 0.5*a, 0.5*a)
+                ]
+                
+                for ox, oy, oz in offsets:
+                    x = base_x + ox
+                    y = base_y + oy
+                    z = base_z + oz
+                    # Check if inside cube [-0.5, 0.5]
+                    if -0.5 <= x <= 0.5 and -0.5 <= y <= 0.5 and -0.5 <= z <= 0.5:
+                        points.append([x, y, z])
+    
+    points = np.array(points)
+    
+    # We might have more or fewer than 100.
+    # If more, we can randomly sample 100.
+    # If fewer, we need to add more or adjust 'a'.
+    # Let's check count.
+    if len(points) < N:
+        # Fall back to simple grid if FCC generation fails to produce enough
+        # This is unlikely with a=0.35, but good for safety.
+        nx, ny, nz = 5, 4, 5
+        xs = np.linspace(-0.45, 0.45, nx)
+        ys = np.linspace(-0.45, 0.45, ny)
+        zs = np.linspace(-0.45, 0.45, nz)
+        grid = np.array([(x, y, z) for z in zs for y in ys for x in xs])
+        points = grid[:N].copy()
+    elif len(points) > N:
+        # Randomly select N points
+        rng = np.random.default_rng(42)
+        idx = rng.choice(len(points), size=N, replace=False)
+        points = points[idx]
+    
+    # Add small noise to break symmetry
+    rng = np.random.default_rng(42)
+    pos = points + rng.normal(0, 0.005, size=(N, 3))
+    pos = np.clip(pos, -0.49, 0.49)
+    
+    return pos
 
 def construct():
-    t0 = time.time()
-    DEADLINE = 115.0  # Safety margin under 120s
-
-    # ---- Seed: Simple cubic 5x5x5 grid ----
-    # 5^3 = 125 points. We take the first 100.
-    m = 5
-    ticks = (np.arange(m) + 0.5) / m - 0.5
-    grid = np.array([(x, y, z) for z in ticks for y in ticks for x in ticks])
-    pts = grid[:N].copy()
-
-    best_pts = pts.copy()
-    best_r = _score(best_pts)
+    start_time = time.time()
+    deadline = start_time + 145.0  # 5s safety margin
     
-    rng = np.random.RandomState(42)
-
-    # Strategy: Run BFGS with increasing target radii
-    # Start with a target slightly above the grid score (0.1)
-    # Grid score is 0.1 (spacing 0.2, radius 0.1).
-    # Best known is ~0.11138.
+    # 1. Initialization
+    best_pos = _generate_initial_positions()
     
-    # We will try a sequence of targets.
-    # If a target fails to improve, we keep the best points found so far.
+    # Initial soft-min optimization to spread out spheres evenly
+    # This helps escape the initial lattice artifacts
+    try:
+        soft_pos, _ = _minimize_soft_min(best_pos, beta=50.0, max_iter=200)
+        soft_r = _compute_radius(soft_pos)
+        if soft_r > _compute_radius(best_pos):
+            best_pos = soft_pos
+    except Exception:
+        pass
     
-    targets = [0.105, 0.110, 0.112, 0.114, 0.116, 0.118]
-    
-    current_pts = best_pts.copy()
-    
-    for target_r in targets:
-        if time.time() - t0 > DEADLINE - 10.0:
-            break
-            
-        # Add small noise to break symmetry and help escape local minima
-        # Noise magnitude should be small enough not to cause massive violations
-        noise = rng.normal(0, 0.005, size=(N, 3))
-        init_pts = np.clip(current_pts + noise, -0.49, 0.49)
+    # Initial optimization with a conservative radius using energy minimization
+    initial_r = _compute_radius(best_pos)
+    if initial_r < 0.08:
+        initial_r = 0.08
+    else:
+        initial_r = initial_r * 0.95  # Start slightly below current to ensure convergence
         
-        opt_pts, success = _optimize_bfgs(
-            init_pts, 
-            target_r, 
-            max_iter=2000, 
-            gtol=1e-10,
-            time_limit=DEADLINE - (time.time() - t0) - 5.0
-        )
+    best_pos, energy, _ = _minimize_energy(best_pos, initial_r, max_iter=300)
+    best_r = _compute_radius(best_pos)
+    
+    if best_r <= 0:
+        rng = np.random.default_rng(123)
+        best_pos = rng.uniform(-0.45, 0.45, size=(N, 3))
+        best_r = _compute_radius(best_pos)
+    
+    # 2. Iterative Radius Increase with adaptive step size
+    current_r = best_r
+    step_size = 0.001  # Start with a reasonable step
+    
+    consecutive_failures = 0
+    max_failures = 3
+    
+    rng_search = np.random.default_rng(123)
+    
+    while time.time() < deadline - 10.0:
+        target_r = current_r + step_size
         
-        if np.all(np.isfinite(opt_pts)):
-            # Clip to ensure validity
-            opt_pts = np.clip(opt_pts, -0.5 + 1e-9, 0.5 - 1e-9)
-            r_opt = _score(opt_pts)
-            
-            if r_opt > best_r:
-                best_r = r_opt
-                best_pts = opt_pts.copy()
-                # Update current_pts to the best found so far for next iteration
-                current_pts = opt_pts.copy()
-            else:
-                # Even if r didn't improve, the configuration might be better positioned
-                # for a larger target. But usually, we stick to the best radius.
-                # However, if the optimizer converged to a local min with lower r,
-                # using it as start for a *larger* target might be bad.
-                # We'll stick to best_pts as the base for next noise if no improvement.
-                pass
-
-    # If time permits, try random restarts with the best target found
-    # or a slightly higher target
-    if time.time() - t0 < DEADLINE - 15.0:
-        # Try a few restarts from the best configuration with larger noise
-        for i in range(5):
-            if time.time() - t0 > DEADLINE - 5.0:
+        if consecutive_failures >= max_failures:
+            step_size *= 0.6
+            consecutive_failures = 0
+            if step_size < 1e-8:
                 break
+        
+        # Try multiple perturbations to escape local minima
+        candidates = [best_pos.copy()]
+        for scale in [0.003, 0.01, 0.03]:
+            perturbed = best_pos + rng_search.normal(0, scale, size=(N, 3))
+            perturbed = np.clip(perturbed, -0.5, 0.5)
+            candidates.append(perturbed)
+        
+        success = False
+        for start_pos in candidates:
+            # Increase max_iter for higher precision as we get closer to optimum
+            max_iter = 400 if current_r < 0.105 else 600
             
-            noise = rng.normal(0, 0.02, size=(N, 3))
-            init_pts = np.clip(best_pts + noise, -0.49, 0.49)
+            new_pos, energy, opt_success = _minimize_energy(start_pos, target_r, max_iter=max_iter)
             
-            # Use a target slightly above best_r
-            target_r = best_r * 1.01
+            if energy < 1e-10:
+                actual_r = _compute_radius(new_pos)
+                if actual_r >= target_r - 1e-7:
+                    best_pos = new_pos
+                    best_r = actual_r
+                    current_r = actual_r
+                    success = True
+                    consecutive_failures = 0
+                    break
+            else:
+                # Even if energy is not perfectly zero, if we improved the radius, accept it
+                actual_r = _compute_radius(new_pos)
+                if actual_r > current_r + 1e-8:
+                    best_pos = new_pos
+                    best_r = actual_r
+                    current_r = actual_r
+                    # Don't mark as full success, but accept the improvement
+                    pass
+        
+        if not success:
+            consecutive_failures += 1
             
-            opt_pts, success = _optimize_bfgs(
-                init_pts, 
-                target_r, 
-                max_iter=1000, 
-                gtol=1e-9,
-                time_limit=DEADLINE - (time.time() - t0) - 5.0
-            )
-            
-            if np.all(np.isfinite(opt_pts)):
-                opt_pts = np.clip(opt_pts, -0.5 + 1e-9, 0.5 - 1e-9)
-                r_opt = _score(opt_pts)
-                
-                if r_opt > best_r:
-                    best_r = r_opt
-                    best_pts = opt_pts.copy()
+            # If we failed, try a soft-min step to re-spread and escape local minimum
+            if time.time() < deadline - 15.0 and consecutive_failures % 2 == 0:
+                try:
+                    # Use a lower beta for more exploration
+                    soft_pos, _ = _minimize_soft_min(best_pos, beta=30.0, max_iter=100)
+                    soft_r = _compute_radius(soft_pos)
+                    if soft_r > best_r:
+                        best_pos = soft_pos
+                        best_r = soft_r
+                        current_r = best_r
+                    else:
+                        # If soft-min didn't help, try polishing the current best position
+                        polished, _, _ = _minimize_energy(best_pos, current_r, max_iter=300)
+                        polished_r = _compute_radius(polished)
+                        if polished_r > best_r:
+                            best_pos = polished
+                            best_r = polished_r
+                            current_r = best_r
+                except Exception:
+                    pass
 
-    # Final Polish: High precision optimization on the best found radius
-    if time.time() - t0 < DEADLINE - 5.0 and best_r > 0.1:
-        # Try to optimize exactly for the best_r found, with very tight tolerance
-        # This can squeeze out a tiny bit more if the previous runs stopped early
-        noise = rng.normal(0, 0.001, size=(N, 3))
-        init_pts = np.clip(best_pts + noise, -0.49, 0.49)
+    # 3. Final High-Precision Polish
+    if time.time() < deadline - 3.0:
+        # Try to push slightly beyond current_r
+        final_target = best_r + 5e-6
+        polished_pos, final_energy, _ = _minimize_energy(best_pos, final_target, max_iter=800, ftol=1e-15, gtol=1e-14)
+        final_r = _compute_radius(polished_pos)
         
-        opt_pts, success = _optimize_bfgs(
-            init_pts, 
-            best_r, 
-            max_iter=5000, 
-            gtol=1e-12,
-            time_limit=DEADLINE - (time.time() - t0) - 2.0
-        )
-        
-        if np.all(np.isfinite(opt_pts)):
-            opt_pts = np.clip(opt_pts, -0.5 + 1e-9, 0.5 - 1e-9)
-            r_opt = _score(opt_pts)
-            if r_opt > best_r:
-                best_r = r_opt
-                best_pts = opt_pts.copy()
+        if final_r > best_r:
+            best_pos = polished_pos
+            best_r = final_r
+            
+        # One more polish at the exact best_r to ensure tightness
+        if time.time() < deadline - 1.0:
+            polished_pos, _, _ = _minimize_energy(best_pos, best_r, max_iter=500, ftol=1e-15, gtol=1e-14)
+            final_r = _compute_radius(polished_pos)
+            if final_r > best_r:
+                best_pos = polished_pos
+                best_r = final_r
 
-    # Final safety check
-    best_pts = np.clip(best_pts, -0.5 + 1e-9, 0.5 - 1e-9)
-    if not np.all(np.isfinite(best_pts)):
-        best_pts = grid[:N].copy()
-        
-    return best_pts
-# EVOLVE-BLOCK-END
+    return best_pos

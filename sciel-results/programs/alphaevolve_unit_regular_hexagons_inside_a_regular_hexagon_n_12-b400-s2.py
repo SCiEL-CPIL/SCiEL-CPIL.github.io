@@ -2,9 +2,11 @@
 import math
 import time
 import random
+import numpy as np
+from scipy.optimize import minimize
 
 N = 12
-TIME_LIMIT = 112.0  # safety margin below 120s
+TIME_LIMIT = 115.0  # safety margin below 120s
 
 def _hex_vertices(cx, cy, angle_deg, side=1.0):
     """Vertices of a regular hexagon centered at (cx,cy) with rotation angle_deg."""
@@ -69,6 +71,110 @@ def _outer_hex_side(centers_angles, center, angle_deg):
                     max_need = val
     return max_need
 
+def _sdf_hex_point(px, py, angle_deg, side=1.0):
+    """Signed distance from point (px,py) to hexagon centered at origin with rotation angle_deg."""
+    a = math.radians(angle_deg)
+    ca, sa = math.cos(a), math.sin(a)
+    # Transform point into hexagon's local frame
+    lx = ca * px + sa * py
+    ly = -sa * px + ca * py
+    abs_lx = abs(lx)
+    abs_ly = abs(ly)
+    apothem = side * math.sqrt(3) / 2.0
+    # Hexagon in local frame: |x| <= apothem, |y| <= apothem/sqrt(3) for the "flat" sides
+    # Actually for a regular hexagon with side length s:
+    # The hexagon is the intersection of 6 half-planes
+    # Let's use the standard SDF for a regular hexagon
+    # Vertices at angles 0, 60, 120, 180, 240, 300 degrees from center
+    # In local frame, vertices are at (s*cos(k*60), s*sin(k*60)) for k=0..5
+    # The hexagon can be described as: for each edge, the point must be on the interior side
+    # Edge normals point outward at angles 30, 90, 150, 210, 270, 330 degrees
+    # Distance from center to each edge (apothem) = s * sqrt(3)/2
+    # For a point (lx, ly), the signed distance to the hexagon:
+    # We check all 6 edges and take the max of the signed distances (inside = negative)
+    min_dist = float('inf')
+    for k in range(6):
+        theta = math.radians(30 + 60 * k)
+        nx, ny = math.cos(theta), math.sin(theta)
+        # Signed distance from point to this edge line (positive = outside)
+        d = nx * lx + ny * ly - apothem
+        if d < min_dist:
+            min_dist = d
+    # But this gives the distance to the nearest edge, not the true SDF
+    # For a convex polygon, the SDF is: if inside, -min distance to edges; if outside, min distance to polygon
+    # Let's use a simpler approach: check if point is inside, then compute distance appropriately
+    # Point is inside if for all edges, nx*lx + ny*ly <= apothem
+    inside = True
+    for k in range(6):
+        theta = math.radians(30 + 60 * k)
+        nx, ny = math.cos(theta), math.sin(theta)
+        if nx * lx + ny * ly > apothem + 1e-12:
+            inside = False
+            break
+    if inside:
+        # Distance to nearest edge (negative)
+        max_proj = 0.0
+        for k in range(6):
+            theta = math.radians(30 + 60 * k)
+            nx, ny = math.cos(theta), math.sin(theta)
+            proj = nx * lx + ny * ly
+            if proj > max_proj:
+                max_proj = proj
+        return -(apothem - max_proj)
+    else:
+        # Outside: compute distance to nearest point on polygon
+        # Project onto each edge and compute distance
+        min_d = float('inf')
+        for k in range(6):
+            # Edge from vertex k to vertex k+1
+            t1 = math.radians(60 * k)
+            t2 = math.radians(60 * (k + 1))
+            v1 = (side * math.cos(t1), side * math.sin(t1))
+            v2 = (side * math.cos(t2), side * math.sin(t2))
+            # Point-to-segment distance
+            dx, dy = v2[0] - v1[0], v2[1] - v1[1]
+            len2 = dx * dx + dy * dy
+            if len2 < 1e-12:
+                continue
+            t = max(0.0, min(1.0, ((lx - v1[0]) * dx + (ly - v1[1]) * dy) / len2))
+            qx, qy = v1[0] + t * dx, v1[1] + t * dy
+            d = math.hypot(lx - qx, ly - qy)
+            if d < min_d:
+                min_d = d
+        return min_d
+
+def _sdf_hex_hex(cx1, cy1, a1, cx2, cy2, a2, side=1.0):
+    """Approximate SDF between two hexagons using vertex sampling."""
+    # Sample vertices of hex1 and compute distance to hex2
+    verts1 = _hex_vertices(cx1, cy1, a1, side)
+    verts2 = _hex_vertices(cx2, cy2, a2, side)
+    min_d = float('inf')
+    # For each vertex of hex1, compute distance to hex2
+    for (vx, vy) in verts1:
+        d = _sdf_hex_point(vx - cx2, vy - cy2, a2, side)
+        if d < min_d:
+            min_d = d
+    # For each vertex of hex2, compute distance to hex1
+    for (vx, vy) in verts2:
+        d = _sdf_hex_point(vx - cx1, vy - cy1, a1, side)
+        if d < min_d:
+            min_d = d
+    return min_d
+
+def _smooth_collision_penalty(cfg, center, angle, sigma=0.1):
+    """Smooth penalty for collisions using soft-min of SDFs."""
+    m = len(cfg)
+    total_penalty = 0.0
+    for i in range(m):
+        for j in range(i + 1, m):
+            d = _sdf_hex_hex(cfg[i][0], cfg[i][1], cfg[i][2], 
+                            cfg[j][0], cfg[j][1], cfg[j][2])
+            # Soft penalty: exp(-d/sigma) is large when d < 0 (overlapping)
+            if d < 2.0 * sigma:
+                penalty = math.exp(-d / sigma) - 1.0
+                total_penalty += penalty
+    return total_penalty
+
 def _is_valid(centers_angles):
     """Check all pairs of hexagons are disjoint."""
     m = len(centers_angles)
@@ -78,6 +184,19 @@ def _is_valid(centers_angles):
             if _separating_axis_check(polys[i], polys[j]):
                 return False
     return True
+
+def _smooth_objective(v, cfg_shape=None):
+    """Smooth objective for L-BFGS-B: outer side + collision penalty."""
+    N_local = 12
+    cfg = []
+    for i in range(N_local):
+        cfg.append([v[3*i], v[3*i+1], v[3*i+2]])
+    center = (v[3*N_local], v[3*N_local+1])
+    angle = v[3*N_local+2]
+    
+    s = _outer_hex_side(cfg, center, angle)
+    penalty = _smooth_collision_penalty(cfg, center, angle, sigma=0.05)
+    return s + 10.0 * penalty
 
 def construct():
     t0 = time.time()
@@ -175,7 +294,7 @@ def construct():
         best_f = min(objective(v) for v in simplex)
         best_v = min(simplex, key=objective)
         
-        max_iters = 3000
+        max_iters = 2000
         iter_count = 0
         while iter_count < max_iters and time.time() - t0 < time_budget:
             simplex.sort(key=lambda v: objective(v))
@@ -329,12 +448,44 @@ def construct():
         
         T = max(T_end, T * alpha_sa)
     
-    # Nelder-Mead polish on the best configuration found
+    # L-BFGS-B polish with smooth objective
     remaining_time = TIME_LIMIT - (time.time() - t0)
-    if remaining_time > 4.0:
+    if remaining_time > 8.0:
+        try:
+            v0 = []
+            for p in best_cfg:
+                v0.extend([p[0], p[1], p[2]])
+            v0.extend([best_center[0], best_center[1], best_angle])
+            
+            res = minimize(
+                _smooth_objective,
+                v0,
+                method='L-BFGS-B',
+                options={'maxiter': 500, 'ftol': 1e-12, 'gtol': 1e-10, 'maxfun': 2000}
+            )
+            
+            v_lbfgs = res.x
+            cfg_lbfgs = []
+            for i in range(N):
+                cfg_lbfgs.append([v_lbfgs[3*i], v_lbfgs[3*i+1], v_lbfgs[3*i+2]])
+            center_lbfgs = [v_lbfgs[3*N], v_lbfgs[3*N+1]]
+            angle_lbfgs = v_lbfgs[3*N+2]
+            
+            lbfgs_score = full_score(cfg_lbfgs, tuple(center_lbfgs), angle_lbfgs)
+            if lbfgs_score is not None and lbfgs_score < best_score:
+                best_score = lbfgs_score
+                best_cfg = cfg_lbfgs
+                best_center = center_lbfgs
+                best_angle = angle_lbfgs
+        except Exception:
+            pass
+    
+    # Final tight Nelder-Mead polish
+    remaining_time = TIME_LIMIT - (time.time() - t0)
+    if remaining_time > 3.0:
         try:
             polished_v, polished_f = nelder_mead_polish(
-                best_cfg, best_center, best_angle, TIME_LIMIT - 3.0
+                best_cfg, best_center, best_angle, TIME_LIMIT - 2.0
             )
             cfg_polished = []
             for i in range(N):

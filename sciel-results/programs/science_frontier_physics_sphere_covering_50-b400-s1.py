@@ -1,553 +1,535 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+"""Combined approach: multi-start scaffolding + smooth LSE covering-radius refinement + Riesz polish."""
+
 N = 50
-import time
 
 # EVOLVE-BLOCK-START
 import numpy as np
-from scipy.optimize import minimize
+import time
 from scipy.spatial import ConvexHull
+from scipy.optimize import minimize
 
+# ---------------- utilities ----------------
 
 def _normalize(points):
-    """Normalize points to unit sphere."""
+    points = np.asarray(points, dtype=float)
     norms = np.linalg.norm(points, axis=1, keepdims=True)
-    norms = np.where(norms < 1e-10, 1.0, norms)
+    norms[norms < 1e-15] = 1.0
     return points / norms
 
 
 def _covering_radius(points):
-    """
-    Compute the covering radius in degrees for a set of unit points.
-    Uses convex hull facet circumradii (vectorized).
-    """
-    if len(points) < 3:
-        return 180.0
+    """Exact covering radius (radians) via convex hull facet circumcenters."""
+    points = _normalize(points)
     try:
         hull = ConvexHull(points)
-    except:
-        return 180.0
-    
-    simplices = hull.simplices
-    p1 = points[simplices[:, 0]]
-    p2 = points[simplices[:, 1]]
-    p3 = points[simplices[:, 2]]
-    
-    v1 = p2 - p1
-    v2 = p3 - p1
-    n = np.cross(v1, v2)
-    norm_n = np.linalg.norm(n, axis=1, keepdims=True)
-    mask = norm_n[:, 0] > 1e-10
-    if not np.any(mask):
-        return 180.0
-    
-    n = n[mask] / norm_n[mask]
-    p1m = p1[mask]
-    
-    # Ensure normals point outward
-    dots = np.sum(n * p1m, axis=1)
-    n[dots < 0] *= -1
-    p1m[dots < 0] = p1m[dots < 0]  # p1m doesn't change, just n
-    
-    h = np.sum(n * p1m, axis=1)
-    h = np.clip(h, -1.0, 1.0)
-    angles = np.arccos(h)
-    
-    return float(np.max(angles)) * 180.0 / np.pi
+    except Exception:
+        # Fallback: dense random sampling
+        from scipy.spatial import cKDTree
+        tree = cKDTree(points)
+        rng = np.random.RandomState(0)
+        n_samples = 60000
+        samples = rng.randn(n_samples, 3)
+        samples /= np.linalg.norm(samples, axis=1, keepdims=True)
+        dists, _ = tree.query(samples)
+        return float(np.max(2.0 * np.arcsin(np.clip(dists / 2.0, 0, 1))))
+
+    max_r = 0.0
+    for simplex in hull.simplices:
+        if len(simplex) != 3:
+            continue
+        a, b, c = points[simplex[0]], points[simplex[1]], points[simplex[2]]
+        v = np.cross(b - a, c - a)
+        vn = np.linalg.norm(v)
+        if vn < 1e-12:
+            continue
+        v /= vn
+        d = np.dot(v, a)
+        if d < 0:
+            v = -v
+            d = -d
+        cos_r = np.clip(d, -1.0, 1.0)
+        r = np.arccos(cos_r)
+        if r > max_r:
+            max_r = r
+    return float(max_r)
 
 
-def _covering_radius_radians(points):
-    """Covering radius in radians (for optimization)."""
-    return _covering_radius(points) * np.pi / 180.0
-
-
-def _generate_test_grid(n_theta=40, n_phi=80):
-    """Generate a grid of test points on the sphere."""
-    thetas = np.linspace(0, np.pi, n_theta)
-    phis = np.linspace(0, 2*np.pi, n_phi, endpoint=False)
-    theta_grid, phi_grid = np.meshgrid(thetas, phis, indexing='ij')
-    x = np.sin(theta_grid) * np.cos(phi_grid)
-    y = np.sin(theta_grid) * np.sin(phi_grid)
-    z = np.cos(theta_grid)
-    grid = np.stack([x, y, z], axis=-1)
-    return grid.reshape(-1, 3)
-
-
-def _smooth_surrogate(params, beta=200.0, grid=None):
-    """
-    Vectorized smooth differentiable surrogate for the covering radius.
-    Uses a grid of test points and log-sum-exp for soft min/max.
-    """
-    pts = params.reshape(N, 3)
-    pts = _normalize(pts)
-    
-    if grid is None:
-        grid = _generate_test_grid()
-        
-    # Compute angular distances: grid (M,3) x pts (N,3) -> (M,N)
-    dots = np.clip(grid @ pts.T, -1.0, 1.0)
-    angles = np.arccos(dots)  # (M, N)
-    
-    # Soft-min over points for each grid point
-    neg_beta_angles = -beta * angles
-    max_neg = np.max(neg_beta_angles, axis=1, keepdims=True)
-    exp_terms = np.exp(neg_beta_angles - max_neg)
-    sum_exp = np.sum(exp_terms, axis=1)
-    logsumexp_neg = max_neg.squeeze() + np.log(sum_exp)
-    soft_min_angles = -logsumexp_neg / beta  # (M,)
-    
-    # Soft-max over grid points
-    beta_soft_min = beta * soft_min_angles
-    max_val = np.max(beta_soft_min)
-    logsumexp_max = max_val + np.log(np.sum(np.exp(beta_soft_min - max_val)))
-    soft_max = logsumexp_max / beta
-    
-    return soft_max
-
-
-def _facet_smooth_surrogate(params, beta=100.0):
-    """
-    Smooth surrogate based on convex hull facet circumradii (vectorized).
-    """
-    pts = params.reshape(N, 3)
-    pts = _normalize(pts)
-    
+def _facet_data(points):
+    """Return (radii, centers, simplices) for triangular facets."""
+    points = _normalize(points)
     try:
-        hull = ConvexHull(pts)
-    except:
-        return np.pi
-    
-    simplices = hull.simplices
-    p1 = pts[simplices[:, 0]]
-    p2 = pts[simplices[:, 1]]
-    p3 = pts[simplices[:, 2]]
-    
-    v1 = p2 - p1
-    v2 = p3 - p1
-    n = np.cross(v1, v2)
-    norm_n = np.linalg.norm(n, axis=1, keepdims=True)
-    mask = norm_n[:, 0] > 1e-10
-    if not np.any(mask):
-        return np.pi
-    
-    n = n[mask] / norm_n[mask]
-    p1m = p1[mask]
-    
-    dots = np.sum(n * p1m, axis=1)
-    n[dots < 0] *= -1
-    
-    h = np.sum(n * p1m, axis=1)
-    h = np.clip(h, -1.0, 1.0)
-    facet_angles = np.arccos(h)
-    
-    if len(facet_angles) == 0:
-        return np.pi
-    
-    # Soft-max over facet angles
-    beta_facet = beta * facet_angles
-    max_val = np.max(beta_facet)
-    logsumexp = max_val + np.log(np.sum(np.exp(beta_facet - max_val)))
-    soft_max = logsumexp / beta
-    
-    return soft_max
+        hull = ConvexHull(points)
+    except Exception:
+        return np.array([]), [], []
+
+    radii = []
+    centers = []
+    simplices = []
+    for simplex in hull.simplices:
+        if len(simplex) != 3:
+            continue
+        a, b, c = points[simplex[0]], points[simplex[1]], points[simplex[2]]
+        v = np.cross(b - a, c - a)
+        vn = np.linalg.norm(v)
+        if vn < 1e-12:
+            continue
+        v /= vn
+        d = np.dot(v, a)
+        if d < 0:
+            v = -v
+            d = -d
+        cos_r = np.clip(d, -1.0, 1.0)
+        r = np.arccos(cos_r)
+        radii.append(r)
+        centers.append(v)
+        simplices.append(simplex)
+
+    return np.array(radii), centers, simplices
 
 
-def _smooth_gradient_optimize(points, time_limit=30, beta=200.0, use_facet=False, grid=None):
+def _smooth_covering_radius_grad(points, beta=50.0):
     """
-    Gradient-based optimization using smooth surrogate with L-BFGS-B.
+    Smooth surrogate: log-sum-exp of facet circumradii.
+    Returns (value, gradient) with gradient in ambient R^3 (not projected).
     """
-    start_time = time.time()
-    
-    if use_facet:
-        grid = None
-    elif grid is None:
-        grid = _generate_test_grid(n_theta=40, n_phi=80)
-    
-    def objective(params):
-        if time.time() - start_time > time_limit:
-            return 1e6
-        if use_facet:
-            return _facet_smooth_surrogate(params, beta=beta)
-        else:
-            return _smooth_surrogate(params, beta=beta, grid=grid)
-    
+    points = _normalize(points)
+    radii, centers, simplices = _facet_data(points)
+    n = len(radii)
+    if n == 0:
+        return 0.0, np.zeros_like(points)
+
+    m = np.max(radii)
+    if m < 1e-12:
+        return 0.0, np.zeros_like(points)
+
+    # numerically stable LSE
+    exps = np.exp(beta * (radii - m))
+    lse = m + np.log(np.sum(exps)) / beta
+    w = exps / np.sum(exps)
+
+    grad = np.zeros_like(points)
+    for i in range(n):
+        wi = w[i]
+        if wi < 1e-15:
+            continue
+        center = centers[i]
+        simplex = simplices[i]
+        for idx in simplex:
+            p = points[idx]
+            cos_r = np.clip(np.dot(center, p), -1.0, 1.0)
+            sin_r = np.sqrt(max(0.0, 1.0 - cos_r * cos_r))
+            if sin_r < 1e-10:
+                continue
+            g = -center / sin_r
+            # project to tangent plane at p
+            g_tan = g - np.dot(g, p) * p
+            grad[idx] += wi * g_tan
+
+    return float(lse), grad
+
+
+def _riesz_energy_grad(points, s=12.0):
+    """
+    Riesz s-energy (sum over pairs of angular distance^{-s}) and gradient (tangent-projected).
+    Used as an auxiliary smoother to diversify local minima.
+    """
+    points = _normalize(points)
+    n = len(points)
+    dots = points @ points.T
+    dots = np.clip(dots, -1.0 + 1e-15, 1.0 - 1e-15)
+    angles = np.arccos(dots)
+    sins = np.sin(angles)
+    sins = np.maximum(sins, 1e-15)
+
+    ang_powers = angles ** (-s - 1)
+    np.fill_diagonal(ang_powers, 0.0)
+    np.fill_diagonal(sins, 1.0)
+    np.fill_diagonal(dots, 1.0)
+
+    weights = s * ang_powers / sins
+    np.fill_diagonal(weights, 0.0)
+
+    grad = weights @ points
+    grad_tan = grad - np.sum(grad * points, axis=1, keepdims=True) * points
+
+    iu = np.triu_indices(n, k=1)
+    energy = float(np.sum(angles[iu] ** (-s)))
+    return energy, grad_tan
+
+
+def _lbfgs_smooth(points, start_time=None, deadline=None, beta=50.0, maxiter=300,
+                  ftol=1e-14, gtol=1e-12, maxfun=500):
+    """
+    L-BFGS-B on smooth LSE surrogate.
+    """
+    points = _normalize(points)
+    best = points.copy()
+    best_cr = _covering_radius(points)
+
+    def obj_and_grad(x_flat):
+        x = x_flat.reshape(-1, 3)
+        x = _normalize(x)
+        val, grad = _smooth_covering_radius_grad(x, beta=beta)
+        # project gradient to tangent space
+        grad_tan = grad - np.sum(grad * x, axis=1, keepdims=True) * x
+        return val, grad_tan.flatten()
+
     x0 = points.flatten()
-    result = minimize(objective, x0, method='L-BFGS-B', 
-                      options={'maxiter': 1500, 'ftol': 1e-15, 'gtol': 1e-12, 'maxfun': 8000})
-    best_points = result.x.reshape(N, 3)
-    return _normalize(best_points)
+    try:
+        res = minimize(
+            obj_and_grad,
+            x0,
+            jac=True,
+            method="L-BFGS-B",
+            options={
+                "maxiter": maxiter,
+                "ftol": ftol,
+                "gtol": gtol,
+                "maxfun": maxfun,
+            }
+        )
+        x_opt = res.x.reshape(-1, 3)
+        x_opt = _normalize(x_opt)
+        cr_opt = _covering_radius(x_opt)
+        if cr_opt < best_cr:
+            best = x_opt.copy()
+            best_cr = cr_opt
+    except Exception:
+        pass
+
+    # time guard
+    if deadline is not None and time.time() >= deadline:
+        return best, best_cr
+
+    return best, best_cr
 
 
-def _fibonacci_points():
-    """Generate Fibonacci spiral points on sphere."""
-    i = np.arange(N) + 0.5
-    z = 1.0 - 2.0 * i / N
-    phi = np.pi * (1.0 + np.sqrt(5.0)) * i
-    r = np.sqrt(1.0 - z * z)
-    return np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
-
-def _jittered_fibonacci_points(seed=123, jitter=0.05):
-    """Generate Fibonacci points with small random jitter to break symmetries."""
-    pts = _fibonacci_points()
-    rng = np.random.RandomState(seed)
-    noise = rng.randn(N, 3) * jitter
-    pts = pts + noise
-    return _normalize(pts)
-
-
-def _random_points(seed=42):
-    """Generate random points on sphere."""
-    rng = np.random.RandomState(seed)
-    points = rng.randn(N, 3)
-    return _normalize(points)
-
-
-def _icosahedron_based_points():
-    """Generate points based on icosahedron vertices with perturbations."""
-    phi = (1 + np.sqrt(5)) / 2
-    verts = np.array([
-        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
-        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
-        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1]
-    ], dtype=float)
-    verts = _normalize(verts)
-    
-    rng = np.random.RandomState(123)
-    points = [verts[i] for i in range(12)]
-    
-    while len(points) < N:
-        base = verts[rng.randint(12)]
-        noise = rng.randn(3) * 0.3
-        new_pt = base + noise
-        new_pt = new_pt / np.linalg.norm(new_pt)
-        min_dist = min(np.linalg.norm(new_pt - p) for p in points)
-        if min_dist > 0.1:
-            points.append(new_pt)
-    
-    return np.array(points[:N])
-
-
-def _spherical_lloyd_iteration(points, max_iter=100, time_limit=30, damping=0.3):
+def _lbfgs_riesz(points, start_time=None, deadline=None, s=12.0, maxiter=200,
+                 ftol=1e-12, gtol=1e-10, maxfun=400):
     """
-    Spherical Lloyd's algorithm (Voronoi relaxation) with adaptive damping.
-    Fixed to use array accumulation instead of attribute assignment.
+    L-BFGS-B on Riesz energy (auxiliary smoother).
     """
-    start_time = time.time()
-    points = _normalize(points).copy()
-    current_cost = _covering_radius(points)
-    best_points = points.copy()
-    best_cost = current_cost
-    current_damping = damping
-    
-    for i in range(max_iter):
-        if time.time() - start_time > time_limit:
+    points = _normalize(points)
+    best = points.copy()
+    best_cr = _covering_radius(points)
+
+    def obj_and_grad(x_flat):
+        x = x_flat.reshape(-1, 3)
+        x = _normalize(x)
+        val, grad = _riesz_energy_grad(x, s=s)
+        # grad already tangent-projected
+        return val, grad.flatten()
+
+    x0 = points.flatten()
+    try:
+        res = minimize(
+            obj_and_grad,
+            x0,
+            jac=True,
+            method="L-BFGS-B",
+            options={
+                "maxiter": maxiter,
+                "ftol": ftol,
+                "gtol": gtol,
+                "maxfun": maxfun,
+            }
+        )
+        x_opt = res.x.reshape(-1, 3)
+        x_opt = _normalize(x_opt)
+        cr_opt = _covering_radius(x_opt)
+        if cr_opt < best_cr:
+            best = x_opt.copy()
+            best_cr = cr_opt
+    except Exception:
+        pass
+
+    if deadline is not None and time.time() >= deadline:
+        return best, best_cr
+
+    return best, best_cr
+
+
+def _lloyd_iteration(points, max_iters=300, tol=1e-10, start_time=None, deadline=None):
+    """
+    Spherical Lloyd: move each point toward the mean of circumcenters of incident facets.
+    """
+    points = _normalize(points)
+    best = points.copy()
+    best_cr = _covering_radius(points)
+
+    for _ in range(max_iters):
+        if deadline is not None and time.time() >= deadline:
             break
-        
+
         try:
             hull = ConvexHull(points)
-        except:
+        except Exception:
             break
-        
-        simplices = hull.simplices
-        p1 = points[simplices[:, 0]]
-        p2 = points[simplices[:, 1]]
-        p3 = points[simplices[:, 2]]
-        
-        v1 = p2 - p1
-        v2 = p3 - p1
-        n = np.cross(v1, v2)
-        norm_n = np.linalg.norm(n, axis=1, keepdims=True)
-        mask = norm_n[:, 0] > 1e-10
-        if not np.any(mask):
-            break
-        
-        n_valid = n[mask] / norm_n[mask]
-        p1_valid = p1[mask]
-        
-        dots = np.sum(n_valid * p1_valid, axis=1)
-        n_valid[dots < 0] *= -1
-        
-        h = np.sum(n_valid * p1_valid, axis=1)
-        h = np.clip(h, -1.0, 1.0)
-        facet_angles = np.arccos(h)
-        
-        # Accumulate targets for each point using arrays
-        acc = np.zeros((N, 3))
-        weights = np.zeros(N)
-        
-        simplices_valid = simplices[mask]
-        # Vectorized accumulation is tricky with variable indices, so we loop facets but update arrays
-        for fi in range(len(simplices_valid)):
-            angle = facet_angles[fi]
-            n_vec = n_valid[fi]
-            idxs = simplices_valid[fi]
-            acc[idxs] += angle * n_vec
-            weights[idxs] += angle
-        
+
         new_points = points.copy()
-        for pi in range(N):
-            if weights[pi] > 1e-10:
-                target = acc[pi] / np.linalg.norm(acc[pi])
-                # Move towards target
-                candidate = points[pi] + current_damping * (target - points[pi])
-                candidate = candidate / np.linalg.norm(candidate)
-                new_points[pi] = candidate
-        
-        new_points = _normalize(new_points)
-        new_cost = _covering_radius(new_points)
-        
-        if new_cost < current_cost:
-            current_cost = new_cost
-            points = new_points
-            if current_cost < best_cost:
-                best_cost = current_cost
-                best_points = points.copy()
-            current_damping = min(0.8, current_damping * 1.1)
-        else:
-            current_damping *= 0.5
-            if current_damping < 0.01:
-                break
-    
-    return best_points
+        point_to_facets = [[] for _ in range(len(points))]
+        for fi, simplex in enumerate(hull.simplices):
+            for idx in simplex:
+                point_to_facets[idx].append(fi)
 
+        for i in range(len(points)):
+            if not point_to_facets[i]:
+                continue
+            circumcenters = []
+            for fi in point_to_facets[i]:
+                simplex = hull.simplices[fi]
+                pts = points[simplex]
+                a, b, c = pts[0], pts[1], pts[2]
+                v = np.cross(b - a, c - a)
+                vn = np.linalg.norm(v)
+                if vn < 1e-12:
+                    continue
+                v /= vn
+                d = np.dot(v, a)
+                if d < 0:
+                    v = -v
+                circumcenters.append(v)
+            if not circumcenters:
+                continue
+            centroid = np.mean(circumcenters, axis=0)
+            cn = np.linalg.norm(centroid)
+            if cn > 1e-12:
+                new_points[i] = centroid / cn
 
-def _nelder_mead_optimize(points, time_limit=20, maxiter=1000):
-    """
-    Local optimization using Nelder-Mead on the true covering radius.
-    """
-    start_time = time.time()
-    
-    def objective(params):
-        if time.time() - start_time > time_limit:
-            return 1e6
-        pts = params.reshape(N, 3)
-        pts = _normalize(pts)
-        return _covering_radius_radians(pts)
-    
-    x0 = points.flatten()
-    result = minimize(objective, x0, method='Nelder-Mead', 
-                      options={'maxiter': maxiter, 'xatol': 1e-10, 'fatol': 1e-10})
-    best_points = result.x.reshape(N, 3)
-    return _normalize(best_points)
-
-
-def _block_coordinate_descent(points, time_limit=30, max_rounds=10):
-    """
-    Block coordinate descent: optimize each point individually while keeping others fixed.
-    """
-    start_time = time.time()
-    points = _normalize(points).copy()
-    current_cost = _covering_radius(points)
-    best_points = points.copy()
-    best_cost = current_cost
-    
-    for round_num in range(max_rounds):
-        if time.time() - start_time > time_limit:
+        diff = np.max(np.linalg.norm(new_points - points, axis=1))
+        points = new_points
+        cr = _covering_radius(points)
+        if cr < best_cr:
+            best_cr = cr
+            best = points.copy()
+        if diff < tol:
             break
-        
-        for idx in range(N):
-            if time.time() - start_time > time_limit:
-                break
-            
-            other_points = np.delete(points, idx, axis=0)
-            
-            def objective_single(params):
-                pt = params / np.linalg.norm(params)
-                all_pts = np.vstack([other_points, pt.reshape(1, 3)])
-                return _covering_radius_radians(all_pts)
-            
-            x0 = points[idx]
-            result = minimize(objective_single, x0, method='Nelder-Mead',
-                              options={'maxiter': 100, 'xatol': 1e-8, 'fatol': 1e-8})
-            new_pt = result.x / np.linalg.norm(result.x)
-            points[idx] = new_pt
-        
-        new_cost = _covering_radius(points)
-        if new_cost < best_cost:
-            best_cost = new_cost
-            best_points = points.copy()
-    
-    return best_points
+
+    return best, best_cr
 
 
-def _sa_optimize_covering(points, T_start=1.0, T_end=1e-4, n_iter=5000, time_limit=100):
+def _simulated_annealing(points, start_time=None, deadline=None, seed=123):
     """
-    Simulated Annealing to minimize covering radius directly.
+    Short SA to escape local minima before final polish.
     """
-    start_time = time.time()
-    points = _normalize(points).copy()
-    current_cost = _covering_radius(points)
-    best_points = points.copy()
-    best_cost = current_cost
-    
-    cooling = (T_end / T_start) ** (1.0 / n_iter)
-    
-    for i in range(n_iter):
-        if time.time() - start_time > time_limit:
+    points = _normalize(points)
+    best = points.copy()
+    best_cr = _covering_radius(points)
+    current = points.copy()
+    current_cr = best_cr
+
+    rng = np.random.RandomState(seed)
+    T = 0.03
+    cooling = 0.997
+    T_min = 1e-5
+
+    while T > T_min:
+        if deadline is not None and time.time() >= deadline:
             break
-        T = T_start * (cooling ** i)
-        
-        idx = np.random.randint(N)
-        original_point = points[idx].copy()
-        
-        step_size = 0.05 * T / T_start
-        noise = np.random.normal(0, step_size, 3)
-        new_point = original_point + noise
-        new_point = new_point / np.linalg.norm(new_point)
-        
-        points[idx] = new_point
-        
-        new_cost = _covering_radius(points)
-        delta_C = new_cost - current_cost
-        
-        if delta_C < 0 or np.random.rand() < np.exp(-delta_C / T):
-            current_cost = new_cost
-            if current_cost < best_cost:
-                best_cost = current_cost
-                best_points = points.copy()
-        else:
-            points[idx] = original_point
-            
-    return best_points
+
+        n_pert = rng.randint(1, 4)
+        idxs = rng.choice(N, size=n_pert, replace=False)
+        cand = current.copy()
+        for idx in idxs:
+            noise = rng.randn(3) * T
+            cand[idx] = current[idx] + noise
+            cand[idx] /= np.linalg.norm(cand[idx])
+
+        new_cr = _covering_radius(cand)
+        delta = new_cr - current_cr
+        if delta < 0 or rng.rand() < np.exp(-delta / T):
+            current = cand
+            current_cr = new_cr
+            if new_cr < best_cr:
+                best_cr = new_cr
+                best = cand.copy()
+
+        T *= cooling
+
+    return best, best_cr
 
 
-def _refine_point(points, idx, time_limit=5):
+def _multi_beta_lse(points, start_time, deadline):
     """
-    Refine a single point by optimizing its position given others fixed.
+    Multi-stage beta cascade with progressively tighter L-BFGS tolerances.
     """
-    start_time = time.time()
-    points = _normalize(points).copy()
-    other_points = np.delete(points, idx, axis=0)
-    
-    def objective_single(params):
-        if time.time() - start_time > time_limit:
-            return 1e6
-        pt = params / np.linalg.norm(params)
-        all_pts = np.vstack([other_points, pt.reshape(1, 3)])
-        return _covering_radius_radians(all_pts)
-    
-    x0 = points[idx]
-    result = minimize(objective_single, x0, method='Nelder-Mead',
-                      options={'maxiter': 200, 'xatol': 1e-9, 'fatol': 1e-9})
-    new_pt = result.x / np.linalg.norm(result.x)
-    points[idx] = new_pt
-    return points
+    best = _normalize(points)
+    best_cr = _covering_radius(best)
 
+    stages = [
+        (15.0, 1e-10, 1e-8, 200, 300),
+        (50.0, 1e-12, 1e-10, 300, 400),
+        (150.0, 1e-14, 1e-12, 300, 400),
+        (300.0, 1e-15, 1e-13, 300, 400),
+        (500.0, 1e-16, 1e-14, 300, 400),
+    ]
+
+    for beta, ftol, gtol, maxiter, maxfun in stages:
+        if deadline is not None and time.time() >= deadline:
+            break
+        # time budget per stage
+        remaining = max(1.0, deadline - time.time()) if deadline else 10.0
+        # allocate up to 12s per stage, but not more than remaining
+        stage_time = min(12.0, remaining * 0.6)
+
+        # run L-BFGS with a local deadline
+        local_deadline = time.time() + stage_time
+        pts, cr = _lbfgs_smooth(
+            best,
+            start_time=start_time,
+            deadline=local_deadline,
+            beta=beta,
+            maxiter=maxiter,
+            ftol=ftol,
+            gtol=gtol,
+            maxfun=maxfun,
+        )
+        if cr < best_cr:
+            best_cr = cr
+            best = pts.copy()
+
+        # optional Riesz polish at lower beta to diversify
+        if deadline is not None and time.time() < deadline - 5.0:
+            riesz_deadline = time.time() + min(6.0, max(0.5, deadline - time.time() - 5.0))
+            pts2, cr2 = _lbfgs_riesz(
+                best,
+                start_time=start_time,
+                deadline=riesz_deadline,
+                s=12.0,
+                maxiter=150,
+                ftol=1e-12,
+                gtol=1e-10,
+                maxfun=300,
+            )
+            if cr2 < best_cr:
+                best_cr = cr2
+                best = pts2.copy()
+
+    return best, best_cr
+
+
+# ---------------- initializers ----------------
+
+def _fibonacci_points(n):
+    i = np.arange(n) + 0.5
+    z = 1.0 - 2.0 * i / n
+    phi = np.pi * (1.0 + np.sqrt(5.0)) * i
+    r = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    return np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
+
+
+def _random_points(n, seed=42):
+    rng = np.random.RandomState(seed)
+    pts = rng.randn(n, 3)
+    return pts / np.linalg.norm(pts, axis=1, keepdims=True)
+
+
+def _icosahedron_based_points(n):
+    t = (1.0 + np.sqrt(5.0)) / 2.0
+    base = np.array([
+        [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
+        [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
+        [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]
+    ], dtype=float)
+    base /= np.linalg.norm(base, axis=1, keepdims=True)
+
+    pts = base.copy()
+    rng = np.random.RandomState(123)
+    while len(pts) < n:
+        i, j = rng.randint(0, len(pts), 2)
+        if i == j:
+            continue
+        mid = (pts[i] + pts[j]) / 2.0
+        mn = np.linalg.norm(mid)
+        if mn > 1e-10:
+            mid /= mn
+            dists = 1.0 - np.sum(mid * pts, axis=1)
+            if np.min(dists) > 0.01:
+                pts = np.vstack([pts, mid])
+    return pts[:n]
+
+
+# ---------------- main ----------------
 
 def construct():
-    """Construct 50 points on the unit sphere minimizing the covering radius."""
-    total_time_limit = 145.0
     start_time = time.time()
-    
-    def _time_left():
-        return total_time_limit - (time.time() - start_time)
-    
-    # Precompute grid for smooth surrogate
-    grid = _generate_test_grid(n_theta=40, n_phi=80)
-    
-    # Try multiple initializations and keep the best
-    initializations = []
-    
-    # Fibonacci spiral
-    initializations.append(_fibonacci_points())
-    
-    # Jittered Fibonacci (breaks symmetry, often better start)
-    initializations.append(_jittered_fibonacci_points(seed=123, jitter=0.05))
-    initializations.append(_jittered_fibonacci_points(seed=456, jitter=0.1))
-    initializations.append(_jittered_fibonacci_points(seed=789, jitter=0.08))
-    
-    # Random with different seeds
-    for seed in [42, 123, 777, 999, 1234]:
-        initializations.append(_random_points(seed=seed))
-    
-    # Icosahedron-based
-    initializations.append(_icosahedron_based_points())
-    
-    best_points = None
-    best_cost = np.inf
-    
-    # Stage 1: Global Structure via Lloyd's
-    for init_pts in initializations:
-        if _time_left() < 40:
+    deadline = start_time + 145.0  # safety margin before 150s
+
+    # Diverse initial configurations
+    inits = [
+        _fibonacci_points(N),
+        _random_points(N, seed=1),
+        _random_points(N, seed=2),
+        _random_points(N, seed=3),
+        _icosahedron_based_points(N),
+    ]
+
+    best = _normalize(inits[0])
+    best_cr = _covering_radius(best)
+
+    # Phase 1: short Lloyd on each init to get into a reasonable basin
+    for i, init in enumerate(inits):
+        if deadline is not None and time.time() >= deadline - 20.0:
             break
-        
-        # Lloyd's relaxation
-        pts = _spherical_lloyd_iteration(init_pts, max_iter=60, time_limit=min(12, _time_left() - 35), damping=0.3)
-        cost = _covering_radius(pts)
-        
-        if cost < best_cost:
-            best_cost = cost
-            best_points = pts.copy()
-    
-    if best_points is None:
-        best_points = _fibonacci_points()
-        best_cost = _covering_radius(best_points)
-    
-    # Stage 2: Smooth Gradient Optimization (Moderate Beta)
-    if _time_left() > 35:
-        pts = _smooth_gradient_optimize(best_points, time_limit=min(12, _time_left() - 30), beta=100.0, use_facet=True)
-        cost = _covering_radius(pts)
-        if cost < best_cost:
-            best_cost = cost
-            best_points = pts.copy()
-    
-    # Stage 3: Block Coordinate Descent
-    if _time_left() > 30:
-        pts = _block_coordinate_descent(best_points, time_limit=min(15, _time_left() - 25), max_rounds=5)
-        cost = _covering_radius(pts)
-        if cost < best_cost:
-            best_cost = cost
-            best_points = pts.copy()
-    
-    # Stage 4: High-Precision Polish (High Beta)
-    if _time_left() > 25:
-        pts = _smooth_gradient_optimize(best_points, time_limit=min(10, _time_left() - 20), beta=500.0, use_facet=True)
-        cost = _covering_radius(pts)
-        if cost < best_cost:
-            best_cost = cost
-            best_points = pts.copy()
-    
-    # Stage 5: Nelder-Mead on True Objective
-    if _time_left() > 20:
-        pts = _nelder_mead_optimize(best_points, time_limit=min(10, _time_left() - 15))
-        cost = _covering_radius(pts)
-        if cost < best_cost:
-            best_cost = cost
-            best_points = pts.copy()
-    
-    # Stage 6: Simulated Annealing (Escape Local Minima)
-    if _time_left() > 30:
-        pts = _sa_optimize_covering(best_points, T_start=0.3, T_end=1e-4, n_iter=5000, time_limit=min(15, _time_left() - 25))
-        cost = _covering_radius(pts)
-        if cost < best_cost:
-            best_cost = cost
-            best_points = pts.copy()
-        
-        # If SA improved, do a quick Lloyd's polish again
-        if cost < best_cost:
-            pts = _spherical_lloyd_iteration(best_points, max_iter=30, time_limit=min(5, _time_left() - 15), damping=0.2)
-            cost = _covering_radius(pts)
-            if cost < best_cost:
-                best_cost = cost
-                best_points = pts.copy()
-    
-    # Stage 7: Final Block Coordinate Descent
-    if _time_left() > 15:
-        pts = _block_coordinate_descent(best_points, time_limit=min(8, _time_left() - 10), max_rounds=3)
-        cost = _covering_radius(pts)
-        if cost < best_cost:
-            best_cost = cost
-            best_points = pts.copy()
-    
-    # Stage 8: Final High-Precision Nelder-Mead
-    if _time_left() > 8:
-        pts = _nelder_mead_optimize(best_points, time_limit=min(5, _time_left() - 5), maxiter=500)
-        cost = _covering_radius(pts)
-        if cost < best_cost:
-            best_cost = cost
-            best_points = pts.copy()
-    
-    # Final normalization
-    best_points = _normalize(best_points)
-    
-    return best_points
+        # allocate up to 4s per Lloyd pass
+        lloyd_deadline = time.time() + min(4.0, max(0.5, deadline - time.time() - 20.0))
+        pts, cr = _lloyd_iteration(
+            _normalize(init),
+            max_iters=150,
+            tol=1e-10,
+            start_time=start_time,
+            deadline=lloyd_deadline,
+        )
+        if cr < best_cr:
+            best_cr = cr
+            best = pts.copy()
+
+    # Phase 2: short SA from best to escape local minima
+    if deadline is not None and time.time() < deadline - 25.0:
+        sa_deadline = time.time() + min(10.0, max(1.0, deadline - time.time() - 25.0))
+        pts, cr = _simulated_annealing(
+            best,
+            start_time=start_time,
+            deadline=sa_deadline,
+            seed=123,
+        )
+        if cr < best_cr:
+            best_cr = cr
+            best = pts.copy()
+
+    # Phase 3: multi-beta LSE cascade (main refinement)
+    if deadline is not None and time.time() < deadline - 10.0:
+        pts, cr = _multi_beta_lse(
+            best,
+            start_time=start_time,
+            deadline=deadline - 5.0,
+        )
+        if cr < best_cr:
+            best_cr = cr
+            best = pts.copy()
+
+    # Phase 4: final high-precision polish (tight LSE)
+    if deadline is not None and time.time() < deadline - 2.0:
+        polish_deadline = deadline - 1.0
+        pts, cr = _lbfgs_smooth(
+            best,
+            start_time=start_time,
+            deadline=polish_deadline,
+            beta=1000.0,
+            maxiter=400,
+            ftol=1e-16,
+            gtol=1e-15,
+            maxfun=600,
+        )
+        if cr < best_cr:
+            best_cr = cr
+            best = pts.copy()
+
+    # Final normalization and sanity check
+    best = _normalize(best)
+    # Ensure no NaN/Inf
+    if not np.all(np.isfinite(best)):
+        best = _fibonacci_points(N)
+
+    return best
 # EVOLVE-BLOCK-END

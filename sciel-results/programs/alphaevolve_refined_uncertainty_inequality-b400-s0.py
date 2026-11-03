@@ -1,131 +1,151 @@
-import numpy as np
-from scipy.optimize import minimize
-from scipy.special import roots_laguerre
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
 import time
+import math
+import numpy as np
+from scipy.special import eval_genlaguerre
+from scipy.optimize import differential_evolution
 
-def _compute_c4_bound_fast(roots):
-    """Compute the C4 upper bound for given double-root positions using Gauss-Laguerre quadrature."""
-    roots = np.asarray(roots, dtype=np.float64)
-    if np.any(roots <= 0) or np.any(np.isnan(roots)):
-        return np.inf
-    
-    n_quad = 150
-    x_quad, w_quad = np.polynomial.laguerre.laggauss(n_quad)
-    
-    # Vectorized: compute log_P for all roots at once
-    diff = x_quad[:, np.newaxis] - roots[np.newaxis, :]
-    log_abs_diff = np.log(np.abs(diff) + 1e-300)
-    log_P = 2.0 * np.sum(log_abs_diff, axis=1)
-    
-    P = np.exp(log_P)
-    P2 = P * P
-    
-    int_P = np.sum(w_quad * P)
-    int_P2 = np.sum(w_quad * P2)
-    
-    if int_P <= 0 or np.isinf(int_P) or np.isinf(int_P2):
-        return np.inf
-    
-    c4 = int_P2 / (int_P * int_P)
-    return c4
-
-def _objective(roots):
-    """Objective function for optimization."""
-    return _compute_c4_bound_fast(roots)
-
+# EVOLVE-BLOCK-START
 def construct():
-    """Return 12 positive double-root locations for the Laguerre combination (m=12, n=1)."""
+    """
+    Construct 12 positive double-root locations for the Laguerre combination (m=12, n=1).
+    Returns a list of 12 positive root locations.
+    Score is the upper bound on C4 (lower is better for the evaluator's raw value,
+    but the search score is seed/value, so higher search score = better).
+    """
     start_time = time.time()
-    deadline = start_time + 580.0  # Safety margin before 630s kill
+    DEADLINE = 630.0  # seconds wall-clock limit
+    SAFETY_MARGIN = 30.0  # return 30s before the kill
+
+    def time_ok():
+        return (time.time() - start_time) < (DEADLINE - SAFETY_MARGIN)
+
+    m = 12
+    n = 1
+
+    # Precompute the transformation matrix from standard basis to Laguerre basis
+    # P(x) = sum c_k L_k^{(1)}(x)
+    # L_k^{(1)}(x) = sum_{j=0}^k A[k,j] x^j
+    # A[k, j] = (-1)^j * binom(k+1, j+1) / j!
     
-    # Strategy: Use the asymptotic equilibrium of Laguerre zeros as an initial guess,
-    # then refine with local optimization. The Laguerre zeros themselves are the
-    # stationary points of the potential, so they should be a very good starting point.
+    A = np.zeros((13, 13))  # A[k, j] = coeff of x^j in L_k^{(1)}(x)
+    for k in range(13):
+        for j in range(k + 1):
+            A[k, j] = ((-1)**j) * math.comb(k+1, j+1) / math.factorial(j)
     
-    # Get the standard Laguerre roots of degree 12 (these are the equilibrium points)
-    x0, _ = roots_laguerre(12)
-    x0 = np.sort(x0)
+    # Solve for c given p. c = (A^T)^{-1} p
+    try:
+        A_T_inv = np.linalg.inv(A.T)
+    except np.linalg.LinAlgError:
+        A_T_inv = np.linalg.pinv(A.T)
+
+    def compute_norm_sq(roots):
+        """
+        Compute the squared norm of the polynomial in the Laguerre basis.
+        roots: array of 12 positive numbers.
+        """
+        # Build polynomial coefficients in standard basis (ascending)
+        # P(x) = prod(x - r_i)
+        # np.poly returns descending coeffs: [1, c1, ..., cm]
+        coeffs_desc = np.poly(roots)
+        p = coeffs_desc[::-1] # ascending
+        
+        # c = A_T_inv @ p
+        c = A_T_inv @ p
+        
+        # Norm squared: <L_k, L_l> = delta_kl * (k+1) for alpha=1
+        # ||P||^2 = sum c_k^2 * (k+1)
+        norm_sq = np.sum(c**2 * (np.arange(13) + 1))
+        
+        if norm_sq <= 1e-10:
+            return 0.0
+        return norm_sq
+
+    def cost_func(log_roots):
+        """
+        Minimize the upper bound on C4.
+        Bound ~ 1 / ||P||^2.
+        So we minimize 1/norm_sq, which is equivalent to maximizing norm_sq.
+        We return 1/norm_sq.
+        """
+        roots = np.exp(log_roots)
+        
+        # Check for numerical issues
+        if np.any(roots <= 0) or np.any(np.isnan(roots)) or np.any(np.isinf(roots)):
+            return 1e10
+            
+        norm_sq = compute_norm_sq(roots)
+        
+        if norm_sq <= 1e-10:
+            return 1e10
+            
+        return 1.0 / norm_sq
+
+    # Optimization Strategy:
+    # 1. Global search over 12 log-root parameters using Differential Evolution.
+    # 2. Multiple restarts to avoid local minima.
     
-    best_roots = x0.copy()
-    best_score = _compute_c4_bound_fast(best_roots)
+    # Seed: geometric sequence a=4, q=2
+    # r_i = 4 * 2^i
+    # log_r_i = log(4) + i * log(2)
+    seed_log_roots = np.log(4.0) + np.arange(12) * np.log(2.0)
     
-    if time.time() > deadline - 120:
-        return [float(xi) for xi in best_roots]
+    # Bounds for log_roots
+    # Roots should be positive.
+    # If roots are too small or too large, the norm might behave badly.
+    # Based on seed (4 to 4*2^11 ~ 8192), log range is [~1.4, ~9].
+    # Let's allow a wider range: log(0.01) ~ -4.6 to log(10000) ~ 9.2
+    bounds = [(-4.0, 10.0)] * 12
     
-    rng = np.random.default_rng(42)
+    best_roots = None
+    best_val = 1e10
     
-    # Generate diverse initial points around the Laguerre roots
-    initial_points = [x0.copy()]
+    # Run Differential Evolution with multiple restarts
+    # We have 600s. DE is stochastic.
+    # Let's run a few independent DEs with different seeds and settings.
     
-    # Perturbed Laguerre roots with different scales
-    for scale in [0.05, 0.1, 0.2, 0.3, 0.5]:
-        perturbed = x0 * (1 + scale * rng.standard_normal(12))
-        perturbed = np.maximum(perturbed, 1e-3)
-        perturbed = np.sort(perturbed)
-        initial_points.append(perturbed)
+    seeds = [42, 123, 456, 789, 101]
     
-    # Add some structured variations
-    # Scaled Laguerre roots
-    for scale in [0.8, 1.2, 1.5, 2.0]:
-        scaled = x0 * scale
-        initial_points.append(scaled.copy())
-    
-    # Random uniform in [0.1, 30]
-    for _ in range(3):
-        rand_roots = rng.uniform(0.1, 30, size=12)
-        rand_roots = np.sort(rand_roots)
-        initial_points.append(rand_roots)
-    
-    # Geometric spacing variations
-    for start in [0.5, 1.0, 2.0]:
-        for ratio in [1.3, 1.5, 1.8]:
-            geom = start * (ratio ** np.arange(12))
-            if geom[-1] < 100 and geom[0] > 0.1:
-                initial_points.append(geom.copy())
-    
-    # Try L-BFGS-B from each initial point
-    bounds = [(1e-6, None)] * 12
-    
-    for x_init in initial_points:
-        if time.time() > deadline - 60:
+    for seed in seeds:
+        if not time_ok():
             break
         
         try:
-            result = minimize(
-                _objective,
-                x_init,
-                method='L-BFGS-B',
-                bounds=bounds,
-                options={'maxiter': 500, 'ftol': 1e-14, 'gtol': 1e-12}
+            # Use smaller popsize and maxiter for speed, relying on multiple restarts
+            # popsize=15, maxiter=100 is usually fast for 12D.
+            result = differential_evolution(
+                cost_func, 
+                bounds, 
+                seed=seed, 
+                maxiter=150, 
+                popsize=20, 
+                tol=1e-8, 
+                polish=True,  # L-BFGS-B polish
+                init='sobol' # Better initial distribution
             )
             
-            candidate = result.x
-            if np.all(candidate > 0) and not np.any(np.isnan(candidate)):
-                candidate = np.sort(candidate)
-                score = _compute_c4_bound_fast(candidate)
-                if score < best_score:
-                    best_score = score
-                    best_roots = candidate.copy()
-        except Exception:
+            if result.fun < best_val:
+                best_val = result.fun
+                best_log_roots = result.x
+                best_roots = np.exp(best_log_roots)
+                
+        except Exception as e:
             pass
+
+    # Fallback / Initial guess if DE fails or to ensure we have a baseline
+    # The seed from the prompt: r0=4, q=2
+    seed_roots = 4.0 * (2.0 ** np.arange(12))
+    seed_val = cost_func(seed_log_roots)
     
-    # Final polish on best roots with tighter tolerance
-    if time.time() < deadline - 10:
-        try:
-            result_final = minimize(
-                _objective,
-                best_roots,
-                method='L-BFGS-B',
-                bounds=bounds,
-                options={'maxiter': 1000, 'ftol': 1e-16, 'gtol': 1e-14}
-            )
-            if np.all(result_final.x > 0) and not np.any(np.isnan(result_final.x)):
-                candidate = np.sort(result_final.x)
-                score = _compute_c4_bound_fast(candidate)
-                if score < best_score:
-                    best_score = score
-                    best_roots = candidate.copy()
-        except Exception:
-            pass
+    if best_roots is None or seed_val < best_val:
+        best_val = seed_val
+        best_roots = seed_roots
+
+    # Ensure roots are positive and sorted (though order doesn't matter for the product)
+    if best_roots is not None:
+        best_roots = np.maximum(best_roots, 1e-6)
+        return list(best_roots)
     
-    return [float(xi) for xi in best_roots]
+    # Absolute fallback
+    return [4.0 * (2.0 ** i) for i in range(12)]
+# EVOLVE-BLOCK-END

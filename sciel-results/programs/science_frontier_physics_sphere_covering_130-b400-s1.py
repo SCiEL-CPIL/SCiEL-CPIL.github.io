@@ -4,275 +4,385 @@ import time
 
 N = 130
 
-def compute_facet_data(points):
+def _normalize(points):
+    norms = np.linalg.norm(points, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-15, 1.0, norms)
+    return points / norms
+
+def _facet_circumradii(points, simplices):
     """
-    Computes the circumradius and circumcenter direction for each facet of the convex hull.
+    Compute circumradii and circumcenters for all hull facets (vectorized).
     Returns:
-        radii: array of shape (M,)
-        centers: array of shape (M, 3) unit vectors
-        simplices: array of shape (M, 3)
+        radii: (M,) array of angular circumradii
+        centers: (M, 3) array of circumcenters on sphere
+        mask: (M,) boolean array of valid facets
+    """
+    M = len(simplices)
+    p1 = points[simplices[:, 0]]
+    p2 = points[simplices[:, 1]]
+    p3 = points[simplices[:, 2]]
+    
+    v1 = p2 - p1
+    v2 = p3 - p1
+    cross = np.cross(v1, v2)
+    norm_cross = np.linalg.norm(cross, axis=1)
+    
+    valid = norm_cross > 1e-14
+    centers = np.zeros((M, 3))
+    radii = np.zeros(M)
+    
+    if np.any(valid):
+        c = cross[valid] / norm_cross[valid, np.newaxis]
+        
+        centroid = (p1[valid] + p2[valid] + p3[valid]) / 3.0
+        dot_c_centroid = np.sum(c * centroid, axis=1)
+        flip = dot_c_centroid < 0
+        c[flip] = -c[flip]
+        
+        centers[valid] = c
+        dot_val = np.clip(np.sum(c * p1[valid], axis=1), -1.0, 1.0)
+        dist = np.arccos(dot_val)
+        radii[valid] = np.where(dist > np.pi / 2, np.pi - dist, dist)
+    
+    return radii, centers, valid
+
+def _covering_radius_rad(points):
+    """
+    Compute the covering radius of a set of points on the unit sphere (in radians).
     """
     try:
         hull = ConvexHull(points)
-        simplices = hull.simplices
+        radii, centers, valid = _facet_circumradii(points, hull.simplices)
+        if not np.any(valid):
+            return np.pi
+        return float(np.max(radii[valid]))
     except Exception:
-        return np.array([]), np.array([]), np.array([])
-    
-    if len(simplices) == 0:
-        return np.array([]), np.array([]), np.array([])
-        
-    a = points[simplices[:, 0]]
-    b = points[simplices[:, 1]]
-    c = points[simplices[:, 2]]
-    
-    # Normals
-    n = np.cross(b - a, c - a)
-    norms = np.linalg.norm(n, axis=1)
-    
-    valid = norms > 1e-10
-    if not np.all(valid):
-        # Degenerate facets, handle gracefully
-        radii = np.full(len(simplices), np.pi)
-        centers = np.zeros((len(simplices), 3))
-        centers[~valid] = [0, 0, 1]
-        return radii, centers, simplices
-        
-    u = n / norms[:, np.newaxis]
-    
-    # Orient normals outwards
-    centroids = (a + b + c) / 3.0
-    dots = np.sum(u * centroids, axis=1)
-    u[dots < 0] *= -1
-    
-    # Circumradius
-    cos_theta = np.sum(u * a, axis=1)
-    cos_theta = np.clip(cos_theta, -1.0, 1.0)
-    radii = np.arccos(cos_theta)
-    
-    return radii, u, simplices
+        return np.pi
 
-def greedy_init(n_points, seed=0):
-    """
-    Greedy initialization: start with a random point, then repeatedly add the point
-    that maximizes the minimum distance to existing points.
-    """
-    np.random.seed(seed)
-    points = [np.random.randn(3)]
-    points[0] /= np.linalg.norm(points[0])
-    
-    for _ in range(n_points - 1):
-        # Generate many candidates
-        candidates = np.random.randn(500, 3)
-        candidates /= np.linalg.norm(candidates, axis=1, keepdims=True)
-        
-        # For each candidate, compute min distance to existing points
-        existing = np.array(points)
-        # Dot products
-        dots = candidates @ existing.T
-        min_cos = np.min(dots, axis=1)
-        min_cos = np.clip(min_cos, -1.0, 1.0)
-        max_dist = np.arccos(min_cos)
-        
-        best_idx = np.argmax(max_dist)
-        points.append(candidates[best_idx])
-    
-    return np.array(points)
+def _covering_radius_deg(points):
+    return _covering_radius_rad(points) * 180.0 / np.pi
 
-def polish(points, time_budget):
+def _soft_max_objective_and_grad(points, beta=50.0):
     """
-    High-precision polish pass with tighter tolerance and adaptive step size.
+    Compute the soft-max (log-sum-exp) surrogate for the max circumradius
+    and its gradient with respect to point positions.
     """
-    start = time.time()
-    alpha = 0.01
-    best_local = points.copy()
-    best_local_radius = np.pi
+    try:
+        hull = ConvexHull(points)
+    except Exception:
+        return 1.0, np.zeros_like(points)
     
-    for step in range(2000):
-        if time.time() - start > time_budget:
-            break
-            
-        radii, centers, simplices = compute_facet_data(points)
-        if len(radii) == 0:
-            break
-            
-        max_radius = np.max(radii)
+    radii, centers, valid = _facet_circumradii(points, hull.simplices)
+    M = len(radii)
+    
+    if M == 0 or not np.any(valid):
+        return 0.0, np.zeros_like(points)
+    
+    # Use only valid facets
+    r_valid = radii[valid]
+    c_valid = centers[valid]
+    f_valid = hull.simplices[valid]
+    
+    if len(r_valid) == 0:
+        return 0.0, np.zeros_like(points)
+    
+    r_max = np.max(r_valid)
+    if r_max < 1e-15:
+        return 0.0, np.zeros_like(points)
+    
+    shifted = beta * (r_valid - r_max)
+    log_sum_exp = r_max + np.log(np.sum(np.exp(shifted))) / beta
+    
+    weights = np.exp(shifted) / np.sum(np.exp(shifted))
+    
+    grad = np.zeros_like(points)
+    
+    for k in range(len(f_valid)):
+        if weights[k] < 1e-10:
+            continue
         
-        if max_radius < best_local_radius:
-            best_local_radius = max_radius
-            best_local = points.copy()
-            
-        # Only move the largest facets (top 10%)
-        if len(radii) > 5:
-            threshold = np.percentile(radii, 90)
-            mask = radii > threshold
-        else:
-            max_idx = np.argmax(radii)
-            mask = np.zeros(len(radii), dtype=bool)
-            mask[max_idx] = True
-            
-        if not np.any(mask):
-            break
-            
-        updates = np.zeros_like(points)
+        tri = f_valid[k]
+        p1 = points[tri[0]]
+        p2 = points[tri[1]]
+        p3 = points[tri[2]]
+        c = c_valid[k]
+        r_k = r_valid[k]
         
-        for m in np.where(mask)[0]:
-            simplex = simplices[m]
-            i_idx, j_idx, k_idx = simplex
-            
-            a = points[i_idx]
-            b = points[j_idx]
-            c = points[k_idx]
-            
-            center = centers[m]
-            
-            step_size = alpha * radii[m]
-            
-            updates[i_idx] += step_size * (center - a)
-            updates[j_idx] += step_size * (center - b)
-            updates[k_idx] += step_size * (center - c)
+        if r_k < 1e-12:
+            continue
         
-        points += updates
-        points /= np.linalg.norm(points, axis=1, keepdims=True)
+        # Gradient of r = arccos(c . p) w.r.t. p is -(c - (c.p)p) / sin(r)
+        # We want to decrease r, so move p in direction of -grad = (c - (c.p)p) / sin(r)
+        # But we are doing gradient descent on the objective, so we subtract grad.
+        # grad_obj = sum w_k * grad_r_k
+        # grad_r_k = - (c - (c.p_k)p_k) / sin(r_k)
+        # So -grad_obj = sum w_k * (c - (c.p_k)p_k) / sin(r_k)
+        # We want to move points to decrease objective, so step = -lr * grad_obj
+        # Which is equivalent to step = lr * sum w_k * (c - (c.p_k)p_k) / sin(r_k)
         
-        # Decay step size
-        alpha *= 0.995
-        
-        if alpha < 1e-5:
-            break
-            
-    return best_local
+        for idx, p in zip(tri, [p1, p2, p3]):
+            dot_cp = np.dot(c, p)
+            sin_r = np.sqrt(max(0.0, 1.0 - dot_cp * dot_cp))
+            if sin_r > 1e-12:
+                # Direction to move p to decrease r: towards c (tangent component)
+                direction = c - dot_cp * p
+                # Normalize direction? No, the magnitude is 1/sin(r) * sin(r) = 1?
+                # |c - (c.p)p| = sin(r). So direction/sin(r) is unit vector.
+                # The gradient magnitude is 1/sin(r).
+                # So the step contribution is w_k * (c - dot_cp * p) / sin_r^2 ?
+                # Let's just use the analytic gradient of arccos(x) = -1/sqrt(1-x^2)
+                # d(arccos(c.p))/dp = -(c - (c.P)P) / sqrt(1-(c.P)^2)
+                # So grad_r = - (c - dot_cp * p) / sin_r
+                # We want to minimize, so we move in direction -grad_r = (c - dot_cp * p) / sin_r
+                # Wait, the code below adds to grad, and later does points - lr * grad.
+                # So we need grad = d(objective)/dp.
+                # d(objective)/dp = sum w_k * d(r_k)/dp
+                # d(r_k)/dp = - (c - dot_cp * p) / sin_r
+                # So grad += w_k * (-(c - dot_cp * p) / sin_r)
+                # Then step = -lr * grad = lr * w_k * (c - dot_cp * p) / sin_r
+                # This moves p towards c. Correct.
+                
+                grad_p = -(c - dot_cp * p) / sin_r
+                # Project to tangent plane (should already be, but just in case)
+                grad_p -= np.dot(grad_p, p) * p
+                grad[idx] += weights[k] * grad_p
+    
+    return float(log_sum_exp), grad
 
 def construct():
     start_time = time.time()
-    time_limit = 145.0
+    deadline = start_time + 135.0  # 15s safety margin
+
+    def time_left():
+        return deadline - time.time()
+
+    rng = np.random.default_rng(42)
     
-    best_points = None
-    best_radius = np.pi
+    # Phase 0: Generate diverse initializations
+    inits = []
     
-    # Initial configurations
-    initializations = []
-    
-    # 1. Fibonacci Sphere
+    # 1. Fibonacci spiral
     i = np.arange(N) + 0.5
     z = 1.0 - 2.0 * i / N
     phi = np.pi * (1.0 + np.sqrt(5.0)) * i
     r = np.sqrt(1.0 - z * z)
-    init_fib = np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
-    initializations.append(init_fib)
+    fib_pts = np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
+    fib_pts = _normalize(fib_pts)
+    
+    # Perturbed Fibonacci
+    fib_pert = fib_pts + rng.normal(0, 0.05, fib_pts.shape)
+    fib_pert = _normalize(fib_pert)
+    
+    inits.append(fib_pts)
+    inits.append(fib_pert)
     
     # 2. Random points
-    np.random.seed(42)
-    init_rand = np.random.randn(N, 3)
-    init_rand /= np.linalg.norm(init_rand, axis=1, keepdims=True)
-    initializations.append(init_rand)
+    for _ in range(3):
+        pts = rng.normal(0, 1, (N, 3))
+        pts = _normalize(pts)
+        inits.append(pts)
     
-    # 3. Greedy initialization
-    init_greedy = greedy_init(N, seed=42)
-    initializations.append(init_greedy)
+    # 3. Electrostatic refinement of Fibonacci
+    def electrostatic_refine(pts, n_iters=100, lr=0.01):
+        pts = pts.copy()
+        for _ in range(n_iters):
+            D = pts @ pts.T
+            chord2 = 2.0 - 2.0 * D
+            np.fill_diagonal(chord2, 1.0)
+            W = 1.0 / chord2
+            np.fill_diagonal(W, 0.0)
+            row_sum = W.sum(axis=1)
+            forces = pts * row_sum[:, None] - (W @ pts)
+            forces = forces - np.einsum('ij,ij->i', forces, pts)[:, None] * pts
+            norms = np.linalg.norm(forces, axis=1, keepdims=True)
+            norms = np.where(norms < 1e-12, 1.0, norms)
+            forces /= norms
+            pts = pts + lr * forces
+            pts = _normalize(pts)
+        return pts
     
-    # 4. Another greedy with different seed
-    init_greedy2 = greedy_init(N, seed=123)
-    initializations.append(init_greedy2)
+    if time_left() > 10.0:
+        elec_pts = electrostatic_refine(fib_pts, n_iters=200, lr=0.005)
+        inits.append(elec_pts)
     
-    # 5. Fibonacci + noise
-    np.random.seed(123)
-    init_fib_noise = init_fib + np.random.randn(N, 3) * 0.2
-    init_fib_noise /= np.linalg.norm(init_fib_noise, axis=1, keepdims=True)
-    initializations.append(init_fib_noise)
+    # Evaluate initializations and pick the best
+    best_points = None
+    best_radius = np.pi
     
-    # More randomized restarts
-    for s in range(20):
-        np.random.seed(1000 + s * 7)
-        init = init_fib + np.random.randn(N, 3) * (0.1 + 0.1 * s / 20)
-        init /= np.linalg.norm(init, axis=1, keepdims=True)
-        initializations.append(init)
-    
-    max_restarts = 25
-    
-    for restart in range(max_restarts):
-        if time.time() - start_time > time_limit:
+    for init in inits:
+        if time_left() < 5.0:
             break
-            
-        if restart < len(initializations):
-            points = initializations[restart].copy()
-        else:
-            np.random.seed(restart * 137)
-            points = init_fib + np.random.randn(N, 3) * 0.3
-            points /= np.linalg.norm(points, axis=1, keepdims=True)
-        
-        # Local Optimization
-        alpha = 0.05
-        no_improve = 0
-        
-        for step in range(5000):
-            if time.time() - start_time > time_limit:
-                break
-                
-            radii, centers, simplices = compute_facet_data(points)
-            
-            if len(radii) == 0:
-                break
-                
-            max_radius = np.max(radii)
-            
-            if max_radius < best_radius:
-                best_radius = max_radius
-                best_points = points.copy()
-                no_improve = 0
-            else:
-                no_improve += 1
-                if no_improve > 50:
-                    alpha *= 0.9
-                    if alpha < 1e-4:
-                        break
-                if no_improve > 200:
-                    break
-            
-            # Identify facets to move
-            threshold = np.percentile(radii, 80)
-            mask = radii > threshold
-            
-            if not np.any(mask):
-                max_idx = np.argmax(radii)
-                mask = np.zeros(len(radii), dtype=bool)
-                mask[max_idx] = True
-            
-            # Accumulate moves for vertices
-            updates = np.zeros_like(points)
-            
-            for m in np.where(mask)[0]:
-                simplex = simplices[m]
-                i_idx, j_idx, k_idx = simplex
-                
-                a = points[i_idx]
-                b = points[j_idx]
-                c = points[k_idx]
-                
-                center = centers[m]
-                
-                step_size = alpha * radii[m]
-                
-                updates[i_idx] += step_size * (center - a)
-                updates[j_idx] += step_size * (center - b)
-                updates[k_idx] += step_size * (center - c)
-            
-            points += updates
-            points /= np.linalg.norm(points, axis=1, keepdims=True)
-    
-    # Final polish pass on the best configuration found
-    if best_points is not None and time.time() - start_time < time_limit - 5.0:
-        remaining_time = time_limit - 5.0 - (time.time() - start_time)
-        if remaining_time > 2.0:
-            polished = polish(best_points, remaining_time)
-            # Check if polished is better
-            radii, _, _ = compute_facet_data(polished)
-            if len(radii) > 0:
-                pol_radius = np.max(radii)
-                if pol_radius < best_radius:
-                    best_radius = pol_radius
-                    best_points = polished
+        rad = _covering_radius_rad(init)
+        if rad < best_radius:
+            best_radius = rad
+            best_points = init.copy()
     
     if best_points is None:
-        best_points = init_fib
+        best_points = fib_pts
+        best_radius = _covering_radius_rad(fib_pts)
+    
+    # Phase 1: Main optimization loop with adaptive strategy
+    points = best_points.copy()
+    
+    # Strategy parameters
+    use_gradient = False
+    gradient_step = 0.02
+    beta = 30.0
+    lloyd_step = 0.03
+    min_step = 1e-7
+    no_improve_count = 0
+    max_no_improve = 30
+    
+    while time_left() > 20.0:
+        try:
+            hull = ConvexHull(points)
+            radii, centers, valid = _facet_circumradii(points, hull.simplices)
+            if not np.any(valid):
+                break
+        except Exception:
+            # Hull failed, kick and continue
+            kick = rng.normal(0, 0.02, points.shape)
+            points += kick
+            points = _normalize(points)
+            continue
         
+        M = len(radii)
+        r_valid = radii[valid]
+        c_valid = centers[valid]
+        f_valid = hull.simplices[valid]
+        
+        if use_gradient:
+            # Gradient descent on soft-max
+            obj, grad = _soft_max_objective_and_grad(points, beta)
+            
+            # Project gradient to tangent plane
+            grad_tangent = np.zeros_like(points)
+            for i in range(N):
+                g = grad[i]
+                g_tan = g - np.dot(g, points[i]) * points[i]
+                norm_g = np.linalg.norm(g_tan)
+                if norm_g > 1e-12:
+                    grad_tangent[i] = g_tan / norm_g
+            
+            new_points = points - gradient_step * grad_tangent
+            new_points = _normalize(new_points)
+            
+            current_radius = _covering_radius_rad(new_points)
+            
+            if current_radius < best_radius:
+                best_radius = current_radius
+                best_points = new_points.copy()
+                points = new_points
+                no_improve_count = 0
+                gradient_step = min(gradient_step * 1.05, 0.05)
+                beta = min(beta * 1.03, 150.0)
+            else:
+                gradient_step = max(gradient_step * 0.85, min_step)
+                no_improve_count += 1
+        else:
+            # Lloyd-style: move points towards their worst facet center
+            point_max_radius = np.zeros(N)
+            point_max_center = np.zeros((N, 3))
+            
+            for k in range(len(f_valid)):
+                r_k = r_valid[k]
+                if r_k <= 0:
+                    continue
+                c_k = c_valid[k]
+                tri = f_valid[k]
+                for idx in tri:
+                    if r_k > point_max_radius[idx]:
+                        point_max_radius[idx] = r_k
+                        point_max_center[idx] = c_k
+            
+            max_move = np.zeros_like(points)
+            
+            for i in range(N):
+                if point_max_radius[i] > 0:
+                    v = point_max_center[i] - points[i]
+                    dot_vp = np.dot(v, points[i])
+                    tangent_v = v - dot_vp * points[i]
+                    norm_tv = np.linalg.norm(tangent_v)
+                    if norm_tv > 1e-12:
+                        max_move[i] = (tangent_v / norm_tv) * point_max_radius[i]
+            
+            new_points = points + lloyd_step * max_move
+            new_points = _normalize(new_points)
+            
+            current_radius = _covering_radius_rad(new_points)
+            
+            if current_radius < best_radius:
+                best_radius = current_radius
+                best_points = new_points.copy()
+                points = new_points
+                no_improve_count = 0
+                lloyd_step = min(lloyd_step * 1.04, 0.08)
+            else:
+                lloyd_step = max(lloyd_step * 0.82, min_step)
+                no_improve_count += 1
+        
+        if no_improve_count > max_no_improve:
+            if not use_gradient:
+                use_gradient = True
+                gradient_step = 0.02
+                beta = 30.0
+            else:
+                # Random kick to escape local minimum
+                kick = rng.normal(0, 0.04, points.shape)
+                points += kick
+                points = _normalize(points)
+                lloyd_step = 0.02
+                gradient_step = 0.01
+                beta = 20.0
+                no_improve_count = 0
+                current_radius = _covering_radius_rad(points)
+                if current_radius < best_radius:
+                    best_radius = current_radius
+                    best_points = points.copy()
+            no_improve_count = 0
+    
+    # Phase 2: High-precision polish
+    points = best_points.copy()
+    polish_deadline = deadline - 5.0
+    polish_step = 0.003
+    
+    while time_left() > 5.0:
+        try:
+            hull = ConvexHull(points)
+            radii, centers, valid = _facet_circumradii(points, hull.simplices)
+            if not np.any(valid):
+                break
+        except Exception:
+            break
+        
+        r_valid = radii[valid]
+        c_valid = centers[valid]
+        f_valid = hull.simplices[valid]
+        
+        max_idx = np.argmax(r_valid)
+        max_r = r_valid[max_idx]
+        worst_facet = f_valid[max_idx]
+        worst_center = c_valid[max_idx]
+        
+        # Move points in the worst facet towards the circumcenter
+        for idx in worst_facet:
+            v = worst_center - points[idx]
+            dot_vp = np.dot(v, points[idx])
+            tangent_v = v - dot_vp * points[idx]
+            norm_tv = np.linalg.norm(tangent_v)
+            if norm_tv > 1e-12:
+                points[idx] += polish_step * tangent_v / norm_tv
+        
+        points = _normalize(points)
+        
+        current_radius = _covering_radius_rad(points)
+        if current_radius < best_radius:
+            best_radius = current_radius
+            best_points = points.copy()
+        else:
+            polish_step *= 0.6
+            if polish_step < 1e-7:
+                break
+            points = best_points.copy()
+    
     return best_points

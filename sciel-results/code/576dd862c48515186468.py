@@ -1,0 +1,3 @@
+s, c, ang = _score_of(inner)
+# ...
+if _config_valid(best_inner, c, ang): # ERROR: missing 'side'

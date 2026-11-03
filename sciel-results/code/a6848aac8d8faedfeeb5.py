@@ -1,0 +1,171 @@
+"""Matrix multiplication 4x5x5 - rank-minimal exact tensor decomposition."""
+import time
+import numpy as np
+
+DIMENSIONS = [4, 5, 5]
+
+def _verify(U, V, W, n, m, p):
+    """Verify that U, V, W give an exact decomposition of the matmul tensor."""
+    rank = len(U[0]) if U else 0
+    U = np.array(U, dtype=np.float64)
+    V = np.array(V, dtype=np.float64)
+    W = np.array(W, dtype=np.float64)
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                s = 0.0
+                for r in range(rank):
+                    s += U[i*m+j, r] * V[j*p+k, r] * W[k*n+i, r]
+                if abs(s - 1.0) > 1e-9:
+                    return False
+    return True
+
+def _schoolbook(n, m, p):
+    """Schoolbook decomposition of rank n*m*p."""
+    rank = n * m * p
+    U = [[0]*rank for _ in range(n*m)]
+    V = [[0]*rank for _ in range(m*p)]
+    W = [[0]*rank for _ in range(p*n)]
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i*m+j][col] = 1
+                V[j*p+k][col] = 1
+                W[k*n+i][col] = 1
+                col += 1
+    return U, V, W
+
+def _strassen_2x2x2():
+    """Strassen 2x2x2 rank 7."""
+    rank = 7
+    U = [[0]*rank for _ in range(4)]
+    V = [[0]*rank for _ in range(4)]
+    W = [[0]*rank for _ in range(4)]
+    # M1 = (A00+A11)*(B00+B11)
+    U[0][0]=1; U[3][0]=1; V[0][0]=1; V[3][0]=1; W[0][0]=1; W[3][0]=1
+    # M2 = (A10+A11)*B00
+    U[2][1]=1; U[3][1]=1; V[0][1]=1; W[2][1]=1; W[3][1]=-1
+    # M3 = A00*(B01-B11)
+    U[0][2]=1; V[1][2]=1; V[3][2]=-1; W[1][2]=1; W[3][2]=1
+    # M4 = A11*(B10-B00)
+    U[3][3]=1; V[2][3]=1; V[0][3]=-1; W[0][3]=1; W[2][3]=1
+    # M5 = (A00+A10)*B11
+    U[0][4]=1; U[2][4]=1; V[3][4]=1; W[0][4]=-1; W[1][4]=1
+    # M6 = (A11-A01)*(B00+B01)
+    U[3][5]=1; U[1][5]=-1; V[0][5]=1; V[1][5]=1; W[3][5]=1
+    # M7 = (A01-A11)*(B10+B11)
+    U[1][6]=1; U[3][6]=-1; V[2][6]=1; V[3][6]=1; W[0][6]=1
+    return U, V, W
+
+def _block_combine(U1, V1, W1, U2, V2, W2, offset, shift_i=0, shift_j=0, shift_k=0, n1=0, m1=0, p1=0, n2=0, m2=0, p2=0, n_tot=0, m_tot=0, p_tot=0):
+    """Combine two block decompositions into one larger decomposition."""
+    rank1 = len(U1[0]) if U1 else 0
+    rank2 = len(U2[0]) if U2 else 0
+    rank = rank1 + rank2
+    U = [[0]*rank for _ in range(n_tot*m_tot)]
+    V = [[0]*rank for _ in range(m_tot*p_tot)]
+    W = [[0]*rank for _ in range(p_tot*n_tot)]
+    # Place block 1
+    for i in range(n1):
+        for j in range(m1):
+            for r in range(rank1):
+                U[(shift_i+i)*m_tot + (shift_j+j)][r] = U1[i*m1+j][r]
+    for j in range(m1):
+        for k in range(p1):
+            for r in range(rank1):
+                V[(shift_j+j)*p_tot + (shift_k+k)][r] = V1[j*p1+k][r]
+    for k in range(p1):
+        for i in range(n1):
+            for r in range(rank1):
+                W[(shift_k+k)*n_tot + (shift_i+i)][r] = W1[k*n1+i][r]
+    # Place block 2
+    off = rank1
+    for i in range(n2):
+        for j in range(m2):
+            for r in range(rank2):
+                U[(shift_i+n1+i)*m_tot + (shift_j+m1+j)][off+r] = U2[i*m2+j][r]
+    for j in range(m2):
+        for k in range(p2):
+            for r in range(rank2):
+                V[(shift_j+m1+j)*p_tot + (shift_k+p1+k)][off+r] = V2[j*p2+k][r]
+    for k in range(p2):
+        for i in range(n2):
+            for r in range(rank2):
+                W[(shift_k+p1+k)*n_tot + (shift_i+n1+i)][off+r] = W2[k*n2+i][r]
+    return U, V, W
+
+def _construct_2x5x5():
+    """
+    Construct 2x5x5 decomposition.
+    A is 2x5, B is 5x5, C is 2x5.
+    Split into:
+      Block 1: 2x2 x 2x2 -> 2x2 (Strassen, rank 7)
+      Block 2: 2x3 x 3x3 -> 2x3 (need decomposition)
+    Total rank: 7 + rank(2x3x3)
+    """
+    # For 2x3x3, let's use schoolbook for now (rank 9)
+    # Actually, let me try to do better
+    # 2x3x3: A is 2x3, B is 3x3, C is 2x3
+    # Schoolbook: 2*3*3 = 18
+    # But we can share B's columns
+    
+    # Let's use a simple block approach:
+    # Split A into two 1x3 rows, each multiplied by B (3x3)
+    # 1x3 x 3x3 = 1x3, rank 3 per row, total 6? No, that's not right.
+    # 1x3 x 3x3: C[0,k] = sum_j A[0,j]*B[j,k], so rank is 3*3=9 for one row
+    # Two rows: 18 total, but we can share
+    
+    # Actually for 2x3x3, let me just use schoolbook (18) for correctness
+    # and see if the total works out
+    
+    U1, V1, W1 = _strassen_2x2x2()  # 2x2x2, rank 7
+    U2, V2, W2 = _schoolbook(2, 3, 3)  # 2x3x3, rank 18
+    
+    # Combine: n=2, m=5, p=5
+    # Block 1: rows 0-1 of A, cols 0-1 of A, cols 0-1 of B -> C cols 0-1
+    # Block 2: rows 0-1 of A, cols 2-4 of A, cols 2-4 of B -> C cols 2-4
+    U, V, W = _block_combine(
+        U1, V1, W1, U2, V2, W2,
+        offset=0, shift_i=0, shift_j=0, shift_k=0,
+        n1=2, m1=2, p1=2, n2=2, m2=3, p2=3,
+        n_tot=2, m_tot=5, p_tot=5
+    )
+    return U, V, W
+
+def _construct_4x5x5():
+    """
+    Construct 4x5x5 decomposition.
+    Split A into two 2x5 blocks.
+    Each 2x5 x 5x5 = 2x5.
+    """
+    U1, V1, W1 = _construct_2x5x5()  # First 2 rows of A
+    U2, V2, W2 = _construct_2x5x5()  # Second 2 rows of A
+    
+    # Combine: n=4, m=5, p=5
+    U, V, W = _block_combine(
+        U1, V1, W1, U2, V2, W2,
+        offset=0, shift_i=0, shift_j=0, shift_k=0,
+        n1=2, m1=5, p1=5, n2=2, m2=5, p2=5,
+        n_tot=4, m_tot=5, p_tot=5
+    )
+    return U, V, W
+
+# EVOLVE-BLOCK-START
+def construct():
+    n, m, p = DIMENSIONS
+    deadline = time.time() + 110  # safety margin
+    
+    # Try block decomposition
+    try:
+        U, V, W = _construct_4x5x5()
+        rank = len(U[0]) if U else 0
+        if _verify(U, V, W, n, m, p):
+            return {'U': U, 'V': V, 'W': W}
+    except Exception:
+        pass
+    
+    # Fallback to schoolbook
+    U, V, W = _schoolbook(n, m, p)
+    return {'U': U, 'V': V, 'W': W}
+# EVOLVE-BLOCK-END

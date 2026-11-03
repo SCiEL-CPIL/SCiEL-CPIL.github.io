@@ -1,8 +1,6 @@
 import numpy as np
 import time
-import sys
 from scipy.optimize import minimize
-import scipy.optimize as opt
 
 N = 50
 DELTA = 0.5 / N  # Step size for [-1/4, 1/4]
@@ -23,18 +21,18 @@ def _score_raw(h):
 def construct():
     start_time = time.time()
     deadline = start_time + 140.0  # Safety margin for 150s limit
-    
+
     best_h = np.ones(N) / N
     best_score = _score_raw(best_h)
-    
+
     x_idx = np.arange(N)
-    
+
     # --- Phase 1: Generate diverse initializations ---
     inits = []
-    
+
     # 1. Uniform
     inits.append(np.ones(N) / N)
-    
+
     # 2. Sparse structured (Sidon-like intuition)
     np.random.seed(42)
     for trial in range(30):
@@ -44,7 +42,7 @@ def construct():
         h_s[idx] = 1.0
         h_s /= np.sum(h_s)
         inits.append(h_s)
-        
+
     # 3. Concentrated Gaussians
     for c in np.linspace(3, N-3, 10):
         for w in np.linspace(0.5, N/3, 6):
@@ -52,7 +50,7 @@ def construct():
             if np.sum(h_g) > 1e-10:
                 h_g /= np.sum(h_g)
                 inits.append(h_g)
-                
+
     # 4. Triangular
     for c in np.linspace(3, N-3, 8):
         for w in np.linspace(2, N, 6):
@@ -60,7 +58,7 @@ def construct():
             if np.sum(h_t) > 1e-10:
                 h_t /= np.sum(h_t)
                 inits.append(h_t)
-                
+
     # 5. Random smooth
     for _ in range(20):
         h_r = np.random.rand(N)
@@ -70,7 +68,7 @@ def construct():
         if np.sum(h_r) > 1e-10:
             h_r /= np.sum(h_r)
             inits.append(h_r)
-            
+
     # 6. Alternating patterns (helps reduce auto-correlation peaks)
     for start in range(N):
         for gap in [2, 3, 4, 5]:
@@ -88,37 +86,33 @@ def construct():
     # 1. sum(h) - 1 == 0
     # 2. h_i >= 0 (via bounds)
     # 3. M - conv_k >= 0 for all k
-    
+
     def objective(x):
         return x[N]
-        
+
     def objective_grad(x):
         grad = np.zeros(N + 1)
         grad[N] = 1.0
         return grad
-        
+
     def constraint_eq_fun(x):
         return np.sum(x[:N]) - 1.0
-        
+
     def constraint_eq_jac(x):
         jac = np.zeros(N + 1)
         jac[:N] = 1.0
         return jac
-        
+
     def constraint_ineq_fun(x):
         h = x[:N]
         M = x[N]
         conv = np.convolve(h, h, mode='full')
         return M - conv
-        
+
     def constraint_ineq_jac(x):
         h = x[:N]
         jac = np.zeros((NUM_CONV, N + 1))
         jac[:, N] = 1.0
-        # d(M - conv_k)/dh_j = -2 * h_{k-j} where valid
-        # conv_k = sum_{j=0}^{N-1} h_j h_{k-j}
-        # d conv_k / d h_j = h_{k-j} + h_{j-k} (with 0 if out of bounds)
-        # Since conv is symmetric and we sum over all valid j, we can compute efficiently.
         for j in range(N):
             # Part 1: k-j is in [0, N-1] => k in [j, j+N-1]
             k_start = j
@@ -127,28 +121,17 @@ def construct():
                 indices_k = np.arange(k_start, k_end)
                 indices_h = indices_k - j
                 jac[indices_k, j] -= h[indices_h]
-            
+
             # Part 2: j-k is in [0, N-1] => k in [j-N+1, j]
-            # Note: if k=j, both parts contribute h_0? 
-            # conv_j = sum h_m h_{j-m}.
-            # d/dh_j conv_j = h_0 + h_0 = 2h_0? 
-            # Let's check: conv_j = ... + h_j h_0 + h_0 h_j + ...
-            # Yes, if m=j, term is h_j h_0. If m=0, term is h_0 h_j.
-            # So d conv_j / d h_j = 2 h_0.
-            # My loop above:
-            # Part 1 for j: k=j, index_h=0, jac[j,j] -= h[0]
-            # Part 2 for j: k=j, index_h=0, jac[j,j] -= h[0]
-            # Total -2h[0]. Correct.
-            
             k_start2 = max(0, j - N + 1)
             k_end2 = min(j, NUM_CONV)
             if k_start2 < NUM_CONV and k_end2 >= 0:
                 indices_k = np.arange(k_start2, k_end2 + 1)
                 indices_h = j - indices_k
                 jac[indices_k, j] -= h[indices_h]
-                
+
         return jac
-        
+
     constraints = [
         {
             'type': 'eq',
@@ -161,9 +144,9 @@ def construct():
             'jac': constraint_ineq_jac
         }
     ]
-    
+
     bounds = [(0.0, 1.0)] * N + [(0.0, None)]
-    
+
     def run_epigraph(h_init, maxiter=300, ftol=1e-12):
         if np.sum(h_init) < 1e-15:
             return None
@@ -171,18 +154,18 @@ def construct():
         conv_init = np.convolve(h_init, h_init, mode='full')
         M_init = np.max(conv_init) + 1e-6
         x0 = np.concatenate((h_init, [M_init]))
-        
+
         try:
-            res = opt.minimize(
-                objective, 
-                x0, 
-                method='SLSQP', 
-                bounds=bounds, 
+            res = minimize(
+                objective,
+                x0,
+                method='SLSQP',
+                bounds=bounds,
                 constraints=constraints,
                 jac=objective_grad,
                 options={'maxiter': maxiter, 'ftol': ftol}
             )
-            
+
             if res.success:
                 h_candidate = res.x[:N]
                 h_candidate = np.clip(h_candidate, 0, None)
@@ -192,14 +175,14 @@ def construct():
         except Exception:
             pass
         return None
-    
+
     # Sort inits by initial score (descending) to try best ones first
     scored_inits = []
     for h_init in inits:
         s = _score_raw(h_init)
         scored_inits.append((s, h_init))
     scored_inits.sort(key=lambda x: -x[0])
-    
+
     # Run epigraph from top candidates
     max_epigraph_runs = min(len(scored_inits), 30)
     for i in range(max_epigraph_runs):
@@ -212,20 +195,20 @@ def construct():
             if s_candidate > best_score:
                 best_score = s_candidate
                 best_h = h_candidate.copy()
-    
+
     # --- Phase 3: Local Refinement (Coordinate Descent) ---
     # The epigraph SLSQP finds a good global structure, but might leave small
     # improvements on the table due to numerical tolerance.
     # We perform a coordinate descent where we adjust pairs of bins to reduce
     # the peak convolution while maintaining L1 and maximizing L2.
-    
+
     def refine_local(h_start, max_iter=50):
         h = h_start.copy()
         h = np.clip(h, 0, None)
         if np.sum(h) < 1e-15:
             return h
         h /= np.sum(h)
-        
+
         improved = True
         iter_count = 0
         while improved and iter_count < max_iter:
@@ -233,86 +216,79 @@ def construct():
                 break
             improved = False
             iter_count += 1
-            
+
             conv = np.convolve(h, h, mode='full')
             k_star = np.argmax(conv)
             M_val = conv[k_star]
             l1 = np.sum(h)
             l2_sq = np.sum(h**2)
             current_score = l2_sq / (l1 * DELTA * M_val)
-            
-            # Try swapping mass between i and j
-            # We want to minimize M_val (peak) primarily, as L2_sq is relatively stable
-            # or increases if we concentrate mass.
-            # A simple heuristic: move mass from a bin contributing heavily to the peak
-            # to a bin that contributes less, or to a bin that is "far" from the peak index.
-            
-            # Identify top contributors to the peak conv[k_star]
-            # conv[k_star] = sum_j h[j] h[k_star-j]
-            # We can try to reduce h[j] for j that are part of the peak sum.
-            
-            # A more robust local search: 
-            # For each i, try to move a small epsilon from i to j (i != j)
-            # and check if score improves.
-            # This is O(N^2) per iteration. N=50, so 2500 checks. Fast enough.
-            
-            epsilon = 1e-4
-            best_move = None
-            best_move_score = current_score
-            
-            # Sample a subset of moves to speed up if needed, but N=50 is small
+
+            # Try moving mass from high-impact positions to low-impact ones
+            # or adjusting individual coordinates to reduce peak convolution
+            # while preserving L1
+
+            # Simple coordinate ascent on score
             for i in range(N):
-                if h[i] < epsilon:
-                    continue
-                for j in range(N):
-                    if i == j:
-                        continue
-                    # Move epsilon from i to j
+                if time.time() > deadline - 10:
+                    break
+                h_old = h[i]
+                # Try small perturbations
+                for delta_val in [0.01, -0.01, 0.001, -0.001, 0.05, -0.05]:
                     h_new = h.copy()
-                    h_new[i] -= epsilon
-                    h_new[j] += epsilon
-                    if h_new[i] < 0 or h_new[j] < 0:
+                    h_new[i] = max(0, h_old + delta_val)
+                    # Renormalize to maintain L1=1
+                    if np.sum(h_new) < 1e-15:
                         continue
-                    
-                    # Quick score check
-                    l1_new = l1 # sum is unchanged
-                    l2_sq_new = l2_sq - h[i]**2 - h[j]**2 + (h[i]-epsilon)**2 + (h[j]+epsilon)**2
-                    # l2_sq_new = l2_sq - 2*epsilon*h[i] + epsilon^2 + 2*epsilon*h[j] + epsilon^2
-                    # = l2_sq + 2*epsilon*(h[j]-h[i]) + 2*epsilon^2
-                    
-                    conv_new = np.convolve(h_new, h_new, mode='full')
-                    M_new = np.max(conv_new)
-                    
-                    if M_new <= 0:
-                        continue
-                        
-                    score_new = l2_sq_new / (l1_new * DELTA * M_new)
-                    
-                    if score_new > best_move_score + 1e-8:
-                        best_move_score = score_new
-                        best_move = (i, j, epsilon)
-            
-            if best_move:
-                i, j, eps = best_move
-                h[i] -= eps
-                h[j] += eps
-                improved = True
-        
+                    h_new /= np.sum(h_new)
+                    s_new = _score_raw(h_new)
+                    if s_new > current_score:
+                        h = h_new
+                        current_score = s_new
+                        improved = True
+
         return h
 
-    # Run local refinement on the best candidate
-    if time.time() < deadline - 15:
-        h_refined = refine_local(best_h, max_iter=20)
+    # Apply local refinement to the best solution
+    if time.time() < deadline - 10:
+        h_refined = refine_local(best_h, max_iter=30)
         s_refined = _score_raw(h_refined)
         if s_refined > best_score:
             best_score = s_refined
             best_h = h_refined
 
-    # Final sanity check and return
-    best_h = np.clip(best_h, 0, None)
+    # Final polish with tighter tolerance
+    if time.time() < deadline - 5:
+        h_start = best_h / np.sum(best_h)
+        conv_init = np.convolve(h_start, h_start, mode='full')
+        M_init = np.max(conv_init) + 1e-6
+        x0 = np.concatenate((h_start, [M_init]))
+
+        try:
+            res = minimize(
+                objective,
+                x0,
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraints,
+                jac=objective_grad,
+                options={'maxiter': 500, 'ftol': 1e-14}
+            )
+            if res.success:
+                h_candidate = res.x[:N]
+                h_candidate = np.clip(h_candidate, 0, None)
+                if np.sum(h_candidate) > 1e-15:
+                    h_candidate /= np.sum(h_candidate)
+                    s_candidate = _score_raw(h_candidate)
+                    if s_candidate > best_score:
+                        best_score = s_candidate
+                        best_h = h_candidate
+        except Exception:
+            pass
+
+    # Return the optimized shape (normalized to L1=1)
+    best_h = np.maximum(0, best_h)
     if np.sum(best_h) > 0:
-        best_h /= np.sum(best_h)
-    else:
-        best_h = np.ones(N) / N
+        best_h = best_h / np.sum(best_h)
 
     return list(best_h)
