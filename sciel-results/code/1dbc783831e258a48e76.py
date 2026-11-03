@@ -1,0 +1,38 @@
+import time
+import random
+import numpy as np
+
+DIMENSIONS = [3, 3, 5]
+
+def construct():
+    """
+    Returns a dictionary with keys 'U', 'V', 'W' representing the tensor decomposition.
+    U: (n*m, rank)
+    V: (m*p, rank)
+    W: (p*n, rank)
+    The decomposition satisfies:
+    C[i, k] = sum_{j} A[i, j] B[j, k]
+    Which is encoded in the tensor T[i, j, k] = A[i, j] B[j, k] C^*[i, k] (conceptually).
+    The factorization is T = sum_r U[:, r] V[:, r] W[:, r]
+    where U[i*m+j, r], V[j*p+k, r], W[k*n+i, r].
+    """
+    n, m, p = DIMENSIONS
+    start_time = time.time()
+    deadline = start_time + 110  # 10s margin before 120s limit
+    
+    # Schoolbook decomposition
+    rank = n * m * p
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    
+    column = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][column] = 1
+                V[j * p + k][column] = 1
+                W[k * n + i][column] = 1
+                column += 1
+                
+    return {"U": U, "V": V, "W": W}

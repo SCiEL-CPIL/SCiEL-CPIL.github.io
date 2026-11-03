@@ -1,216 +1,217 @@
-"""Erdos minimum overlap: minimize max overlap of h with shifted 1-h.
-Structural change: bisection on t with feasibility via accelerated projected gradient
-on the smooth-max surrogate, exploiting Toeplitz structure for O(n log n) evaluation."""
-import time
-import numpy as np
-
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
 N = 100
-_DEADLINE = time.time() + 145
 
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
 
-def _linear_overlap_values(h):
-    """Compute C_k = (2/N)*(N/2 - r_k) where r_k = sum_{i=k}^{N-1} h_i h_{i-k}."""
-    n = len(h)
-    n_fft = 1
-    while n_fft < 2 * n:
-        n_fft *= 2
-    h_pad = np.zeros(n_fft)
-    h_pad[:n] = h
-    H = np.fft.rfft(h_pad)
-    corr = np.fft.irfft(H * np.conj(H), n=n_fft)
-    r = corr[:n]
-    cs = (2.0 / n) * (n / 2.0 - r)
-    return cs
-
-
-def _score(h):
-    h = np.asarray(h, dtype=np.float64)
-    cs = _linear_overlap_values(h)
-    return float(np.max(cs))
-
-
-def _smooth_max_val_grad(h, beta):
-    """Return (smooth_max_value, gradient) of max(C_k) using log-sum-exp."""
-    h = np.asarray(h, dtype=np.float64)
-    n = len(h)
-    cs = _linear_overlap_values(h)
-    m = np.max(cs)
-    exp_terms = np.exp(beta * (cs - m))
-    sum_exp = np.sum(exp_terms)
-    w = exp_terms / sum_exp
-    val = m + np.log(sum_exp) / beta
-    
-    grad = np.zeros(n)
-    for k in range(n):
-        wk = w[k]
-        if wk < 1e-15:
-            continue
-        factor = -(2.0 / n) * wk
-        if k > 0:
-            grad[k:] += factor * h[:n - k]
-        grad[:n - k] += factor * h[k:]
-    return val, grad
-
-
-def _fix_sum(h):
-    """Adjust h to have sum exactly N/2, keeping values in [0, 1]."""
-    h = np.array(h, dtype=np.float64, copy=True)
-    target = N / 2.0
-    diff = target - np.sum(h)
-    h += diff / N
-    h = np.clip(h, 0.0, 1.0)
-    diff = target - np.sum(h)
-    if abs(diff) > 1e-12:
-        mask = (h > 1e-10) & (h < 1.0 - 1e-10)
-        if np.any(mask):
-            h[mask] += diff / np.sum(mask)
-            h = np.clip(h, 0.0, 1.0)
-    diff = target - np.sum(h)
-    if abs(diff) > 1e-14:
-        if diff > 0:
-            idx = np.argmin(h)
+def _overlap_max(h, k_max=None):
+    """Compute the maximum overlap of h with shifted (1-h)."""
+    if k_max is None:
+        k_max = N - 1
+    max_ov = 0.0
+    for k in range(-k_max, k_max + 1):
+        # Overlap: sum_i h[i] * (1-h)[i+k] for valid indices
+        if k >= 0:
+            a = h[:N - k]
+            b = h[k:]
         else:
-            idx = np.argmax(h)
-        h[idx] += diff
+            a = h[-k:]
+            b = h[:N + k]
+        ov = np.sum(a * (1.0 - b))
+        if ov > max_ov:
+            max_ov = ov
+    return max_ov
+
+def _logsumexp_max(h, beta=100.0, k_max=None):
+    """Smooth approximation of max overlap using log-sum-exp."""
+    if k_max is None:
+        k_max = N - 1
+    overlaps = []
+    for k in range(-k_max, k_max + 1):
+        if k >= 0:
+            a = h[:N - k]
+            b = h[k:]
+        else:
+            a = h[-k:]
+            b = h[:N + k]
+        ov = np.sum(a * (1.0 - b))
+        overlaps.append(ov)
+    overlaps = np.array(overlaps)
+    max_ov = np.max(overlaps)
+    if beta <= 0:
+        return max_ov
+    shifted = beta * (overlaps - max_ov)
+    log_sum = np.log(np.sum(np.exp(shifted)))
+    return max_ov + np.log(log_sum) / beta
+
+def _project(h):
+    """Project h onto {0<=h[i]<=1, sum h = N/2}."""
+    h = np.clip(h, 0.0, 1.0)
+    s = np.sum(h)
+    if s == 0:
+        return np.full(N, 0.5)
+    # Adjust to make sum = N/2
+    target = N / 2.0
+    diff = target - s
+    # Distribute diff proportionally, respecting bounds
+    for _ in range(100):
+        if abs(diff) < 1e-12:
+            break
+        if diff > 0:
+            # Need to increase some values
+            mask = h < 1.0
+            if not np.any(mask):
+                break
+            h[mask] += diff / np.sum(mask)
+        else:
+            mask = h > 0.0
+            if not np.any(mask):
+                break
+            h[mask] += diff / np.sum(mask)
         h = np.clip(h, 0.0, 1.0)
+        s = np.sum(h)
+        diff = target - s
     return h
 
-
-def _accelerated_smooth_max(h0, beta, max_iter=500, tol=1e-10):
-    """Nesterov accelerated projected gradient on smooth max with box+sum constraints."""
-    h = np.array(h0, dtype=np.float64, copy=True)
-    h = _fix_sum(h)
+def _gradient_smooth(h, beta=100.0, k_max=None):
+    """Compute gradient of the log-sum-exp approximation of max overlap."""
+    if k_max is None:
+        k_max = N - 1
+    overlaps = []
+    for k in range(-k_max, k_max + 1):
+        if k >= 0:
+            a = h[:N - k]
+            b = h[k:]
+        else:
+            a = h[-k:]
+            b = h[:N + k]
+        ov = np.sum(a * (1.0 - b))
+        overlaps.append(ov)
+    overlaps = np.array(overlaps)
+    max_ov = np.max(overlaps)
+    shifted = beta * (overlaps - max_ov)
+    exps = np.exp(shifted)
+    weights = exps / np.sum(exps)
     
-    # Nesterov momentum
-    h_prev = h.copy()
-    t_k = 1.0
-    lr = 0.01
+    grad = np.zeros(N)
+    for idx, k in enumerate(range(-k_max, k_max + 1)):
+        w = weights[idx]
+        if w < 1e-12:
+            continue
+        if k >= 0:
+            # ov = sum_i h[i] * (1 - h[i+k]) for i in 0..N-k-1
+            # d(ov)/d(h[i]) = (1 - h[i+k]) for i in 0..N-k-1
+            # d(ov)/d(h[i+k]) = -h[i] for i in 0..N-k-1
+            a = h[:N - k]
+            b = h[k:]
+            grad[:N - k] += w * (1.0 - b)
+            grad[k:] += w * (-a)
+        else:
+            # k < 0, let j = -k
+            # ov = sum_i h[i] * (1 - h[i+k]) where i+k >= 0, i.e., i >= -k
+            # = sum_i h[i] * (1 - h[i-j]) for i in j..N-1
+            j = -k
+            a = h[j:]
+            b = h[:N - j]
+            grad[j:] += w * (1.0 - b)
+            grad[:N - j] += w * (-a)
     
-    for it in range(max_iter):
-        if time.time() > _DEADLINE - 5:
-            break
-        val, grad = _smooth_max_val_grad(h, beta)
-        
-        # Gradient step
-        h_new = h - lr * grad
-        
-        # Project onto {h: 0 <= h_i <= 1, sum(h) = N/2}
-        h_new = np.clip(h_new, 0.0, 1.0)
-        h_new = _fix_sum(h_new)
-        
-        # Nesterov update
-        t_new = (1.0 + np.sqrt(1.0 + 4.0 * t_k * t_k)) / 2.0
-        h_next = h_new + ((t_k - 1.0) / t_new) * (h_new - h_prev)
-        h_next = np.clip(h_next, 0.0, 1.0)
-        h_next = _fix_sum(h_next)
-        
-        h_prev = h
-        h = h_next
-        t_k = t_new
-        
-        # Adaptive learning rate
-        if it % 50 == 49:
-            lr = max(0.001, min(0.1, lr * 0.95))
-    
-    return h, _score(h)
-
+    return grad
 
 def construct():
-    """Construct step heights minimizing maximum overlap with shifted complement."""
-    t0 = time.time()
-    np.random.seed(12345)
+    start_time = time.time()
+    deadline = start_time + 140.0  # 10s safety margin
     
-    best_h = None
-    best_score = float('inf')
+    best_h = np.full(N, 0.5)
+    best_score = _overlap_max(best_h)
     
-    def _update_best(h):
-        nonlocal best_h, best_score
-        h = _fix_sum(h)
-        s = _score(h)
-        if s < best_score:
-            best_score = s
+    # Try multiple initializations
+    rng = np.random.default_rng(42)
+    
+    n_restarts = 0
+    max_restarts = 20
+    
+    for restart in range(max_restarts):
+        if time.time() > deadline - 10.0:
+            break
+        
+        # Different initialization strategies
+        if restart == 0:
+            h = np.full(N, 0.5)
+        elif restart % 3 == 1:
+            # Random with mean 0.5
+            h = rng.uniform(0, 1, N)
+            h = _project(h)
+        elif restart % 3 == 2:
+            # Structured: alternating high/low
+            h = np.where(np.arange(N) % 2 == 0, 0.7, 0.3)
+            h = _project(h)
+        else:
+            # Smooth variation
+            t = np.linspace(0, 1, N)
+            h = 0.5 + 0.3 * np.sin(2 * np.pi * t)
+            h = _project(h)
+        
+        # Gradient descent
+        lr = 0.01
+        beta = 50.0
+        prev_score = _logsumexp_max(h, beta=beta)
+        
+        for step in range(500):
+            if time.time() > deadline - 5.0:
+                break
+            
+            grad = _gradient_smooth(h, beta=beta)
+            h_new = h - lr * grad
+            h_new = _project(h_new)
+            
+            # Check improvement
+            cur_score = _logsumexp_max(h_new, beta=beta)
+            if cur_score < prev_score:
+                h = h_new
+                prev_score = cur_score
+            else:
+                lr *= 0.5
+                if lr < 1e-6:
+                    break
+        
+        # Evaluate true max
+        true_score = _overlap_max(h)
+        if true_score < best_score:
+            best_score = true_score
+            best_h = h.copy()
+        
+        n_restarts += 1
+    
+    # Final polish with higher beta
+    if time.time() < deadline - 10.0:
+        h = best_h.copy()
+        beta = 500.0
+        lr = 0.005
+        prev_score = _logsumexp_max(h, beta=beta)
+        
+        for step in range(200):
+            if time.time() > deadline - 5.0:
+                break
+            
+            grad = _gradient_smooth(h, beta=beta)
+            h_new = h - lr * grad
+            h_new = _project(h_new)
+            
+            cur_score = _logsumexp_max(h_new, beta=beta)
+            if cur_score < prev_score:
+                h = h_new
+                prev_score = cur_score
+            else:
+                lr *= 0.5
+                if lr < 1e-7:
+                    break
+        
+        true_score = _overlap_max(h)
+        if true_score < best_score:
+            best_score = true_score
             best_h = h.copy()
     
-    i = np.arange(N)
-    
-    # Diverse initial guesses
-    starts = []
-    
-    # Cosine
-    h_cos = 0.5 + 0.5 * np.cos(2.0 * np.pi * i / N)
-    starts.append(_fix_sum(h_cos))
-    
-    # Sine
-    h_sin = 0.5 + 0.5 * np.sin(2.0 * np.pi * i / N)
-    starts.append(_fix_sum(h_sin))
-    
-    # Two-frequency
-    h_2f = 0.5 + 0.3 * np.cos(2.0 * np.pi * i / N) + 0.2 * np.cos(4.0 * np.pi * i / N)
-    starts.append(_fix_sum(h_2f))
-    
-    # Sawtooth-like
-    h_saw = 0.5 + 0.5 * np.sin(2.0 * np.pi * i / N) * np.sign(np.sin(4.0 * np.pi * i / N))
-    starts.append(_fix_sum(h_saw))
-    
-    # Random
-    for _ in range(5):
-        h_r = np.random.uniform(0, 1, N)
-        starts.append(_fix_sum(h_r))
-    
-    # Evaluate all starts
-    for h0 in starts:
-        _update_best(h0)
-    
-    # Bisection on t with accelerated gradient feasibility
-    # Lower bound: 0, Upper bound: current best
-    t_low = 0.0
-    t_high = best_score
-    
-    # For each t in bisection, run accelerated gradient to try to find feasible h
-    # where smooth_max(h, beta) <= t + small_margin
-    for bisect_iter in range(25):
-        if time.time() > _DEADLINE - 10:
-            break
-        
-        t_mid = (t_low + t_high) / 2.0
-        beta = 50.0 + bisect_iter * 10  # Increasing beta for sharper max approximation
-        
-        # Try to find h with smooth_max(h, beta) <= t_mid
-        # Use accelerated gradient from best_h
-        if best_h is not None:
-            h_candidate, s_candidate = _accelerated_smooth_max(
-                best_h, beta, max_iter=300, tol=1e-12
-            )
-            if s_candidate < best_score:
-                _update_best(h_candidate)
-            
-            # Also try from a perturbed start
-            h_pert = best_h + 0.05 * np.random.randn(N)
-            h_pert = _fix_sum(h_pert)
-            h_candidate2, s_candidate2 = _accelerated_smooth_max(
-                h_pert, beta, max_iter=200, tol=1e-12
-            )
-            if s_candidate2 < best_score:
-                _update_best(h_candidate2)
-        
-        # Check if feasible: if best_score <= t_mid, go lower
-        if best_score <= t_mid + 1e-6:
-            t_high = t_mid
-        else:
-            t_low = t_mid
-        
-        # If gap is small, break
-        if t_high - t_low < 1e-8:
-            break
-    
-    # Final polish with high beta
-    if best_h is not None and time.time() < _DEADLINE - 5:
-        h_final, s_final = _accelerated_smooth_max(best_h, beta=200.0, max_iter=500, tol=1e-14)
-        if s_final < best_score:
-            _update_best(h_final)
-    
-    if best_h is None:
-        best_h = np.full(N, 0.5)
-    
-    best_h = _fix_sum(best_h)
     return best_h
+# EVOLVE-BLOCK-END

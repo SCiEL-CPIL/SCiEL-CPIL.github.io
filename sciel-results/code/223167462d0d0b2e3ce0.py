@@ -1,0 +1,13 @@
+<<<<<<< SEARCH
+# Check for linear dependencies among the 56 rank-1 terms
+    # ...
+    if rank_M < total_rank:
+        # ...
+        total_rank = rank_M
+=======
+# Check for linear dependencies among the 56 rank-1 terms
+# ...
+if rank_M < total_rank:
+    # ...
+    total_rank = rank_M
+>>>>>>> REPLACE

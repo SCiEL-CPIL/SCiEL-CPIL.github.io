@@ -1,0 +1,2 @@
+    G[idx] = gpair[idx]
+    

@@ -1,0 +1,6 @@
+    def add_block(n_block, m_block, p_block, rank_block, U_block, V_block, W_block, 
+                  i_offset, j_offset, k_offset):
+        ...
+        for r in range(rank_block):
+            ...
+            u_vec[u_global] = U_block[i_local * m_block + j_local][r]

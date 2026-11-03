@@ -1,244 +1,261 @@
+"""Kissing number in dimension 11: support-level MIS + SA + Type A vectors."""
 import numpy as np
 import itertools
 import time
+import random
 
 D = 11
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 140  # Safety margin
-    
-    # Generate candidates with squared norm 4
-    candidates = []
-    
-    # Type 1: One 2, rest 0
-    for i in range(D):
-        for s in [1, -1]:
-            v = [0] * D
-            v[i] = 2 * s
-            candidates.append(v)
-            
-    # Type 2: Four 1s, rest 0
-    for idxs in itertools.combinations(range(D), 4):
-        for signs in itertools.product([1, -1], repeat=4):
-            v = [0] * D
-            for idx, s in zip(idxs, signs):
-                v[idx] = s
-            candidates.append(v)
-            
-    candidates = np.array(candidates, dtype=np.int32)
-    N = len(candidates)
-    
-    # Compute dot product matrix
-    M = candidates @ candidates.T
-    
-    # Conflict matrix: 1 if dot > 2 (and i != j)
-    # Note: M[i,i] = 4, which is > 2, but we don't conflict with ourselves.
-    Conflict = (M > 2).astype(np.uint8)
-    np.fill_diagonal(Conflict, 0)
-    
-    best_set = []
-    
-    # Try multiple random tie-breakings
-    # The greedy algorithm is:
-    # 1. active = all True
-    # 2. deg = sum(Conflict, axis=1)
-    # 3. While active:
-    #    a. Find active nodes with min deg
-    #    b. Pick one (randomly if tie, or first)
-    #    c. Add to set
-    #    d. Remove it and its neighbors
-    #    e. Update degrees
-    
-    def run_greedy(seed):
-        if time.time() > deadline:
-            return []
-            
+    deadline = start_time + 145.0  # Safety margin for 150s limit
+
+    # Generate all C(11,4) = 330 supports
+    supports = list(itertools.combinations(range(D), 4))
+    n_sup = len(supports)  # 330
+
+    # Build conflict matrix: edge if intersection size == 3
+    # (intersection 4 means same support, intersection <=2 means no conflict)
+    adj_mask = np.zeros((n_sup, n_sup), dtype=np.uint8)
+    support_sets = [set(s) for s in supports]
+    for i in range(n_sup):
+        for j in range(i + 1, n_sup):
+            if len(support_sets[i] & support_sets[j]) == 3:
+                adj_mask[i, j] = 1
+                adj_mask[j, i] = 1
+
+    # Precompute adjacency lists for faster operations
+    adj_lists = [np.where(adj_mask[i] == 1)[0] for i in range(n_sup)]
+    adj_sizes = np.array([len(a) for a in adj_lists])
+
+    def greedy_is(seed=0):
+        """Greedy independent set using minimum-degree heuristic with random tie-breaking."""
         rng = np.random.default_rng(seed)
-        active = np.ones(N, dtype=bool)
-        # Use int64 to prevent overflow/casting errors during subtraction
-        deg = Conflict.sum(axis=1).astype(np.int64)
-        selected = []
+        remaining = np.ones(n_sup, dtype=np.uint8)
+        selected = np.zeros(n_sup, dtype=np.uint8)
         
-        while active.any():
-            if time.time() > deadline:
+        while True:
+            if time.time() > deadline - 15.0:
                 break
-            # Find active nodes
-            active_indices = np.where(active)[0]
-            if len(active_indices) == 0:
+            rem_idx = np.where(remaining > 0)[0]
+            if len(rem_idx) == 0:
                 break
-                
-            # Get degrees of active nodes
-            active_deg = deg[active_indices]
             
-            # Find min degree
-            min_deg = np.min(active_deg)
+            # Compute degree within remaining set
+            deg = (adj_mask * remaining[np.newaxis, :]).sum(axis=1)
+            deg[remaining == 0] = n_sup + 1
             
-            # Find all active nodes with min degree
-            candidates_for_pick = active_indices[active_deg == min_deg]
+            min_deg = deg.min()
+            candidates = np.where((deg == min_deg) & (remaining > 0))[0]
+            if len(candidates) == 0:
+                break
             
-            # Pick one randomly
-            idx = rng.choice(candidates_for_pick)
-            
-            selected.append(idx)
-            
-            # Remove idx and its neighbors
-            # neighbors are where Conflict[idx] == 1 and active
-            neighbors_mask = Conflict[idx].astype(bool)
-            
-            # Nodes to remove: idx and neighbors
-            removed_mask = np.zeros(N, dtype=bool)
-            removed_mask[idx] = True
-            removed_mask[neighbors_mask & active] = True
-            
-            # Get list of removed indices for efficient degree update
-            removed_indices = np.where(removed_mask)[0]
-            
-            # Update degrees:
-            # For each remaining active node j, deg[j] -= number of removed neighbors
-            if len(removed_indices) > 0:
-                removal_counts = Conflict[removed_indices, :].sum(axis=0).astype(np.int64)
-                
-                # Update deg for active nodes
-                deg[active] -= removal_counts[active]
-                
-            # Update active mask
-            active[removed_mask] = False
-            
+            pick = rng.choice(candidates)
+            selected[pick] = 1
+            remaining[pick] = 0
+            remaining[adj_mask[pick] == 1] = 0
+        
         return selected
 
-    # Run with several seeds
-    best_size = 0
-    best_set = []
-    
-    # Helper for local search: try to improve a set
-    def local_search(selected_indices):
-        if time.time() > deadline:
-            return selected_indices
-            
-        selected_set = set(selected_indices)
-        # Precompute conflict mask for selected set? No, use global Conflict matrix.
-        # We want to find i in selected, j,k not in selected
-        # such that j,k compatible with each other
-        # j compatible with selected \ {i}
-        # k compatible with selected \ {i}
+    def local_search_sa(selected, n_steps=50000, seed=0):
+        """Simulated annealing with 1-for-k moves on the support-level problem."""
+        rng = np.random.default_rng(seed)
+        rand = random.Random(seed)
         
-        # This is O(N^2) per iteration which is too slow for N=5000.
-        # We will do a lighter version: 
-        # For each i in selected, find all j not in selected that conflict ONLY with i.
-        # If we find two such j1, j2 that are compatible with each other, swap i -> j1, j2.
+        S = selected.copy()
+        current_size = int(S.sum())
+        best_size = current_size
+        best_S = S.copy()
         
-        improved = True
-        while improved and time.time() < deadline:
-            improved = False
-            # Shuffled order to break symmetry
-            indices_list = list(selected_set)
-            rng_ls = np.random.default_rng()
-            rng_ls.shuffle(indices_list)
+        T = 2.0
+        cooling = 0.9997
+        min_T = 0.05
+        
+        step = 0
+        while step < n_steps and time.time() < deadline - 10.0:
+            step += 1
+            v = rng.integers(0, n_sup)
             
-            for i in indices_list:
-                if time.time() > deadline:
-                    return list(selected_set)
-                
-                # Find candidates j not in selected_set that conflict with i
-                # and do NOT conflict with any other element in selected_set
-                # conflict_mask_i = Conflict[i]
-                # selected_mask = np.zeros(N, dtype=bool)
-                # selected_mask[list(selected_set)] = True
-                
-                # Efficient check:
-                # Let S = selected_set.
-                # For j not in S, let C_j = set of elements in S that conflict with j.
-                # We want |C_j| == 1 and that element is i.
-                
-                # Compute conflicts of i with all N
-                conflicts_with_i = Conflict[i].astype(bool)
-                
-                # For each j not in S:
-                # Check if j conflicts with any k in S \ {i}
-                # This is expensive.
-                
-                # Alternative:
-                # We know j must conflict with i. So j is in neighbors of i.
-                # Let neighbors_of_i = np.where(conflicts_with_i)[0]
-                # Filter neighbors_of_i to those not in S.
-                # For each candidate j in that list:
-                #   Check if j conflicts with any k in S \ {i}.
-                #   If not, j is a "valid replacement candidate" for i (single conflict).
-                
-                neighbors_of_i = np.where(conflicts_with_i)[0]
-                # Exclude those already in S
-                valid_js = [j for j in neighbors_of_i if j not in selected_set]
-                
-                # Now find pairs (j1, j2) in valid_js such that:
-                # 1. j1 and j2 are compatible (Conflict[j1, j2] == 0)
-                # 2. j1 does not conflict with any k in S \ {i}
-                # 3. j2 does not conflict with any k in S \ {i}
-                
-                # Precompute "bad" sets for S \ {i}?
-                # Let's just check on the fly for small lists.
-                # If valid_js is large, this is slow.
-                
-                # Optimization:
-                # A vector j is "compatible with S\{i}" if Conflict[j, S\{i}].sum() == 0.
-                
-                compatible_with_rest = []
-                for j in valid_js:
-                    # Check conflicts with S \ {i}
-                    # S is a set. We can iterate.
-                    # To speed up, if len(S) is large, this is bad.
-                    # However, greedy sets are usually smallish relative to N.
-                    conflict_count = 0
-                    for k in selected_set:
-                        if k == i:
-                            continue
-                        if Conflict[j, k]:
-                            conflict_count += 1
-                            break
-                    if conflict_count == 0:
-                        compatible_with_rest.append(j)
-                
-                # Now look for a pair in compatible_with_rest that are mutually compatible
-                if len(compatible_with_rest) >= 2:
-                    # Check pairs
-                    found_pair = False
-                    cwr = compatible_with_rest
-                    for p in range(len(cwr)):
-                        if found_pair: break
-                        j1 = cwr[p]
-                        for q in range(p+1, len(cwr)):
-                            j2 = cwr[q]
-                            if not Conflict[j1, j2]:
-                                # Swap i -> j1, j2
-                                selected_set.remove(i)
-                                selected_set.add(j1)
-                                selected_set.add(j2)
-                                improved = True
-                                found_pair = True
-                                break
-                    if found_pair:
-                        # Restart the loop to re-evaluate
-                        break
-                
-        return list(selected_set)
+            if S[v]:
+                # Removal move (probabilistic)
+                if rand.random() < 0.03:
+                    S[v] = 0
+                    current_size -= 1
+                continue
+            
+            # v not in S: try to add it
+            conflicts = np.where(adj_mask[v] & S)[0]
+            n_conf = len(conflicts)
+            
+            if n_conf == 0:
+                S[v] = 1
+                current_size += 1
+                if current_size > best_size:
+                    best_size = current_size
+                    best_S = S.copy()
+            else:
+                # 1-for-n move: remove n_conf conflicting supports, add v
+                delta = 1 - n_conf
+                if delta >= 0:
+                    S[conflicts] = 0
+                    S[v] = 1
+                    current_size += delta
+                    if current_size > best_size:
+                        best_size = current_size
+                        best_S = S.copy()
+                else:
+                    if T > min_T:
+                        p = np.exp(delta / T)
+                        if rand.random() < p:
+                            S[conflicts] = 0
+                            S[v] = 1
+                            current_size += delta
+                            if current_size > best_size:
+                                best_size = current_size
+                                best_S = S.copy()
+            
+            T = max(min_T, T * cooling)
+        
+        return best_S, best_size
 
-    for s in range(100):
-        if time.time() > deadline:
+    def polish_2for2(S, max_rounds=20):
+        """Try all 2-for-2 moves: remove 2 supports, add 2 others."""
+        improved = True
+        rounds = 0
+        while improved and rounds < max_rounds and time.time() < deadline - 8.0:
+            improved = False
+            rounds += 1
+            
+            sel = np.where(S == 1)[0]
+            k = len(sel)
+            if k < 2:
+                break
+            
+            # For each pair of selected supports, try to replace with a better pair
+            # This is O(k^2 * n^2) which is too slow, so use sampling
+            n_trials = min(5000, k * k // 2)
+            for _ in range(n_trials):
+                if time.time() > deadline - 8.0:
+                    break
+                i1, i2 = rng_pair = np.random.default_rng().integers(0, k, size=2)
+                if i1 == i2:
+                    continue
+                v1, v2 = sel[i1], sel[i2]
+                
+                # Find all supports compatible with both v1 and v2 (not conflicting)
+                # and not currently selected
+                compat = (adj_mask[v1] == 0) & (adj_mask[v2] == 0) & (S == 0)
+                # Also need the two new supports to be compatible with each other
+                candidates = np.where(compat)[0]
+                if len(candidates) < 2:
+                    continue
+                
+                # Sample pairs from candidates
+                for trial in range(min(10, len(candidates) - 1)):
+                    u_idx = np.random.choice(len(candidates))
+                    w_idx = np.random.choice(len(candidates) - 1)
+                    if w_idx >= u_idx:
+                        w_idx += 1
+                    u, w = candidates[u_idx], candidates[w_idx]
+                    if adj_mask[u, w] == 1:
+                        continue
+                    
+                    # Check: removing v1, v2 and adding u, w improves
+                    # u and w must not conflict with any other selected support
+                    others = np.delete(sel, [i1, i2])
+                    if len(others) > 0:
+                        if np.any(adj_mask[u][others] == 1) or np.any(adj_mask[w][others] == 1):
+                            continue
+                    
+                    S[v1] = 0
+                    S[v2] = 0
+                    S[u] = 1
+                    S[w] = 1
+                    improved = True
+                    break
+                if improved:
+                    break
+        
+        return S
+
+    # Main search: multiple restarts
+    best_S = np.zeros(n_sup, dtype=np.uint8)
+    best_size = 0
+    
+    # Initial greedy starts with different seeds
+    n_restarts = 30
+    for i in range(n_restarts):
+        if time.time() > deadline - 25.0:
             break
         
-        res = run_greedy(s)
-        if not res:
-            continue
-            
-        # Apply local search
-        res_improved = local_search(res)
+        # Greedy initialization
+        S_init = greedy_is(seed=1000 + i)
+        init_size = int(S_init.sum())
         
-        if len(res_improved) > best_size:
-            best_size = len(res_improved)
-            best_set = res_improved
-            
-    if not best_set:
-        # Fallback
-        best_set = list(range(22))
+        # SA refinement
+        S_sa, sa_size = local_search_sa(S_init, n_steps=30000, seed=2000 + i)
         
-    return candidates[best_set].astype(np.int64)
+        # Polish
+        S_polished = polish_2for2(S_sa.copy(), max_rounds=10)
+        pol_size = int(S_polished.sum())
+        
+        if pol_size > best_size:
+            best_size = pol_size
+            best_S = S_polished.copy()
+        
+        # Also try SA with longer run every few restarts
+        if i % 5 == 0 and time.time() < deadline - 30.0:
+            S_sa2, sa2_size = local_search_sa(S_init, n_steps=80000, seed=5000 + i)
+            S_pol2 = polish_2for2(S_sa2.copy(), max_rounds=15)
+            pol2_size = int(S_pol2.sum())
+            if pol2_size > best_size:
+                best_size = pol2_size
+                best_S = S_pol2.copy()
+
+    # Construct vectors from best support set
+    # For each selected support, add all 16 sign patterns
+    vectors = []
+    for idx in range(n_sup):
+        if best_S[idx]:
+            sup = supports[idx]
+            for signs in itertools.product([1, -1], repeat=4):
+                v = [0] * D
+                for pos, s in zip(sup, signs):
+                    v[pos] = s
+                vectors.append(v)
+    
+    # Add Type A vectors: +/- 2e_i (22 vectors)
+    for i in range(D):
+        for sign in (1, -1):
+            v = [0] * D
+            v[i] = sign * 2
+            vectors.append(v)
+    
+    result = np.array(vectors, dtype=np.int64)
+    
+    # Verify: check that minimum pairwise distance >= max norm
+    # (This is a sanity check; the construction guarantees it by design)
+    # Norms: Type A have norm 2, Type B have norm 2
+    # Distance between Type A vectors: 4 (different coords) or 0 (same)
+    #   Actually +/-2e_i vs +/-2e_j: if i!=j, dist^2 = 4+4=8, dist=2*sqrt(2) > 2
+    #   +/-2e_i vs -/+2e_i: dist^2 = 16 or 0
+    #   Wait: 2e_i vs -2e_i: dist^2 = (4)^2 = 16, dist = 4 > 2
+    #   2e_i vs 2e_j (i!=j): dist^2 = 4+4 = 8, dist = 2*sqrt(2) > 2 ✓
+    # Distance between Type B vectors: supports intersect in <=2 coords
+    #   If intersect in 0: min dist^2 >= 4 (each has 4 nonzeros)
+    #   If intersect in 1: min dist^2 >= 2*1^2 + 3*1^2 = 5... let me think
+    #   Actually with |intersection| <= 2, we can always choose signs to make dot <= 0
+    #   So dist^2 >= 4+4-2*dot >= 8 if dot <= 0
+    #   Wait, we need dist >= max_norm = 2, so dist^2 >= 4
+    #   With |intersection| <= 2 and appropriate signs, dot can be made <= 0
+    #   So dist^2 >= 4+4 = 8 > 4 ✓
+    # Distance between Type A (2e_i) and Type B (support containing i or not):
+    #   If i in support: dot = 2 * (+/-1) = +/-2, dist^2 = 4+4-2*(+/-2) = 0 or 8
+    #   Wait, that's a problem! 2e_i vs e_i+e_j+e_k+e_l: dot = 2, dist^2 = 4+4-4 = 4, dist = 2 ✓
+    #   2e_i vs -e_i+e_j+e_k+e_l: dot = -2, dist^2 = 4+4+4 = 12, dist > 2 ✓
+    #   So minimum is exactly 2, which equals max_norm = 2. That's OK (>= required).
+    #   Actually wait: the requirement is dist >= max_norm. max_norm = 2. dist = 2 >= 2 ✓
+    
+    return result
+
+# EVOLVE-BLOCK-END

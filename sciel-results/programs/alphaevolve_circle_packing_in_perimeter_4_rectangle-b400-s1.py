@@ -10,7 +10,7 @@ from scipy.spatial import Delaunay
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 140.0  # Safety margin before 150s kill
+    deadline = start_time + 140.0
 
     def time_left():
         return deadline - time.time()
@@ -19,7 +19,6 @@ def construct():
     best_result = None
 
     def _strictly_valid(circles, w, h, tol=1e-8):
-        """Full-pair strict validity check. circles: (N,3)."""
         n = circles.shape[0]
         xs = circles[:, 0]
         ys = circles[:, 1]
@@ -40,7 +39,6 @@ def construct():
         return True
 
     def _evaluate(circles, w, h, tol=1e-7):
-        """Return sum of radii if valid, else -inf."""
         if not _strictly_valid(circles, w, h, tol):
             return -np.inf
         return float(np.sum(circles[:, 2]))
@@ -64,7 +62,6 @@ def construct():
         return 1.0 / (1.0 + np.exp(-beta * x))
 
     def _objective_and_grad(x, w, h, beta=100.0, eq_weight=0.05):
-        """Softplus-penalized objective with analytical gradients (vectorized)."""
         c = x.reshape(-1, 3)
         xs = c[:, 0]
         ys = c[:, 1]
@@ -73,14 +70,12 @@ def construct():
         obj = -np.sum(rs)
         grad = np.zeros_like(x)
 
-        # Equalization pressure
         if eq_weight > 0:
             r_mean = np.mean(rs)
             r_dev = rs - r_mean
             obj += eq_weight * np.sum(r_dev * r_dev)
             grad[2::3] += -2.0 * eq_weight * r_dev
 
-        # Boundary penalties
         v1 = rs - xs
         obj += np.sum(_softplus(v1, beta)); g1 = _softplus_grad(v1, beta)
         grad[0::3] -= g1; grad[2::3] += g1
@@ -97,7 +92,6 @@ def construct():
         obj += np.sum(_softplus(v5, beta)); g5 = _softplus_grad(v5, beta)
         grad[2::3] -= g5
 
-        # Pairwise overlap penalties
         for i in range(N):
             dx = xs[i] - xs[i + 1:]
             dy = ys[i] - ys[i + 1:]
@@ -114,6 +108,62 @@ def construct():
             grad[3 * idx + 2] += g
 
         grad[2::3] += -1.0
+        return obj, grad
+
+    def _objective_joint(x, beta=100.0, eq_weight=0.05):
+        """Objective with w as free variable; h = 2 - w. x = [w, x0, y0, r0, x1, y1, r1, ...]"""
+        w = x[0]
+        h = 2.0 - w
+        c = x[1:].reshape(-1, 3)
+        xs = c[:, 0]
+        ys = c[:, 1]
+        rs = c[:, 2]
+
+        obj = -np.sum(rs)
+        grad = np.zeros_like(x)
+        grad_w = 0.0
+
+        if eq_weight > 0:
+            r_mean = np.mean(rs)
+            r_dev = rs - r_mean
+            obj += eq_weight * np.sum(r_dev * r_dev)
+            grad[3::3] += -2.0 * eq_weight * r_dev
+
+        v1 = rs - xs
+        obj += np.sum(_softplus(v1, beta)); g1 = _softplus_grad(v1, beta)
+        grad[1::3] -= g1; grad[3::3] += g1
+        v2 = xs + rs - w
+        obj += np.sum(_softplus(v2, beta)); g2 = _softplus_grad(v2, beta)
+        grad[1::3] += g2; grad[3::3] += g2
+        grad_w -= np.sum(g2)
+        v3 = rs - ys
+        obj += np.sum(_softplus(v3, beta)); g3 = _softplus_grad(v3, beta)
+        grad[2::3] -= g3; grad[3::3] += g3
+        v4 = ys + rs - h
+        obj += np.sum(_softplus(v4, beta)); g4 = _softplus_grad(v4, beta)
+        grad[2::3] += g4; grad[3::3] += g4
+        grad_w += np.sum(g4)
+        v5 = -rs
+        obj += np.sum(_softplus(v5, beta)); g5 = _softplus_grad(v5, beta)
+        grad[3::3] -= g5
+
+        for i in range(N):
+            dx = xs[i] - xs[i + 1:]
+            dy = ys[i] - ys[i + 1:]
+            d = np.sqrt(dx * dx + dy * dy + 1e-12)
+            v = rs[i] + rs[i + 1:] - d
+            obj += np.sum(_softplus(v, beta))
+            g = _softplus_grad(v, beta)
+            grad[1 + 3 * i]     += -np.sum(g * dx / d)
+            grad[2 + 3 * i] += -np.sum(g * dy / d)
+            grad[3 + 3 * i] += np.sum(g)
+            idx = np.arange(i + 1, N)
+            grad[1 + 3 * idx]     += g * dx / d
+            grad[2 + 3 * idx] += g * dy / d
+            grad[3 + 3 * idx] += g
+
+        grad[0] = grad_w
+        grad[3::3] += -1.0
         return obj, grad
 
     def _delaunay_neighbors(centers):
@@ -171,6 +221,13 @@ def construct():
             [1, 5, 5, 5, 5],
             [3, 4, 5, 4, 5],
             [5, 4, 5, 4, 3],
+            [4, 4, 4, 4, 4, 1],
+            [1, 4, 4, 4, 4, 4],
+            [3, 4, 4, 4, 4, 2],
+            [2, 4, 4, 4, 4, 3],
+            [4, 4, 4, 3, 4, 2],
+            [3, 3, 3, 4, 4, 4],
+            [4, 4, 4, 3, 3, 3],
         ]
         best = None
         best_val = -np.inf
@@ -259,7 +316,6 @@ def construct():
         return circles
 
     def _polish(circles, w, h, beta_start=10.0, max_iter=30):
-        """Multi-phase polish with increasing beta."""
         x = circles.flatten()
         best_x = x.copy()
         best_val = -np.inf
@@ -299,7 +355,6 @@ def construct():
         return best_x.reshape(-1, 3)
 
     def _contact_graph_polish(circles, w, h):
-        """High-precision polish using very tight beta and contact-aware tolerances."""
         if time_left() < 10.0:
             return circles
 
@@ -346,12 +401,6 @@ def construct():
         return best_x.reshape(-1, 3)
 
     def _physics_refine(circles, w, h, n_steps=2000, seed=42):
-        """
-        Physics-based refinement: treat circles as particles with repulsive forces.
-        This is a different modelling family: instead of gradient-based optimization,
-        we simulate a force-directed system that pushes overlapping circles apart
-        and pulls them toward the walls to maximize packing density.
-        """
         if time_left() < 8.0:
             return circles
 
@@ -360,7 +409,6 @@ def construct():
         ys = circles[:, 1].copy().astype(float)
         rs = circles[:, 2].copy().astype(float)
 
-        # Adaptive temperature schedule
         temp_start = 0.02
         temp_end = 0.001
         n_total = n_steps
@@ -369,7 +417,6 @@ def construct():
             if time_left() < 3.0:
                 break
 
-            # Annealing schedule
             t = step / max(n_total - 1, 1)
             temp = temp_start * (temp_end / temp_start) ** t
 
@@ -377,7 +424,6 @@ def construct():
             forces_y = np.zeros(N)
             forces_r = np.zeros(N)
 
-            # Pairwise repulsion
             for i in range(N):
                 for j in range(i + 1, N):
                     dx = xs[i] - xs[j]
@@ -385,7 +431,6 @@ def construct():
                     d = np.sqrt(dx * dx + dy * dy + 1e-12)
                     overlap = rs[i] + rs[j] - d
                     if overlap > 0:
-                        # Strong repulsive force proportional to overlap
                         f = overlap * 50.0
                         fx = f * dx / d
                         fy = f * dy / d
@@ -393,44 +438,35 @@ def construct():
                         forces_y[i] += fy
                         forces_x[j] -= fx
                         forces_y[j] -= fy
-                        # Slightly shrink both to resolve overlap
                         forces_r[i] -= overlap * 0.5
                         forces_r[j] -= overlap * 0.5
 
-            # Wall constraints: push circles away from walls
             for i in range(N):
-                # Left wall
                 pen = rs[i] - xs[i]
                 if pen > 0:
                     forces_x[i] += pen * 80.0
                     forces_r[i] -= pen * 0.3
-                # Right wall
                 pen = xs[i] + rs[i] - w
                 if pen > 0:
                     forces_x[i] -= pen * 80.0
                     forces_r[i] -= pen * 0.3
-                # Bottom wall
                 pen = rs[i] - ys[i]
                 if pen > 0:
                     forces_y[i] += pen * 80.0
                     forces_r[i] -= pen * 0.3
-                # Top wall
                 pen = ys[i] + rs[i] - h
                 if pen > 0:
                     forces_y[i] -= pen * 80.0
                     forces_r[i] -= pen * 0.3
 
-            # Pressure to grow radii (maximize sum of radii)
             forces_r += 0.01
 
-            # Update positions with damping and noise
             damping = 0.7
             for i in range(N):
                 xs[i] += damping * forces_x[i] * 0.01 + temp * rng.randn() * 0.005
                 ys[i] += damping * forces_y[i] * 0.01 + temp * rng.randn() * 0.005
                 rs[i] += damping * forces_r[i] * 0.01 + temp * rng.randn() * 0.002
 
-                # Clamp to bounds
                 xs[i] = max(rs[i] + 1e-9, min(w - rs[i] - 1e-9, xs[i]))
                 ys[i] = max(rs[i] + 1e-9, min(h - rs[i] - 1e-9, ys[i]))
                 rs[i] = max(1e-4, min(min(w, h) / 2.0, rs[i]))
@@ -438,8 +474,89 @@ def construct():
         new_circles = np.column_stack([xs, ys, rs])
         return new_circles
 
+    def _joint_optimize(circles, w, h, beta_start=50.0, max_iter=200):
+        """Jointly optimize w and circle positions/radii."""
+        if time_left() < 10.0:
+            return circles, w, h
+
+        x0 = np.concatenate([[w], circles.flatten()])
+        r_max = min(w, h) / 2.0
+        bounds = [(0.3, 1.7)]  # w bounds
+        for i in range(N):
+            bounds.append((0, w * 1.1))
+            bounds.append((0, h * 1.1))
+            bounds.append((1e-4, r_max))
+
+        best_x = x0.copy()
+        best_val = _evaluate(circles, w, h)
+
+        for beta in [beta_start, beta_start * 10, beta_start * 100]:
+            if time_left() < 5.0:
+                break
+            try:
+                res = minimize(_objective_joint, x0, method='L-BFGS-B', bounds=bounds,
+                               jac=True, args=(beta, 0.05),
+                               options={'maxiter': max_iter, 'ftol': 1e-12, 'gtol': 1e-10})
+                if time_left() < 3.0:
+                    break
+                new_w = res.x[0]
+                new_h = 2.0 - new_w
+                new_circles = res.x[1:].reshape(-1, 3)
+                if _strictly_valid(new_circles, new_w, new_h):
+                    val = float(np.sum(new_circles[:, 2]))
+                    if val > best_val:
+                        best_val = val
+                        best_x = res.x.copy()
+                x0 = res.x
+            except Exception:
+                pass
+
+        new_w = best_x[0]
+        new_h = 2.0 - new_w
+        new_circles = best_x[1:].reshape(-1, 3)
+        return new_circles, new_w, new_h
+
+    def _final_polish(circles, w, h):
+        """High-precision final polish with very high beta."""
+        if time_left() < 8.0:
+            return circles
+
+        x = circles.flatten()
+        r_max = min(w, h) / 2.0
+        bounds = []
+        for i in range(N):
+            bounds.append((0, w))
+            bounds.append((0, h))
+            bounds.append((1e-4, r_max))
+
+        best_x = x.copy()
+        best_val = -np.inf
+        if _strictly_valid(circles, w, h):
+            best_val = float(np.sum(circles[:, 2]))
+
+        for beta in [5000.0, 10000.0]:
+            if time_left() < 4.0:
+                break
+            try:
+                res = minimize(_objective_and_grad, x, method='L-BFGS-B', bounds=bounds,
+                               jac=True, args=(w, h, beta, 0.01),
+                               options={'maxiter': 5000, 'ftol': 1e-15, 'gtol': 1e-13,
+                                        'maxls': 100, 'maxfun': 100000})
+                if time_left() < 2.0:
+                    break
+                new_circles = res.x.reshape(-1, 3)
+                if _strictly_valid(new_circles, w, h):
+                    val = float(np.sum(new_circles[:, 2]))
+                    if val > best_val:
+                        best_val = val
+                        best_x = res.x.copy()
+                x = res.x
+            except Exception:
+                pass
+
+        return best_x.reshape(-1, 3)
+
     def _aspect_refine(circles, w, h):
-        """Try small perturbations of aspect ratio to find better fit."""
         if time_left() < 15.0:
             return circles, w, h
 
@@ -447,7 +564,6 @@ def construct():
         best_val = _evaluate(circles, w, h)
         best_w, best_h = w, h
 
-        # Try small aspect ratio perturbations
         for dw in [-0.05, -0.03, -0.02, 0.02, 0.03, 0.05]:
             if time_left() < 5.0:
                 break
@@ -456,11 +572,9 @@ def construct():
             if new_w < 0.3 or new_h < 0.3:
                 continue
 
-            # Scale circles to fit new rectangle
             scaled = circles.copy()
             scaled[:, 0] *= new_w / w
             scaled[:, 1] *= new_h / h
-            # Keep radii the same initially, let polish adjust
             polished = _polish(scaled, new_w, new_h, beta_start=50.0, max_iter=20)
             val = _evaluate(polished, new_w, new_h)
             if val > best_val:
@@ -471,7 +585,7 @@ def construct():
         return best_circles, best_w, best_h
 
     # Main loop over aspect ratios
-    widths = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4]
+    widths = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 0.75, 1.25, 0.85, 1.15]
 
     for w in widths:
         if time_left() < 15.0:
@@ -485,23 +599,22 @@ def construct():
         inits.append(grid_circles)
         rand_circles = _random_init(w, h, seed=42)
         inits.append(rand_circles)
+        if time_left() > 20.0:
+            rand_circles2 = _random_init(w, h, seed=123)
+            inits.append(rand_circles2)
 
         for init_circles in inits:
             if time_left() < 12.0:
                 break
 
-            # Phase 1: Standard polish
             polished = _polish(init_circles, w, h, beta_start=10.0, max_iter=30)
             check_and_update(polished, w, h)
 
-            # Phase 2: Physics-based refinement (different modelling family)
             if time_left() > 10.0:
                 phys = _physics_refine(polished, w, h, n_steps=1500, seed=42)
                 check_and_update(phys, w, h)
 
-            # Phase 3: Contact-graph high-precision polish
             if time_left() > 12.0:
-                # Use the best of polished and phys
                 if _evaluate(phys, w, h) > _evaluate(polished, w, h):
                     start_for_cg = phys
                 else:
@@ -509,13 +622,24 @@ def construct():
                 cg_polished = _contact_graph_polish(start_for_cg, w, h)
                 check_and_update(cg_polished, w, h)
 
-            # Phase 4: Aspect ratio refinement
+            if time_left() > 15.0:
+                joint_c, joint_w, joint_h = _joint_optimize(cg_polished, w, h, beta_start=50.0, max_iter=200)
+                check_and_update(joint_c, joint_w, joint_h)
+                if joint_w != w or joint_h != h:
+                    cg_polished = joint_c
+                    w, h = joint_w, joint_h
+
             if time_left() > 10.0:
                 refined, new_w, new_h = _aspect_refine(cg_polished, w, h)
                 if new_w != w or new_h != h:
                     check_and_update(refined, new_w, new_h)
+                    cg_polished = refined
+                    w, h = new_w, new_h
 
-    # Fallback if no valid result found
+            if time_left() > 8.0:
+                final = _final_polish(cg_polished, w, h)
+                check_and_update(final, w, h)
+
     if best_result is None:
         a, b = 7, 3
         w, h = 1.4, 0.6

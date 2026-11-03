@@ -1,304 +1,345 @@
+"""Difference triangle set (7,5) solver with Simulated Annealing and efficient diff tracking."""
 import time
 import random
-import math
 import sys
 
-def construct(n_rows, k):
-    row_len = k + 1
+# Deadline guard: return best result before 145s (5s safety margin under 150s kill)
+_DEADLINE = 145.0
+_START_TIME = time.time()
+
+def _elapsed():
+    return time.time() - _START_TIME
+
+def _row_diffs(row):
+    """Return the list of all positive differences in a row."""
+    diffs = []
+    n = len(row)
+    for i in range(n):
+        for j in range(i + 1, n):
+            diffs.append(row[j] - row[i])
+    return diffs
+
+def _max_entry(rows):
+    return max(max(r) for r in rows) if rows else 0
+
+def _is_valid(rows, k):
+    """Check that all positive differences across all rows are distinct."""
+    seen = set()
+    for row in rows:
+        if len(row) != k + 1:
+            return False
+        if row[0] != 0:
+            return False
+        for i in range(len(row)):
+            for j in range(i + 1, len(row)):
+                d = row[j] - row[i]
+                if d in seen:
+                    return False
+                seen.add(d)
+    return True
+
+def _greedy_row(used, k, rng, max_val=None):
+    """Build one row greedily, choosing the smallest available next mark.
+    used: set of forbidden differences.
+    max_val: optional upper bound for entries.
+    """
+    row = [0]
+    x = 0
+    while len(row) < k + 1:
+        x += 1
+        if max_val is not None and x > max_val:
+            break
+        # Occasionally jump ahead to create diversity
+        if rng.random() < 0.1:
+            x += rng.randint(1, 3)
+            if max_val is not None and x > max_val:
+                break
+        
+        new_diffs = {x - a for a in row}
+        if not new_diffs & used:
+            row.append(x)
+            used |= new_diffs
+    return row
+
+def _greedy_full(n_rows, k, rng, max_val=None):
+    """Build all rows greedily with randomization."""
+    used = set()
+    rows = []
+    for _ in range(n_rows):
+        row = _greedy_row(used, k, rng, max_val)
+        if len(row) < k + 1:
+            return None
+        rows.append(row)
+    return rows
+
+def _sa_optimize(rows, k, rng, time_budget=60):
+    """Simulated Annealing to minimize the scope (max entry)."""
+    n_rows = len(rows)
+    # Initial state
+    best_rows = [list(r) for r in rows]
+    current_rows = [list(r) for r in best_rows]
+    
+    # Track used differences globally for fast conflict checking
+    # We need to be able to add/remove row diffs quickly.
+    # Since k is small (5), each row has 15 diffs.
+    # Total diffs is manageable.
+    
+    def get_diffs(row):
+        return _row_diffs(row)
+
+    # Initialize global diff counts
+    diff_counts = {}
+    for row in current_rows:
+        for d in get_diffs(row):
+            diff_counts[d] = diff_counts.get(d, 0) + 1
+            
+    def count_conflicts():
+        c = 0
+        for cnt in diff_counts.values():
+            if cnt > 1:
+                c += cnt - 1
+        return c
+
+    def get_scope():
+        return _max_entry(current_rows)
+
+    # Objective: Minimize scope + Penalty * Conflicts
+    # We want valid solutions (0 conflicts) with low scope.
+    # If invalid, we prioritize reducing conflicts first.
+    
+    current_scope = get_scope()
+    current_conflicts = count_conflicts()
+    current_cost = current_scope + 1000 * current_conflicts
+    
+    best_scope = current_scope
+    best_conflicts = current_conflicts
+    best_cost = current_cost
+    
     start_time = time.time()
-    deadline = start_time + 115.0  # Safety margin before 120s limit
+    temp = 10.0
+    cooling = 0.999
     
-    # Number of differences per row
-    n_diffs_per_row = k * (k + 1) // 2
-    total_diffs = n_rows * n_diffs_per_row
+    while time.time() - start_time < time_budget:
+        if _elapsed() > _DEADLINE - 5:
+            break
+            
+        # Pick a random move
+        move_type = rng.random()
+        
+        if move_type < 0.7:
+            # Move: Rebuild a random row
+            ri = rng.randrange(n_rows)
+            old_row = current_rows[ri]
+            
+            # Remove old row diffs from counts
+            for d in get_diffs(old_row):
+                diff_counts[d] -= 1
+                if diff_counts[d] == 0:
+                    del diff_counts[d]
+            
+            # Rebuild row with some randomness, trying to stay within current scope
+            # Use a greedy approach with a slight bias towards smaller numbers
+            used = set(diff_counts.keys())
+            max_limit = current_scope + rng.randint(0, 5) # Allow slight expansion to escape
+            new_row = _greedy_row(used, k, rng, max_limit)
+            
+            if len(new_row) < k + 1:
+                # Restore old row
+                for d in get_diffs(old_row):
+                    diff_counts[d] = diff_counts.get(d, 0) + 1
+                continue
+            
+            # Add new row diffs
+            for d in get_diffs(new_row):
+                diff_counts[d] = diff_counts.get(d, 0) + 1
+            
+            current_rows[ri] = new_row
+            
+        else:
+            # Move: Shift an entry in a random row
+            ri = rng.randrange(n_rows)
+            row = current_rows[ri]
+            if len(row) < 2:
+                continue
+            
+            # Pick a random index > 0
+            idx = rng.randint(1, len(row) - 1)
+            old_val = row[idx]
+            
+            # Try to reduce value to compress scope
+            # Or randomly perturb
+            if rng.random() < 0.6:
+                # Try to reduce
+                reduction = rng.randint(1, 3)
+                new_val = old_val - reduction
+                if new_val <= 0:
+                    continue
+                # Check strictly increasing
+                if idx > 1 and new_val <= row[idx - 1]:
+                    continue
+                if idx < len(row) - 1 and new_val >= row[idx + 1]:
+                    continue
+            else:
+                # Random small change
+                delta = rng.randint(-3, 3)
+                new_val = old_val + delta
+                if new_val <= 0:
+                    continue
+                if idx > 1 and new_val <= row[idx - 1]:
+                    continue
+                if idx < len(row) - 1 and new_val >= row[idx + 1]:
+                    continue
+            
+            # If new_val == old_val, skip
+            if new_val == old_val:
+                continue
+                
+            # Calculate diff changes
+            old_diffs = get_diffs(row)
+            
+            # Remove old diffs
+            for d in old_diffs:
+                diff_counts[d] -= 1
+                if diff_counts[d] == 0:
+                    del diff_counts[d]
+            
+            # Apply change
+            row[idx] = new_val
+            new_row = row
+            new_diffs = get_diffs(new_row)
+            
+            # Add new diffs
+            for d in new_diffs:
+                diff_counts[d] = diff_counts.get(d, 0) + 1
+            
+            # Check validity of the row itself (strictly increasing is already checked)
+            # But we need to ensure no internal duplicates in the new row?
+            # The problem says "increasing integers", so strictly increasing is required.
+            # Our check `new_val <= row[idx-1]` etc ensures that.
+            
+            # Evaluate cost
+            new_scope = get_scope()
+            new_conflicts = count_conflicts()
+            new_cost = new_scope + 1000 * new_conflicts
+            
+            delta_cost = new_cost - current_cost
+            
+            # Acceptance criterion
+            if delta_cost < 0 or (temp > 0 and rng.random() < pow(2.718281828, -delta_cost / temp)):
+                current_scope = new_scope
+                current_conflicts = new_conflicts
+                current_cost = new_cost
+                
+                if current_cost < best_cost:
+                    best_cost = current_cost
+                    best_scope = current_scope
+                    best_conflicts = current_conflicts
+                    best_rows = [list(r) for r in current_rows]
+            else:
+                # Reject: Revert changes
+                for d in new_diffs:
+                    diff_counts[d] -= 1
+                    if diff_counts[d] == 0:
+                        del diff_counts[d]
+                
+                for d in old_diffs:
+                    diff_counts[d] = diff_counts.get(d, 0) + 1
+                    
+                row[idx] = old_val
+                # current_rows[ri] is already updated to new_val, so revert it
+                current_rows[ri][idx] = old_val
+
+        # Cool down
+        temp *= cooling
+        if temp < 0.01:
+            temp = 0.01
+
+    # Return the best valid solution found, or the best overall if no valid found
+    # The task requires a valid solution.
+    # If best_conflicts > 0, we should try to return a valid one from history if possible,
+    # or just return the best_rows and hope it's valid? No, it must be valid.
+    # Let's check if best_rows is valid.
+    if _is_valid(best_rows, k):
+        return best_rows
+    else:
+        # Fallback: try to find any valid solution from the process?
+        # Or just return current if valid?
+        if _is_valid(current_rows, k):
+            return current_rows
+        # If neither is valid, return best_rows (which might be invalid, but we hope the greedy init was valid)
+        return best_rows
+
+def construct(n_rows, k):
+    global _START_TIME
+    _START_TIME = time.time()
     
-    def greedy_construct():
-        """Fast greedy construction to get a baseline."""
+    rng = random.Random(42)
+    
+    # Phase 1: Multiple randomized greedy restarts to find a valid start
+    best_rows = None
+    best_score = float('inf')
+    
+    n_restarts = 100
+    for i in range(n_restarts):
+        if _elapsed() > _DEADLINE - 20:
+            break
+        rng2 = random.Random(12345 + i * 7919)
+        rows = _greedy_full(n_rows, k, rng2)
+        if rows is None:
+            continue
+        if not _is_valid(rows, k):
+            continue
+        score = _max_entry(rows)
+        if score < best_score:
+            best_score = score
+            best_rows = [list(r) for r in rows]
+    
+    if best_rows is None:
+        # Fallback: pure greedy without randomization jumps
         used = set()
-        rows = []
+        best_rows = []
         for _ in range(n_rows):
             row = [0]
             x = 0
-            while len(row) < row_len:
+            while len(row) < k + 1:
                 x += 1
-                # Check if x can be added
-                valid = True
-                for a in row:
-                    d = x - a
-                    if d in used:
-                        valid = False
-                        break
-                if valid:
+                new = {x - a for a in row}
+                if not new & used:
                     row.append(x)
-                    for a in row[:-1]:
-                        used.add(x - a)
-            rows.append(row)
-        return rows
+                    used |= new
+            best_rows.append(row)
+        best_score = _max_entry(best_rows)
     
-    # Get baseline
-    baseline_rows = greedy_construct()
-    best_rows = [r[:] for r in baseline_rows]
-    best_max = max(max(r) for r in best_rows)
-    
-    # Function to compute cost: (collisions, max_val)
-    # We want to minimize collisions first, then max_val
-    def compute_cost(rows):
-        used = {}
-        max_val = 0
-        for r in rows:
-            if r[-1] > max_val:
-                max_val = r[-1]
-            for i in range(len(r)):
-                for j in range(i+1, len(r)):
-                    d = r[j] - r[i]
-                    if d in used:
-                        used[d] += 1
-                    else:
-                        used[d] = 1
+    # Phase 2: Simulated Annealing
+    if _elapsed() < _DEADLINE - 10:
+        time_left = _DEADLINE - 10 - _elapsed()
+        # Limit SA time to ensure we return in time
+        sa_time = min(60, time_left)
+        improved_rows = _sa_optimize(best_rows, k, rng, time_budget=sa_time)
         
-        collisions = 0
-        for cnt in used.values():
-            if cnt > 1:
-                collisions += cnt - 1
-        
-        return collisions, max_val
-    
-    # Fast cost update for single element change
-    # We maintain the difference counts incrementally
-    class SAState:
-        def __init__(self, rows):
-            self.rows = [r[:] for r in rows]
-            self.n_rows = len(rows)
-            self.row_len = len(rows[0])
-            self.diff_count = {}
-            self.collisions = 0
-            self.max_val = 0
-            self._rebuild()
-        
-        def _rebuild(self):
-            self.diff_count = {}
-            self.collisions = 0
-            self.max_val = 0
-            for r in self.rows:
-                if r[-1] > self.max_val:
-                    self.max_val = r[-1]
-                for i in range(len(r)):
-                    for j in range(i+1, len(r)):
-                        d = r[j] - r[i]
-                        if d in self.diff_count:
-                            self.diff_count[d] += 1
-                            if self.diff_count[d] == 2:
-                                self.collisions += 1
-                        else:
-                            self.diff_count[d] = 1
-        
-        def get_cost(self):
-            return self.collisions, self.max_val
-        
-        def is_valid(self):
-            return self.collisions == 0
-        
-        def try_move(self, r_idx, i_idx, new_val):
-            """Try to change rows[r_idx][i_idx] to new_val. Return True if accepted."""
-            old_val = self.rows[r_idx][i_idx]
-            if old_val == new_val:
-                return False
-            
-            # Check bounds
-            if i_idx > 0 and new_val <= self.rows[r_idx][i_idx-1]:
-                return False
-            if i_idx < self.row_len - 1 and new_val >= self.rows[r_idx][i_idx+1]:
-                return False
-            
-            # Remove old differences
-            old_row = self.rows[r_idx]
-            old_diffs = []
-            for j in range(self.row_len):
-                if j != i_idx:
-                    d = abs(old_val - old_row[j])
-                    old_diffs.append((d, j))
-            
-            for d, j in old_diffs:
-                self.diff_count[d] -= 1
-                if self.diff_count[d] == 1:
-                    self.collisions -= 1
-                # If it goes to 0, we could delete it, but let's keep it simple
-                if self.diff_count[d] == 0:
-                    del self.diff_count[d]
-            
-            # Apply change
-            old_max = self.max_val
-            self.rows[r_idx][i_idx] = new_val
-            
-            # Add new differences
-            new_row = self.rows[r_idx]
-            new_diffs = []
-            for j in range(self.row_len):
-                if j != i_idx:
-                    d = abs(new_val - new_row[j])
-                    new_diffs.append((d, j))
-            
-            for d, j in new_diffs:
-                if d in self.diff_count:
-                    self.diff_count[d] += 1
-                    if self.diff_count[d] == 2:
-                        self.collisions += 1
-                else:
-                    self.diff_count[d] = 1
-            
-            # Update max_val
-            if new_val > self.max_val:
-                self.max_val = new_val
-            elif old_val == old_max and new_val < old_max:
-                # Need to recompute max
-                self.max_val = max(max(r) for r in self.rows)
-            
-            return True
-        
-        def undo_move(self, r_idx, i_idx, old_val):
-            """Undo a move by restoring old_val."""
-            new_val = self.rows[r_idx][i_idx]
-            if new_val == old_val:
-                return
-            
-            # Remove new differences
-            new_row = self.rows[r_idx]
-            for j in range(self.row_len):
-                if j != i_idx:
-                    d = abs(new_val - new_row[j])
-                    self.diff_count[d] -= 1
-                    if self.diff_count[d] == 1:
-                        self.collisions -= 1
-                    if self.diff_count[d] == 0:
-                        del self.diff_count[d]
-            
-            # Restore old value
-            self.rows[r_idx][i_idx] = old_val
-            
-            # Add old differences
-            old_row = self.rows[r_idx]
-            for j in range(self.row_len):
-                if j != i_idx:
-                    d = abs(old_val - old_row[j])
-                    if d in self.diff_count:
-                        self.diff_count[d] += 1
-                        if self.diff_count[d] == 2:
-                            self.collisions += 1
-                    else:
-                        self.diff_count[d] = 1
-            
-            # Update max_val
-            if old_val > self.max_val:
-                self.max_val = old_val
-            elif new_val == self.max_val and old_val < new_val:
-                self.max_val = max(max(r) for r in self.rows)
-    
-    def simulate_annealing(initial_rows, time_limit):
-        state = SAState(initial_rows)
-        current_collisions, current_max = state.get_cost()
-        best_collisions = current_collisions
-        best_max = current_max
-        best_rows = [r[:] for r in state.rows]
-        
-        T = 50.0
-        cooling = 0.9995
-        start = time.time()
-        
-        while time.time() - start < time_limit:
-            # Choose a random row and position
-            r_idx = random.randint(0, n_rows - 1)
-            i_idx = random.randint(1, row_len - 1)  # Don't change the 0
-            
-            # Determine range for new value
-            lower = state.rows[r_idx][i_idx - 1] + 1
-            if i_idx < row_len - 1:
-                upper = state.rows[r_idx][i_idx + 1] - 1
+        if improved_rows and _is_valid(improved_rows, k):
+            new_score = _max_entry(improved_rows)
+            if new_score < best_score:
+                best_rows = improved_rows
+                best_score = new_score
             else:
-                upper = best_max + 10  # Allow some expansion
-            
-            if lower > upper:
-                continue
-            
-            # Try a few random values
-            for _ in range(3):
-                new_val = random.randint(lower, upper)
-                old_val = state.rows[r_idx][i_idx]
-                if new_val == old_val:
-                    continue
-                
-                if not state.try_move(r_idx, i_idx, new_val):
-                    continue
-                
-                new_collisions, new_max = state.get_cost()
-                
-                # Acceptance criterion
-                if new_collisions < current_collisions:
-                    accept = True
-                elif new_collisions == current_collisions:
-                    if new_max < current_max:
-                        accept = True
-                    else:
-                        # Accept with some probability to escape local minima
-                        delta = new_max - current_max
-                        if delta < 0:
-                            accept = True
-                        else:
-                            p = math.exp(-delta / max(T, 0.1))
-                            accept = random.random() < p
-                else:
-                    # More collisions - rarely accept
-                    delta = (new_collisions - current_collisions) * 100 + (new_max - current_max)
-                    if delta < 0:
-                        accept = True
-                    else:
-                        p = math.exp(-delta / max(T, 0.1))
-                        accept = random.random() < p
-                
-                if accept:
-                    current_collisions = new_collisions
-                    current_max = new_max
-                    if current_collisions < best_collisions or (current_collisions == best_collisions and current_max < best_max):
-                        best_collisions = current_collisions
-                        best_max = current_max
-                        best_rows = [r[:] for r in state.rows]
-                        if best_collisions == 0:
-                            # Found a valid solution
-                            # Try to reduce max further
-                            pass
-                else:
-                    state.undo_move(r_idx, i_idx, old_val)
-            
-            T *= cooling
-            if T < 0.5:
-                T = 0.5
-        
-        return best_rows, best_max, best_collisions
+                # Keep original if SA didn't improve scope
+                pass
     
-    # Main loop
-    while time.time() < deadline:
-        # Create initial state
-        if random.random() < 0.3:
-            # Use best rows as starting point
-            init_rows = [r[:] for r in best_rows]
-        else:
-            # Random initialization within a bound
-            bound = best_max + 5
-            init_rows = []
-            for _ in range(n_rows):
-                pts = random.sample(range(1, bound + 1), k)
-                pts.sort()
-                init_rows.append([0] + pts)
-        
-        # Run SA for a fixed time
-        sa_time = min(8.0, deadline - time.time())
-        if sa_time < 1.0:
-            break
-        
-        local_rows, local_max, local_collisions = simulate_annealing(init_rows, sa_time)
-        
-        if local_collisions < (best_rows and compute_cost(best_rows)[0]) or \
-           (local_collisions == 0 and local_max < best_max):
-            best_rows = local_rows
-            best_max = local_max
+    # Final validation
+    if not _is_valid(best_rows, k):
+        # Shouldn't happen, but fallback to a known valid greedy
+        used = set()
+        best_rows = []
+        for _ in range(n_rows):
+            row = [0]
+            x = 0
+            while len(row) < k + 1:
+                x += 1
+                new = {x - a for a in row}
+                if not new & used:
+                    row.append(x)
+                    used |= new
+            best_rows.append(row)
     
     return best_rows

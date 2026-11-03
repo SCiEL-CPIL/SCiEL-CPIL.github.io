@@ -1,0 +1,3 @@
+def _score_raw(h):
+    ...
+    return l2_sq / (l1 * DELTA * max_conv)

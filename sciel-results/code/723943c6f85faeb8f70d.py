@@ -1,0 +1,491 @@
+"""
+First autocorrelation inequality: minimize normalized max of autoconvolution
+for a nonnegative step function with 600 equal intervals on [-1/4, 1/4].
+
+Strategy:
+1. Parametric initialization with cosine bumps (smooth family)
+2. Spectral magnitude optimization: parametric model for |F(k)|, optimize
+   to minimize peak of inverse-FFT of |F(k)|^2, project to nonnegative time domain
+3. Block-level simulated annealing: make large structural changes to escape
+   local minima, with cooling schedule
+4. Final local polish with sensitivity-based refinement
+
+The key structural change: instead of only time-domain gradient descent, we
+optimize in the spectral domain where the autoconvolution structure is more
+directly visible. The peak of the autoconvolution is the DC term of the
+squared magnitude spectrum convolved with itself, so shaping the spectrum
+can directly reduce peaks.
+"""
+
+import numpy as np
+from scipy.optimize import minimize
+import time
+
+N = 600
+TIME_LIMIT = 146  # safety margin before 150s kill
+
+def compute_score(f):
+    """Compute the normalized maximum of the autoconvolution."""
+    f = np.asarray(f, dtype=np.float64)
+    if np.any(f < -1e-15):
+        return np.inf
+    f = np.maximum(f, 0.0)
+    conv = np.convolve(f, f, mode='full')
+    s = np.sum(f)
+    if s < 1e-15:
+        return np.inf
+    return np.max(conv) / (s * s)
+
+def fft_convolve(f):
+    """Fast autoconvolution via FFT."""
+    n_fft = 2 * N
+    f_hat = np.fft.rfft(f, n=n_fft)
+    conv = np.fft.irfft(f_hat * f_hat, n=n_fft)[:2*N-1]
+    return conv
+
+def smooth_max(x, beta):
+    """Smooth approximation to max using log-sum-exp."""
+    x = np.asarray(x, dtype=np.float64)
+    x_max = np.max(x)
+    if x_max < 1e-15:
+        return 0.0
+    x_scaled = x / x_max
+    shifted = x_scaled - np.max(x_scaled)
+    log_sum = np.log(np.sum(np.exp(beta * shifted))) / beta
+    return x_max * (1.0 + log_sum)
+
+def cosine_basis(x, centers, widths, heights):
+    """Generate a smooth nonnegative function from cosine bump components."""
+    result = np.zeros_like(x)
+    for c, w, h in zip(centers, widths, heights):
+        dist = np.abs(x - c)
+        mask = dist <= w / 2.0
+        if np.any(mask):
+            result[mask] += h * np.cos(np.pi * (x[mask] - c) / w) ** 2
+    return result
+
+def parametric_to_step(params, n_components):
+    """Convert parameters to a step function of length N."""
+    x = np.linspace(-0.25, 0.25, N, endpoint=False) + 0.25 / N
+    centers = params[:n_components]
+    widths = params[n_components:2*n_components]
+    heights = params[2*n_components:3*n_components]
+    
+    widths = np.abs(widths) + 0.01
+    widths = np.minimum(widths, 0.5)
+    heights = np.abs(heights)
+    
+    f = cosine_basis(x, centers, widths, heights)
+    f = np.maximum(f, 0.0)
+    return f
+
+def objective(params, n_components, beta=10.0):
+    f = parametric_to_step(params, n_components)
+    conv = np.convolve(f, f, mode='full')
+    s = np.sum(f)
+    if s < 1e-15:
+        return np.inf
+    return smooth_max(conv, beta) / (s * s)
+
+def spectral_refinement(h, start_time, max_time):
+    """Spectral magnitude optimization: fit a parametric model to |F(k)|,
+    optimize parameters to minimize peak autoconvolution, then project back
+    to nonnegative time domain."""
+    best_h = h.copy()
+    best_val = compute_score(h)
+    n_fft = 2 * N
+    
+    # Get current spectrum
+    f_hat = np.fft.rfft(h, n=n_fft)
+    mag = np.abs(f_hat)
+    n_freqs = len(mag)
+    
+    # Parametric model: log-magnitude as sum of Lorentzian bumps in frequency
+    # This allows smooth spectral shaping
+    def spectral_objective(params, n_bumps):
+        centers = params[:n_bumps]
+        widths = params[n_bumps:2*n_bumps]
+        heights = params[2*n_bumps:3*n_bumps]
+        
+        widths = np.abs(widths) + 0.01
+        heights = np.abs(heights)
+        
+        freqs = np.arange(n_freqs)
+        log_mag = np.zeros(n_freqs)
+        for c, w, hgt in zip(centers, widths, heights):
+            log_mag += hgt / (1.0 + ((freqs - c) / w) ** 2)
+        
+        mag_model = np.exp(log_mag)
+        
+        # Reconstruct time domain with conjugate symmetry
+        f_recon = np.zeros(n_fft)
+        f_recon[:n_freqs] = mag_model
+        f_recon[n_freqs-1:0:-1] = mag_model[n_freqs-1:0:-1]
+        
+        f_time = np.fft.irfft(f_recon, n=n_fft)[:N]
+        f_time = np.maximum(f_time, 0.0)
+        
+        s = np.sum(f_time)
+        if s < 1e-12:
+            return 1e10
+        f_time = f_time * (N / s)
+        
+        conv = fft_convolve(f_time)
+        return np.max(conv) / (N * N)
+    
+    # Fit initial parameters from current spectrum
+    rng = np.random.RandomState(42)
+    best_params = None
+    best_obj = np.inf
+    
+    for n_bumps in [3, 5, 8]:
+        if time.time() > max_time:
+            break
+        
+        for restart in range(3):
+            if time.time() > max_time:
+                break
+            
+            # Initialize from peaks in current magnitude spectrum
+            mag_smooth = mag.copy()
+            # Find local maxima in magnitude
+            peaks = []
+            for i in range(1, n_freqs-1):
+                if mag[i] > mag[i-1] and mag[i] > mag[i+1] and mag[i] > np.mean(mag) * 0.5:
+                    peaks.append(i)
+            
+            if len(peaks) >= n_bumps:
+                # Select top n_bumps peaks
+                peak_vals = [mag[p] for p in peaks]
+                top_idx = np.argsort(peak_vals)[-n_bumps:]
+                centers = np.array([peaks[i] for i in top_idx], dtype=float)
+            else:
+                centers = rng.uniform(0, n_freqs-1, size=n_bumps)
+            
+            widths = rng.uniform(2.0, 20.0, size=n_bumps)
+            # Estimate heights from log-magnitude at peaks
+            heights = np.zeros(n_bumps)
+            for i, c in enumerate(centers):
+                c_int = int(np.clip(c, 0, n_freqs-1))
+                heights[i] = np.log(mag[c_int] + 1e-10)
+            
+            x0 = np.concatenate([centers, widths, heights])
+            
+            try:
+                result = minimize(
+                    spectral_objective, x0, args=(n_bumps,),
+                    method='Nelder-Mead',
+                    options={'maxiter': 200, 'xatol': 0.1, 'fatol': 1e-5}
+                )
+                if result.fun < best_obj:
+                    best_obj = result.fun
+                    best_params = result.x
+            except Exception:
+                pass
+    
+    if best_params is not None:
+        # Reconstruct from optimized spectrum
+        n_bumps = best_params.size // 3
+        centers = best_params[:n_bumps]
+        widths = np.abs(best_params[n_bumps:2*n_bumps]) + 0.01
+        heights = np.abs(best_params[2*n_bumps:3*n_bumps])
+        
+        freqs = np.arange(n_freqs)
+        log_mag = np.zeros(n_freqs)
+        for c, w, hgt in zip(centers, widths, heights):
+            log_mag += hgt / (1.0 + ((freqs - c) / w) ** 2)
+        
+        mag_model = np.exp(log_mag)
+        
+        f_recon = np.zeros(n_fft)
+        f_recon[:n_freqs] = mag_model
+        f_recon[n_freqs-1:0:-1] = mag_model[n_freqs-1:0:-1]
+        
+        f_time = np.fft.irfft(f_recon, n=n_fft)[:N]
+        f_time = np.maximum(f_time, 0.0)
+        
+        s = np.sum(f_time)
+        if s > 1e-12:
+            f_time = f_time * (N / s)
+            val = compute_score(f_time)
+            if val < best_val:
+                best_h = f_time
+                best_val = val
+    
+    return best_h, best_val
+
+def block_simulated_annealing(h, start_time, max_time):
+    """Block-level simulated annealing: make large structural changes to blocks
+    of the step function, accepting worse solutions with probability based on
+    temperature, to escape local minima."""
+    best_h = h.copy()
+    best_val = compute_score(h)
+    current_h = h.copy()
+    n_fft = 2 * N
+    
+    # Precompute current FFT for faster evaluation
+    current_fft = np.fft.rfft(current_h, n=n_fft)
+    current_conv = np.fft.irfft(current_fft * current_fft, n=n_fft)[:2*N-1]
+    current_val = np.max(current_conv) / (N * N)
+    
+    # Cooling schedule
+    T_start = 0.1
+    T_end = 0.001
+    T_current = T_start
+    
+    # Block sizes to try
+    block_sizes = [4, 8, 16, 32, 64]
+    
+    no_improve = 0
+    max_no_improve = 100
+    total_steps = 0
+    
+    while time.time() - start_time < max_time:
+        total_steps += 1
+        s = np.sum(current_h)
+        if s < 1e-12:
+            break
+        current_h = current_h * (N / s)
+        
+        # Pick a random block
+        bs = block_sizes[np.random.randint(len(block_sizes))]
+        n_blocks = N // bs
+        if n_blocks < 2:
+            bs = 4
+            n_blocks = N // bs
+        
+        block_idx = np.random.randint(0, n_blocks)
+        start_idx = block_idx * bs
+        end_idx = start_idx + bs
+        
+        # Generate a random perturbation for this block
+        # Option 1: scale the block
+        # Option 2: shift mass within the block
+        # Option 3: add a small bump
+        mode = np.random.randint(3)
+        
+        h_new = current_h.copy()
+        if mode == 0:
+            # Scale block
+            scale = np.random.uniform(0.5, 1.5)
+            h_new[start_idx:end_idx] *= scale
+        elif mode == 1:
+            # Shift mass: decrease first half, increase second half (or vice versa)
+            half = bs // 2
+            delta = np.random.uniform(-0.3, 0.3) * np.mean(current_h[start_idx:end_idx])
+            h_new[start_idx:start_idx+half] -= delta
+            h_new[start_idx+half:end_idx] += delta
+        else:
+            # Add a Gaussian bump centered in the block
+            center = start_idx + bs // 2
+            sigma = bs // 4 + 1
+            x = np.arange(start_idx, end_idx)
+            bump = np.exp(-((x - center) ** 2) / (2 * sigma ** 2))
+            amp = np.random.uniform(-0.2, 0.2) * np.mean(current_h)
+            h_new[start_idx:end_idx] += amp * bump
+        
+        h_new = np.maximum(h_new, 0.0)
+        s_new = np.sum(h_new)
+        if s_new < 1e-12:
+            continue
+        h_new = h_new * (N / s_new)
+        
+        # Fast evaluation using FFT
+        new_fft = np.fft.rfft(h_new, n=n_fft)
+        new_conv = np.fft.irfft(new_fft * new_fft, n=n_fft)[:2*N-1]
+        val_new = np.max(new_conv) / (N * N)
+        
+        # Accept if better, or with probability exp(-(val_new - val_cur)/T)
+        if val_new < current_val or np.random.random() < np.exp(-(val_new - current_val) / max(T_current, 1e-10)):
+            current_h = h_new
+            current_fft = new_fft
+            current_conv = new_conv
+            current_val = val_new
+            no_improve = 0
+        else:
+            no_improve += 1
+        
+        if val_new < best_val:
+            best_val = val_new
+            best_h = h_new.copy()
+            no_improve = 0
+        
+        # Cool down
+        cooling_rate = (T_end / T_start) ** (1.0 / max(500, total_steps))
+        T_current = max(T_current * cooling_rate, T_end)
+        
+        if no_improve > max_no_improve:
+            # Reset to best and restart with higher temperature
+            current_h = best_h.copy()
+            current_fft = np.fft.rfft(current_h, n=n_fft)
+            current_conv = np.fft.irfft(current_fft * current_fft, n=n_fft)[:2*N-1]
+            current_val = np.max(current_conv) / (N * N)
+            T_current = T_start * 0.5
+            no_improve = 0
+    
+    return best_h, best_val
+
+def local_polish(h, start_time, max_time):
+    """Final local polish with sensitivity-based refinement for fine-tuning."""
+    best_h = h.copy()
+    best_val = compute_score(h)
+    current_h = h.copy()
+    alpha = 0.02
+    threshold_frac = 0.99
+    n_fft = 2 * N
+    
+    no_improve_count = 0
+    max_no_improve = 50  # Increased to allow more iterations
+    
+    while time.time() - start_time < max_time:
+        s = np.sum(current_h)
+        if s < 1e-12:
+            break
+        current_h = current_h * (N / s)
+        
+        f_hat = np.fft.rfft(current_h, n=n_fft)
+        conv = np.fft.irfft(f_hat * f_hat, n=n_fft)[:2*N-1]
+        max_c = np.max(conv)
+        current_val = max_c / (N * N)
+        
+        if current_val < best_val:
+            best_val = current_val
+            best_h = current_h.copy()
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
+        
+        if no_improve_count > max_no_improve:
+            break
+        
+        # Smooth peak mask with wider range
+        threshold = max_c * threshold_frac
+        lower_thresh = max_c * 0.90
+        peak_mask = np.clip((conv - lower_thresh) / (threshold - lower_thresh + 1e-15), 0, 1)
+        peak_mask = peak_mask ** 1.5  # Softer peak weighting
+        
+        pm_hat = np.fft.rfft(peak_mask, n=n_fft)
+        ch_hat = np.fft.rfft(current_h, n=n_fft)
+        sens = np.fft.irfft(pm_hat * np.conj(ch_hat), n=n_fft)[:N]
+        
+        sens_mean = np.mean(sens)
+        sens_std = np.std(sens) + 1e-12
+        sens_norm = (sens - sens_mean) / sens_std
+        
+        best_alpha = alpha
+        best_h_candidate = None
+        best_val_candidate = current_val
+        
+        # Try more alpha values for better convergence
+        for trial_alpha in [alpha * 0.25, alpha * 0.5, alpha, alpha * 2.0, alpha * 4.0]:
+            h_new = current_h * (1.0 - trial_alpha * sens_norm)
+            h_new = np.maximum(h_new, 0.0)
+            
+            s_new = np.sum(h_new)
+            if s_new < 1e-12:
+                continue
+            h_new = h_new * (N / s_new)
+            
+            f_new_hat = np.fft.rfft(h_new, n=n_fft)
+            conv_new = np.fft.irfft(f_new_hat * f_new_hat, n=n_fft)[:2*N-1]
+            val_new = np.max(conv_new) / (N * N)
+            
+            if val_new < best_val_candidate:
+                best_val_candidate = val_new
+                best_alpha = trial_alpha
+                best_h_candidate = h_new
+        
+        if best_h_candidate is not None and best_val_candidate < current_val:
+            current_h = best_h_candidate
+            alpha = min(alpha * 1.15, 0.15)
+        else:
+            alpha *= 0.7
+            if alpha < 1e-7:
+                break
+    
+    return best_h, best_val
+
+def construct():
+    start_time = time.time()
+    
+    # Initial best: constant function
+    best_f = np.ones(N)
+    best_score = compute_score(best_f)
+    
+    # Phase 1: Parametric initialization with cosine bumps
+    # Reserve time: 15% for parametric, 30% for spectral, 35% for SA, 20% for polish
+    param_budget_end = start_time + (TIME_LIMIT - 5) * 0.15
+    
+    for n_c in [2, 3, 4]:
+        if time.time() > param_budget_end:
+            break
+        
+        rng = np.random.RandomState(42 + n_c)
+        best_params = None
+        best_obj = np.inf
+        
+        for restart in range(2):
+            if time.time() > param_budget_end:
+                break
+            
+            centers = rng.uniform(-0.15, 0.15, size=n_c)
+            widths = rng.uniform(0.08, 0.25, size=n_c)
+            heights = rng.uniform(0.5, 2.0, size=n_c)
+            
+            x0 = np.concatenate([centers, widths, heights])
+            
+            try:
+                result = minimize(
+                    objective, x0, args=(n_c, 15.0),
+                    method='Nelder-Mead',
+                    options={'maxiter': 300, 'xatol': 1e-5, 'fatol': 1e-6}
+                )
+                if result.fun < best_obj:
+                    best_obj = result.fun
+                    best_params = result.x
+            except Exception:
+                pass
+        
+        if best_params is not None:
+            f = parametric_to_step(best_params, n_c)
+            actual_score = compute_score(f)
+            if actual_score < best_score:
+                best_f = f
+                best_score = actual_score
+    
+    # Phase 2: Spectral magnitude optimization
+    if time.time() < TIME_LIMIT - 70:
+        spectral_f, spectral_score = spectral_refinement(
+            best_f, start_time, TIME_LIMIT - 70
+        )
+        if spectral_score < best_score:
+            best_f = spectral_f
+            best_score = spectral_score
+    
+    # Phase 3: Block-level simulated annealing
+    if time.time() < TIME_LIMIT - 30:
+        sa_f, sa_score = block_simulated_annealing(
+            best_f, start_time, TIME_LIMIT - 30
+        )
+        if sa_score < best_score:
+            best_f = sa_f
+            best_score = sa_score
+    
+    # Phase 4: Final local polish
+    if time.time() < TIME_LIMIT - 1:
+        polished_f, polished_score = local_polish(
+            best_f, start_time, TIME_LIMIT - 1
+        )
+        if polished_score < best_score:
+            best_f = polished_f
+            best_score = polished_score
+    
+    # Ensure nonnegative
+    best_f = np.maximum(best_f, 0.0)
+    return [float(x) for x in best_f]
+
+if __name__ == "__main__":
+    f = construct()
+    print(f"Score: {compute_score(f)}")
+    print(f"Length: {len(f)}")
+    print(f"Min: {min(f)}, Max: {max(f)}")

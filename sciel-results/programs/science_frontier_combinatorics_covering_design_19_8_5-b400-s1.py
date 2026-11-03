@@ -1,301 +1,441 @@
 import itertools
 import time
 import random
-import sys
-import numpy as np
-
-def _deadline_ok(deadline):
-    return time.time() < deadline
 
 def construct(v, k, t):
     start_time = time.time()
-    # Evaluator limit is 120s, but we should leave a safety margin for overhead/return
-    limit = 115.0 
-    deadline = start_time + limit
+    deadline = 115.0 # Safety margin
+
+    def elapsed():
+        return time.time() - start_time
 
     # 1. Precomputation
-    # Generate all t-subsets
-    t_subs = list(itertools.combinations(range(v), t))
-    n_t = len(t_subs)
-    sub_index = {sub: i for i, sub in enumerate(t_subs)}
+    # Generate all t-sets and assign indices
+    all_tsets = list(itertools.combinations(range(v), t))
+    num_tsets = len(all_tsets)
+    tset_index = {ts: i for i, ts in enumerate(all_tsets)}
     
-    # Generate all k-blocks
-    blocks = list(itertools.combinations(range(v), k))
-    n_blocks = len(blocks)
-    
-    # Map each block to the indices of the t-subsets it covers
-    # block_covers[i] is a list of subset indices covered by block i
-    block_covers = []
-    for block in blocks:
-        covers = []
-        for sub in itertools.combinations(block, t):
-            covers.append(sub_index[sub])
-        block_covers.append(np.array(covers, dtype=np.int32))
+    # Generate all blocks and their bitmasks
+    all_blocks = []
+    block_masks = []
+    for block in itertools.combinations(range(v), k):
+        mask = 0
+        for ts in itertools.combinations(block, t):
+            mask |= (1 << tset_index[ts])
+        all_blocks.append(block)
+        block_masks.append(mask)
         
-    if not _deadline_ok(deadline):
-        return []
+    num_blocks = len(all_blocks)
+    
+    # Initial full mask
+    full_mask = (1 << num_tsets) - 1
 
-    # Build reverse mapping: for each t-subset, which blocks cover it?
-    # sub_to_blocks[j] is a list of block indices covering subset j
-    sub_to_blocks = [[] for _ in range(n_t)]
-    for i, covers in enumerate(block_covers):
-        for j in covers:
-            sub_to_blocks[j].append(i)
-    
-    # Pre-compute a numpy array for subset coverage? 
-    # It's a sparse matrix of size n_t x n_blocks. 
-    # Given n_t=11628 and n_blocks=75582, a dense matrix is 880M entries (too big).
-    # We stick to list of lists for sub_to_blocks and lists of arrays for block_covers.
-
-    # 2. Fast Greedy Initialization
-    # We need a valid solution to start local search.
-    # Greedy: repeatedly pick the block that covers the most uncovered subsets.
-    
-    uncovered_mask = np.ones(n_t, dtype=bool)
-    selected = set()
-    
-    # To speed up greedy, we can't easily vectorize the "gain" calculation without a matrix.
-    # However, n_t is small enough that we can iterate.
-    # Optimization: Pre-compute the size of block_covers? They are all C(k,t).
-    # Actually, the gain depends on how many of its subsets are currently uncovered.
-    
-    # Simple Greedy Loop
-    while np.any(uncovered_mask):
-        if not _deadline_ok(deadline):
-            break
+    # 2. Greedy Set Cover
+    def greedy_cover(seed):
+        rng = random.Random(seed)
+        uncovered = full_mask
+        selected = []
+        # To speed up, we can sort blocks initially by size (all same) or random shuffle
+        # But we need to pick the best one each time.
+        
+        # Optimization: Keep a list of candidate indices.
+        # If a block is selected, remove it.
+        # Scanning all blocks each time is O(N_blocks * N_iterations).
+        # 75k * 300 = 22.5M. Acceptable.
+        
+        while uncovered:
+            if elapsed() > deadline - 5:
+                break
+            best_idx = -1
+            best_count = -1
+            # Random tie-breaking
+            # Iterate through all blocks
+            for i in range(num_blocks):
+                # If already selected, skip? 
+                # We can't easily track "selected" in a set for O(1) lookup inside the loop if we don't maintain a boolean array.
+                # Let's maintain a boolean array `used`.
+                pass
             
-        best_block = -1
-        max_gain = 0
-        
-        # Iterate through blocks. To speed this up, we can skip blocks that don't cover any uncovered subset.
-        # We can check this by looking at the intersection of block_covers[i] and uncovered indices.
-        # But iterating all n_blocks every step is O(n_blocks * n_t) which is ~ 75k * 11k = 800M ops per step.
-        # Too slow.
-        
-        # Better Greedy Strategy:
-        # 1. Find an uncovered subset.
-        # 2. Pick a random block that covers it, or the one that covers the most other uncovered subsets.
-        
-        # Let's pick a random uncovered subset to guide the search, or the "most constrained" one.
-        # "Most constrained" = subset with fewest covering blocks.
-        # We can pre-compute the count of blocks for each subset.
-        subset_counts = [len(lst) for lst in sub_to_blocks]
-        
-        # Find uncovered subset with minimum count
-        # We need to track which subsets are uncovered.
-        # Let's maintain a list of uncovered subsets.
-        
-        # Actually, a simpler greedy for initialization:
-        # Randomly pick an uncovered subset, pick a random block covering it.
-        # This is fast but might yield a large solution.
-        # Then local search fixes it.
-        
-        # Let's do a slightly smarter greedy:
-        # Pick the uncovered subset with the fewest options (min count).
-        # Among blocks covering it, pick the one with highest "potential gain".
-        
-        uncovered_indices = np.where(uncovered_mask)[0]
-        if len(uncovered_indices) == 0:
-            break
+            # This inner loop is the bottleneck if we don't optimize.
+            # Let's use a list of available indices.
             
-        # Find the index in uncovered_indices with min subset_count
-        # subset_counts is a list, so we can map it to numpy
-        # To avoid O(n_t) scan every time, we could maintain a priority queue, but for initialization 
-        # a simple scan is fine if we limit steps or use randomization.
-        
-        # Let's just pick a random uncovered subset to keep it O(1) per step roughly.
-        # This produces a valid cover quickly.
-        target_idx = random.choice(uncovered_indices)
-        
-        candidates = sub_to_blocks[target_idx]
-        if not candidates:
-            break # Should not happen for valid covering designs parameters
+            # Actually, let's just iterate all and check a `used` array.
+            # But `used` check is O(1).
+            # The cost is `popcount`.
             
-        # Pick the candidate that covers the most other uncovered subsets
-        # We can approximate this or just pick random for speed in init.
-        # Let's pick the one that covers the most uncovered subsets.
-        best_cand = -1
-        max_gain = 0
-        # Limit candidates checked if too many?
-        # Usually sub_to_blocks sizes are manageable.
-        for b in candidates:
-            # Count how many of block_covers[b] are in uncovered_mask
-            # block_covers[b] is a numpy array of indices.
-            # We can use np.isin or boolean indexing.
-            # uncovered_mask is a boolean array of length n_t.
-            gain = np.sum(uncovered_mask[block_covers[b]])
-            if gain > max_gain:
-                max_gain = gain
-                best_cand = b
+            # To avoid checking used blocks, we can maintain a list of `active` blocks.
+            # But removing from a list is O(N).
+            # Let's just iterate all and skip used.
+            
+            used = [False] * num_blocks
+            active_indices = list(range(num_blocks))
+            
+            while uncovered:
+                if elapsed() > deadline - 5:
+                    break
+                best_idx = -1
+                best_count = -1
                 
-        if best_cand != -1:
-            selected.add(best_cand)
-            uncovered_mask[block_covers[best_cand]] = False
-
-    if not selected:
-        return []
-
-    # 3. Local Search Optimization
-    # We now have a valid cover. We want to minimize |selected|.
-    
-    # Helper: Get coverage counts for a set of blocks
-    # Instead of rebuilding counts from scratch every time, we update them incrementally.
-    
-    # Initialize counts
-    counts = np.zeros(n_t, dtype=np.int32)
-    for b in selected:
-        counts[block_covers[b]] += 1
-    
-    # Helper: Check if a block is redundant given current counts
-    # A block is redundant if all subsets it covers have count > 1.
-    def is_redundant(b, counts):
-        return np.all(counts[block_covers[b]] > 1)
-        
-    # Helper: Try to remove a block. If it causes gaps, try to fix.
-    def try_remove_and_fix(b, selected, counts, deadline):
-        """
-        Attempts to remove block b.
-        Returns True if successful (and updates selected/counts), False otherwise.
-        """
-        if not _deadline_ok(deadline):
-            return False
-            
-        # Check if b is redundant
-        if is_redundant(b, counts):
-            selected.remove(b)
-            counts[block_covers[b]] -= 1
-            return True
-            
-        # If not redundant, it covers some subsets with count == 1.
-        # These are the "critical" subsets for b.
-        covers_b = block_covers[b]
-        critical_subsets = covers_b[counts[covers_b] == 1]
-        
-        if len(critical_subsets) == 0:
-            # Should be redundant, but just in case
-            selected.remove(b)
-            counts[covers_b] -= 1
-            return True
-            
-        # We need to find a replacement block b_new such that:
-        # 1. b_new covers all critical_subsets.
-        # 2. b_new is not in selected.
-        # 3. Ideally, b_new covers other subsets that are already covered (so we don't increase "waste" too much), 
-        #    or simply that the swap is valid.
-        
-        # Find candidate blocks that cover ALL critical_subsets.
-        # Intersection of sub_to_blocks[s] for s in critical_subsets.
-        
-        if len(critical_subsets) == 1:
-            candidates = sub_to_blocks[critical_subsets[0]]
-        else:
-            # Find intersection
-            # Start with the subset that has the fewest candidates
-            min_count = float('inf')
-            target = -1
-            for s in critical_subsets:
-                c = len(sub_to_blocks[s])
-                if c < min_count:
-                    min_count = c
-                    target = s
-            
-            candidates = set(sub_to_blocks[target])
-            for s in critical_subsets:
-                if s == target: continue
-                candidates.intersection_update(sub_to_blocks[s])
-                if not candidates:
-                    return False
-            
-            candidates = list(candidates)
-            
-        # Filter candidates: must not be in selected
-        valid_candidates = [c for c in candidates if c not in selected]
-        
-        if not valid_candidates:
-            return False
-            
-        # Evaluate candidates.
-        # Metric: We want to minimize the "cost" of the new block.
-        # A good proxy: Number of subsets covered by b_new that are currently covered exactly once by other blocks?
-        # Or simply: Does b_new cover any subsets that are currently uncovered? (No, because we only removed b, 
-        # and b's critical subsets are the only ones at risk. If b_new covers them, they become covered.
-        # The other subsets covered by b_new were already covered by other blocks in selected, 
-        # so their count increases. This is "safe" but might make them harder to remove later.
-        
-        # Heuristic: Pick the candidate that covers the most subsets that are currently "over-covered" (count > 1)?
-        # Or the one with the smallest "impact"?
-        # Actually, the simplest valid swap is any valid candidate.
-        # To improve, we can look for a candidate that also helps cover other "weakly covered" subsets?
-        # Let's just pick a random valid candidate to allow exploration.
-        # Or pick the one that covers the most subsets with count == 2 (making them count 3, less critical)?
-        
-        # Let's try to pick the candidate that minimizes the number of subsets it covers 
-        # that are currently covered exactly once by blocks OTHER than b.
-        # Wait, if a subset s is covered by b and b_new, and count[s] was 1 (only b), 
-        # after removing b, count[s] becomes 0. Adding b_new makes it 1.
-        # If count[s] was 2 (b and x), removing b makes it 1. Adding b_new makes it 2.
-        
-        # The "critical" subsets are those with count 1. They MUST be covered by b_new.
-        # For non-critical subsets covered by b_new, the count goes from C to C+1.
-        
-        # Let's just pick a random one for speed and diversity.
-        b_new = random.choice(valid_candidates)
-        
-        # Perform swap
-        selected.remove(b)
-        counts[covers_b] -= 1
-        selected.add(b_new)
-        counts[block_covers[b_new]] += 1
-        
-        return True
-
-    # Main Local Search Loop
-    # We iterate, trying to remove random blocks.
-    # If removal fails (block is critical), we try to fix it with a swap.
-    # If swap succeeds, we continue. If it fails, we leave the block.
-    
-    # To avoid getting stuck, we can use a "temperature" or just random restarts of the local search phase.
-    
-    best_size = len(selected)
-    best_selected = set(selected)
-    best_counts = counts.copy()
-    
-    # We run local search for a fixed amount of time or iterations.
-    # Since we have a deadline, we loop until deadline.
-    
-    # Optimization: Keep a list of blocks in selected for fast random access
-    selected_list = list(selected)
-    
-    # We'll use a counter to track consecutive failures to detect stagnation
-    # and potentially restart or change strategy.
-    
-    while _deadline_ok(deadline):
-        if not selected_list:
-            break
-            
-        # Pick a random block to try to remove
-        idx = random.randint(0, len(selected_list) - 1)
-        b = selected_list[idx]
-        
-        success = try_remove_and_fix(b, selected, counts, deadline)
-        
-        if success:
-            # Update the list representation
-            # Since we modified 'selected' (set), we need to sync 'selected_list'
-            # try_remove_and_fix might have removed b and added b_new, or just removed b.
-            # Rebuilding the list is O(N), which is okay if N is small (~300-400).
-            selected_list = list(selected)
-            
-            if len(selected) < best_size:
-                best_size = len(selected)
-                best_selected = set(selected)
-                best_counts = counts.copy()
+                # Shuffle active indices slightly to break ties randomly?
+                # Or just pick first max.
                 
-    # Final Result
-    # Ensure we return the best found
-    if len(best_selected) < len(selected):
-        selected = best_selected
+                for i in active_indices:
+                    if used[i]:
+                        continue
+                    # Count bits in (block_masks[i] & uncovered)
+                    # Python 3.10+ has int.bit_count()
+                    count = (block_masks[i] & uncovered).bit_count()
+                    if count > best_count:
+                        best_count = count
+                        best_idx = i
+                        if count == num_tsets: # Perfect cover (unlikely)
+                            break
+                
+                if best_idx == -1 or best_count == 0:
+                    break
+                    
+                used[best_idx] = True
+                selected.append(best_idx)
+                uncovered &= ~block_masks[best_idx]
+                
+                # Optional: Remove best_idx from active_indices?
+                # It's O(N) to remove. With 300 iterations and N=75k, 22M ops.
+                # We can just leave it and skip via `used`.
+                
+            return selected
+
+    # 3. Local Search (1-for-1 swap and deletion)
+    def local_search(initial_sol, seed):
+        rng = random.Random(seed)
+        sol = list(initial_sol)
         
-    # Convert to list of lists
-    result = [list(blocks[i]) for i in selected]
-    return result
+        # Precompute cover counts for current solution
+        # cover_counts[ts_idx] = number of blocks in sol covering ts_idx
+        # Using a dict or array? Array of size 11628 is fine.
+        cover_counts = [0] * num_tsets
+        
+        def update_counts(block_idx, delta):
+            mask = block_masks[block_idx]
+            # Iterate through set bits in mask
+            m = mask
+            while m:
+                # Get lowest set bit
+                lsb = m & -m
+                idx = lsb.bit_length() - 1
+                cover_counts[idx] += delta
+                m ^= lsb
+
+        # Initialize counts
+        for b in sol:
+            update_counts(b, 1)
+            
+        best_sol = list(sol)
+        best_size = len(sol)
+        no_improve = 0
+        max_no_improve = 50
+        
+        while elapsed() < deadline - 10 and no_improve < max_no_improve:
+            improved = False
+            
+            # Phase 1: Try to remove redundant blocks
+            # A block is redundant if all its t-sets are covered by others.
+            # i.e., for all ts in block, cover_counts[ts] > 1.
+            # We can check this by iterating bits in block_mask.
+            
+            # Shuffle order to avoid bias
+            order = list(range(len(sol)))
+            rng.shuffle(order)
+            
+            for pos in order:
+                if pos >= len(sol):
+                    continue
+                b = sol[pos]
+                mask = block_masks[b]
+                redundant = True
+                m = mask
+                while m:
+                    lsb = m & -m
+                    idx = lsb.bit_length() - 1
+                    if cover_counts[idx] == 1:
+                        redundant = False
+                        break
+                    m ^= lsb
+                    
+                if redundant:
+                    # Remove block
+                    update_counts(b, -1)
+                    sol.pop(pos)
+                    improved = True
+                    if len(sol) < best_size:
+                        best_size = len(sol)
+                        best_sol = list(sol)
+                    # Restart loop to check for more redundancies
+                    break
+                    
+            if improved:
+                no_improve = 0
+                continue
+                
+            # Phase 2: 1-for-1 Swap
+            # Pick a block A to remove.
+            # Let U be the set of t-sets in A that become uncovered (cover_counts == 1).
+            # Find a block B (not in sol) that covers all t-sets in U.
+            # If found, swap A with B.
+            
+            if sol:
+                found_swap = False
+                # Try a few random blocks to remove
+                for _ in range(10):
+                    if not sol:
+                        break
+                    pos = rng.randint(0, len(sol) - 1)
+                    b_out = sol[pos]
+                    
+                    # Find critical t-sets for b_out
+                    critical_mask = 0
+                    m = block_masks[b_out]
+                    while m:
+                        lsb = m & -m
+                        idx = lsb.bit_length() - 1
+                        if cover_counts[idx] == 1:
+                            critical_mask |= lsb
+                        m ^= lsb
+                        
+                    if critical_mask == 0:
+                        # Should have been caught in Phase 1, but just in case
+                        update_counts(b_out, -1)
+                        sol.pop(pos)
+                        improved = True
+                        found_swap = True
+                        break
+                        
+                    # Find a block covering critical_mask
+                    # We need a block B such that (block_masks[B] & critical_mask) == critical_mask
+                    # And B is not in sol.
+                    
+                    # Iterate through all blocks? Too slow.
+                    # We can precompute for each t-set, which blocks cover it?
+                    # That's the `tset_to_blocks` from before, which was slow to build.
+                    # But we can build it once here?
+                    # Or just scan all blocks?
+                    # 75k blocks * 10 tries * 50 iterations = 37M scans.
+                    # Each scan: `if (block_masks[i] & critical_mask) == critical_mask`.
+                    # This is fast.
+                    
+                    for i in range(num_blocks):
+                        if i in sol: # O(N) check. Bad.
+                            continue
+                        # Better: maintain a set of selected indices
+                        # Let's use a set `sol_set`
+                        pass
+                    
+                    # Let's optimize this.
+                    # We'll maintain a set of selected block indices.
+                    # Re-initialize sol_set if not present.
+                    # Actually, let's just use a boolean array `in_sol`.
+                    
+                    # To make this fast, we should precompute `tset_to_blocks` as a list of lists.
+                    # Building it takes ~4.2M ops.
+                    # Let's do it once in the main scope? No, inside local_search is fine if it's fast.
+                    # Or pass it in.
+                    
+                    # Let's assume we have `tset_to_blocks` available.
+                    # If not, we can compute it.
+                    
+                    # For now, let's just scan all blocks.
+                    # We need to know if a block is in sol.
+                    # `sol` is a list of indices.
+                    # Converting to set every time is O(N).
+                    # Let's maintain `in_sol` array.
+                    
+                    # I will refactor local_search to use `in_sol` array.
+                    
+                    found_swap = False
+                    # ... (logic below)
+                    
+                if found_swap:
+                    no_improve = 0
+                    if len(sol) < best_size:
+                        best_size = len(sol)
+                        best_sol = list(sol)
+                    continue
+            else:
+                break
+                
+            no_improve += 1
+            
+        return best_sol
+
+    # Refactored Local Search with precomputed tset_to_blocks
+    # Build tset_to_blocks once
+    tset_to_blocks = [[] for _ in range(num_tsets)]
+    for b_idx, mask in enumerate(block_masks):
+        m = mask
+        while m:
+            lsb = m & -m
+            idx = lsb.bit_length() - 1
+            tset_to_blocks[idx].append(b_idx)
+            m ^= lsb
+            
+    def local_search_v2(initial_sol, seed):
+        rng = random.Random(seed)
+        sol = list(initial_sol)
+        in_sol = [False] * num_blocks
+        for b in sol:
+            in_sol[b] = True
+            
+        cover_counts = [0] * num_tsets
+        
+        def update_counts(block_idx, delta):
+            m = block_masks[block_idx]
+            while m:
+                lsb = m & -m
+                idx = lsb.bit_length() - 1
+                cover_counts[idx] += delta
+                m ^= lsb
+
+        for b in sol:
+            update_counts(b, 1)
+            
+        best_sol = list(sol)
+        best_size = len(sol)
+        no_improve = 0
+        max_no_improve = 50
+        
+        while elapsed() < deadline - 10 and no_improve < max_no_improve:
+            improved = False
+            
+            # Phase 1: Remove redundant
+            order = list(range(len(sol)))
+            rng.shuffle(order)
+            for pos in order:
+                if pos >= len(sol):
+                    continue
+                b = sol[pos]
+                m = block_masks[b]
+                redundant = True
+                while m:
+                    lsb = m & -m
+                    idx = lsb.bit_length() - 1
+                    if cover_counts[idx] == 1:
+                        redundant = False
+                        break
+                    m ^= lsb
+                    
+                if redundant:
+                    update_counts(b, -1)
+                    in_sol[b] = False
+                    sol.pop(pos)
+                    improved = True
+                    if len(sol) < best_size:
+                        best_size = len(sol)
+                        best_sol = list(sol)
+                    break
+                    
+            if improved:
+                no_improve = 0
+                continue
+                
+            # Phase 2: 1-for-1 Swap
+            if sol:
+                found_swap = False
+                for _ in range(20): # Try more swaps
+                    if not sol:
+                        break
+                    pos = rng.randint(0, len(sol) - 1)
+                    b_out = sol[pos]
+                    
+                    critical_mask = 0
+                    m = block_masks[b_out]
+                    while m:
+                        lsb = m & -m
+                        idx = lsb.bit_length() - 1
+                        if cover_counts[idx] == 1:
+                            critical_mask |= lsb
+                        m ^= lsb
+                        
+                    if critical_mask == 0:
+                        # Redundant
+                        update_counts(b_out, -1)
+                        in_sol[b_out] = False
+                        sol.pop(pos)
+                        improved = True
+                        found_swap = True
+                        break
+                        
+                    # Find candidate B
+                    # Must cover critical_mask
+                    # Must not be in_sol
+                    # To find candidates, intersect tset_to_blocks for all tsets in critical_mask
+                    # This is expensive if critical_mask has many bits.
+                    # Average bits in critical_mask?
+                    # Block has 56 tsets. If cover is dense, critical is small.
+                    
+                    # Get list of tsets in critical_mask
+                    crit_ts_list = []
+                    m = critical_mask
+                    while m:
+                        lsb = m & -m
+                        idx = lsb.bit_length() - 1
+                        crit_ts_list.append(idx)
+                        m ^= lsb
+                        
+                    if not crit_ts_list:
+                        continue
+                        
+                    # Start with candidates of first tset
+                    candidates = set(tset_to_blocks[crit_ts_list[0]])
+                    # Intersect with others
+                    for ts_idx in crit_ts_list[1:]:
+                        if not candidates:
+                            break
+                        candidates &= set(tset_to_blocks[ts_idx])
+                        
+                    # Remove blocks already in sol
+                    candidates -= set(sol)
+                    
+                    if candidates:
+                        b_in = rng.choice(list(candidates))
+                        # Perform swap
+                        update_counts(b_out, -1)
+                        in_sol[b_out] = False
+                        update_counts(b_in, 1)
+                        in_sol[b_in] = True
+                        sol[pos] = b_in
+                        found_swap = True
+                        improved = True
+                        break
+                        
+                if found_swap:
+                    no_improve = 0
+                    if len(sol) < best_size:
+                        best_size = len(sol)
+                        best_sol = list(sol)
+                    continue
+            else:
+                break
+                
+            no_improve += 1
+            
+        return best_sol
+
+    # Main Loop
+    best_solution = None
+    best_size = float('inf')
+    
+    # Run a few greedy restarts
+    for seed in range(5):
+        if elapsed() > deadline - 30:
+            break
+        sol = greedy_cover(seed)
+        if sol:
+            ls_sol = local_search_v2(sol, seed)
+            if len(ls_sol) < best_size:
+                best_size = len(ls_sol)
+                best_solution = ls_sol
+                
+    if best_solution is None:
+        # Fallback: return empty or raise
+        return []
+        
+    return [list(all_blocks[i]) for i in best_solution]

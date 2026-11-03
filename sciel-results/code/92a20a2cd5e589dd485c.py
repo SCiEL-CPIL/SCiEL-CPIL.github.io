@@ -1,0 +1,27 @@
+"""Rank-20 tensor decomposition for 2x4x5 matrix multiplication."""
+DIMENSIONS = [2, 4, 5]
+
+# EVOLVE-BLOCK-START
+def construct():
+    n, m, p = DIMENSIONS  # n=2, m=4, p=5
+    rank = m * p  # 4 * 5 = 20
+    
+    U = [[0] * rank for _ in range(n * m)]  # 8 x 20
+    V = [[0] * rank for _ in range(m * p)]  # 20 x 20
+    W = [[0] * rank for _ in range(p * n)]  # 10 x 20
+    
+    col = 0
+    for j in range(m):
+        for k in range(p):
+            # U: 1 at (i, j) for i = 0, 1
+            for i in range(n):
+                U[i * m + j][col] = 1
+            # V: 1 at (j, k)
+            V[j * p + k][col] = 1
+            # W: 1 at (k, i) for i = 0, 1
+            for i in range(n):
+                W[k * n + i][col] = 1
+            col += 1
+    
+    return {"U": U, "V": V, "W": W}
+# EVOLVE-BLOCK-END

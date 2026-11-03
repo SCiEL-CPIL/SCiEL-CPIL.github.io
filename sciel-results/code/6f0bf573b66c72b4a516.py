@@ -1,0 +1,488 @@
+import time
+import random
+import math
+import numpy as np
+
+_DEADLINE = 0.0
+_BEST = None
+
+def _valid(rows, k):
+    seen = set()
+    for r in rows:
+        if r[0] != 0 or len(r) != k + 1:
+            return False
+        for i in range(len(r)):
+            for j in range(i + 1, len(r)):
+                d = r[j] - r[i]
+                if d <= 0 or d in seen:
+                    return False
+                seen.add(d)
+    return True
+
+def _scope(rows):
+    return max(a for r in rows for a in r[1:])
+
+def _fast_greedy(k, n_rows, rng, spread=False):
+    used = 0
+    rows = []
+    for _ in range(n_rows):
+        row = [0]
+        x = 0
+        while len(row) < k + 1:
+            x += 1
+            new = 0
+            for a in row:
+                new |= (1 << (x - a))
+            if (used & new) == 0:
+                row.append(x)
+                used |= new
+                if spread:
+                    x += max(1, (k - len(row) + 1) * 2 - 2)
+        rows.append(row)
+    return rows
+
+def _sa_vectorized(rows, k, deadline, rng, T_init=10.0, cooling=0.9997, min_T=0.05):
+    """
+    SA with vectorized cost computation and row-pair swap moves.
+    Cost = scope + W * collisions, where collisions = sum(max(0, c-1) for c in diff_counts).
+    """
+    n_rows = len(rows)
+    mat = np.array(rows, dtype=np.int32)  # shape (n_rows, k+1)
+    current_scope = int(mat.max())
+    
+    # Precompute pair indices for difference extraction
+    # For a row of length k+1, there are (k+1)*k/2 pairs
+    n_pairs = (k + 1) * k // 2
+    # Build index arrays for all (i, j) pairs with i < j within a row
+    row_idx = []
+    col_idx = []
+    for i in range(k + 1):
+        for j in range(i + 1, k + 1):
+            row_idx.append(i)
+            col_idx.append(j)
+    row_idx = np.array(row_idx, dtype=np.int32)
+    col_idx = np.array(col_idx, dtype=np.int32)
+    
+    def get_all_diffs(m):
+        """Return 1D array of all differences across all rows."""
+        # m has shape (n_rows, k+1)
+        # For each row, compute m[r, col_idx] - m[r, row_idx]
+        # Use broadcasting: m[:, col_idx] - m[:, row_idx] gives (n_rows, n_pairs)
+        diffs_per_row = m[:, col_idx] - m[:, row_idx]  # (n_rows, n_pairs)
+        return diffs_per_row.flatten()
+    
+    def compute_cost(m):
+        diffs = get_all_diffs(m)
+        if len(diffs) == 0:
+            return int(m.max()), 0
+        unique, counts = np.unique(diffs, return_counts=True)
+        collisions = int(np.sum(np.maximum(0, counts - 1)))
+        scope = int(m.max())
+        return scope, collisions
+    
+    current_scope, current_collisions = compute_cost(mat)
+    W = 15.0
+    current_cost = current_scope + W * current_collisions
+    best_cost = current_cost
+    best_mat = mat.copy()
+    best_scope = current_scope
+    
+    T = T_init
+    n_iters = 0
+    stagnant = 0
+    MAX_STAGNANT = 3000
+    
+    while time.time() < deadline:
+        n_iters += 1
+        r = rng.random()
+        
+        if r < 0.25:
+            # --- Row rebuild: replace one row via greedy with conflict awareness ---
+            i = rng.randint(0, n_rows - 1)
+            old_row = mat[i].copy()
+            
+            # Build a set of currently-used differences (excluding row i)
+            other_mat = np.delete(mat, i, axis=0)
+            other_diffs = get_all_diffs(other_mat)
+            used_diffs = set(int(d) for d in other_diffs)
+            
+            # Greedily build new row
+            new_row = [0]
+            x = 0
+            ok = True
+            for j in range(1, k + 1):
+                found = False
+                # Try nearby values first, then expand
+                for attempt in range(50):
+                    if attempt == 0:
+                        start = x + 1
+                        end = x + 1 + max(1, (k - j + 1) * 3)
+                    else:
+                        start = x + 1
+                        end = x + 1 + attempt * 5
+                    for t in range(start, min(end, current_scope + 10)):
+                        conflict = False
+                        for a in new_row:
+                            d = t - a
+                            if d <= 0:
+                                continue
+                            if d in used_diffs:
+                                conflict = True
+                                break
+                        if not conflict:
+                            # Check internal conflicts
+                            for a in new_row:
+                                d = t - a
+                                if d <= 0:
+                                    continue
+                                # Check if d already used within this row
+                                # (implicitly handled since we build incrementally)
+                            new_row.append(t)
+                            for a in new_row[:-1]:
+                                used_diffs.add(t - a)
+                            x = t
+                            found = True
+                            break
+                    if found:
+                        break
+                if not found:
+                    ok = False
+                    break
+            
+            if not ok or len(new_row) != k + 1:
+                continue
+            
+            new_row_arr = np.array(new_row, dtype=np.int32)
+            if new_row_arr.max() > current_scope + 5:
+                continue
+            
+            mat[i] = new_row_arr
+            new_scope, new_collisions = compute_cost(mat)
+            new_cost = new_scope + W * new_collisions
+            
+            if new_cost < current_cost or rng.random() < math.exp(-(new_cost - current_cost) / max(T, min_T)):
+                current_cost = new_cost
+                current_scope = new_scope
+                current_collisions = new_collisions
+                if new_cost < best_cost:
+                    best_cost = new_cost
+                    best_mat = mat.copy()
+                    best_scope = new_scope
+                    stagnant = 0
+            else:
+                mat[i] = old_row
+                
+        elif r < 0.45:
+            # --- Row-pair swap: swap two entire rows to break symmetry/local minima ---
+            i, j = rng.sample(range(n_rows), 2)
+            mat[[i, j]] = mat[[j, i]]
+            # Cost doesn't change under row permutation, so always accept
+            # This is a no-op for cost but can help if we later add row-order-dependent moves
+            # Actually, for this problem, row order doesn't matter. Skip this.
+            mat[[i, j]] = mat[[j, i]]  # undo
+            # Instead, do a "row shift": add a constant to one row's non-zero elements
+            i = rng.randint(0, n_rows - 1)
+            shift = rng.randint(-3, 3)
+            if shift == 0:
+                continue
+            old_row = mat[i].copy()
+            new_row = old_row.copy()
+            new_row[1:] += shift
+            if new_row[1:].min() <= 0 or new_row[1:].max() > current_scope + 10:
+                continue
+            # Check strict increase
+            if np.any(np.diff(new_row) <= 0):
+                continue
+            mat[i] = new_row
+            new_scope, new_collisions = compute_cost(mat)
+            new_cost = new_scope + W * new_collisions
+            if new_cost < current_cost or rng.random() < math.exp(-(new_cost - current_cost) / max(T, min_T)):
+                current_cost = new_cost
+                current_scope = new_scope
+                current_collisions = new_collisions
+                if new_cost < best_cost:
+                    best_cost = new_cost
+                    best_mat = mat.copy()
+                    best_scope = new_scope
+                    stagnant = 0
+            else:
+                mat[i] = old_row
+                
+        elif r < 0.70:
+            # --- Single-element move: adjust one element within its row ---
+            i = rng.randint(0, n_rows - 1)
+            j = rng.randint(1, k)
+            old_val = int(mat[i, j])
+            prev_val = int(mat[i, j - 1])
+            next_val = int(mat[i, j + 1]) if j < k else current_scope + 100
+            
+            lo = prev_val + 1
+            hi = next_val - 1
+            if lo > hi:
+                continue
+            
+            if old_val == current_scope:
+                new_val = rng.randint(lo, min(hi, old_val - 1))
+            else:
+                span = hi - lo
+                delta = int(rng.gauss(0, max(1, span * 0.25)))
+                new_val = old_val + delta
+            
+            if new_val == old_val or new_val < lo or new_val > hi:
+                continue
+            
+            mat[i, j] = new_val
+            new_scope, new_collisions = compute_cost(mat)
+            new_cost = new_scope + W * new_collisions
+            
+            if new_cost < current_cost or rng.random() < math.exp(-(new_cost - current_cost) / max(T, min_T)):
+                current_cost = new_cost
+                current_scope = new_scope
+                current_collisions = new_collisions
+                if new_cost < best_cost:
+                    best_cost = new_cost
+                    best_mat = mat.copy()
+                    best_scope = new_scope
+                    stagnant = 0
+            else:
+                mat[i, j] = old_val
+                
+        else:
+            # --- Pairwise element move: adjust two elements in the same row simultaneously ---
+            i = rng.randint(0, n_rows - 1)
+            j1, j2 = rng.sample(range(1, k + 1), 2)
+            if j1 > j2:
+                j1, j2 = j2, j1
+            
+            old_v1 = int(mat[i, j1])
+            old_v2 = int(mat[i, j2])
+            
+            prev1 = int(mat[i, j1 - 1])
+            next1 = int(mat[i, j1 + 1]) if j1 < k else current_scope + 100
+            prev2 = int(mat[i, j2 - 1])
+            next2 = int(mat[i, j2 + 1]) if j2 < k else current_scope + 100
+            
+            lo1 = prev1 + 1
+            hi1 = next1 - 1
+            lo2 = prev2 + 1
+            hi2 = next2 - 1
+            
+            if lo1 > hi1 or lo2 > hi2:
+                continue
+            
+            new_v1 = rng.randint(lo1, hi1)
+            new_v2 = rng.randint(lo2, hi2)
+            
+            if new_v1 == old_v1 and new_v2 == old_v2:
+                continue
+            
+            # Check strict increase after move
+            mat[i, j1] = new_v1
+            mat[i, j2] = new_v2
+            if np.any(np.diff(mat[i]) <= 0):
+                mat[i, j1] = old_v1
+                mat[i, j2] = old_v2
+                continue
+            
+            new_scope, new_collisions = compute_cost(mat)
+            new_cost = new_scope + W * new_collisions
+            
+            if new_cost < current_cost or rng.random() < math.exp(-(new_cost - current_cost) / max(T, min_T)):
+                current_cost = new_cost
+                current_scope = new_scope
+                current_collisions = new_collisions
+                if new_cost < best_cost:
+                    best_cost = new_cost
+                    best_mat = mat.copy()
+                    best_scope = new_scope
+                    stagnant = 0
+            else:
+                mat[i, j1] = old_v1
+                mat[i, j2] = old_v2
+        
+        T = max(T * cooling, min_T)
+        
+        # Stagnation detection: restart from best with perturbation
+        if n_iters % 500 == 0 and stagnant > MAX_STAGNANT:
+            mat = best_mat.copy()
+            current_scope = best_scope
+            current_scope, current_collisions = compute_cost(mat)
+            current_cost = current_scope + W * current_collisions
+            # Perturb: randomize a few elements
+            for _ in range(rng.randint(1, 3)):
+                i = rng.randint(0, n_rows - 1)
+                j = rng.randint(1, k)
+                prev_val = int(mat[i, j - 1])
+                next_val = int(mat[i, j + 1]) if j < k else current_scope + 100
+                lo = prev_val + 1
+                hi = next_val - 1
+                if lo <= hi:
+                    mat[i, j] = rng.randint(lo, hi)
+                    if np.any(np.diff(mat[i]) <= 0):
+                        mat[i, j] = prev_val + 1  # fallback
+            current_scope, current_collisions = compute_cost(mat)
+            current_cost = current_scope + W * current_collisions
+            T = T_init * 0.5
+            stagnant = 0
+    
+    return best_scope, [list(map(int, r)) for r in best_mat]
+
+def _dfs_row_minimize(row, k, used_diffs, max_scope, deadline):
+    """DFS to find a row with minimal max entry avoiding used_diffs."""
+    best_row = None
+    best_max = max_scope + 1
+    used_set = set(used_diffs)
+    
+    def dfs(pos, current_row, current_x):
+        nonlocal best_row, best_max
+        if time.time() > deadline:
+            return
+        if pos == k + 1:
+            if current_x < best_max:
+                best_max = current_x
+                best_row = list(current_row)
+            return
+        if current_x + (k + 1 - pos) >= best_max:
+            return
+        for t in range(current_x + 1, best_max):
+            ok = True
+            for a in current_row:
+                d = t - a
+                if d <= 0:
+                    continue
+                if d in used_set:
+                    ok = False
+                    break
+            if ok:
+                current_row.append(t)
+                # Temporarily add diffs for pruning
+                for a in current_row[:-1]:
+                    used_set.add(t - a)
+                dfs(pos + 1, current_row, t)
+                for a in current_row[:-1]:
+                    used_set.discard(t - a)
+                current_row.pop()
+            if time.time() > deadline:
+                return
+    
+    dfs(1, [0], 0)
+    return best_row
+
+def construct(n_rows, k):
+    global _BEST, _DEADLINE
+    _BEST = None
+    _DEADLINE = time.time() + 108.0
+
+    def consider(rows):
+        global _BEST
+        if not _valid(rows, k):
+            return
+        s = _scope(rows)
+        if _BEST is None or s < _BEST[0]:
+            _BEST = (s, [list(r) for r in rows])
+
+    rng = random.Random(42)
+
+    # Generate diverse initial candidates
+    candidates = []
+    candidates.append(_fast_greedy(k, n_rows, rng, spread=False))
+    candidates.append(_fast_greedy(k, n_rows, rng, spread=True))
+    for _ in range(3):
+        used = 0
+        rows = []
+        for _ in range(n_rows):
+            row = [0]
+            x = 0
+            while len(row) < k + 1:
+                found = False
+                max_step = rng.randint(1, 10)
+                for t in range(x + 1, x + 1 + max_step * 4):
+                    new = 0
+                    for a in row:
+                        new |= (1 << (t - a))
+                    if (used & new) == 0:
+                        row.append(t)
+                        used |= new
+                        x = t
+                        found = True
+                        break
+                if not found:
+                    t = x + 1
+                    new = 0
+                    for a in row:
+                        new |= (1 << (t - a))
+                    while used & new:
+                        t += 1
+                        new = 0
+                        for a in row:
+                            new |= (1 << (t - a))
+                    row.append(t)
+                    used |= new
+                    x = t
+            rows.append(row)
+        candidates.append(rows)
+
+    candidates.sort(key=_scope)
+
+    # Run vectorized SA on top candidates
+    for idx, cand in enumerate(candidates[:3]):
+        if time.time() > _DEADLINE:
+            break
+        remaining = _DEADLINE - time.time()
+        if idx == 0:
+            sa_deadline = time.time() + remaining * 0.35
+        elif idx == 1:
+            sa_deadline = time.time() + remaining * 0.35
+        else:
+            sa_deadline = _DEADLINE
+        s, rows = _sa_vectorized(cand, k, sa_deadline, rng)
+        consider(rows)
+
+    # DFS refinement on best result
+    if _BEST is not None and time.time() < _DEADLINE - 5:
+        best_rows = [list(r) for r in _BEST[1]]
+        # Build global diff set
+        all_diffs = set()
+        for r in best_rows:
+            for i in range(len(r)):
+                for j in range(i + 1, len(r)):
+                    all_diffs.add(r[j] - r[i])
+        current_scope = _scope(best_rows)
+        improved = True
+        while improved and time.time() < _DEADLINE - 5:
+            improved = False
+            for i in range(n_rows):
+                if time.time() > _DEADLINE - 5:
+                    break
+                old_row = list(best_rows[i])
+                # Remove this row's diffs from global set
+                row_diffs = set()
+                for a in range(len(old_row)):
+                    for b in range(a + 1, len(old_row)):
+                        row_diffs.add(old_row[b] - old_row[a])
+                other_diffs = all_diffs - row_diffs
+                new_row = _dfs_row_minimize(old_row, k, other_diffs, current_scope, _DEADLINE - 5)
+                if new_row is not None and new_row[-1] < old_row[-1]:
+                    best_rows[i] = new_row
+                    all_diffs = other_diffs | set(
+                        new_row[b] - new_row[a]
+                        for a in range(len(new_row))
+                        for b in range(a + 1, len(new_row))
+                    )
+                    current_scope = min(current_scope, _scope(best_rows))
+                    improved = True
+                else:
+                    all_diffs = other_diffs | row_diffs
+                    best_rows[i] = old_row
+        consider(best_rows)
+
+    # Final polish SA
+    if _BEST is not None and time.time() < _DEADLINE - 3:
+        remaining = _DEADLINE - time.time()
+        if remaining > 3:
+            s, rows = _sa_vectorized(_BEST[1], k, _DEADLINE - 1, rng, T_init=3.0, cooling=0.9999, min_T=0.01)
+            consider(rows)
+
+    if _BEST is not None:
+        return _BEST[1]
+    return candidates[0]

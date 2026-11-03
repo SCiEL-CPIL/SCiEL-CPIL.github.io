@@ -1,0 +1,286 @@
+"""Randomized local search for covering design C(24,7,3)."""
+# EVOLVE-BLOCK-START
+import itertools
+import math
+import random
+import time
+
+
+def _sample_candidate(cands, gains, beta, rng):
+    """Smooth surrogate: sample an index with prob ∝ exp(beta * gain).
+    beta -> inf recovers argmax (greedy); lower beta adds exploration."""
+    n = len(cands)
+    if n == 0:
+        return None
+    if n == 1:
+        return 0
+    # log-sum-exp for numerical stability
+    gs = gains
+    m = max(gs)
+    if m < -1e9:
+        m = 0.0
+    scaled = [math.exp(beta * (g - m)) for g in gs]
+    total = sum(scaled)
+    if total <= 0.0:
+        return rng.randrange(n)
+    r = rng.random() * total
+    acc = 0.0
+    for i, w in enumerate(scaled):
+        acc += w
+        if r <= acc:
+            return i
+    return n - 1
+
+
+def _greedy_cover(v, k, t, rng, beta):
+    """Greedy construction using a soft-min surrogate. Lower beta = more exploration."""
+    all_tsubsets = [frozenset(c) for c in itertools.combinations(range(v), t)]
+    uncovered = set(all_tsubsets)
+    blocks = []
+
+    while uncovered:
+        seed = rng.choice(list(uncovered))
+        block = list(seed)
+        rng.shuffle(block)
+
+        while len(block) < k:
+            cands = [x for x in range(v) if x not in block]
+            if not cands:
+                break
+            gains = []
+            for x in cands:
+                gain = 0
+                for rest in itertools.combinations(block, t - 1):
+                    fs = frozenset(list(rest) + [x])
+                    if fs in uncovered:
+                        gain += 1
+                gains.append(gain)
+
+            idx = _sample_candidate(cands, gains, beta, rng)
+            if idx is None:
+                break
+            block.append(cands[idx])
+
+        block.sort()
+        b_tuple = tuple(block)
+        if b_tuple not in blocks:
+            blocks.append(b_tuple)
+            for c in itertools.combinations(block, t):
+                uncovered.discard(frozenset(c))
+
+    return blocks
+
+
+def construct(v, k, t):
+    rng = random.Random(42)
+    start_time = time.time()
+    time_limit = 112.0  # safety margin under the 150s kill
+
+    # ---- Build initial valid covering (soft-min surrogate, high beta ~ greedy) ----
+    blocks = _greedy_cover(v, k, t, rng, beta=6.0)
+
+    # Optional second start with lower beta (more exploration) if time remains
+    elapsed = time.time() - start_time
+    if elapsed < time_limit * 0.45 and len(blocks) > 0:
+        alt = _greedy_cover(v, k, t, rng, beta=1.0)
+        if len(alt) < len(blocks):
+            blocks = alt
+
+    def compute_counts(blk_list):
+        counts = {}
+        for b in blk_list:
+            for fs in itertools.combinations(b, t):
+                f = frozenset(fs)
+                counts[f] = counts.get(f, 0) + 1
+        return counts
+
+    counts = compute_counts(blocks)
+    best_blocks = list(blocks)
+    best_count = len(blocks)
+
+    total_t = math.comb(v, t)
+    uncovered = total_t - len(counts)
+
+    def apply_block_change(blk, sign):
+        """sign = 1 to add, -1 to remove. Returns change in uncovered count."""
+        delta_uncovered = 0
+        for fs in itertools.combinations(blk, t):
+            f = frozenset(fs)
+            old_c = counts.get(f, 0)
+            new_c = old_c + sign
+            if new_c == 0:
+                if f in counts:
+                    del counts[f]
+                if old_c == 1:
+                    delta_uncovered += 1
+            elif new_c > 0:
+                if old_c == 0:
+                    delta_uncovered -= 1
+                counts[f] = new_c
+        return delta_uncovered
+
+    no_improve_iter = 0
+    max_no_improve = 400
+
+    while time.time() - start_time < time_limit:
+
+        # 1. Try to remove redundant blocks
+        removed_any = False
+        indices = list(range(len(blocks)))
+        rng.shuffle(indices)
+        for i in indices:
+            b = blocks[i]
+            redundant = True
+            for fs in itertools.combinations(b, t):
+                f = frozenset(fs)
+                if counts.get(f, 0) <= 1:
+                    redundant = False
+                    break
+            if redundant:
+                delta_u = apply_block_change(b, -1)
+                uncovered += delta_u
+                if uncovered == 0:
+                    blocks.pop(i)
+                    if len(blocks) < best_count:
+                        best_count = len(blocks)
+                        best_blocks = list(blocks)
+                    removed_any = True
+                    no_improve_iter = 0
+                    break
+                else:
+                    apply_block_change(b, 1)
+                    uncovered -= delta_u
+
+        if removed_any:
+            continue
+
+        # 2. Try swaps (rebuild a block from its critical t-subsets)
+        if len(blocks) > 0:
+            i = rng.randrange(len(blocks))
+            old_block = blocks[i]
+
+            critical = []
+            for fs in itertools.combinations(old_block, t):
+                f = frozenset(fs)
+                if counts.get(f, 0) == 1:
+                    critical.append(f)
+
+            if not critical:
+                no_improve_iter += 1
+                continue
+
+            points_needed = set()
+            for fs in critical:
+                points_needed.update(fs)
+
+            if len(points_needed) <= k:
+                new_block_set = set(points_needed)
+                cands = [x for x in range(v) if x not in new_block_set]
+                rng.shuffle(cands)
+
+                for x in cands:
+                    if len(new_block_set) >= k:
+                        break
+                    gain = 0
+                    for rest in itertools.combinations(new_block_set, t - 1):
+                        fs = frozenset(list(rest) + [x])
+                        c = counts.get(fs, 0)
+                        if c == 0:
+                            gain += 10
+                        elif c == 1:
+                            gain += 1
+                    new_block_set.add(x)
+
+                if len(new_block_set) == k:
+                    new_block = tuple(sorted(new_block_set))
+                    if new_block != old_block:
+                        delta_u_remove = apply_block_change(old_block, -1)
+                        delta_u_add = apply_block_change(new_block, 1)
+                        new_uncovered = uncovered + delta_u_remove + delta_u_add
+                        if new_uncovered == 0:
+                            blocks[i] = new_block
+                            uncovered = new_uncovered
+                            no_improve_iter = 0
+                        else:
+                            apply_block_change(new_block, -1)
+                            apply_block_change(old_block, 1)
+                            uncovered = uncovered
+                    else:
+                        no_improve_iter += 1
+                else:
+                    no_improve_iter += 1
+            else:
+                no_improve_iter += 1
+
+        # 3. Perturbation if stuck
+        if no_improve_iter > max_no_improve:
+            if len(blocks) > 1:
+                old_blocks = list(blocks)
+                old_counts = dict(counts)
+                old_uncovered = uncovered
+
+                i = rng.randrange(len(blocks))
+                b = blocks[i]
+
+                delta_u = apply_block_change(b, -1)
+                uncovered += delta_u
+                blocks.pop(i)
+
+                unc_list = []
+                for c in itertools.combinations(range(v), t):
+                    f = frozenset(c)
+                    if counts.get(f, 0) == 0:
+                        unc_list.append(f)
+
+                # Re-cover using the soft-min surrogate at moderate beta
+                while unc_list:
+                    seed = rng.choice(unc_list)
+                    new_b = list(seed)
+                    rng.shuffle(new_b)
+
+                    while len(new_b) < k:
+                        cands = [x for x in range(v) if x not in new_b]
+                        if not cands:
+                            break
+                        gains = []
+                        for x in cands:
+                            gain = 0
+                            for rest in itertools.combinations(new_b, t - 1):
+                                fs = frozenset(list(rest) + [x])
+                                if counts.get(fs, 0) == 0:
+                                    gain += 1
+                            gains.append(gain)
+                        idx = _sample_candidate(cands, gains, 3.0, rng)
+                        if idx is None:
+                            break
+                        new_b.append(cands[idx])
+
+                    new_b.sort()
+                    new_b_tuple = tuple(new_b)
+
+                    if new_b_tuple not in blocks:
+                        blocks.append(new_b_tuple)
+                        delta_u_add = apply_block_change(new_b_tuple, 1)
+                        uncovered += delta_u_add
+
+                        unc_list = []
+                        for c in itertools.combinations(range(v), t):
+                            f = frozenset(c)
+                            if counts.get(f, 0) == 0:
+                                unc_list.append(f)
+
+                if uncovered == 0:
+                    if len(blocks) < best_count:
+                        best_count = len(blocks)
+                        best_blocks = list(blocks)
+                    no_improve_iter = 0
+                else:
+                    blocks = old_blocks
+                    counts = old_counts
+                    uncovered = old_uncovered
+                    no_improve_iter += 1
+            else:
+                no_improve_iter += 1
+
+    return [list(b) for b in best_blocks]
+# EVOLVE-BLOCK-END

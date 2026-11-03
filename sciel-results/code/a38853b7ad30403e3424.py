@@ -1,0 +1,3 @@
+    for w in range(total_words):
+        # ... generate list ...
+        neighbors[w] = set(neigh)

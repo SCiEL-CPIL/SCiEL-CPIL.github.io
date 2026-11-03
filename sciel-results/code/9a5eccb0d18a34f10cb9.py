@@ -1,0 +1,382 @@
+"""Erdos minimum overlap: minimize max overlap of h with shifted 1-h.
+Uses a combination of spectral low-dim optimization, Nesterov accelerated
+projected gradient, and SLSQP refinement. The spectral parameterization
+naturally satisfies the integral constraint and reduces effective dimensionality."""
+import time
+import numpy as np
+from scipy.optimize import minimize
+
+N = 100
+_DEADLINE = time.time() + 135  # Safety margin before 150s kill
+
+
+def _autocorr(h):
+    """
+    Compute linear autocorrelation r_k = sum_{i=k}^{N-1} h_i * h_{i-k} for k=0..N-1.
+    Uses FFT for O(N log N) computation.
+    """
+    n = len(h)
+    n_fft = 2 * n
+    h_pad = np.zeros(n_fft)
+    h_pad[:n] = h
+    H = np.fft.rfft(h_pad, n=n_fft)
+    corr = np.fft.irfft(H * np.conj(H), n=n_fft)
+    return corr[:n]
+
+
+def _overlap_values(h):
+    """
+    Compute overlap values C_k = (2/N) * (N/2 - r_k) for k=0..N-1.
+    """
+    n = len(h)
+    r = _autocorr(h)
+    return (2.0 / n) * (n / 2.0 - r)
+
+
+def _score(h):
+    """
+    Compute the maximum linear overlap.
+    """
+    h = np.asarray(h, dtype=np.float64)
+    cs = _overlap_values(h)
+    return float(np.max(cs))
+
+
+def _smooth_max_value(h, beta):
+    """
+    Smooth maximum of overlap values using log-sum-exp.
+    """
+    h = np.asarray(h, dtype=np.float64)
+    cs = _overlap_values(h)
+    m = np.max(cs)
+    return m + np.log(np.sum(np.exp(beta * (cs - m)))) / beta
+
+
+def _smooth_max_grad(h, beta):
+    """
+    Gradient of the smooth maximum objective.
+    Returns (value, gradient)
+    """
+    h = np.asarray(h, dtype=np.float64)
+    n = len(h)
+    cs = _overlap_values(h)
+    m = np.max(cs)
+    exp_terms = np.exp(beta * (cs - m))
+    sum_exp = np.sum(exp_terms)
+    w = exp_terms / sum_exp  # Weights for soft max
+    
+    val = m + np.log(sum_exp) / beta
+    
+    grad = np.zeros(n)
+    
+    # C_k = 1 - (2/n) * r_k
+    # dC_k/dh_j = -(2/n) * (h_{j-k} if j>=k + h_{j+k} if j+k<n)
+    
+    for k in range(n):
+        if w[k] == 0.0:
+            continue
+        factor = -(2.0 / n) * w[k]
+        
+        if k > 0:
+            grad[k:] += factor * h[:n-k]
+        if k < n:
+            grad[:n-k] += factor * h[k:]
+            
+    return val, grad
+
+
+def _fix_sum(h):
+    """
+    Adjust h to have sum exactly N/2, keeping values in [0, 1].
+    """
+    h = np.array(h, dtype=np.float64, copy=True)
+    target = N / 2.0
+    diff = target - np.sum(h)
+    h += diff / N
+    h = np.clip(h, 0.0, 1.0)
+    
+    # Second pass if clipping changed sum
+    diff = target - np.sum(h)
+    if abs(diff) > 1e-12:
+        mask = (h > 0) & (h < 1)
+        if np.any(mask):
+            h[mask] += diff / np.sum(mask)
+            h = np.clip(h, 0.0, 1.0)
+            
+    # Final tiny correction
+    diff = target - np.sum(h)
+    if abs(diff) > 1e-15:
+        if diff > 0:
+            idx = np.argmin(h)
+        else:
+            idx = np.argmax(h)
+        h[idx] += diff
+        h = np.clip(h, 0.0, 1.0)
+        
+    return h
+
+
+def _spectral_h_from_coeffs(coeffs):
+    """
+    Reconstruct h from real DFT coefficients (modes 1..K).
+    coeffs = [a1, b1, a2, b2, ..., aK, bK]
+    h_i = 0.5 + sum_{k=1}^K (a_k cos(2*pi*k*i/N) + b_k sin(2*pi*k*i/N))
+    """
+    n_modes = len(coeffs) // 2
+    h = np.full(N, 0.5)
+    i = np.arange(N)
+    for k in range(1, n_modes + 1):
+        a = coeffs[2*(k-1)]
+        b = coeffs[2*(k-1)+1]
+        h += a * np.cos(2.0 * np.pi * k * i / N)
+        h += b * np.sin(2.0 * np.pi * k * i / N)
+    return h
+
+
+def _h_to_spectral_coeffs(h, K):
+    """
+    Extract the first K real DFT coefficients from h.
+    Returns [a1, b1, ..., aK, bK] where h ~ 0.5 + sum (a_k cos + b_k sin)
+    """
+    H = np.fft.rfft(h)
+    out = []
+    for k in range(1, K + 1):
+        a = 2.0 / N * H[k].real
+        b = -2.0 / N * H[k].imag
+        out.append(a)
+        out.append(b)
+    return out
+
+
+def _nesterov_projected(h, beta, n_iter=5000, lr=0.01):
+    """
+    Nesterov accelerated projected gradient descent on the smooth max objective.
+    Projects onto the simplex-like constraint {h in [0,1]^N : sum(h) = N/2}.
+    """
+    h = np.array(h, dtype=np.float64, copy=True)
+    y = h.copy()
+    t = 1.0
+    
+    for it in range(n_iter):
+        # Nesterov lookahead
+        t_new = (1.0 + np.sqrt(1.0 + 4.0 * t * t)) / 2.0
+        alpha = (t - 1.0) / t_new
+        y = h + alpha * (h - y)
+        
+        # Gradient step
+        val, grad = _smooth_max_grad(y, beta)
+        y_new = y - lr * grad
+        
+        # Project onto feasible set: sum = N/2, 0 <= h_i <= 1
+        h = _project_feasible(y_new)
+        
+        t = t_new
+    
+    return h
+
+
+def _project_feasible(x):
+    """
+    Project x onto the set {h : sum(h) = N/2, 0 <= h_i <= 1}.
+    Uses iterative bisection on the Lagrange multiplier.
+    """
+    target = N / 2.0
+    
+    # Bisection on lambda: h_i = clip(x_i - lambda, 0, 1), find lambda s.t. sum(h) = target
+    lo = -10.0
+    hi = 10.0
+    
+    for _ in range(100):
+        mid = (lo + hi) / 2.0
+        h = np.clip(x - mid, 0.0, 1.0)
+        s = np.sum(h)
+        if s > target:
+            lo = mid
+        else:
+            hi = mid
+    
+    h = np.clip(x - (lo + hi) / 2.0, 0.0, 1.0)
+    return _fix_sum(h)
+
+
+def _optimize_spectral(h_init, K, beta, maxiter=300):
+    """
+    Optimize the spectral coefficients of h to minimize the smooth max objective.
+    Uses L-BFGS-B on the low-dimensional coefficient space.
+    """
+    coeffs0 = _h_to_spectral_coeffs(h_init, K)
+    
+    def obj(coeffs):
+        h = _spectral_h_from_coeffs(coeffs)
+        
+        # Penalty for out-of-bounds to keep solution valid
+        penalty = 0.0
+        if np.any(h < 0) or np.any(h > 1):
+            penalty = 10.0 * (np.sum(np.maximum(0, -h)**2) + np.sum(np.maximum(0, h-1)**2))
+        
+        val, _ = _smooth_max_grad(h, beta)
+        return val + penalty
+    
+    def obj_grad(coeffs):
+        h = _spectral_h_from_coeffs(coeffs)
+        val, grad_h = _smooth_max_grad(h, beta)
+        
+        # Gradient with respect to coefficients
+        n_modes = len(coeffs) // 2
+        grad_coeffs = np.zeros(len(coeffs))
+        i = np.arange(N)
+        for k in range(1, n_modes + 1):
+            a_idx = 2*(k-1)
+            b_idx = 2*(k-1)+1
+            grad_coeffs[a_idx] = np.sum(grad_h * np.cos(2.0 * np.pi * k * i / N))
+            grad_coeffs[b_idx] = np.sum(grad_h * np.sin(2.0 * np.pi * k * i / N))
+        
+        # Penalty gradient
+        if np.any(h < 0) or np.any(h > 1):
+            pen_grad_h = 20.0 * np.where(h < 0, -h, 0.0) + 20.0 * np.where(h > 1, h-1.0, 0.0)
+            for k in range(1, n_modes + 1):
+                a_idx = 2*(k-1)
+                b_idx = 2*(k-1)+1
+                grad_coeffs[a_idx] += np.sum(pen_grad_h * np.cos(2.0 * np.pi * k * i / N))
+                grad_coeffs[b_idx] += np.sum(pen_grad_h * np.sin(2.0 * np.pi * k * i / N))
+        
+        return val + 10.0 * (np.sum(np.maximum(0, -h)**2) + np.sum(np.maximum(0, h-1)**2)), grad_coeffs
+    
+    try:
+        res = minimize(obj, coeffs0, jac=objective_grad_wrapper, method='L-BFGS-B',
+                       options={'maxiter': maxiter, 'ftol': 1e-14, 'gtol': 1e-10})
+        if res.success or res.fun < obj(coeffs0):
+            h_opt = _spectral_h_from_coeffs(res.x)
+            return h_opt
+    except Exception:
+        pass
+    return h_init
+
+
+def objective_grad_wrapper(coeffs):
+    """Wrapper for objective and gradient."""
+    h = _spectral_h_from_coeffs(coeffs)
+    val, grad_h = _smooth_max_grad(h, 50.0)
+    
+    penalty = 0.0
+    pen_grad_h = np.zeros(N)
+    if np.any(h < 0) or np.any(h > 1):
+        penalty = 10.0 * (np.sum(np.maximum(0, -h)**2) + np.sum(np.maximum(0, h-1)**2))
+        pen_grad_h = 20.0 * np.where(h < 0, -h, 0.0) + 20.0 * np.where(h > 1, h-1.0, 0.0)
+    
+    n_modes = len(coeffs) // 2
+    grad_coeffs = np.zeros(len(coeffs))
+    i = np.arange(N)
+    for k in range(1, n_modes + 1):
+        a_idx = 2*(k-1)
+        b_idx = 2*(k-1)+1
+        grad_coeffs[a_idx] = np.sum((grad_h + pen_grad_h) * np.cos(2.0 * np.pi * k * i / N))
+        grad_coeffs[b_idx] = np.sum((grad_h + pen_grad_h) * np.sin(2.0 * np.pi * k * i / N))
+    
+    return val + penalty, grad_coeffs
+
+
+def _run_slsqp(h0, beta, maxiter, ftol, gtol):
+    """
+    Run SLSQP optimization on the smooth max objective.
+    """
+    cons = [{'type': 'eq', 'fun': lambda x: np.sum(x) - N/2.0,
+             'jac': lambda x: np.ones(N)}]
+    bounds = [(0.0, 1.0)] * N
+    
+    def obj_func(x):
+        val, _ = _smooth_max_grad(x, beta)
+        return val
+        
+    def jac_func(x):
+        _, grad = _smooth_max_grad(x, beta)
+        return grad
+        
+    try:
+        res = minimize(obj_func, h0.copy(), jac=jac_func, method='SLSQP',
+                       bounds=bounds, constraints=cons,
+                       options={'maxiter': maxiter, 'ftol': ftol, 'gtol': gtol})
+        return res.x
+    except Exception:
+        return h0
+
+
+def _polish(h, beta, maxiter, ftol, gtol):
+    """
+    High-precision polish pass with tighter tolerances.
+    """
+    h0 = h.copy()
+    h_new = _run_slsqp(h0, beta, maxiter, ftol, gtol)
+    h_new = _fix_sum(h_new)
+    
+    # Verify improvement
+    if _score(h_new) < _score(h0):
+        return h_new
+    return h0
+
+
+def construct():
+    """Construct step heights minimizing maximum overlap with shifted complement."""
+    t0 = time.time()
+    np.random.seed(42)
+    
+    best_h = None
+    best_score = float('inf')
+    
+    def _update_best(h):
+        nonlocal best_h, best_score
+        h = _fix_sum(h)
+        s = _score(h)
+        if s < best_score:
+            best_score = s
+            best_h = h.copy()
+    
+    # 1. Cosine start
+    i = np.arange(N)
+    h_cos = 0.5 + 0.5 * np.cos(2.0 * np.pi * i / N)
+    h_cos = _fix_sum(h_cos)
+    _update_best(h_cos)
+    
+    # 2. Spectral Optimization with multiple K values
+    for K in [2, 4, 8, 16, 32]:
+        if time.time() - t0 > _DEADLINE - 40:
+            break
+        h_spec = _optimize_spectral(h_cos, K, beta=50.0, maxiter=300)
+        _update_best(h_spec)
+        
+    # 3. Nesterov accelerated projected gradient from best spectral solution
+    if time.time() - t0 < _DEADLINE - 30:
+        h_nest = _nesterov_projected(best_h, beta=50.0, n_iter=3000, lr=0.005)
+        _update_best(h_nest)
+        
+    # 4. Primary SLSQP optimization
+    if time.time() - t0 < _DEADLINE - 25:
+        h_opt = _run_slsqp(best_h, beta=50.0, maxiter=300, ftol=1e-10, gtol=1e-8)
+        _update_best(h_opt)
+        
+    # 5. Random restarts with spectral + Nesterov
+    if time.time() - t0 < _DEADLINE - 20:
+        for _ in range(5):
+            if time.time() - t0 > _DEADLINE - 12:
+                break
+            h_rand = np.random.uniform(0, 1, N)
+            h_rand = _fix_sum(h_rand)
+            h_spec_rand = _optimize_spectral(h_rand, K=8, beta=50.0, maxiter=100)
+            h_nest_rand = _nesterov_projected(h_spec_rand, beta=50.0, n_iter=1000, lr=0.005)
+            _update_best(h_nest_rand)
+            
+    # 6. Polish with higher beta
+    if best_h is not None and time.time() - t0 < _DEADLINE - 10:
+        h_polished = _polish(best_h, beta=100.0, maxiter=500, ftol=1e-12, gtol=1e-10)
+        _update_best(h_polished)
+        
+    # 7. Final ultra-precise polish
+    if best_h is not None and time.time() - t0 < _DEADLINE - 5:
+        h_final = _polish(best_h, beta=200.0, maxiter=1000, ftol=1e-14, gtol=1e-12)
+        _update_best(h_final)
+        
+    if best_h is None:
+        best_h = np.full(N, 0.5)
+    
+    best_h = _fix_sum(best_h)
+    return best_h

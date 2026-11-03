@@ -1,0 +1,242 @@
+"""
+Signed autocorrelation maximum absolute-value variant.
+
+We seek a signed step function f (length N) that minimizes:
+    max_k | (f * f)[k] / (sum f)^2 |
+where * is circular autoconvolution.
+
+Strategy:
+1. Initialize with a diverse set of candidates (all-ones, low-autocorrelation
+   binary sequences, random).
+2. Use a fast local search with efficient autoconvolution updates.
+3. Use simulated annealing to escape local minima.
+4. Final polish with a differentiable surrogate.
+
+Key insight: The seed (all ones) gives score 1/N. We can do better by
+using signs to reduce the peak autoconvolution while keeping the sum large.
+"""
+
+import numpy as np
+import time
+from scipy.optimize import minimize
+from scipy.signal import fftconvolve
+
+N = 400
+
+def _score_sequence(s):
+    """True score: max|autoconv| / (sum s)^2."""
+    sq_int = (np.sum(s)) ** 2
+    if sq_int < 1e-10:
+        return np.inf
+    ac = fftconvolve(s, s, mode='full')
+    max_ac = np.max(np.abs(ac))
+    return max_ac / sq_int
+
+def _soft_max_ac(s, temperature=1.0, K=128):
+    """Differentiable surrogate for max|autoconv| via top-K log-sum-exp."""
+    ac = fftconvolve(s, s, mode='full')
+    ac_sq = ac ** 2
+    max_val = np.max(ac_sq)
+    if max_val < 1e-10:
+        return 0.0
+    kk = min(K, ac_sq.size)
+    idx = np.argpartition(ac_sq, -kk)[-kk:]
+    top = ac_sq[idx]
+    lse = max_val + np.log(np.sum(np.exp(top - max_val)))
+    return np.sqrt(lse)
+
+def _soft_objective(x, temperature=1.0, K=128):
+    """Soft objective: log-sum-exp surrogate for max|ac| divided by (sum s)^2."""
+    s = np.tanh(x)
+    sq_int = (np.sum(s)) ** 2
+    if sq_int < 1e-10:
+        return 1e10
+    return _soft_max_ac(s, temperature, K) / sq_int
+
+def _max_ac_after_flip(cur, cur_ac, cur_sum, j):
+    """Vectorized single-flip score update."""
+    val = cur[j]
+    delta = -2.0 * val
+    new_sum = cur_sum + delta
+    nsq = new_sum ** 2
+    if nsq < 1e-10:
+        return np.inf
+    new_ac = cur_ac.copy()
+    new_ac[j:j+N] += 2.0 * delta * cur
+    new_ac[j] += delta * delta
+    return float(np.max(np.abs(new_ac)) / nsq)
+
+def _batched_flip_eval(cur, cur_ac, cur_sum):
+    """
+    Vectorized evaluation of all single flips.
+    Returns:
+        scores: array of new scores for each flip
+        best_idx: index of the flip with the minimum score
+        best_score: the minimum score
+    """
+    N = len(cur)
+    deltas = -2.0 * cur
+    new_sums = cur_sum + deltas
+    new_sums_sq = new_sums ** 2
+    
+    m_idx = np.arange(2*N - 1)
+    j_idx = np.arange(N)
+    
+    M = m_idx[None, :] - j_idx[:, None]
+    valid = (M >= 0) & (M < N)
+    
+    safe_M = np.clip(M, 0, N-1)
+    cur_vals = np.take(cur, safe_M, axis=0)
+    cur_vals = np.where(valid, cur_vals, 0.0)
+    
+    term1 = -4.0 * cur[:, None] * cur_vals
+    
+    term2 = np.zeros_like(cur_vals)
+    term2[j_idx, 2*j_idx] = 4.0 * cur**2
+    
+    new_acs = cur_ac[None, :] + term1 + term2
+    max_abs_acs = np.max(np.abs(new_acs), axis=1)
+    
+    scores = max_abs_acs / new_sums_sq
+    scores[new_sums_sq < 1e-10] = np.inf
+    
+    best_idx = np.argmin(scores)
+    best_score = scores[best_idx]
+    
+    return scores, best_idx, best_score
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 143.0  # 7 s safety margin before the 150 s kill
+
+    def _now():
+        return time.time()
+
+    best_score = np.inf
+    best_s = None
+    np.random.seed(42)
+
+    # ---------------- Phase 1: gradient-based optimization ----------------
+    # Multiple diverse initializations
+    n_restarts = 20
+    for it in range(n_restarts):
+        if _now() > deadline - 30:
+            break
+
+        if it < 6:
+            x0 = np.random.randn(N) * 0.1
+        elif it < 12:
+            t = np.arange(N)
+            x0 = 0.6 * np.sin(2 * np.pi * t * np.random.uniform(0.05, 0.6)) \
+                + np.random.randn(N) * 0.05
+        elif it < 16:
+            x0 = np.random.randn(N) * 0.3
+        else:
+            x0 = np.random.randn(N) * 0.15
+
+        temp = 3.0 * (0.6 ** (it / 10.0))
+        try:
+            result = minimize(
+                _soft_objective,
+                x0,
+                method='L-BFGS-B',
+                args=(temp, 128),
+                options={'maxiter': 120, 'ftol': 1e-10, 'gtol': 1e-8},
+            )
+            s_cont = np.tanh(result.x)
+            s_bin = np.sign(s_cont)
+            s_bin[s_bin == 0] = 1.0
+
+            sc_b = _score_sequence(s_bin)
+            if sc_b < best_score:
+                best_score = sc_b
+                best_s = s_bin.copy()
+            sc_c = _score_sequence(s_cont)
+            if sc_c < best_score:
+                best_score = sc_c
+                best_s = s_cont.copy()
+        except Exception:
+            continue
+
+    # ---------------- Phase 2: discrete local search + SA ----------------
+    if best_s is not None:
+        cur = best_s.copy()
+        cur_ac = fftconvolve(cur, cur, mode='full')
+        cur_sum = float(np.sum(cur))
+        cur_score = best_score
+
+        # Greedy local search: repeatedly take the best single flip.
+        max_passes = 2000
+        for _ in range(max_passes):
+            if _now() > deadline - 25:
+                break
+
+            scores, best_j, best_js = _batched_flip_eval(cur, cur_ac, cur_sum)
+
+            if best_js >= cur_score - 1e-12:
+                break
+
+            val = cur[best_j]
+            delta = -2.0 * val
+            cur_ac = cur_ac.copy()
+            cur_ac[best_j:best_j+N] += 2.0 * delta * cur
+            cur_ac[best_j] += delta * delta
+            cur[best_j] = -val
+            cur_sum = cur_sum + delta
+            cur_score = best_js
+
+            if cur_score < best_score:
+                best_score = cur_score
+                best_s = cur.copy()
+
+        # Simulated annealing to escape local minima.
+        T_start = 0.05
+        sa_steps = 5000
+        for it in range(sa_steps):
+            if _now() > deadline - 25:
+                break
+            idx = int(np.random.randint(N))
+            new_score = _max_ac_after_flip(cur, cur_ac, cur_sum, idx)
+            if new_score == np.inf:
+                continue
+            d = new_score - cur_score
+            T = max(T_start * (0.995 ** it), 1e-6)
+            if d < 0 or np.random.rand() < np.exp(-d / T):
+                val = cur[idx]
+                delta = -2.0 * val
+                cur_ac = cur_ac.copy()
+                cur_ac[idx:idx+N] += 2.0 * delta * cur
+                cur_ac[idx] += delta * delta
+                cur[idx] = -val
+                cur_sum += delta
+                cur_score = new_score
+                if cur_score < best_score:
+                    best_score = cur_score
+                    best_s = cur.copy()
+
+    # ---------------- Phase 3: final high-precision polish ----------------
+    if best_s is not None and _now() < deadline - 8:
+        x_start = np.arctanh(np.clip(best_s, -0.999, 0.999))
+        for temp, iters in ((0.4, 200), (0.15, 200), (0.05, 200)):
+            if _now() > deadline - 8:
+                break
+            try:
+                result = minimize(
+                    _soft_objective,
+                    x_start,
+                    method='L-BFGS-B',
+                    args=(temp, 128),
+                    options={'maxiter': iters, 'ftol': 1e-12, 'gtol': 1e-10},
+                )
+                s_cont = np.tanh(result.x)
+                sc = _score_sequence(s_cont)
+                if sc < best_score:
+                    best_score = sc
+                    best_s = s_cont.copy()
+                    x_start = result.x.copy()
+            except Exception:
+                continue
+
+    return best_s
+
+# EVOLVE-BLOCK-END

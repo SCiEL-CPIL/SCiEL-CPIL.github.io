@@ -1,189 +1,179 @@
 import time
 import random
 import numpy as np
-from itertools import product
 
 def construct(q, n, radius):
-    total_words = q ** n
+    start_time = time.time()
+    deadline = start_time + 115.0  # Safety margin
     
-    def idx_to_tuple(idx):
-        t = []
-        for _ in range(n):
-            t.append(idx % q)
-            idx //= q
-        return tuple(reversed(t))
+    total_space = q ** n
     
-    def tuple_to_idx(t):
+    # Precompute word to index and index to word
+    def word_to_idx(w):
         idx = 0
-        for i in range(n):
-            idx = idx * q + t[i]
+        for v in w:
+            idx = idx * q + v
         return idx
 
-    # Precompute neighbors
-    neighbor_indices = []
-    for i in range(total_words):
-        w = idx_to_tuple(i)
-        idxs = [i]
-        for pos in range(n):
-            original_val = w[pos]
-            for new_val in range(q):
-                if new_val == original_val:
-                    continue
-                new_w = list(w)
-                new_w[pos] = new_val
-                j = tuple_to_idx(tuple(new_w))
-                idxs.append(j)
-        neighbor_indices.append(idxs)
-    
-    cover_count = 1 + n * (q - 1)
-    neighbors_arr = np.zeros((total_words, cover_count), dtype=np.int32)
-    for i in range(total_words):
-        for j, idx in enumerate(neighbor_indices[i]):
-            neighbors_arr[i, j] = idx
+    def idx_to_word(idx):
+        w = []
+        for i in range(n):
+            w.append(idx % q)
+            idx //= q
+        w.reverse()
+        return w
 
-    # Precompute reverse mapping: for each word, which codewords cover it
-    # reverse_cover[word] = list of codeword indices that cover this word
-    reverse_cover = [[] for _ in range(total_words)]
-    for i in range(total_words):
-        for j in range(cover_count):
-            w = neighbors_arr[i, j]
-            reverse_cover[w].append(i)
+    # Precompute all words
+    all_words = [idx_to_word(i) for i in range(total_space)]
     
-    # Convert to numpy arrays for faster access
-    reverse_cover_arr = np.zeros((total_words, cover_count), dtype=np.int32)
-    reverse_cover_counts = np.zeros(total_words, dtype=np.int32)
-    for w in range(total_words):
-        rc = reverse_cover[w]
-        for j, ci in enumerate(rc):
-            reverse_cover_arr[w, j] = ci
-        reverse_cover_counts[w] = len(rc)
-
-    def greedy_construct_vectorized(random_seed):
-        if random_seed is not None:
-            random.seed(random_seed)
+    # Build cover matrix
+    # cover_matrix[i, j] is True if word j is within Hamming distance <= radius of word i
+    cover_matrix = np.zeros((total_space, total_space), dtype=bool)
+    np.fill_diagonal(cover_matrix, True)
+    
+    if radius >= 1:
+        # For radius 1, we can efficiently compute neighbors
+        # Precompute powers for index calculation
+        powers = [q ** (n - 1 - pos) for pos in range(n)]
         
-        uncovered = np.ones(total_words, dtype=np.bool_)
+        for i in range(total_space):
+            w = all_words[i]
+            for pos in range(n):
+                orig_val = w[pos]
+                for val in range(q):
+                    if val == orig_val:
+                        continue
+                    j = i + (val - orig_val) * powers[pos]
+                    cover_matrix[i, j] = True
+    elif radius > 1:
+        # Fallback for radius > 1: compute Hamming distance for all pairs
+        # This is slower but correct for general radius
+        for i in range(total_space):
+            wi = all_words[i]
+            for j in range(i, total_space):
+                wj = all_words[j]
+                dist = sum(1 for k in range(n) if wi[k] != wj[k])
+                if dist <= radius:
+                    cover_matrix[i, j] = True
+                    cover_matrix[j, i] = True
+
+    # Precompute int8 version of cover matrix for fast dot products
+    cm_int8 = cover_matrix.astype(np.int8)
+    
+    # Precompute neighbor lists for potential use in more advanced search
+    # neighbors[i] is a list of indices j such that cover_matrix[i, j] is True
+    neighbors = [np.where(cover_matrix[i])[0] for i in range(total_space)]
+    
+    def greedy_cover_randomized():
+        uncovered = np.ones(total_space, dtype=np.int8)
         code = []
         
-        while uncovered.any():
-            # Vectorized gain computation
-            uncovered_expanded = uncovered[neighbors_arr]
-            gains = uncovered_expanded.sum(axis=1)
-            
-            valid = gains > 0
-            if not valid.any():
+        while True:
+            if time.time() > deadline - 5.0:
                 break
+                
+            # Calculate gains: how many uncovered words each codeword covers
+            gains = cm_int8.dot(uncovered)
             
-            max_gain = gains[valid].max()
-            best_candidates = np.where((gains == max_gain) & valid)[0]
+            max_gain = np.max(gains)
+            if max_gain == 0:
+                break
+                
+            # Find all indices with max gain
+            candidates = np.where(gains == max_gain)[0]
             
-            chosen = random.choice(best_candidates.tolist())
-            code.append(chosen)
-            uncovered[neighbors_arr[chosen, :]] = False
-        
+            # Random choice among best
+            best_idx = candidates[random.randint(0, len(candidates)-1)]
+            
+            code.append(int(best_idx))
+            uncovered[cover_matrix[best_idx]] = 0
+            
         return code
 
-    def reduce_code_fast(code):
-        counts = np.zeros(total_words, dtype=np.int16)
-        for c in code:
-            counts[neighbors_arr[c, :]] += 1
+    def local_search_reduce(code, max_time=None):
+        if not code:
+            return code
         
-        changed = True
-        while changed:
-            changed = False
-            new_code = []
-            for c in code:
-                counts[neighbors_arr[c, :]] -= 1
-                if np.any(counts == 0):
-                    counts[neighbors_arr[c, :]] += 1
-                    new_code.append(c)
-                else:
-                    changed = True
-            code = new_code
-        return code
-
-    def local_search_improve(code, deadline):
-        code = list(code)
-        counts = np.zeros(total_words, dtype=np.int16)
-        for c in code:
-            counts[neighbors_arr[c, :]] += 1
+        if max_time is None:
+            max_time = deadline - time.time()
+        
+        current_code = code[:]
+        
+        # cover_count[w] = number of codewords covering word w
+        cover_count = np.zeros(total_space, dtype=np.int32)
+        
+        # Update cover_count
+        for idx in current_code:
+            cover_count += cover_matrix[idx]
         
         improved = True
-        while improved and time.time() < deadline:
+        while improved:
             improved = False
-            indices = list(range(len(code)))
-            random.shuffle(indices)
+            random.shuffle(current_code)
+            n_cw = len(current_code)
             
-            for i in indices:
-                if time.time() >= deadline:
-                    break
+            for i in range(n_cw):
+                if time.time() > deadline - 2.0:
+                    return current_code
                 
-                c_remove = code[i]
-                counts[neighbors_arr[c_remove, :]] -= 1
+                idx = current_code[i]
+                mask = cover_matrix[idx]
                 
-                if np.any(counts == 0):
-                    counts[neighbors_arr[c_remove, :]] += 1
-                    
-                    critical_words = neighbors_arr[c_remove, :][counts[neighbors_arr[c_remove, :]] == 1]
-                    
-                    if len(critical_words) == 0:
-                        continue
-                    
-                    # Find replacement using reverse_cover
-                    # Candidates that cover all critical words
-                    candidate_set = None
-                    for cw in critical_words:
-                        rc = reverse_cover_arr[cw, :reverse_cover_counts[cw]]
-                        if candidate_set is None:
-                            candidate_set = set(rc.tolist())
-                        else:
-                            candidate_set &= set(rc.tolist())
-                    
-                    if candidate_set is None or len(candidate_set) == 0:
-                        continue
-                    
-                    candidate_set.discard(c_remove)
-                    if len(candidate_set) == 0:
-                        continue
-                    
-                    best_w = random.choice(list(candidate_set))
-                    code[i] = best_w
-                    counts[neighbors_arr[c_remove, :]] -= 1
-                    counts[neighbors_arr[best_w, :]] += 1
+                # Check if removable: all covered words have count > 1
+                min_count = np.min(cover_count[mask])
+                
+                if min_count > 1:
+                    # Remove
+                    cover_count -= mask
+                    current_code.pop(i)
                     improved = True
                     break
                 else:
-                    code.pop(i)
-                    improved = True
-                    break
-        
-        return code
+                    # Try swap
+                    unique_mask = mask & (cover_count == 1)
+                    
+                    if np.any(unique_mask):
+                        unique_indices = np.where(unique_mask)[0]
+                        
+                        if len(unique_indices) > 0:
+                            # Create exclusion mask
+                            exclude_mask = np.zeros(total_space, dtype=bool)
+                            for j in current_code:
+                                exclude_mask[j] = True
+                        
+                            # Find candidates that cover all unique words
+                            # We need codewords j such that for all u in unique_indices, cover_matrix[j, u] is True
+                            candidates = np.where(cover_matrix[:, unique_indices].all(axis=1))[0]
+                            candidates = candidates[~exclude_mask[candidates]]
+                        
+                            if len(candidates) > 0:
+                                # Among candidates, pick one that covers the most other words
+                                # or just pick randomly for diversity
+                                new_idx = candidates[random.randint(0, len(candidates)-1)]
+                                
+                                # Update cover_count
+                                cover_count -= mask
+                                cover_count += cover_matrix[new_idx]
+                                
+                                current_code[i] = int(new_idx)
+                                improved = True
+                                break
+                            
+        return current_code
 
-    start_time = time.time()
-    deadline = start_time + 115
+    # Initial greedy construction
+    best_code = greedy_cover_randomized()
+    best_code = local_search_reduce(best_code)
     
-    best_code = None
-    best_size = float('inf')
+    # Run restarts if time permits
+    while time.time() < deadline - 10.0:
+        cand_code = greedy_cover_randomized()
+        cand_code = local_search_reduce(cand_code)
+        if len(cand_code) < len(best_code):
+            best_code = cand_code
     
-    seed = 0
-    while time.time() < deadline:
-        code = greedy_construct_vectorized(seed)
-        code = reduce_code_fast(code)
-        
-        if len(code) < best_size or best_code is None:
-            if time.time() < deadline - 10:
-                code = local_search_improve(code, deadline - 5)
-                code = reduce_code_fast(code)
-        
-        if len(code) < best_size:
-            best_size = len(code)
-            best_code = code
-        
-        seed += 1
+    # Final polish: run local search on best_code with remaining time
+    best_code = local_search_reduce(best_code)
     
-    result = []
-    for idx in best_code:
-        w = idx_to_tuple(idx)
-        result.append(list(w))
-    
-    return result
+    # Convert indices back to words
+    return [all_words[i] for i in best_code]

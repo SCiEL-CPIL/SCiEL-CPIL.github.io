@@ -155,7 +155,7 @@ def construct():
         ang = np.zeros(N)
         for i in range(6):
             pos[i] = [i * 2 * sqrt3, 0]
-            pos[i + 6] = [i * 2 * sqrt3 + sqrt3, 1.5 * 2]
+            pos[i + 6] = [i * 2 * sqrt3 + sqrt3, 3.0]
         return pos, ang
 
     def make_compact_hex():
@@ -170,7 +170,23 @@ def construct():
             pos[i + 7] = [4 * sqrt3 * math.cos(theta), 4 * sqrt3 * math.sin(theta)]
         return pos, ang
 
-    init_configs = [make_honeycomb(), make_ring_config(), make_two_rows(), make_compact_hex()]
+    def make_voronoi_hex():
+        # 12 hexagons arranged in a compact pattern
+        pos = np.zeros((N, 2))
+        ang = np.zeros(N)
+        # Center
+        pos[0] = [0, 0]
+        # 6 around center
+        for i in range(6):
+            theta = i * np.pi / 3
+            pos[i + 1] = [2 * sqrt3 * math.cos(theta), 2 * sqrt3 * math.sin(theta)]
+        # 5 more to make 12
+        for i in range(5):
+            theta = (i + 0.5) * np.pi / 3
+            pos[i + 7] = [4 * sqrt3 * math.cos(theta), 4 * sqrt3 * math.sin(theta)]
+        return pos, ang
+
+    init_configs = [make_honeycomb(), make_ring_config(), make_two_rows(), make_compact_hex(), make_voronoi_hex()]
 
     best_side = float('inf')
     best_positions = None
@@ -195,19 +211,19 @@ def construct():
         best_side, best_phi, best_cx, best_cy = compute_min_outer_side(best_positions, best_angles)
 
     # Phase 1: Simulated Annealing
-    sa_time_budget = DEADLINE * 0.55
+    sa_time_budget = DEADLINE * 0.60
     current_positions = best_positions.copy()
     current_angles = best_angles.copy()
     current_side, current_phi, current_cx, current_cy = compute_min_outer_side(current_positions, current_angles)
 
-    T = 0.3
-    T_min = 0.0001
-    cooling = 0.9999
-    step_size = 0.25
-    step_decay = 0.99998
+    T = 0.5
+    T_min = 0.00005
+    cooling = 0.99985
+    step_size = 0.35
+    step_decay = 0.99997
 
     step_count = 0
-    max_steps = 300000
+    max_steps = 500000
     accept_count = 0
     total_count = 0
 
@@ -265,7 +281,9 @@ def construct():
         else:
             delta = new_side - current_side
             if delta < 0: delta = 0
-            if random.random() < math.exp(-delta / T):
+            # Use a slightly boosted acceptance to escape local minima
+            boost = 1.0 + 0.1 * (T / T_min) ** 0.2
+            if random.random() < math.exp(-delta / (T * boost)):
                 current_positions = new_positions
                 current_angles = new_angles
                 current_side = new_side
@@ -283,12 +301,12 @@ def construct():
 
         if total_count % 300 == 0:
             acc_rate = accept_count / total_count
-            if acc_rate < 0.08:
-                step_size *= 0.8
-                if step_size < 0.003: step_size = 0.003
-            elif acc_rate > 0.4:
-                step_size *= 1.15
-                if step_size > 0.8: step_size = 0.8
+            if acc_rate < 0.05:
+                step_size *= 0.7
+                if step_size < 0.002: step_size = 0.002
+            elif acc_rate > 0.45:
+                step_size *= 1.2
+                if step_size > 1.0: step_size = 1.0
             accept_count = 0
             total_count = 0
 
@@ -308,8 +326,8 @@ def construct():
             best_ang_cd = ang.copy()
             
             t_start = time.time()
-            step = 0.04
-            min_step = 0.0001
+            step = 0.06
+            min_step = 0.00005
             
             while time.time() - t_start < time_limit and step > min_step:
                 improved = False
@@ -341,7 +359,7 @@ def construct():
                             
                             new_side, _, _, _ = compute_min_outer_side(new_pos, new_ang)
                             
-                            if new_side < best_side_cd - 1e-12:
+                            if new_side < best_side_cd - 1e-13:
                                 best_pos_cd = new_pos
                                 best_ang_cd = new_ang
                                 best_side_cd = new_side
@@ -354,7 +372,7 @@ def construct():
                         continue
                     break
                 else:
-                    step *= 0.7
+                    step *= 0.65
                     continue
                 break
             
@@ -445,6 +463,66 @@ def construct():
                 best_angles = cd_ang2
                 best_side, best_phi, best_cx, best_cy = compute_min_outer_side(best_positions, best_angles)
             
+        remaining_time = DEADLINE - (time.time() - t0)
+        if remaining_time > 4.0:
+            # Nelder-Mead final polish with tight tolerances
+            def nm_objective(params):
+                pos = np.zeros((N, 2))
+                ang = np.zeros(N)
+                for i in range(N):
+                    pos[i, 0] = params[3*i]
+                    pos[i, 1] = params[3*i+1]
+                    ang[i] = params[3*i+2]
+                    
+                angles_rad = np.radians(ang)
+                for i in range(N):
+                    for j in range(i+1, N):
+                        h1 = (pos[i, 0], pos[i, 1], angles_rad[i])
+                        h2 = (pos[j, 0], pos[j, 1], angles_rad[j])
+                        if not hexagons_disjoint_fast(h1, h2):
+                            return best_side + 1.0 + random.random() * 0.1
+                    
+                all_verts = get_all_vertices(pos, angles_rad)
+                verts_flat = all_verts.reshape(-1, 2)
+                center = np.mean(verts_flat, axis=0)
+                offsets = verts_flat - center
+                    
+                phi = np.radians(best_phi)
+                na = phi + np.pi/6 + np.arange(6) * np.pi/3
+                nxx = np.cos(na)
+                nyy = np.sin(na)
+                pr = offsets[:, 0:1] * nxx[None, :] + offsets[:, 1:2] * nyy[None, :]
+                return (2.0 / sqrt3) * np.max(np.abs(pr), axis=0).max()
+                
+            nm_init = np.zeros(3*N)
+            for i in range(N):
+                nm_init[3*i] = best_positions[i, 0]
+                nm_init[3*i+1] = best_positions[i, 1]
+                nm_init[3*i+2] = best_angles[i]
+                
+            try:
+                nm_res = minimize(nm_objective, nm_init, method='Nelder-Mead',
+                                  options={'xatol': 1e-12, 'fatol': 1e-14,
+                                           'maxiter': 5000, 'adaptive': True})
+                if nm_res.fun < best_side:
+                    new_pos = np.zeros((N, 2))
+                    new_ang = np.zeros(N)
+                    for i in range(N):
+                        new_pos[i, 0] = nm_res.x[3*i]
+                        new_pos[i, 1] = nm_res.x[3*i+1]
+                        new_ang[i] = nm_res.x[3*i+2]
+                    if is_valid_configuration(new_pos, new_ang):
+                        new_side, new_phi, new_cx, new_cy = compute_min_outer_side(new_pos, new_ang)
+                        if new_side < best_side:
+                            best_side = new_side
+                            best_positions = new_pos
+                            best_angles = new_ang
+                            best_phi = new_phi
+                            best_cx = new_cx
+                            best_cy = new_cy
+            except Exception:
+                pass
+                
             remaining_time = DEADLINE - (time.time() - t0)
             if remaining_time > 2.0:
                 def eval_phi_fine(phi_deg):
@@ -459,10 +537,10 @@ def construct():
                     nyy = np.sin(na)
                     pr = offsets[:, 0:1] * nxx[None, :] + offsets[:, 1:2] * nyy[None, :]
                     return (2.0 / sqrt3) * np.max(np.abs(pr), axis=0).max()
-                
+                    
                 best_phi_fine = best_phi
                 best_side_fine = eval_phi_fine(best_phi)
-                
+                    
                 for start_phi in [best_phi - 2.0, best_phi, best_phi + 2.0]:
                     lo = max(0.0, start_phi - 1.0)
                     hi = min(60.0, start_phi + 1.0)
@@ -474,7 +552,7 @@ def construct():
                             best_phi_fine = res.x
                     except Exception:
                         pass
-                
+                    
                 if best_side_fine < best_side - 1e-10:
                     best_side = best_side_fine
                     best_phi = best_phi_fine

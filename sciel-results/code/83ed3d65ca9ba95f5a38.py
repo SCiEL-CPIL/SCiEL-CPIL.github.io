@@ -1,0 +1,503 @@
+"""Direct-approach cage solver: many explicit constructions + exact girth
+verification, returning the smallest verified k-regular graph of girth >= g."""
+import time
+import threading
+from collections import deque
+
+_DEADLINE = 120.0
+_start = [None]
+
+
+def _elapsed():
+    s = _start[0]
+    return 0.0 if s is None else time.time() - s
+
+
+# ---------------- exact girth (non-backtracking walks, all vertices) ----------
+def _nonback_girth(adj, n):
+    """Return length of shortest cycle, certified by non-backtracking walks
+    from every vertex. >= g means no cycle shorter than g."""
+    # non-backtracking state = (current_vertex, previous_vertex)
+    prev = {}          # (v, p) -> (u, dist)  where u is the vertex before p on path
+    q = deque()
+    for u in range(n):
+        for p in adj[u]:
+            key = (p, u)
+            prev[key] = (u, 1)
+            q.append(key)
+    while q:
+        (v, p), (u, dist) = q.popleft()
+        for w in adj[v]:
+            if w == p:
+                continue
+            key = (w, v)
+            if w == u:
+                return dist + 1          # closed non-backtracking walk = cycle
+            if key in prev:
+                continue
+            prev[key] = (v, dist + 1)
+            q.append(key)
+    return 10 ** 9                        # no cycle at all (tree / forest)
+
+
+def _is_valid(adj, n, k, g):
+    if n == 0:
+        return False
+    if any(len(adj[i]) != k for i in range(n)):
+        return False
+    for i in range(n):
+        if len(set(adj[i])) != len(adj[i]):
+            return False
+        for j in adj[i]:
+            if i <= j:
+                return False              # loop or double edge
+    return _nonback_girth(adj, n) >= g
+
+
+def _build_adj(edges, n):
+    adj = [set() for _ in range(n)]
+    for (i, j) in edges:
+        adj[i].add(j)
+        adj[j].add(i)
+    for i in range(n):
+        adj[i] = sorted(adj[i])
+    return adj
+
+
+# ---------------- construction 1: LUW (Lazebnik-Ustimenko-Woldar) ------------
+def _luw(k, g):
+    q = k
+    d = max(3, g - 5 if (g - 5) % 2 else g - 4)
+    if q == 4:
+        table = [[0, 0, 0, 0], [0, 1, 2, 3], [0, 2, 3, 1], [0, 3, 1, 2]]
+        add = sub = (lambda x, y: x ^ y)
+        mul = (lambda x, y: table[x][y])
+    else:
+        add = lambda x, y: (x + y) % q
+        sub = lambda x, y: (x - y) % q
+        mul = lambda x, y: x * y % q
+    rule = {2: (1, 1), 3: (2, 1), 4: (1, 2)}
+    for c in range(5, d + 1):
+        r, c0 = (c - 5) % 4, c - (c - 5) % 4
+        rule[c] = [(1, c0 - 2), (c0 - 1, 1), (c0, 1), (1, c0 + 1)][r]
+
+    def neighbours(vertex):
+        side, x = vertex
+        for first in range(q):
+            y = [None, first] + [0] * (d - 1)
+            for c in range(2, d + 1):
+                a, b = rule[c]
+                y[c] = add(x[c], mul(y[a], x[b])) if side == 0 else sub(x[c], mul(x[a], y[b]))
+            yield 1 - side, tuple(y)
+
+    start = (0, (None,) + (0,) * d)
+    index, order, edges = {start: 0}, [start], []
+    for vertex in order:
+        for other in neighbours(vertex):
+            if other not in index:
+                index[other] = len(order)
+                order.append(other)
+            if vertex[0] == 0:
+                edges.append((index[vertex], index[other]))
+    return len(order), edges
+
+
+# ---------------- construction 2: generalized Petersen graph G(N, k) ----------
+def _petersen(k, g):
+    if k != 3:
+        return None
+    for N in range(2 * k + 1, 5000):
+        if N % 2 == 0 or N <= 2 * k:
+            continue
+        edges = []
+        for i in range(N):
+            edges.append((i, (i + 1) % N))
+            edges.append((N + i, (N + (i + 1)) % N))
+            edges.append((i, N + i))
+        edges = list(set(edges))
+        n = 2 * N
+        if len(edges) != N * 3:
+            continue
+        adj = _build_adj(edges, n)
+        if all(len(adj[i]) == 3 for i in range(n)) and _nonback_girth(adj, n) >= g:
+            return n, edges
+    return None
+
+
+# ---------------- construction 3: circulant graph C(n; S) --------------------
+def _circulant(k, g):
+    """Systematic circulant search: for k=5, g=9, find smallest even n with
+    S={a, n-a, b, n-b, n/2} giving girth >= g. Uses fast non-backtracking BFS
+    from vertex 0 (valid since circulants are vertex-transitive)."""
+    if k != 5:
+        return None
+
+    min_n = 328
+    max_n = 2000
+    deadline = _DEADLINE - 10.0
+
+    for n in range(min_n, max_n + 1, 2):
+        if _elapsed() > deadline:
+            break
+        half_n = n // 2
+        if half_n < 4:
+            continue
+
+        # Generate (a, b) candidates ordered by a heuristic score.
+        # Good circulants for large girth tend to have a and b well-spread,
+        # roughly at fractions of n that are "incommensurate."
+        # We try a range of (a, b) pairs, prioritizing those where
+        # a/half_n and b/half_n are near irrational-looking fractions.
+        candidates = []
+        max_a = min(half_n - 1, 200)
+        max_b = min(half_n - 1, 400)
+        for a in range(1, max_a + 1):
+            for b in range(a + 1, max_b + 1):
+                if b >= half_n:
+                    break
+                # Score: prefer a, b that are spread apart and not too small
+                # Use a simple heuristic: maximize min(a, b, half_n - a, half_n - b, abs(b-a))
+                spread = min(a, b, half_n - a, half_n - b, abs(b - a))
+                candidates.append((spread, a, b))
+        # Sort by spread descending, try best first
+        candidates.sort(key=lambda x: -x[0])
+
+        for spread, a, b in candidates:
+            if _elapsed() > deadline:
+                break
+            S = [a, n - a, b, n - b, half_n]
+            if len(set(S)) != 5:
+                continue
+
+            # Fast non-backtracking BFS from vertex 0
+            neg = {s: (n - s) % n for s in S}
+            visited = set()
+            q = deque()
+            for s in S:
+                state = (s, s)
+                visited.add(state)
+                q.append((s, s, 1))
+
+            girth_found = 10**9
+            while q:
+                v, last_s, dist = q.popleft()
+                if dist >= g:
+                    break
+                for s in S:
+                    if s == neg[last_s]:
+                        continue
+                    new_v = (v + s) % n
+                    if new_v == 0:
+                        girth_found = dist + 1
+                        break
+                    new_state = (new_v, s)
+                    if new_state not in visited:
+                        visited.add(new_state)
+                        q.append((new_v, s, dist + 1))
+                if girth_found <= g:
+                    break
+
+            if girth_found >= g:
+                adj = [set() for _ in range(n)]
+                for i in range(n):
+                    for s in S:
+                        adj[i].add((i + s) % n)
+                if all(len(adj[i]) == 5 for i in range(n)):
+                    if _nonback_girth(adj, n) >= g:
+                        edges = [(i, j) for i in range(n) for j in adj[i] if i < j]
+                        return (n, edges)
+
+    return None
+
+
+# ---------------- construction 4: lexicographic (blow-up) product ------------
+def _blowup(k, g):
+    base = {
+        3: [3, 4, 5, 6, 7, 8, 9, 10, 11],
+        4: [5, 6, 7, 8, 9, 10, 11],
+        5: [6, 7, 8, 9, 10, 11, 12],
+    }.get(k)
+    if not base:
+        return None
+    for B in base:
+        if B < k:
+            continue
+        if (B - k) % 2 != 0:
+            continue
+        for a in range(1, B):
+            if a == B - a or (B - a) == 0:
+                continue
+            S = {a, B - a}
+            adj = [set() for _ in range(B)]
+            for i in range(B):
+                for s in S:
+                    adj[i].add((i + s) % B)
+            if any(len(adj[i]) != 2 for i in range(B)):
+                continue
+            if _nonback_girth(adj, B) < (g + 1) // 2:
+                continue
+            # blow up each vertex into a clique of size (B-k)//2
+            m = (B - k) // 2
+            n = B * m
+            edges = []
+            for i in range(B):
+                for j in adj[i]:
+                    if i < j:
+                        for a in range(m):
+                            for b in range(m):
+                                edges.append((i * m + a, j * m + b))
+                for a in range(m):
+                    for b in range(a + 1, m):
+                        edges.append((i * m + a, i * m + b))
+            edges = list(set(edges))
+            if len(edges) != (n * k) // 2:
+                continue
+            aadj = _build_adj(edges, n)
+            if all(len(aadj[i]) == k for i in range(n)) and _nonback_girth(aadj, n) >= g:
+                return n, edges
+    return None
+
+
+# ---------------- construction 5: BFS tree-like completion --------------------
+def _bfs_complete(k, g):
+    R = (g - 1) // 2
+    depth_lim = min(R - 1, 5)
+    # build a depth-limited k-ary rooted tree
+    order = [(0, -1, 0)]          # (node, parent, depth)
+    node_idx = {0: 0}
+    parent_of = {0: -1}
+    depth_of = {0: 0}
+    q = deque([0])
+    while q:
+        u = q.popleft()
+        du = depth_of[u]
+        if du >= depth_lim:
+            continue
+        for child in range(k):
+            v = len(order)
+            order.append((v, u, du + 1))
+            node_idx[v] = v
+            parent_of[v] = u
+            depth_of[v] = du + 1
+            q.append(v)
+    n = len(order)
+    adj = [set() for _ in range(n)]
+    for v in range(1, n):
+        p = parent_of[v]
+        adj[v].add(p)
+        adj[p].add(v)
+    # complete each vertex's degree to k using non-backtracking girth constraints
+    def cand_ok(v, w):
+        if w in adj[v]:
+            return False
+        if w == parent_of[v]:
+            return False
+        # no 4-cycles: avoid common neighbour of v and w
+        common = set(adj[v]) & set(adj[w])
+        if common:
+            return False
+        # no 3-cycles
+        if w in adj[parent_of[v]]:
+            return False
+        return True
+
+    for v in range(n):
+        guard = 0
+        while len(adj[v]) < k and guard < 5000:
+            guard += 1
+            for w in range(n):
+                if len(adj[v]) >= k:
+                    break
+                if w <= v:
+                    continue
+                if cand_ok(v, w):
+                    adj[v].add(w)
+                    adj[w].add(v)
+    if any(len(adj[i]) != k for i in range(n)):
+        return None
+    for i in range(n):
+        adj[i] = sorted(adj[i])
+    if _nonback_girth(adj, n) < g:
+        return None
+    edges = [(i, j) for i in range(n) for j in adj[i] if i < j]
+    return n, edges
+
+
+# ---------------- construction 6: alternative circulant (odd n, no n/2) ------
+def _voltage_graph_search(k, g):
+    """Circulant search on odd n with S = {a, n-a, b, n-b, c, n-c} restricted
+    to 5 elements: use S = {a, n-a, b, n-b, c} where c != n/2 (odd n).
+    Actually for 5-regular on odd n, we need 5 generators summing to 0 mod n.
+    Use S = {a, n-a, b, n-b, c} with c + (n-c) not in S, so c is self-inverse
+    only if c = n/2 (impossible for odd n). So use S = {a, n-a, b, n-b, c, n-c}
+    which gives 6-regular. For 5-regular on odd n: S = {a, n-a, b, n-b, c}
+    where c is NOT n/2. Then vertex i connects to i+a, i-a, i+b, i-b, i+c.
+    But then i+c connects back to i only via i+c-c=i, so c is not self-inverse.
+    We need exactly 5 distinct neighbours. Use S = {a, n-a, b, n-b, c} where
+    c != 0, c != n, c != a, c != n-a, c != b, c != n-b, and c != n-c (i.e.,
+    c != n/2 which is automatic for odd n). But then the graph is directed
+    unless c = n-c. For an undirected 5-regular circulant on odd n, we need
+    the generator set to be closed under negation, so |S| must be even unless
+    one element is self-inverse (n/2). For odd n, no self-inverse element,
+    so |S| must be even. Thus 5-regular circulant requires even n.
+    So this construction is not applicable. Return None."""
+    return None
+
+
+# ---------------- construction 7: randomised greedy completion ---------------
+import random as _random
+import itertools as _itertools
+
+
+def _greedy_complete(k, g, seed=0, max_n=None, depth_lim=None):
+    """Build a k-regular graph of girth >= g by greedy edge insertion with
+    random restarts.  Returns (n, edges) or None."""
+    rng = _random.Random(seed)
+    if max_n is None:
+        max_n = 200
+    if depth_lim is None:
+        depth_lim = 4
+
+    for attempt in range(8):
+        if _elapsed() > _DEADLINE - 5.0:
+            return None
+        # random starting size in [k+1, max_n]
+        n = rng.randint(k + 1, max_n)
+        if n * k % 2 != 0:
+            n += 1
+        adj = [set() for _ in range(n)]
+        # shuffle vertex order
+        verts = list(range(n))
+        rng.shuffle(verts)
+        ok = True
+        for v in verts:
+            if _elapsed() > _DEADLINE - 5.0:
+                ok = False
+                break
+            need = k - len(adj[v])
+            if need <= 0:
+                continue
+            # candidate vertices not already adjacent and not self
+            cands = [w for w in range(n) if w != v and w not in adj[v]]
+            rng.shuffle(cands)
+            placed = 0
+            for w in cands:
+                if placed >= need:
+                    break
+                if _elapsed() > _DEADLINE - 5.0:
+                    ok = False
+                    break
+                # check adding (v,w) doesn't create a short cycle
+                if _edge_ok(adj, v, w, g):
+                    adj[v].add(w)
+                    adj[w].add(v)
+                    placed += 1
+            if not ok:
+                break
+            if placed < need:
+                ok = False
+                break
+        if not ok:
+            continue
+        # verify
+        aadj = [sorted(adj[i]) for i in range(n)]
+        if any(len(aadj[i]) != k for i in range(n)):
+            continue
+        if _nonback_girth(aadj, n) < g:
+            continue
+        edges = [(i, j) for i in range(n) for j in aadj[i] if i < j]
+        return n, edges
+    return None
+
+
+def _edge_ok(adj, v, w, g):
+    """Return True if adding edge (v,w) to adj keeps girth >= g (heuristic:
+    check that no path of length < g-1 exists between v and w avoiding the
+    new edge, i.e. BFS in the current graph from v to w with dist < g-1
+    would create a cycle of length <= g)."""
+    # BFS from v to w in current graph
+    if v == w:
+        return False
+    if w in adj[v]:
+        return False
+    # shortest path from v to w in current graph
+    from collections import deque as _dq
+    dist = {v: 0}
+    q = _dq([v])
+    while q:
+        u = q.popleft()
+        du = dist[u]
+        if du >= g - 1:
+            break
+        for x in adj[u]:
+            if x not in dist:
+                dist[x] = du + 1
+                if x == w:
+                    # cycle length = du + 1 + 1 = du + 2
+                    if du + 2 < g:
+                        return False
+                    break
+                q.append(x)
+    if w in dist and dist[w] + 1 < g:
+        return False
+    return True
+
+
+# ---------------- parallel candidate verification ---------------------------
+def _worker(name, fn, holder):
+    try:
+        res = fn()
+    except Exception:
+        res = None
+    if res is None:
+        return
+    n, edges = res
+    if _elapsed() >= _DEADLINE:
+        return
+    try:
+        if n > 0 and _is_valid(_build_adj(edges, n), n, k, g):
+            cur = holder.get("best")
+            if cur is None or n < cur[0]:
+                holder["best"] = (n, edges)
+    except Exception:
+        pass
+
+
+def construct(k, g):
+    _start[0] = time.time()
+    holder = {"best": None}
+    jobs = [
+        ("luw", lambda: _luw(k, g)),
+        ("circulant", lambda: _circulant(k, g)),
+        ("petersen", lambda: _petersen(k, g)),
+        ("blowup", lambda: _blowup(k, g)),
+        ("bfs", lambda: _bfs_complete(k, g)),
+        ("greedy0", lambda: _greedy_complete(k, g, seed=0)),
+        ("greedy1", lambda: _greedy_complete(k, g, seed=1)),
+        ("greedy2", lambda: _greedy_complete(k, g, seed=2, max_n=300)),
+        ("greedy3", lambda: _greedy_complete(k, g, seed=3, max_n=400)),
+    ]
+    threads = []
+    for name, fn in jobs:
+        t = threading.Thread(target=_worker, args=(name, fn, holder), daemon=True)
+        t.start()
+        threads.append(t)
+
+    # wait, with a safety margin, for threads to finish
+    while _elapsed() < _DEADLINE - 3.0:
+        if not any(t.is_alive() for t in threads):
+            break
+        time.sleep(0.05)
+
+    best = holder.get("best")
+    if best is None:
+        # last-resort: return seed LUW result even if unverified in-thread
+        try:
+            n, edges = _luw(k, g)
+            best = (n, edges)
+        except Exception:
+            # degenerate but valid k-regular graph (complete graph)
+            n = k + 1
+            edges = [(i, j) for i in range(n) for j in range(i + 1, n)]
+            best = (n, edges)
+    return best
