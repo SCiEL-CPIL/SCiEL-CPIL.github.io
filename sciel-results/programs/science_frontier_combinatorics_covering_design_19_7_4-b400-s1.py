@@ -3,6 +3,7 @@ import time
 import random
 import numpy as np
 from collections import defaultdict
+import heapq
 
 def construct(v, k, t):
     deadline = time.time() + 115.0
@@ -27,56 +28,60 @@ def construct(v, k, t):
         for ts_idx in tsubs:
             tsub_blocks[ts_idx].append(bi)
             
-    # Convert to numpy arrays for faster access if needed, 
-    # but lists are fine for the logic below.
+    # Precompute set versions of block_tsubs for faster intersection in local search
+    block_tsub_sets = [set(tsubs) for tsubs in block_tsubs]
+    
+    # Precompute tsub_blocks as sets for faster intersection
+    tsub_block_sets = [set(lst) for lst in tsub_blocks]
     
     def greedy_cover(seed):
         rng = random.Random(seed)
         uncovered = [True] * n_tsubsets
-        # gain[i] = number of uncovered t-subsets in block i
         gain = [0] * n_blocks
         for bi in range(n_blocks):
             gain[bi] = len(block_tsubs[bi])
             
+        # Use a max-heap: (-gain, bi)
+        heap = [(-gain[bi], bi) for bi in range(n_blocks)]
+        heapq.heapify(heap)
+        
         selected = []
-        # Use a heap or just max? 
-        # With 50k blocks, finding max is O(N). 
-        # We can use a heap of (-gain, bi).
-        # But gains change. 
-        # Simple O(N) scan is 50k * 150 steps = 7.5M ops. Very fast.
         
         while True:
             if time.time() > deadline - 5:
                 break
                 
-            # Find block with max gain
-            max_gain = -1
+            # Pop until we find a valid (non-stale) entry
             best_bi = -1
-            # Random tie-breaking
-            candidates = []
-            for bi in range(n_blocks):
-                if gain[bi] > max_gain:
-                    max_gain = gain[bi]
-                    candidates = [bi]
-                elif gain[bi] == max_gain and gain[bi] > 0:
-                    candidates.append(bi)
-                    
+            max_gain = 0
+            while heap:
+                neg_g, bi = heapq.heappop(heap)
+                g = -neg_g
+                if g == gain[bi] and g > 0:
+                    best_bi = bi
+                    max_gain = g
+                    break
+                # Stale entry, discard
+            else:
+                break
+                
             if max_gain <= 0:
                 break
                 
-            # Pick random from candidates
-            bi = candidates[rng.randint(0, len(candidates) - 1)]
-            selected.append(bi)
+            selected.append(best_bi)
             
             # Update gains
-            for ts_idx in block_tsubs[bi]:
+            for ts_idx in block_tsubs[best_bi]:
                 if uncovered[ts_idx]:
                     uncovered[ts_idx] = False
                     # Decrement gain for all blocks covering this ts_idx
                     for bj in tsub_blocks[ts_idx]:
                         gain[bj] -= 1
+                        # Push updated gain into heap
+                        heapq.heappush(heap, (-gain[bj], bj))
                         
-            gain[bi] = -1 # Prevent re-selection
+            gain[best_bi] = -1 # Prevent re-selection
+            heapq.heappush(heap, (-gain[best_bi], best_bi))
             
         return selected
 
@@ -97,8 +102,6 @@ def construct(v, k, t):
             improved = False
             
             # Phase 1: Remove redundant blocks
-            # A block is redundant if all its t-subsets are covered by other blocks
-            # i.e., cover_count[ts] > 1 for all ts in block
             to_remove = []
             for bi in block_set:
                 redundant = True
@@ -118,15 +121,13 @@ def construct(v, k, t):
                 continue # Restart loop as structure changed significantly
             
             # Phase 2: Try swaps
-            # For each block, try to replace it with another that covers its unique subsets
-            # and potentially allows further reduction
             current_blocks = list(block_set)
             rng.shuffle(current_blocks)
             
             for bi in current_blocks:
                 if time.time() > deadline - 2:
                     break
-                if bi not in block_set: # Might have been removed in previous iterations? No, we continue above.
+                if bi not in block_set:
                     continue
                     
                 # Find unique subsets for bi
@@ -136,7 +137,6 @@ def construct(v, k, t):
                         unique_tsubs.append(ts_idx)
                         
                 if not unique_tsubs:
-                    # Should have been caught in Phase 1, but just in case
                     block_set.remove(bi)
                     for ts_idx in block_tsubs[bi]:
                         cover_count[ts_idx] -= 1
@@ -144,16 +144,13 @@ def construct(v, k, t):
                     break # Restart
                     
                 # Find candidate blocks that cover all unique_tsubs
-                # Candidate must not be in block_set
-                # Intersection of tsub_blocks[ts] for ts in unique_tsubs
-                # Start with the one with fewest blocks
                 min_ts = min(unique_tsubs, key=lambda x: len(tsub_blocks[x]))
-                candidates = set(tsub_blocks[min_ts])
+                candidates = set(tsub_block_sets[min_ts])
                 
                 for ts_idx in unique_tsubs[1:]:
                     if not candidates:
                         break
-                    candidates &= set(tsub_blocks[ts_idx])
+                    candidates &= tsub_block_sets[ts_idx]
                     
                 # Remove current block from candidates
                 candidates.discard(bi)
@@ -161,28 +158,15 @@ def construct(v, k, t):
                 if not candidates:
                     continue
                     
-                # Try candidates
+                # Try candidates - limit to a reasonable number
                 cand_list = list(candidates)
                 rng.shuffle(cand_list)
                 
                 swapped = False
-                for bj in cand_list[:20]: # Limit trials per block
+                for bj in cand_list[:30]:
                     if bj in block_set:
                         continue
                         
-                    # Check if swapping bi -> bj is valid
-                    # It is valid if bj covers all unique_tsubs of bi
-                    # We already ensured this by intersection.
-                    # But we must ensure that removing bi doesn't uncover any other subset
-                    # that is NOT covered by bj.
-                    # Actually, if bj covers all unique_tsubs of bi, then:
-                    # - Subsets with count > 1 remain covered (by others).
-                    # - Subsets with count == 1 (unique to bi) are now covered by bj.
-                    # So the swap is always valid in terms of coverage!
-                    # Wait, does bj cover *only* those? No, bj covers 35 subsets.
-                    # Some might be new, some might be already covered.
-                    # The condition "bj covers all unique_tsubs of bi" is sufficient for validity.
-                    
                     # Perform swap
                     block_set.remove(bi)
                     for ts_idx in block_tsubs[bi]:
@@ -201,30 +185,275 @@ def construct(v, k, t):
                     
         return list(block_set)
 
+    def two_block_swap_search(blocks, seed):
+        """
+        Try to replace two blocks (bi, bj) with a single block bk that covers
+        all unique t-subsets of bi and bj. This is a 2-for-1 improvement.
+        """
+        rng = random.Random(seed)
+        block_set = set(blocks)
+        cover_count = [0] * n_tsubsets
+        
+        for bi in block_set:
+            for ts_idx in block_tsubs[bi]:
+                cover_count[ts_idx] += 1
+                
+        improved = True
+        while improved and time.time() < deadline - 2:
+            improved = False
+            current_blocks = list(block_set)
+            rng.shuffle(current_blocks)
+            
+            n_checked = 0
+            for i, bi in enumerate(current_blocks):
+                if time.time() > deadline - 2:
+                    break
+                if bi not in block_set:
+                    continue
+                    
+                if len(block_set) < 2:
+                    break
+                
+                # Pick a random partner
+                others = [b for b in block_set if b != bi]
+                if not others:
+                    continue
+                bj = rng.choice(others)
+                
+                n_checked += 1
+                if n_checked > 8000:
+                    break
+                
+                # Compute required t-subsets
+                req_bi = [ts for ts in block_tsubs[bi] if cover_count[ts] == 1]
+                req_bj = [ts for ts in block_tsubs[bj] if cover_count[ts] == 1]
+                
+                required = set(req_bi)
+                required.update(req_bj)
+                
+                # Check intersection for count==2
+                inter = block_tsub_sets[bi] & block_tsub_sets[bj]
+                for ts in inter:
+                    if cover_count[ts] == 2:
+                        required.add(ts)
+                
+                if not required:
+                    continue
+                
+                # Find candidate blocks that cover all ts in required
+                min_ts = min(required, key=lambda x: len(tsub_blocks[x]))
+                candidates = set(tsub_block_sets[min_ts])
+                
+                for ts in required:
+                    if ts == min_ts:
+                        continue
+                    if not candidates:
+                        break
+                    candidates &= tsub_block_sets[ts]
+                    
+                candidates.discard(bi)
+                candidates.discard(bj)
+                
+                if not candidates:
+                    continue
+                
+                cand_list = list(candidates)
+                rng.shuffle(cand_list)
+                
+                swapped = False
+                for bk in cand_list[:15]:
+                    if bk in block_set:
+                        continue
+                        
+                    # Perform swap: remove bi, bj; add bk
+                    block_set.remove(bi)
+                    for ts in block_tsubs[bi]:
+                        cover_count[ts] -= 1
+                        
+                    block_set.remove(bj)
+                    for ts in block_tsubs[bj]:
+                        cover_count[ts] -= 1
+                        
+                    block_set.add(bk)
+                    for ts in block_tsubs[bk]:
+                        cover_count[ts] += 1
+                        
+                    improved = True
+                    swapped = True
+                    break
+                    
+                if swapped:
+                    break # Restart while loop
+                    
+        return list(block_set)
+
+    def final_polish(blocks, seed):
+        """
+        Aggressive final polishing: repeatedly try all 1-for-1 and 2-for-1 swaps
+        until no improvement is found.
+        """
+        rng = random.Random(seed)
+        block_set = set(blocks)
+        cover_count = [0] * n_tsubsets
+        
+        for bi in block_set:
+            for ts_idx in block_tsubs[bi]:
+                cover_count[ts_idx] += 1
+        
+        # Try multiple passes
+        for _ in range(3):
+            if time.time() > deadline - 2:
+                break
+                
+            # Remove redundant
+            to_remove = []
+            for bi in block_set:
+                redundant = True
+                for ts_idx in block_tsubs[bi]:
+                    if cover_count[ts_idx] == 1:
+                        redundant = False
+                        break
+                if redundant:
+                    to_remove.append(bi)
+            if to_remove:
+                for bi in to_remove:
+                    block_set.remove(bi)
+                    for ts_idx in block_tsubs[bi]:
+                        cover_count[ts_idx] -= 1
+                continue
+            
+            # Try 1-for-1 swaps
+            improved = False
+            current_blocks = list(block_set)
+            rng.shuffle(current_blocks)
+            for bi in current_blocks:
+                if time.time() > deadline - 2:
+                    break
+                if bi not in block_set:
+                    continue
+                unique_tsubs = [ts for ts in block_tsubs[bi] if cover_count[ts] == 1]
+                if not unique_tsubs:
+                    block_set.remove(bi)
+                    for ts_idx in block_tsubs[bi]:
+                        cover_count[ts_idx] -= 1
+                    improved = True
+                    break
+                min_ts = min(unique_tsubs, key=lambda x: len(tsub_blocks[x]))
+                candidates = set(tsub_block_sets[min_ts])
+                for ts_idx in unique_tsubs[1:]:
+                    if not candidates:
+                        break
+                    candidates &= tsub_block_sets[ts_idx]
+                candidates.discard(bi)
+                if not candidates:
+                    continue
+                cand_list = list(candidates)
+                rng.shuffle(cand_list)
+                for bj in cand_list[:20]:
+                    if bj in block_set:
+                        continue
+                    block_set.remove(bi)
+                    for ts in block_tsubs[bi]:
+                        cover_count[ts] -= 1
+                    block_set.add(bj)
+                    for ts in block_tsubs[bj]:
+                        cover_count[ts] += 1
+                    improved = True
+                    break
+                if improved:
+                    break
+            
+            if not improved and time.time() < deadline - 2:
+                # Try 2-for-1 swaps
+                current_blocks = list(block_set)
+                rng.shuffle(current_blocks)
+                n_checked = 0
+                for bi in current_blocks:
+                    if time.time() > deadline - 2:
+                        break
+                    if bi not in block_set:
+                        continue
+                    if len(block_set) < 2:
+                        break
+                    others = [b for b in block_set if b != bi]
+                    if not others:
+                        continue
+                    bj = rng.choice(others)
+                    n_checked += 1
+                    if n_checked > 5000:
+                        break
+                    req_bi = [ts for ts in block_tsubs[bi] if cover_count[ts] == 1]
+                    req_bj = [ts for ts in block_tsubs[bj] if cover_count[ts] == 1]
+                    required = set(req_bi)
+                    required.update(req_bj)
+                    inter = block_tsub_sets[bi] & block_tsub_sets[bj]
+                    for ts in inter:
+                        if cover_count[ts] == 2:
+                            required.add(ts)
+                    if not required:
+                        continue
+                    min_ts = min(required, key=lambda x: len(tsub_blocks[x]))
+                    candidates = set(tsub_block_sets[min_ts])
+                    for ts in required:
+                        if ts == min_ts:
+                            continue
+                        if not candidates:
+                            break
+                        candidates &= tsub_block_sets[ts]
+                    candidates.discard(bi)
+                    candidates.discard(bj)
+                    if not candidates:
+                        continue
+                    cand_list = list(candidates)
+                    rng.shuffle(cand_list)
+                    for bk in cand_list[:10]:
+                        if bk in block_set:
+                            continue
+                        block_set.remove(bi)
+                        for ts in block_tsubs[bi]:
+                            cover_count[ts] -= 1
+                        block_set.remove(bj)
+                        for ts in block_tsubs[bj]:
+                            cover_count[ts] -= 1
+                        block_set.add(bk)
+                        for ts in block_tsubs[bk]:
+                            cover_count[ts] += 1
+                        improved = True
+                        break
+                    if improved:
+                        break
+                if not improved:
+                    break
+                    
+        return list(block_set)
+
     best_blocks = None
     best_len = float('inf')
     
     # Run multiple greedy starts
-    num_trials = 100
+    num_trials = 40
     for i in range(num_trials):
-        if time.time() > deadline - 20:
+        if time.time() > deadline - 25:
             break
             
         blocks = greedy_cover(i)
         if not blocks:
             continue
             
-        # Local search
+        # Local search (single swaps)
         blocks = local_search(blocks, i)
+        
+        # Two-block swap search
+        if time.time() < deadline - 12:
+            blocks = two_block_swap_search(blocks, i + 1000)
         
         if len(blocks) < best_len:
             best_len = len(blocks)
             best_blocks = blocks
             
-    # If we have time, try to improve the best solution further
-    if best_blocks is not None and time.time() < deadline - 10:
-        # Run local search again on the best
-        best_blocks = local_search(best_blocks, 99999)
+    # Final polish on the best solution
+    if best_blocks is not None and time.time() < deadline - 8:
+        best_blocks = final_polish(best_blocks, 77777)
         
     # Fallback if something went wrong
     if best_blocks is None:

@@ -1,162 +1,301 @@
 import itertools
 import time
 import random
-import heapq
+import sys
+import numpy as np
+
+def _deadline_ok(deadline):
+    return time.time() < deadline
 
 def construct(v, k, t):
     start_time = time.time()
-    deadline = start_time + 110.0 # 10s margin
+    # Evaluator limit is 120s, but we should leave a safety margin for overhead/return
+    limit = 115.0 
+    deadline = start_time + limit
+
+    # 1. Precomputation
+    # Generate all t-subsets
+    t_subs = list(itertools.combinations(range(v), t))
+    n_t = len(t_subs)
+    sub_index = {sub: i for i, sub in enumerate(t_subs)}
     
-    # 1. Generate all k-subsets (blocks)
-    all_blocks = list(itertools.combinations(range(v), k))
-    num_blocks = len(all_blocks)
+    # Generate all k-blocks
+    blocks = list(itertools.combinations(range(v), k))
+    n_blocks = len(blocks)
     
-    # 2. Generate all t-subsets and map to index
-    all_t_subsets = list(itertools.combinations(range(v), t))
-    num_t_subsets = len(all_t_subsets)
-    t_subset_to_idx = {s: i for i, s in enumerate(all_t_subsets)}
-    
-    # 3. Precompute block -> list of t_subset indices
-    block_t_subsets = []
-    for b in all_blocks:
-        subs = []
-        for ts in itertools.combinations(b, t):
-            subs.append(t_subset_to_idx[ts])
-        block_t_subsets.append(subs)
+    # Map each block to the indices of the t-subsets it covers
+    # block_covers[i] is a list of subset indices covered by block i
+    block_covers = []
+    for block in blocks:
+        covers = []
+        for sub in itertools.combinations(block, t):
+            covers.append(sub_index[sub])
+        block_covers.append(np.array(covers, dtype=np.int32))
         
-    # State for greedy
-    is_uncovered = [True] * num_t_subsets
-    num_uncovered = num_t_subsets
+    if not _deadline_ok(deadline):
+        return []
+
+    # Build reverse mapping: for each t-subset, which blocks cover it?
+    # sub_to_blocks[j] is a list of block indices covering subset j
+    sub_to_blocks = [[] for _ in range(n_t)]
+    for i, covers in enumerate(block_covers):
+        for j in covers:
+            sub_to_blocks[j].append(i)
     
-    best_solution = None
-    best_size = float('inf')
+    # Pre-compute a numpy array for subset coverage? 
+    # It's a sparse matrix of size n_t x n_blocks. 
+    # Given n_t=11628 and n_blocks=75582, a dense matrix is 880M entries (too big).
+    # We stick to list of lists for sub_to_blocks and lists of arrays for block_covers.
+
+    # 2. Fast Greedy Initialization
+    # We need a valid solution to start local search.
+    # Greedy: repeatedly pick the block that covers the most uncovered subsets.
     
-    # Run multiple restarts
-    # Since the greedy choice is deterministic if we break ties by index, 
-    # we need randomness to explore different solutions.
-    # We can randomize the order of blocks in the heap or tie-breaking.
+    uncovered_mask = np.ones(n_t, dtype=bool)
+    selected = set()
     
-    for restart in range(50): # Max restarts, will be cut by time
-        if time.time() > deadline:
+    # To speed up greedy, we can't easily vectorize the "gain" calculation without a matrix.
+    # However, n_t is small enough that we can iterate.
+    # Optimization: Pre-compute the size of block_covers? They are all C(k,t).
+    # Actually, the gain depends on how many of its subsets are currently uncovered.
+    
+    # Simple Greedy Loop
+    while np.any(uncovered_mask):
+        if not _deadline_ok(deadline):
             break
             
-        # Reset state
-        is_uncovered = [True] * num_t_subsets
-        num_uncovered = num_t_subsets
+        best_block = -1
+        max_gain = 0
         
-        # Initialize heap
-        # All blocks start with gain = t_subset_count (56)
-        # But we can randomize the initial order or use random tie-breaking.
-        # To make it simple, we just use a standard heap.
-        # To introduce diversity, we can slightly perturb the initial gains?
-        # Or just rely on the fact that different restarts might not help if the greedy is deterministic.
-        # Let's add randomization: shuffle the block IDs in the heap initialization?
-        # No, heap sorts by value.
-        # We can randomize the tie-breaking by adding a small random noise to the gain?
-        # Or just pick a random block among those with max gain.
+        # Iterate through blocks. To speed this up, we can skip blocks that don't cover any uncovered subset.
+        # We can check this by looking at the intersection of block_covers[i] and uncovered indices.
+        # But iterating all n_blocks every step is O(n_blocks * n_t) which is ~ 75k * 11k = 800M ops per step.
+        # Too slow.
         
-        # Let's implement a "Randomized Greedy"
-        # We maintain a list of active blocks.
-        # Instead of a heap which is complex to randomize ties, 
-        # we can just iterate? No, too slow.
+        # Better Greedy Strategy:
+        # 1. Find an uncovered subset.
+        # 2. Pick a random block that covers it, or the one that covers the most other uncovered subsets.
         
-        # Let's stick to Heap but break ties randomly.
-        # Heap item: (-gain, random_id, block_id)
-        # random_id ensures unique ordering for same gain, effectively randomizing tie-breaks.
+        # Let's pick a random uncovered subset to guide the search, or the "most constrained" one.
+        # "Most constrained" = subset with fewest covering blocks.
+        # We can pre-compute the count of blocks for each subset.
+        subset_counts = [len(lst) for lst in sub_to_blocks]
         
-        heap = []
-        for i in range(num_blocks):
-            # Initial gain is 56 for all
-            heapq.heappush(heap, (-56, random.random(), i))
-            
-        solution = []
+        # Find uncovered subset with minimum count
+        # We need to track which subsets are uncovered.
+        # Let's maintain a list of uncovered subsets.
         
-        while num_uncovered > 0:
-            # Pop best
-            neg_gain, _, bid = heapq.heappop(heap)
-            gain = -neg_gain
-            
-            # Verify gain
-            real_gain = 0
-            for ts_idx in block_t_subsets[bid]:
-                if is_uncovered[ts_idx]:
-                    real_gain += 1
-            
-            if real_gain != gain:
-                # Stale entry, push updated
-                if real_gain > 0:
-                    heapq.heappush(heap, (-real_gain, random.random(), bid))
-                continue
-            
-            if real_gain == 0:
-                # Should not happen if num_uncovered > 0 and we didn't discard 0s correctly?
-                # Actually, if all blocks have 0 gain, we are stuck?
-                # No, if num_uncovered > 0, at least one block must cover an uncovered subset.
-                # So some block must have gain > 0.
-                continue
-            
-            # Select this block
-            solution.append(bid)
-            
-            # Update coverage
-            for ts_idx in block_t_subsets[bid]:
-                if is_uncovered[ts_idx]:
-                    is_uncovered[ts_idx] = False
-                    num_uncovered -= 1
-            
-            # Note: We do NOT update other blocks' gains in the heap.
-            # The lazy evaluation in the next iterations will handle it.
-            
-        # Post-optimization: Remove redundant blocks
-        # Convert solution to a set for fast lookup? Or just list.
-        # We need to check if removing a block breaks coverage.
-        # Efficient check:
-        # Count coverage for each t-subset in the current solution.
-        # If any count is 1, the block providing that coverage is critical.
-        # If a block only provides coverage to subsets that have count > 1, it can be removed.
+        # Actually, a simpler greedy for initialization:
+        # Randomly pick an uncovered subset, pick a random block covering it.
+        # This is fast but might yield a large solution.
+        # Then local search fixes it.
         
-        # Let's do a simple removal pass.
-        # This might be slow if done naively O(n^2).
-        # n is ~300. n^2 is 90000. Checks are 56 ops. 5M ops. Fast enough.
+        # Let's do a slightly smarter greedy:
+        # Pick the uncovered subset with the fewest options (min count).
+        # Among blocks covering it, pick the one with highest "potential gain".
         
-        changed = True
-        while changed:
-            changed = False
-            # Iterate through a copy of the solution
-            for i in range(len(solution) - 1, -1, -1):
-                if time.time() > deadline:
-                    break
+        uncovered_indices = np.where(uncovered_mask)[0]
+        if len(uncovered_indices) == 0:
+            break
+            
+        # Find the index in uncovered_indices with min subset_count
+        # subset_counts is a list, so we can map it to numpy
+        # To avoid O(n_t) scan every time, we could maintain a priority queue, but for initialization 
+        # a simple scan is fine if we limit steps or use randomization.
+        
+        # Let's just pick a random uncovered subset to keep it O(1) per step roughly.
+        # This produces a valid cover quickly.
+        target_idx = random.choice(uncovered_indices)
+        
+        candidates = sub_to_blocks[target_idx]
+        if not candidates:
+            break # Should not happen for valid covering designs parameters
+            
+        # Pick the candidate that covers the most other uncovered subsets
+        # We can approximate this or just pick random for speed in init.
+        # Let's pick the one that covers the most uncovered subsets.
+        best_cand = -1
+        max_gain = 0
+        # Limit candidates checked if too many?
+        # Usually sub_to_blocks sizes are manageable.
+        for b in candidates:
+            # Count how many of block_covers[b] are in uncovered_mask
+            # block_covers[b] is a numpy array of indices.
+            # We can use np.isin or boolean indexing.
+            # uncovered_mask is a boolean array of length n_t.
+            gain = np.sum(uncovered_mask[block_covers[b]])
+            if gain > max_gain:
+                max_gain = gain
+                best_cand = b
                 
-                bid = solution[i]
-                # Check if this block is redundant
-                redundant = True
-                for ts_idx in block_t_subsets[bid]:
-                    # Count how many blocks in solution cover ts_idx
-                    # Exclude current block?
-                    # If there is another block covering it, it's not the only one.
-                    # If this is the ONLY block covering ts_idx, it's not redundant.
-                    count = 0
-                    for j in range(len(solution)):
-                        if i == j: continue
-                        # Check if block j covers ts_idx
-                        # This is O(1) if we precomputed a set of t-subsets for each block?
-                        # We have list. Membership is O(56).
-                        # Better: precompute block_to_set
-                        pass # Placeholder for logic
-                    
-                    # This inner loop is too slow.
-                    # Optimization: Precompute `block_to_set` as a set of ts_indices.
-                    # And maintain `coverage_count` array.
-                    
-                # Let's re-implement post-optimization with coverage counts.
-                break # Skip complex post-opt in first pass to ensure correctness, add in final code
-        
-        if len(solution) < best_size:
-            best_size = len(solution)
-            best_solution = [all_blocks[i] for i in solution]
-            
-    if best_solution is None:
-        # Fallback to simple greedy if something went wrong
+        if best_cand != -1:
+            selected.add(best_cand)
+            uncovered_mask[block_covers[best_cand]] = False
+
+    if not selected:
         return []
+
+    # 3. Local Search Optimization
+    # We now have a valid cover. We want to minimize |selected|.
+    
+    # Helper: Get coverage counts for a set of blocks
+    # Instead of rebuilding counts from scratch every time, we update them incrementally.
+    
+    # Initialize counts
+    counts = np.zeros(n_t, dtype=np.int32)
+    for b in selected:
+        counts[block_covers[b]] += 1
+    
+    # Helper: Check if a block is redundant given current counts
+    # A block is redundant if all subsets it covers have count > 1.
+    def is_redundant(b, counts):
+        return np.all(counts[block_covers[b]] > 1)
         
-    return best_solution
+    # Helper: Try to remove a block. If it causes gaps, try to fix.
+    def try_remove_and_fix(b, selected, counts, deadline):
+        """
+        Attempts to remove block b.
+        Returns True if successful (and updates selected/counts), False otherwise.
+        """
+        if not _deadline_ok(deadline):
+            return False
+            
+        # Check if b is redundant
+        if is_redundant(b, counts):
+            selected.remove(b)
+            counts[block_covers[b]] -= 1
+            return True
+            
+        # If not redundant, it covers some subsets with count == 1.
+        # These are the "critical" subsets for b.
+        covers_b = block_covers[b]
+        critical_subsets = covers_b[counts[covers_b] == 1]
+        
+        if len(critical_subsets) == 0:
+            # Should be redundant, but just in case
+            selected.remove(b)
+            counts[covers_b] -= 1
+            return True
+            
+        # We need to find a replacement block b_new such that:
+        # 1. b_new covers all critical_subsets.
+        # 2. b_new is not in selected.
+        # 3. Ideally, b_new covers other subsets that are already covered (so we don't increase "waste" too much), 
+        #    or simply that the swap is valid.
+        
+        # Find candidate blocks that cover ALL critical_subsets.
+        # Intersection of sub_to_blocks[s] for s in critical_subsets.
+        
+        if len(critical_subsets) == 1:
+            candidates = sub_to_blocks[critical_subsets[0]]
+        else:
+            # Find intersection
+            # Start with the subset that has the fewest candidates
+            min_count = float('inf')
+            target = -1
+            for s in critical_subsets:
+                c = len(sub_to_blocks[s])
+                if c < min_count:
+                    min_count = c
+                    target = s
+            
+            candidates = set(sub_to_blocks[target])
+            for s in critical_subsets:
+                if s == target: continue
+                candidates.intersection_update(sub_to_blocks[s])
+                if not candidates:
+                    return False
+            
+            candidates = list(candidates)
+            
+        # Filter candidates: must not be in selected
+        valid_candidates = [c for c in candidates if c not in selected]
+        
+        if not valid_candidates:
+            return False
+            
+        # Evaluate candidates.
+        # Metric: We want to minimize the "cost" of the new block.
+        # A good proxy: Number of subsets covered by b_new that are currently covered exactly once by other blocks?
+        # Or simply: Does b_new cover any subsets that are currently uncovered? (No, because we only removed b, 
+        # and b's critical subsets are the only ones at risk. If b_new covers them, they become covered.
+        # The other subsets covered by b_new were already covered by other blocks in selected, 
+        # so their count increases. This is "safe" but might make them harder to remove later.
+        
+        # Heuristic: Pick the candidate that covers the most subsets that are currently "over-covered" (count > 1)?
+        # Or the one with the smallest "impact"?
+        # Actually, the simplest valid swap is any valid candidate.
+        # To improve, we can look for a candidate that also helps cover other "weakly covered" subsets?
+        # Let's just pick a random valid candidate to allow exploration.
+        # Or pick the one that covers the most subsets with count == 2 (making them count 3, less critical)?
+        
+        # Let's try to pick the candidate that minimizes the number of subsets it covers 
+        # that are currently covered exactly once by blocks OTHER than b.
+        # Wait, if a subset s is covered by b and b_new, and count[s] was 1 (only b), 
+        # after removing b, count[s] becomes 0. Adding b_new makes it 1.
+        # If count[s] was 2 (b and x), removing b makes it 1. Adding b_new makes it 2.
+        
+        # The "critical" subsets are those with count 1. They MUST be covered by b_new.
+        # For non-critical subsets covered by b_new, the count goes from C to C+1.
+        
+        # Let's just pick a random one for speed and diversity.
+        b_new = random.choice(valid_candidates)
+        
+        # Perform swap
+        selected.remove(b)
+        counts[covers_b] -= 1
+        selected.add(b_new)
+        counts[block_covers[b_new]] += 1
+        
+        return True
+
+    # Main Local Search Loop
+    # We iterate, trying to remove random blocks.
+    # If removal fails (block is critical), we try to fix it with a swap.
+    # If swap succeeds, we continue. If it fails, we leave the block.
+    
+    # To avoid getting stuck, we can use a "temperature" or just random restarts of the local search phase.
+    
+    best_size = len(selected)
+    best_selected = set(selected)
+    best_counts = counts.copy()
+    
+    # We run local search for a fixed amount of time or iterations.
+    # Since we have a deadline, we loop until deadline.
+    
+    # Optimization: Keep a list of blocks in selected for fast random access
+    selected_list = list(selected)
+    
+    # We'll use a counter to track consecutive failures to detect stagnation
+    # and potentially restart or change strategy.
+    
+    while _deadline_ok(deadline):
+        if not selected_list:
+            break
+            
+        # Pick a random block to try to remove
+        idx = random.randint(0, len(selected_list) - 1)
+        b = selected_list[idx]
+        
+        success = try_remove_and_fix(b, selected, counts, deadline)
+        
+        if success:
+            # Update the list representation
+            # Since we modified 'selected' (set), we need to sync 'selected_list'
+            # try_remove_and_fix might have removed b and added b_new, or just removed b.
+            # Rebuilding the list is O(N), which is okay if N is small (~300-400).
+            selected_list = list(selected)
+            
+            if len(selected) < best_size:
+                best_size = len(selected)
+                best_selected = set(selected)
+                best_counts = counts.copy()
+                
+    # Final Result
+    # Ensure we return the best found
+    if len(best_selected) < len(selected):
+        selected = best_selected
+        
+    # Convert to list of lists
+    result = [list(blocks[i]) for i in selected]
+    return result

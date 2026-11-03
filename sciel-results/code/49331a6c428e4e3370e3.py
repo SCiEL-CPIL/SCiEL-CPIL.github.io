@@ -1,0 +1,301 @@
+import math
+import time
+import random
+import numpy as np
+from itertools import combinations
+
+def score_of(U):
+    if not U:
+        return 0.0
+    U_sorted = sorted(set(U))
+    max_u = max(U_sorted)
+    if max_u == 0:
+        return 0.0
+    sums = set()
+    diffs = set()
+    for a in U_sorted:
+        for b in U_sorted:
+            sums.add(a + b)
+            diffs.add(a - b)
+    num_sums = len(sums)
+    num_diffs = len(diffs)
+    if num_sums == 0:
+        return 0.0
+    ratio = num_diffs / num_sums
+    denom = math.log(2 * max_u + 1)
+    if denom == 0:
+        return 0.0
+    return 1 + math.log(ratio) / denom
+
+def _score_set_fast(U):
+    """Compute score using numpy for speed."""
+    U_arr = np.array(sorted(set(U)))
+    n = len(U_arr)
+    if n == 0:
+        return 0.0
+    max_u = np.max(U_arr)
+    if max_u == 0:
+        return 1.0
+    
+    sums = np.add.outer(U_arr, U_arr)
+    diffs = np.subtract.outer(U_arr, U_arr)
+    
+    unique_sums = np.unique(sums)
+    unique_diffs = np.unique(diffs)
+    
+    len_sums = len(unique_sums)
+    len_diffs = len(unique_diffs)
+    
+    if len_sums == 0:
+        return 0.0
+        
+    ratio = len_diffs / len_sums
+    if ratio <= 0:
+        return 0.0
+        
+    log_ratio = np.log(ratio)
+    log_denom = np.log(2 * max_u + 1)
+    
+    if log_denom == 0:
+        return 1.0
+        
+    return 1.0 + log_ratio / log_denom
+
+def _exhaustive_search(deadline):
+    """Exhaustive search for small sets to find good local minima."""
+    best_U = [0, 1, 3]
+    best_score = _score_set_fast(best_U)
+    
+    # Search for sets of size 3 to 7 with max value up to ~40
+    # This explores the discrete landscape more thoroughly than fixed seeds
+    for n in range(3, 8):
+        # Adjust max_val based on n to control combinatorics
+        if n <= 4:
+            max_val = 50
+        elif n == 5:
+            max_val = 40
+        elif n == 6:
+            max_val = 35
+        else:
+            max_val = 30
+            
+        for combo in combinations(range(1, max_val + 1), n - 1):
+            if time.time() > deadline:
+                return best_U, best_score
+            U = [0] + list(combo)
+            s = _score_set_fast(U)
+            if s > best_score:
+                best_score = s
+                best_U = U[:]
+                
+    return best_U, best_score
+
+def _local_search(U, deadline, max_iters=500):
+    """Steepest Descent Local Search with random restarts/perturbations."""
+    U = sorted(set(U))
+    best_score = _score_set_fast(U)
+    best_U = U[:]
+    max_u = max(U)
+    
+    for it in range(max_iters):
+        if time.time() > deadline:
+            break
+            
+        best_neighbor_score = best_score
+        best_neighbor_U = best_U[:]
+        found_improvement = False
+        
+        # 1. Try moving elements
+        for i in range(len(U)):
+            if U[i] == 0: continue
+            old_val = U[i]
+            # Search range: 1 to max_u + 10
+            for new_val in range(1, max_u + 11):
+                if new_val == old_val: continue
+                new_U = U[:]
+                new_U[i] = new_val
+                if len(set(new_U)) != len(new_U): continue
+                s = _score_set_fast(new_U)
+                if s > best_neighbor_score + 1e-10:
+                    best_neighbor_score = s
+                    best_neighbor_U = new_U[:]
+                    found_improvement = True
+                    
+        # 2. Try adding elements
+        for new_val in range(1, max_u + 11):
+            if new_val in U: continue
+            new_U = U[:] + [new_val]
+            new_U.sort()
+            s = _score_set_fast(new_U)
+            if s > best_neighbor_score + 1e-10:
+                best_neighbor_score = s
+                best_neighbor_U = new_U[:]
+                found_improvement = True
+                
+        # 3. Try removing elements (if size > 3)
+        if len(U) > 3:
+            for i in range(1, len(U)):
+                new_U = U[:i] + U[i+1:]
+                s = _score_set_fast(new_U)
+                if s > best_neighbor_score + 1e-10:
+                    best_neighbor_score = s
+                    best_neighbor_U = new_U[:]
+                    found_improvement = True
+                    
+        if best_neighbor_score > best_score + 1e-10:
+            best_score = best_neighbor_score
+            best_U = best_neighbor_U
+            max_u = max(best_U)
+        else:
+            # Stuck. Try a random perturbation to escape local optimum
+            if len(best_U) > 3:
+                idx = random.randint(1, len(best_U) - 1)
+                old_val = best_U[idx]
+                new_val = random.randint(1, max_u + 10)
+                if new_val not in best_U:
+                    perturbed = best_U[:]
+                    perturbed[idx] = new_val
+                    perturbed.sort()
+                    perturbed = list(set(perturbed))
+                    if 0 in perturbed:
+                        s = _score_set_fast(perturbed)
+                        if s > best_score:
+                            best_score = s
+                            best_U = perturbed
+                            max_u = max(best_U)
+            else:
+                break # No perturbation possible or no improvement, stop
+                
+    return best_U, best_score
+
+def _get_heuristic_seeds():
+    """Provide known good structures (Golomb rulers, etc.) as seeds."""
+    seeds = []
+    # Golomb rulers
+    seeds.append([0, 1, 3])
+    seeds.append([0, 1, 4, 6])
+    seeds.append([0, 1, 4, 10, 12])
+    seeds.append([0, 1, 4, 10, 12, 17])
+    seeds.append([0, 1, 4, 10, 18, 23, 29])
+    # Other candidates
+    seeds.append([0, 1, 4, 9, 11])
+    seeds.append([0, 1, 4, 10, 12, 17, 25])
+    return seeds
+
+def _spectral_gap_seed(n_points, max_val, bandwidth=None):
+    """
+    Generate a set using spectral gap construction.
+    
+    Selects positions with maximal magnitude in the inverse Fourier transform
+    of a band-limited signal, which minimizes autocorrelation sidelobes.
+    
+    Args:
+        n_points: Number of points to select
+        max_val: Maximum value in the range
+        bandwidth: Bandwidth parameter (if None, auto-tuned)
+    
+    Returns:
+        Sorted list of nonnegative integers containing 0
+    """
+    if bandwidth is None:
+        # Auto-tune bandwidth based on n_points and max_val
+        bandwidth = max(0.5, 2 * math.pi * n_points / max_val)
+    
+    # Create frequency domain signal
+    freqs = np.arange(0, max_val + 1)
+    
+    # Band-limited signal: raised cosine window in frequency domain
+    if bandwidth > 0:
+        mask = (freqs <= bandwidth) | (freqs >= (max_val - bandwidth))
+        # Use raised cosine for smoother transition
+        freqs_normalized = freqs / max_val
+        window = np.where(
+            freqs_normalized <= bandwidth / max_val,
+            0.5 * (1 + np.cos(np.pi * freqs_normalized / (bandwidth / max_val))),
+            0.0
+        )
+        # Also mirror to negative frequencies
+        window_mirror = np.where(
+            freqs_normalized >= 1 - bandwidth / max_val,
+            0.5 * (1 + np.cos(np.pi * (1 - freqs_normalized) / (bandwidth / max_val))),
+            0.0
+        )
+        spectrum = window + window_mirror
+    else:
+        spectrum = np.ones(max_val + 1)
+    
+    # Inverse Fourier transform to get time domain signal
+    time_signal = np.real(np.fft.ifft(spectrum))
+    
+    # Select positions with maximal magnitude (excluding position 0 which we'll add)
+    magnitudes = np.abs(time_signal)
+    
+    # Get top n_points-1 positions (excluding 0)
+    indices = np.argsort(magnitudes)[::-1]
+    selected = sorted([idx for idx in indices[:n_points - 1] if idx > 0])
+    
+    # Ensure 0 is included
+    U = [0] + selected
+    
+    # Remove duplicates and sort
+    U = sorted(set(U))
+    
+    return U
+
+def construct():
+    start_time = time.time()
+    # Safety margin: 150s limit, keep 5s buffer
+    deadline = start_time + 145
+    
+    # 1. Exhaustive search to find a strong starting point
+    best_U, best_score = _exhaustive_search(deadline)
+    
+    # 2. Local search from best exhaustive result
+    if time.time() < deadline:
+        best_U, best_score = _local_search(best_U, deadline)
+        
+    # 3. Local search from heuristic seeds
+    seeds = _get_heuristic_seeds()
+    for seed in seeds:
+        if time.time() > deadline - 5:
+            break
+        U_opt, s_opt = _local_search(seed, deadline, max_iters=500)
+        if s_opt > best_score:
+            best_score = s_opt
+            best_U = U_opt
+    
+    # 4. Spectral gap construction: try multiple bandwidth parameters
+    for n_points in range(4, 10):
+        if time.time() > deadline - 10:
+            break
+        # Try different bandwidth parameters
+        for bw_factor in [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]:
+            if time.time() > deadline - 5:
+                break
+            max_val = int(n_points * 10)  # Scale max_val with n_points
+            bandwidth = bw_factor * 2 * math.pi * n_points / max_val
+            U_spectral = _spectral_gap_seed(n_points, max_val, bandwidth)
+            
+            # Local search from spectral seed
+            U_opt, s_opt = _local_search(U_spectral, deadline, max_iters=300)
+            if s_opt > best_score:
+                best_score = s_opt
+                best_U = U_opt
+
+    # 5. Multiple restarts with random initializations
+    for _ in range(3): # Reduced to 3 to leave time for spectral construction
+        if time.time() > deadline - 2:
+            break
+        # Generate a random set
+        n = random.randint(3, 8)
+        max_val = random.randint(10, 40)
+        U_rand = [0] + random.sample(range(1, max_val + 1), n - 1)
+        U_rand.sort()
+        
+        # Local search from random start
+        U_opt, s_opt = _local_search(U_rand, deadline, max_iters=150)
+        if s_opt > best_score:
+            best_score = s_opt
+            best_U = U_opt
+            
+    return sorted(set(best_U))

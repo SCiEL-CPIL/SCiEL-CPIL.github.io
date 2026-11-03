@@ -1,0 +1,119 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+DIMENSIONS = [6, 6, 6]
+
+# EVOLVE-BLOCK-START
+import time
+import numpy as np
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140.0  # 10s safety margin
+    
+    n, m, p = DIMENSIONS
+    # Block decomposition with block size 2
+    block_size = 2
+    n_blocks = n // block_size  # 3
+    
+    # Total rank is n_blocks^3 * 7 (Strassen for 2x2)
+    rank = n_blocks**3 * 7  # 189
+    
+    U = np.zeros((n * m, rank), dtype=int)
+    V = np.zeros((m * p, rank), dtype=int)
+    W = np.zeros((p * n, rank), dtype=int)
+    
+    col = 0
+    
+    # Helper to get index in U for block (ib, kb) and local (r, c)
+    # U index: i*m + j where i = ib*bs + r, j = kb*bs + c
+    def u_idx(ib, kb, r, c):
+        return (ib * block_size + r) * m + (kb * block_size + c)
+        
+    # Helper to get index in V for block (kb, jb) and local (r, c)
+    # V index: j*p + k where j = kb*bs + r, k = jb*bs + c
+    def v_idx(kb, jb, r, c):
+        return (kb * block_size + r) * p + (jb * block_size + c)
+        
+    # Helper to get index in W for block (ib, jb) and local (r, c)
+    # W index: k*n + i where k = jb*bs + c, i = ib*bs + r
+    def w_idx(ib, jb, r, c):
+        return (jb * block_size + c) * n + (ib * block_size + r)
+    
+    # Strassen definitions for 2x2 block matrices:
+    # M1 = (X00 + X11)(Y00 + Y11)
+    # M2 = (X10 + X11)Y00
+    # M3 = X00(Y01 - Y11)
+    # M4 = X11(Y10 - Y00)
+    # M5 = (X00 + X01)Y11
+    # M6 = (X10 - X00)(Y00 + Y01)
+    # M7 = (X01 - X11)(Y10 + Y11)
+    #
+    # Z00 = M1 + M4 - M5 + M7
+    # Z01 = M3 + M5
+    # Z10 = M2 + M4
+    # Z11 = M1 - M2 + M3 + M6
+    
+    for ib in range(n_blocks):
+        for jb in range(n_blocks):
+            for kb in range(n_blocks):
+                # M1 = (X00 + X11)(Y00 + Y11)
+                U[u_idx(ib, kb, 0, 0), col] += 1
+                U[u_idx(ib, kb, 1, 1), col] += 1
+                V[v_idx(kb, jb, 0, 0), col] += 1
+                V[v_idx(kb, jb, 1, 1), col] += 1
+                W[w_idx(ib, jb, 0, 0), col] += 1
+                W[w_idx(ib, jb, 1, 1), col] += 1
+                col += 1
+                
+                # M2 = (X10 + X11)Y00
+                U[u_idx(ib, kb, 1, 0), col] += 1
+                U[u_idx(ib, kb, 1, 1), col] += 1
+                V[v_idx(kb, jb, 0, 0), col] += 1
+                W[w_idx(ib, jb, 1, 0), col] += 1
+                W[w_idx(ib, jb, 1, 1), col] -= 1
+                col += 1
+                
+                # M3 = X00(Y01 - Y11)
+                U[u_idx(ib, kb, 0, 0), col] += 1
+                V[v_idx(kb, jb, 0, 1), col] += 1
+                V[v_idx(kb, jb, 1, 1), col] -= 1
+                W[w_idx(ib, jb, 0, 1), col] += 1
+                W[w_idx(ib, jb, 1, 1), col] += 1
+                col += 1
+                
+                # M4 = X11(Y10 - Y00)
+                U[u_idx(ib, kb, 1, 1), col] += 1
+                V[v_idx(kb, jb, 1, 0), col] += 1
+                V[v_idx(kb, jb, 0, 0), col] -= 1
+                W[w_idx(ib, jb, 0, 0), col] += 1
+                W[w_idx(ib, jb, 1, 0), col] += 1
+                col += 1
+                
+                # M5 = (X00 + X01)Y11
+                U[u_idx(ib, kb, 0, 0), col] += 1
+                U[u_idx(ib, kb, 0, 1), col] += 1
+                V[v_idx(kb, jb, 1, 1), col] += 1
+                W[w_idx(ib, jb, 0, 0), col] -= 1
+                W[w_idx(ib, jb, 0, 1), col] += 1
+                col += 1
+                
+                # M6 = (X10 - X00)(Y00 + Y01)
+                U[u_idx(ib, kb, 1, 0), col] += 1
+                U[u_idx(ib, kb, 0, 0), col] -= 1
+                V[v_idx(kb, jb, 0, 0), col] += 1
+                V[v_idx(kb, jb, 0, 1), col] += 1
+                W[w_idx(ib, jb, 1, 1), col] += 1
+                col += 1
+                
+                # M7 = (X01 - X11)(Y10 + Y11)
+                U[u_idx(ib, kb, 0, 1), col] += 1
+                U[u_idx(ib, kb, 1, 1), col] -= 1
+                V[v_idx(kb, jb, 1, 0), col] += 1
+                V[v_idx(kb, jb, 1, 1), col] += 1
+                W[w_idx(ib, jb, 0, 0), col] += 1
+                col += 1
+    
+    if time.time() > deadline:
+        pass
+        
+    return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}
+# EVOLVE-BLOCK-END

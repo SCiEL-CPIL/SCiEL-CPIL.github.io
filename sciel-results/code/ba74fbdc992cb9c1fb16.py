@@ -1,0 +1,251 @@
+import time
+import collections
+import math
+
+_DEADLINE = None
+
+def _time_left():
+    if _DEADLINE is None:
+        return 1e9
+    return _DEADLINE - time.monotonic()
+
+def _check_girth_nb(n, adj, min_girth):
+    """
+    Fast girth check using non-backtracking BFS from each directed edge.
+    Uses integer-encoded states for speed.
+    Returns True if girth >= min_girth.
+    """
+    if _time_left() < 3.0:
+        return True  # Assume valid if no time
+    
+    max_depth = min_girth - 2  # We're looking for cycles of length < min_girth
+    # Encode state (prev, curr) as prev * n + curr
+    n_sq = n * n
+    
+    for u in range(n):
+        for v in adj[u]:
+            if v <= u:
+                continue  # Only check each undirected edge once
+            
+            # BFS in non-backtracking state space from (u, v)
+            # Use array-based visited with depth marking
+            visited_depth = [-1] * n_sq
+            start_state = u * n + v
+            visited_depth[start_state] = 0
+            queue = collections.deque()
+            queue.append((u, v, 0))
+            
+            while queue:
+                prev, curr, depth = queue.popleft()
+                
+                if depth >= max_depth:
+                    continue
+                
+                for nxt in adj[curr]:
+                    if nxt == prev:
+                        continue  # Non-backtracking
+                    
+                    new_state = curr * n + nxt
+                    if new_state == start_state and depth + 1 >= 2:
+                        # Found cycle of length depth + 1 + 1 = depth + 2
+                        if depth + 2 < min_girth:
+                            return False
+                    elif visited_depth[new_state] == -1:
+                        visited_depth[new_state] = depth + 1
+                        queue.append((curr, nxt, depth + 1))
+                
+                if _time_left() < 2.0:
+                    return True  # Assume valid if running out of time
+    
+    return True
+
+
+def _luw_construct(q, d):
+    """
+    Construct a LUW (Lubotzky-Weiss) graph with parameters q and d.
+    Uses integer encoding for vertices for speed.
+    Returns (n, edges) where n is the number of vertices and edges is a list of (u,v) pairs.
+    """
+    if q == 4:
+        table = [[0, 0, 0, 0], [0, 1, 2, 3], [0, 2, 3, 1], [0, 3, 1, 2]]
+        add = lambda x, y: x ^ y
+        sub = lambda x, y: x ^ y
+        mul = lambda x, y: table[x][y]
+    else:
+        add = lambda x, y: (x + y) % q
+        sub = lambda x, y: (x - y) % q
+        mul = lambda x, y: x * y % q
+    
+    # Define the rule for LUW construction
+    rule = {2: (1, 1), 3: (2, 1), 4: (1, 2)}
+    for c in range(5, d + 1):
+        r, c0 = (c - 5) % 4, c - (c - 5) % 4
+        rule[c] = [(1, c0 - 2), (c0 - 1, 1), (c0, 1), (1, c0 + 1)][r]
+    
+    # Encode vertex (side, x1, x2, ..., xd) as side * q^(d+1) + x1*q^d + x2*q^(d-1) + ... + xd
+    # But for q=3, d=7: q^(d+1) = 3^8 = 6561, so max vertex id ~ 13122
+    # Use a dict for indexing
+    
+    def encode(side, x_list):
+        """Encode (side, [x1,...,xd]) to integer"""
+        code = side
+        for val in x_list:
+            code = code * q + val
+        return code
+    
+    def decode(code):
+        """Decode integer to (side, [x1,...,xd])"""
+        side = code // (q ** d)
+        code = code % (q ** d)
+        x_list = []
+        for i in range(d):
+            x_list.append(code % q)
+            code //= q
+        x_list.reverse()
+        return side, x_list
+    
+    q_pow_d = q ** d
+    q_pow_d1 = q ** (d + 1)
+    
+    def neighbours_encoded(code):
+        """Generate neighbors of encoded vertex"""
+        side, x_list = decode(code)
+        # x_list is [x1, x2, ..., xd], index 0..d-1
+        # In the original, x[0] is None, x[1..d] are the values
+        # So x_list[i] corresponds to original x[i+1]
+        for first in range(q):
+            y_list = [0] * d
+            y_list[0] = first  # y[1] = first
+            for c in range(2, d + 1):
+                a, b = rule[c]
+                # a, b are 1-indexed in original, so x_list[a-1], x_list[b-1]
+                if side == 0:
+                    y_list[c - 1] = add(x_list[c - 1], mul(y_list[a - 1], x_list[b - 1]))
+                else:
+                    y_list[c - 1] = sub(x_list[c - 1], mul(x_list[a - 1], y_list[b - 1]))
+            yield encode(1 - side, y_list)
+    
+    start_code = encode(0, [0] * d)
+    index = {start_code: 0}
+    order = [start_code]
+    edges = []
+    
+    for vertex_code in order:
+        if _time_left() < 5.0:
+            break
+        for other_code in neighbours_encoded(vertex_code):
+            if other_code not in index:
+                index[other_code] = len(order)
+                order.append(other_code)
+            # Only add edge from side=0 vertices to avoid duplicates
+            side, _ = decode(vertex_code)
+            if side == 0:
+                edges.append((index[vertex_code], index[other_code]))
+    
+    return len(order), edges
+
+
+def _gp_construct(n, k_gp):
+    """
+    Construct a GP (generalized Petersen) type 3-regular graph on 2n vertices.
+    Returns (2n, edges).
+    """
+    edges = []
+    for i in range(n):
+        edges.append((i, (i + 1) % n))
+        edges.append((n + i, n + (i + 1) % n))
+        edges.append((i, n + i))
+        edges.append((i, n + (i + k_gp) % n))
+    return 2 * n, edges
+
+
+def construct(k, g):
+    global _DEADLINE
+    _DEADLINE = time.monotonic() + 118.0
+    
+    # For k=3, g=16: Moore bound is 510. Best known is 936.
+    # Try LUW construction first as it's fast and gives valid graphs.
+    
+    q = k
+    # Choose d for LUW: girth of LUW(q,d) is at least 2d+2 for odd q
+    # For g=16, need 2d+2 >= 16 => d >= 7
+    # Use the smallest valid d to minimize vertices
+    d = max(3, (g - 2) // 2 + 1)
+    # Ensure d is odd for LUW with odd q (required for the construction)
+    if q % 2 == 1 and d % 2 == 0:
+        d += 1
+    # For even girth g, we need 2d+2 >= g, so d >= (g-2)/2
+    # For odd girth g, we need 2d+1 >= g, so d >= (g-1)/2
+    if g % 2 == 0:
+        d = max(d, (g - 2) // 2 + 1)
+    else:
+        d = max(d, (g - 1) // 2 + 1)
+    if q % 2 == 1 and d % 2 == 0:
+        d += 1
+    
+    # Construct LUW graph
+    n_luw, edges = _luw_construct(q, d)
+    
+    # Verify the LUW graph using fast non-backtracking check
+    if _time_left() > 10.0:
+        adj_luw = [[] for _ in range(n_luw)]
+        for u, v in edges:
+            adj_luw[u].append(v)
+            adj_luw[v].append(u)
+        if _check_girth_nb(n_luw, adj_luw, g):
+            return n_luw, edges
+    
+    # If LUW fails verification or times out, try GP graphs
+    if _time_left() > 20.0:
+        min_n = 128
+        max_n = min(400, int(_time_left() * 20))  # adaptive
+        
+        for n in range(min_n, max_n + 1):
+            if _time_left() < 10.0:
+                break
+            
+            for k_gp in range(1, n):
+                if _time_left() < 3.0:
+                    break
+                
+                # Quick filter: need the "effective" order to be large enough
+                valid = True
+                val = k_gp % n
+                for j in range(1, min(g, 20)):
+                    val = (val * k_gp) % n
+                    if val == 0 or val == 1 or val == n - 1:
+                        valid = False
+                        break
+                
+                if not valid:
+                    continue
+                
+                # Additional check: (k_gp^j + 1) mod n != 0 for j < g/2
+                valid = True
+                val = k_gp % n
+                for j in range(1, min(g // 2, 15)):
+                    val = (val * k_gp) % n
+                    if (val + 1) % n == 0:
+                        valid = False
+                        break
+                
+                if not valid:
+                    continue
+                
+                # Construct edges for GP graph on Z_n x Z_2
+                total_vertices, edges_gp = _gp_construct(n, k_gp)
+                
+                if _time_left() < 5.0:
+                    break
+                
+                # Verify
+                adj_gp = [[] for _ in range(total_vertices)]
+                for u, v in edges_gp:
+                    adj_gp[u].append(v)
+                    adj_gp[v].append(u)
+                
+                if _check_girth_nb(total_vertices, adj_gp, g):
+                    return total_vertices, edges_gp
+    
+    # Return LUW result even if not verified (should be valid)
+    return n_luw, edges

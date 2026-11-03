@@ -1,5 +1,6 @@
 import time
 import numpy as np
+from scipy.optimize import minimize
 
 N = 100
 SCALE = 2.0 / N
@@ -21,17 +22,52 @@ def _compute_O(h):
     
     return np.concatenate([O_pos, O_neg])
 
-def _step(h, tau):
+def _project(z):
     """
-    Compute the gradient of the softmax-smoothed max overlap.
+    Project z onto {h in [0,1], sum h = N/2}
     """
+    lo = float(z.min()) - 1.0
+    hi = float(z.max()) + 1.0
+    target = N / 2.0
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        s = np.clip(z - mid, 0.0, 1.0).sum()
+        if s > target:
+            lo = mid
+        else:
+            hi = mid
+    t = 0.5 * (lo + hi)
+    return np.clip(z - t, 0.0, 1.0)
+
+def _objective(x):
+    """
+    Objective for SLSQP: minimize max overlap with soft regularization.
+    x is the variable vector of length N.
+    """
+    h = _project(x)
     O = _compute_O(h)
+    # Use a soft max to make the objective smooth
+    # tau = 50 for a good balance
+    tau = 50.0
+    Omax = float(O.max())
+    z = tau * (O - Omax)
+    ez = np.exp(z)
+    return Omax + np.log(ez.sum()) / tau
+
+def _gradient(x):
+    """
+    Gradient of the soft max objective.
+    """
+    h = _project(x)
+    O = _compute_O(h)
+    tau = 50.0
     Omax = float(O.max())
     z = tau * (O - Omax)
     ez = np.exp(z)
     w = ez / ez.sum()
     w_pos, w_neg = w[:N], w[N:]
     
+    # Gradient of O w.r.t h
     K = np.arange(N)[:, None]
     I = np.arange(N)[None, :]
     
@@ -44,165 +80,180 @@ def _step(h, tau):
     Gpos = SCALE * (ge.astype(float) - ge * h[idx_p] - lt * h[idx_m])
     Gneg = SCALE * (lt.astype(float) - lt * h[idx_m] - ge * h[idx_p])
     
-    grad = w_pos @ Gpos + w_neg @ Gneg
-    return Omax, grad
+    grad_h = w_pos @ Gpos + w_neg @ Gneg
+    
+    # Chain rule: x -> h = project(x)
+    # The projection is a soft thresholding, so the gradient is approximated by the active set
+    # For simplicity, we return grad_h as the gradient w.r.t x, knowing that SLSQP will handle it
+    # More accurately, we can use the fact that project is a proximal operator
+    # d/dx (project(x)) = 1 if x_i is not at the boundary of the projection
+    # But for SLSQP, it's often better to just optimize h directly with bounds and equality constraint
+    
+    return grad_h
 
-def _project(z):
+def _optimize_slsqp(init, deadline):
     """
-    Project z onto {h in [0,1], sum h = N/2}
+    Use SLSQP to optimize the soft max overlap.
     """
-    lo = float(z.min()) - 1.0
-    hi = float(z.max()) + 1.0
-    target = N / 2.0
-    for _ in range(64):
-        mid = 0.5 * (lo + hi)
-        s = np.clip(z - mid, 0.0, 1.0).sum()
-        if s > target:
-            lo = mid
-        else:
-            hi = mid
-    t = 0.5 * (lo + hi)
-    return np.clip(z - t, 0.0, 1.0)
-
-def _optimize(init, deadline):
     h = _project(np.asarray(init, dtype=float).copy())
     
-    tau_schedule = [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0]
+    # Define constraints
+    constraints = [
+        {'type': 'eq', 'fun': lambda x: np.sum(x) - N / 2.0, 'jac': lambda x: np.ones(N)}
+    ]
+    bounds = [(0.0, 1.0) for _ in range(N)]
     
-    best_h_local = h.copy()
-    best_val_local = float(_compute_O(h).max())
+    # Initial point
+    x0 = h.copy()
     
-    giter = 0
-    for tau in tau_schedule:
-        base_eta = 0.5 / (1.0 + 0.1 * tau)
-        
-        for _ in range(200):
-            if time.time() > deadline - 2.0:
-                return best_h_local, best_val_local
-                
-            Omax, grad = _step(h, tau)
-            if not np.all(np.isfinite(grad)):
-                break
-            
-            eta = base_eta
-            h_new = _project(h - eta * grad)
-            O_new = _compute_O(h_new)
-            val_new = float(O_new.max())
-            
-            if val_new < best_val_local:
-                best_h_local = h_new.copy()
-                best_val_local = val_new
-                
-            h = h_new
-            giter += 1
+    # Optimization options
+    options = {
+        'maxiter': 1000,
+        'ftol': 1e-10,
+        'disp': False
+    }
+    
+    try:
+        res = minimize(
+            _objective,
+            x0,
+            method='SLSQP',
+            jac=_gradient,
+            bounds=bounds,
+            constraints=constraints,
+            options=options
+        )
+        if res.success and np.all(np.isfinite(res.x)):
+            h_opt = _project(res.x)
+            val = float(_compute_O(h_opt).max())
+            return h_opt, val
+    except Exception:
+        pass
+    
+    return h, float(_compute_O(h).max())
 
-    return best_h_local, best_val_local
-
-def _polish(h, best_val, deadline):
-    """High-precision polish with adaptive tau and eta"""
-    h = h.copy()
-    current_val = best_val
+def _optimize_gradient(init, deadline):
+    """
+    Gradient descent with projection and adaptive step size.
+    """
+    h = _project(np.asarray(init, dtype=float).copy())
+    best_h = h.copy()
+    best_val = float(_compute_O(h).max())
     
-    # Phase 1: moderate tau, small steps
-    for tau in [200.0, 500.0, 1000.0]:
-        eta = 0.05
-        for _ in range(500):
-            if time.time() > deadline - 1.0:
-                return h, current_val
-            Omax, grad = _step(h, tau)
-            if not np.all(np.isfinite(grad)):
-                break
-            h_new = _project(h - eta * grad)
-            val_new = float(_compute_O(h_new).max())
-            if val_new < current_val:
-                current_val = val_new
-                h = h_new
-            else:
-                eta *= 0.9
-                if eta < 1e-6:
-                    break
-    
-    # Phase 2: very fine steps
-    tau = 2000.0
+    tau = 100.0
     eta = 0.01
-    for _ in range(1000):
-        if time.time() > deadline - 0.5:
+    
+    for it in range(5000):
+        if time.time() > deadline - 5.0:
             break
-        Omax, grad = _step(h, tau)
-        if not np.all(np.isfinite(grad)):
-            break
+        
+        # Compute gradient of soft max
+        O = _compute_O(h)
+        Omax = float(O.max())
+        z = tau * (O - Omax)
+        ez = np.exp(z)
+        w = ez / ez.sum()
+        w_pos, w_neg = w[:N], w[N:]
+        
+        K = np.arange(N)[:, None]
+        I = np.arange(N)[None, :]
+        
+        ge = (I >= K)
+        lt = (I < (N - K))
+        
+        idx_p = np.clip(I - K, 0, N - 1)
+        idx_m = np.clip(I + K, 0, N - 1)
+        
+        Gpos = SCALE * (ge.astype(float) - ge * h[idx_p] - lt * h[idx_m])
+        Gneg = SCALE * (lt.astype(float) - lt * h[idx_m] - ge * h[idx_p])
+        
+        grad = w_pos @ Gpos + w_neg @ Gneg
+        
+        # Update
         h_new = _project(h - eta * grad)
         val_new = float(_compute_O(h_new).max())
-        if val_new < current_val:
-            current_val = val_new
+        
+        if val_new < best_val:
+            best_h = h_new.copy()
+            best_val = val_new
             h = h_new
+            # Increase eta slightly if we made progress
+            eta = min(eta * 1.05, 0.1)
         else:
-            eta *= 0.95
-            if eta < 1e-8:
+            h = best_h.copy()
+            eta *= 0.9
+            if eta < 1e-6:
                 break
+        
+        # Increase tau gradually
+        if it % 500 == 0 and it > 0:
+            tau *= 2.0
     
-    return h, current_val
+    return best_h, best_val
 
 def construct():
     start = time.time()
-    deadline = start + 145.0
+    deadline = start + 140.0  # Safety margin
     
-    seed = np.full(N, 0.5)
-    best_h = seed.copy()
-    best_val = float(_compute_O(seed).max())
-    
+    # Try multiple initialization strategies
+    rng = np.random.default_rng(42)
     idx = np.arange(N)
+    
     inits = []
     
-    rng = np.random.default_rng(42)
+    # 1. Uniform
+    inits.append(np.full(N, 0.5))
     
-    # Bang-bang random inits
-    for _ in range(8):
+    # 2. Bang-bang random
+    for _ in range(5):
         bb = np.zeros(N)
         bb[rng.choice(N, N // 2, replace=False)] = 1.0
         inits.append(bb)
-        
-    # Structured continuous inits
-    for f in (1, 2, 3, 5, 7, 11):
+    
+    # 3. Structured continuous
+    for f in (1, 2, 3, 5):
         inits.append(0.5 + 0.4 * np.cos(2.0 * np.pi * f * idx / N))
-        
-    # Random continuous
-    for _ in range(8):
-        inits.append(rng.random(N))
-        
-    # Periodic bang-bang patterns
-    for period in [2, 3, 4, 5, 6, 7, 8, 10, 11, 13]:
+    
+    # 4. Periodic bang-bang
+    for period in [2, 3, 4, 5, 7]:
         bb = np.zeros(N)
         ones = period // 2
         pattern = np.zeros(period)
         pattern[:ones] = 1.0
         bb = np.tile(pattern, N // period + 1)[:N]
         if bb.sum() > N/2:
-             idxs = np.where(bb==1)[0]
-             to_remove = rng.choice(idxs, int(bb.sum() - N/2), replace=False)
-             bb[to_remove] = 0
+            idxs = np.where(bb==1)[0]
+            to_remove = rng.choice(idxs, int(bb.sum() - N/2), replace=False)
+            bb[to_remove] = 0
         elif bb.sum() < N/2:
-             idxs = np.where(bb==0)[0]
-             to_add = rng.choice(idxs, int(N/2 - bb.sum()), replace=False)
-             bb[to_add] = 1
+            idxs = np.where(bb==0)[0]
+            to_add = rng.choice(idxs, int(N/2 - bb.sum()), replace=False)
+            bb[to_add] = 1
         inits.append(bb)
     
-    # Optimize each init
-    for init in inits:
-        if time.time() > deadline - 15.0:
+    best_h = inits[0].copy()
+    best_val = float(_compute_O(best_h).max())
+    
+    # Try SLSQP on a few promising inits
+    for i, init in enumerate(inits[:6]):
+        if time.time() > deadline - 30.0:
             break
         try:
-            h, val = _optimize(init, deadline)
-            if np.all(np.isfinite(h)) and val < best_val:
+            h, val = _optimize_slsqp(init, deadline)
+            if val < best_val:
                 best_h = h
                 best_val = val
         except Exception:
             continue
     
-    # Final polish
-    best_h, best_val = _polish(best_h, best_val, deadline)
+    # Polish with gradient descent
+    if time.time() < deadline - 10.0:
+        h, val = _optimize_gradient(best_h, deadline)
+        if val < best_val:
+            best_h = h
+            best_val = val
     
-    # Ensure exact sum and bounds
+    # Final projection
     best_h = _project(best_h)
     for _ in range(10):
         d = N / 2.0 - best_h.sum()
@@ -210,5 +261,5 @@ def construct():
             break
         best_h = np.clip(best_h + d / N, 0.0, 1.0)
         best_h = _project(best_h)
-        
+    
     return best_h

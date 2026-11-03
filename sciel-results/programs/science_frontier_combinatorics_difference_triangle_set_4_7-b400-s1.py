@@ -1,65 +1,74 @@
 import time
 import random
+import sys
+from functools import lru_cache
 
 def construct(n_rows, k):
     start_time = time.time()
-    # 150s limit, use 110s for safety
-    deadline = start_time + 110.0
+    deadline = start_time + 115.0
     
-    # 1. Baseline Greedy Solution
-    best_solution = greedy_construct(n_rows, k)
-    if not best_solution:
-        return []
-    
-    best_scope = max(max(row) for row in best_solution)
-    
-    # Calculate theoretical lower bound
-    # Total number of differences is n_rows * k * (k+1) / 2
-    # These must be distinct integers in [1, M]
-    # So M >= n_rows * k * (k+1) / 2
+    # Theoretical lower bound
     num_diffs = n_rows * k * (k + 1) // 2
     lower_bound = num_diffs
     
+    # 1. Fast greedy baseline
+    best_solution = greedy_construct(n_rows, k)
+    if not best_solution:
+        return []
+    best_scope = max(max(row) for row in best_solution)
+    
     if best_scope <= lower_bound:
         return best_solution
-
-    # 2. Randomized Search to Improve Scope
-    # We try to find a solution with scope < best_scope
-    # We iteratively decrease the target scope
     
-    # To allow for randomization, we set a seed or just use random
-    # We run multiple attempts
+    # 2. Local improvement to reduce scope
+    best_solution = _improve_scope(best_solution, n_rows, k, deadline)
+    best_scope = max(max(row) for row in best_solution)
     
-    while time.time() < deadline:
+    if best_scope <= lower_bound:
+        return best_solution
+    
+    # 3. Try to find better solutions with randomized backtracking
+    # for target scopes below current best
+    attempt = 0
+    while time.time() < deadline - 8.0:
         target_scope = best_scope - 1
         if target_scope < lower_bound:
             break
         
-        # Try to find a solution with max element <= target_scope
-        # We do this with randomized backtracking
-        # We might fail, so we retry
-        
-        # To avoid getting stuck in one specific failure mode,
-        # we can just call the search function which randomizes internally.
-        
-        solution = randomized_search(n_rows, k, target_scope, deadline)
-        
-        if solution:
-            new_scope = max(max(row) for row in solution)
-            if new_scope < best_scope:
-                best_scope = new_scope
-                best_solution = solution
-                
-                # If we reached the lower bound, we can stop
-                if best_scope <= lower_bound:
+        # Try multiple random restarts for this target scope
+        found = False
+        for _ in range(30):
+            if time.time() > deadline - 8.0:
+                break
+            
+            solution = _backtracking_search(n_rows, k, target_scope, deadline, attempt)
+            if solution:
+                new_scope = max(max(row) for row in solution)
+                if new_scope < best_scope:
+                    best_scope = new_scope
+                    best_solution = solution
+                    found = True
+                    # Try to improve further
+                    improved = _improve_scope(best_solution, n_rows, k, deadline)
+                    new_scope = max(max(row) for row in improved)
+                    if new_scope < best_scope:
+                        best_scope = new_scope
+                        best_solution = improved
+                    if best_scope <= lower_bound:
+                        return best_solution
                     break
-            else:
-                # If solution found but scope didn't improve (shouldn't happen if target_scope < best_scope)
-                # Actually, if we find a solution with max <= target_scope, and target_scope < best_scope,
-                # then new_scope <= target_scope < best_scope.
-                # So it always improves.
-                pass
-
+            attempt += 1
+        
+        if not found and target_scope <= lower_bound + 5:
+            # If we can't find anything near the lower bound, 
+            # try a slightly larger target to make progress
+            target_scope = best_scope - 1
+            if target_scope < lower_bound:
+                break
+    
+    # 4. Final polish: try to reduce scope by 1 at a time
+    best_solution = _polish_scope(best_solution, n_rows, k, deadline)
+    
     return best_solution
 
 def greedy_construct(n_rows, k):
@@ -77,79 +86,191 @@ def greedy_construct(n_rows, k):
         rows.append(row)
     return rows
 
-def randomized_search(n_rows, k, max_scope, deadline):
-    used_diffs = set()
+def _backtracking_search(n_rows, k, max_scope, deadline, seed_offset=0):
+    """
+    Backtracking search to build n_rows of k+1 increasing integers starting at 0,
+    with all pairwise differences distinct across all rows, and max element <= max_scope.
+    Uses bitsets for fast difference checking.
+    """
+    rng = random.Random(seed_offset * 12345 + 678)
     rows = []
+    k_plus_1 = k + 1
     
-    # Recursive helper
-    def build_row(row_idx, pos, current_mark, row_so_far):
+    # Use a list of booleans for used differences (faster than set for small ranges)
+    max_diff = max_scope
+    used_diffs = [False] * (max_diff + 1)
+    
+    def build_row(pos, current_mark, row_so_far):
         if time.time() > deadline:
             return None
             
-        if pos == k + 1:
-            return row_so_far
+        if pos == k_plus_1:
+            return list(row_so_far)
         
-        # Find valid candidates for the next mark
-        # x must be > current_mark and <= max_scope
-        # Diffs {x - a for a in row_so_far} must be disjoint from used_diffs
-        
+        # Find valid candidates
         valid_candidates = []
-        # We can break early if we find enough candidates?
-        # No, we want to sample from the smallest ones.
-        # So we iterate from current_mark + 1 upwards.
+        # Prune upper bound: we need at least (k_plus_1 - pos - 1) more elements,
+        # each at least 1 greater than previous, so max possible x is:
+        max_x = max_scope - (k_plus_1 - pos - 1)
+        if max_x <= current_mark:
+            return None
+            
+        for x in range(current_mark + 1, max_x + 1):
+            # Check if any new difference is already used
+            conflict = False
+            for a in row_so_far:
+                d = x - a
+                if used_diffs[d]:
+                    conflict = True
+                    break
+            if not conflict:
+                valid_candidates.append(x)
         
-        for x in range(current_mark + 1, max_scope + 1):
-            # Quick check: if x is too large, we might not be able to finish?
-            # Not a simple check.
-            
-            new_diffs = {x - a for a in row_so_far}
-            if new_diffs & used_diffs:
-                continue
-            
-            valid_candidates.append(x)
-            
-            # Optimization: If we have many candidates, we don't need to check all
-            # if we are going to sample from the smallest ones.
-            # But we don't know the "validity" of future steps.
-            # For now, collect up to a limit?
-            # If we collect all, it's O(M). M is small.
-            
         if not valid_candidates:
             return None
         
-        # Heuristic: Sample from the smallest valid candidates
-        # This encourages smaller scopes
-        # We take the first 20 (smallest) and sample from them
-        sample_pool = valid_candidates[:20]
-        sample_size = min(5, len(sample_pool))
+        # Randomize the order of candidates to escape local minima
+        # But bias towards smaller values to keep scope small
+        n_smallest = min(12, len(valid_candidates))
+        smallest = valid_candidates[:n_smallest]
         
-        # Randomly pick a subset of candidates to try
-        # This introduces randomness to escape local minima
-        candidates_to_try = random.sample(sample_pool, sample_size)
+        # With some probability, also consider larger candidates
+        if len(valid_candidates) > n_smallest and rng.random() < 0.3:
+            extra = rng.sample(valid_candidates[n_smallest:], min(6, len(valid_candidates) - n_smallest))
+            candidates_to_try = smallest + extra
+        else:
+            candidates_to_try = smallest
         
-        # Shuffle them to randomize the order of attempts
-        random.shuffle(candidates_to_try)
+        rng.shuffle(candidates_to_try)
         
         for x in candidates_to_try:
-            new_diffs = {x - a for a in row_so_far}
+            # Mark new differences
+            new_diffs = []
+            for a in row_so_far:
+                d = x - a
+                new_diffs.append(d)
+                used_diffs[d] = True
             
-            # Add to used
-            used_diffs.update(new_diffs)
-            
-            # Recurse
-            res = build_row(row_idx, pos + 1, x, row_so_far + [x])
+            res = build_row(pos + 1, x, row_so_far + [x])
             if res is not None:
                 return res
             
-            # Undo
-            used_diffs.difference_update(new_diffs)
-            
+            # Unmark differences
+            for d in new_diffs:
+                used_diffs[d] = False
+        
         return None
-
+    
     for i in range(n_rows):
-        row = build_row(i, 1, 0, [0])
+        row = build_row(1, 0, [0])
         if row is None:
             return None
         rows.append(row)
-        
+        # Mark all differences in this row as used
+        for j in range(k_plus_1):
+            for i2 in range(j + 1, k_plus_1):
+                used_diffs[row[i2] - row[j]] = True
+    
     return rows
+
+def _improve_scope(solution, n_rows, k, deadline):
+    """
+    Try to reduce the scope of a valid solution by local search.
+    We try to shift elements down to reduce the maximum value.
+    """
+    if not solution:
+        return solution
+    
+    best = [list(row) for row in solution]
+    best_scope = max(max(row) for row in best)
+    k_plus_1 = k + 1
+    
+    # Collect all used differences
+    used_diffs = set()
+    for row in best:
+        for i in range(k_plus_1):
+            for j in range(i + 1, k_plus_1):
+                used_diffs.add(row[j] - row[i])
+    
+    # Try to reduce scope by shifting elements
+    # Strategy: for each row, try to shift elements down
+    improved = True
+    while improved and time.time() < deadline - 2.0:
+        improved = False
+        for row_idx in range(n_rows):
+            row = best[row_idx]
+            for pos in range(k_plus_1 - 1, 0, -1):  # from end to start
+                # Try to shift this element down
+                original = row[pos]
+                # Only try to shift if it's the max or could reduce max
+                for new_val in range(row[pos - 1] + 1, original):
+                    # Check if new value creates conflicts
+                    new_diffs = {new_val - row[i] for i in range(pos)}
+                    # Also need to check diffs with elements after pos
+                    for j in range(pos + 1, k_plus_1):
+                        new_diffs.add(row[j] - new_val)
+                    
+                    # Remove old diffs
+                    old_diffs = set()
+                    for i in range(pos):
+                        old_diffs.add(original - row[i])
+                    for j in range(pos + 1, k_plus_1):
+                        old_diffs.add(row[j] - original)
+                    
+                    # Check if new_diffs conflict with (used_diffs - old_diffs)
+                    if new_diffs & (used_diffs - old_diffs):
+                        continue
+                    
+                    # Check if new_diffs are all positive
+                    if any(d <= 0 for d in new_diffs):
+                        continue
+                    
+                    # Apply the change
+                    used_diffs.difference_update(old_diffs)
+                    used_diffs.update(new_diffs)
+                    row[pos] = new_val
+                    improved = True
+                    break
+    
+    new_scope = max(max(row) for row in best)
+    if new_scope < best_scope:
+        return best
+    else:
+        # Revert if no improvement
+        return [list(row) for row in solution]
+
+def _polish_scope(solution, n_rows, k, deadline):
+    """
+    Final polish: try to reduce the scope by 1 at a time using targeted backtracking.
+    """
+    if not solution:
+        return solution
+    
+    best = [list(row) for row in solution]
+    best_scope = max(max(row) for row in best)
+    
+    # Try to reduce scope by 1
+    while best_scope > 0 and time.time() < deadline - 2.0:
+        target_scope = best_scope - 1
+        if target_scope < 0:
+            break
+        
+        # Try a few random restarts
+        found = False
+        for attempt in range(20):
+            if time.time() > deadline - 2.0:
+                break
+            
+            sol = _backtracking_search(n_rows, k, target_scope, deadline, attempt * 7 + 13)
+            if sol:
+                new_scope = max(max(row) for row in sol)
+                if new_scope <= target_scope:
+                    best = sol
+                    best_scope = new_scope
+                    found = True
+                    break
+        
+        if not found:
+            break
+    
+    return best

@@ -1,0 +1,531 @@
+"""
+Matrix multiplication tensor decomposition for 2x3 * 3x10.
+
+Structural idea:
+  Split A (2x3) into A0 (2x1, j=0) and A2 (2x2, j=1,2).
+  - A0 * B0 (2x1 * 1x10): naive, 2*1*10 = 20 multiplications.
+  - A2 * B2 (2x2 * 2x10): split B2 into 5 blocks of 2x2, apply Strassen (7 mults each) = 35.
+  Total rank = 55.
+
+Refinement:
+  Try to reduce rank below 55 by:
+  1. Merging Strassen terms across different B-blocks
+  2. Local optimization of coefficients
+  3. Random linear combinations of existing terms
+  4. Optimized block-based construction (inspiration 1)
+  5. Faster verification using matrix multiplication (inspiration 2)
+"""
+
+import numpy as np
+import random
+import time
+
+DIMENSIONS = [2, 3, 10]
+
+
+def _verify_fast(U, V, W, n, m, p, tol=1e-9):
+    """
+    Fast verification using matrix multiplication.
+    For each (i, k), check that U[i,:,r] * W[k,i,r] * V[:,k,r] sums to I_m.
+    """
+    U = np.array(U, dtype=np.float64)
+    V = np.array(V, dtype=np.float64)
+    W = np.array(W, dtype=np.float64)
+    rank = U.shape[1]
+    
+    U_mat = U.reshape(n, m, rank)
+    V_mat = V.reshape(m, p, rank)
+    W_mat = W.reshape(p, n, rank)
+    
+    for i in range(n):
+        for k in range(p):
+            # M_ik[r, j] = sum_r U[i, j, r] * W[k, i, r] * V[j, k, r]
+            # We want M_ik = I_m
+            # M_ik[j1, j2] = sum_r U[i, j1, r] * W[k, i, r] * V[j2, k, r]
+            # = (U[i] * diag(W[k,i])) @ V[:,k].T
+            Uw = U_mat[i] * W_mat[k, i]  # shape (m, rank)
+            M_ik = Uw @ V_mat[:, k].T  # shape (m, m)
+            if not np.allclose(M_ik, np.eye(m), atol=tol):
+                return False
+    return True
+
+
+def _verify(U, V, W, n, m, p):
+    """Verify that U, V, W give an exact decomposition of the mult tensor."""
+    rank = len(U[0])
+    U = np.array(U, dtype=np.float64)
+    V = np.array(V, dtype=np.float64)
+    W = np.array(W, dtype=np.float64)
+
+    T_reconstructed = np.zeros((n * m, m * p, p * n), dtype=np.float64)
+    for r in range(rank):
+        T_reconstructed += np.einsum('a,b,c->abc', U[:, r], V[:, r], W[:, r])
+
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                a = i * m + j
+                b = j * p + k
+                c = k * n + i
+                if abs(T_reconstructed[a, b, c] - 1.0) > 1e-9:
+                    return False
+
+    nonzero_set = set()
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                nonzero_set.add((i * m + j, j * p + k, k * n + i))
+
+    for _ in range(1000):
+        a = random.randint(0, n * m - 1)
+        b = random.randint(0, m * p - 1)
+        c = random.randint(0, p * n - 1)
+        if (a, b, c) not in nonzero_set:
+            if abs(T_reconstructed[a, b, c]) > 1e-9:
+                return False
+
+    return True
+
+
+def _is_valid_entries(U, V, W):
+    """Check that all entries are integers or half-integers."""
+    for matrix in [U, V, W]:
+        for row in matrix:
+            for val in row:
+                if abs(val * 2 - round(val * 2)) > 1e-9:
+                    return False
+    return True
+
+
+def _build_strassen55_optimized(n, m, p):
+    """
+    Optimized block-based construction of the rank-55 decomposition.
+    Uses the structure from inspiration 1 with explicit block copying.
+    """
+    rank = 55
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    
+    # Strassen coefficients for 2x2x2
+    # M1 = (a+d)(e+h)
+    # M2 = (c+d)e
+    # M3 = a(f-h)
+    # M4 = d(g-e)
+    # M5 = (a+b)h
+    # M6 = (c-a)(e+f)
+    # M7 = (b-d)(g+h)
+    
+    # Local indices for Strassen part (k in {0,1}, j in {0,1}, i in {0,1})
+    # U[i, k, r], V[k, j, r], W[j, i, r]
+    
+    # r=0 (M1)
+    U[0*3+0][0] = 1; U[1*3+1][0] = 1
+    V[0*10+0][0] = 1; V[1*10+1][0] = 1
+    W[0*2+0][0] = 1; W[1*2+1][0] = 1
+    
+    # r=1 (M2)
+    U[1*3+0][1] = 1; U[1*3+1][1] = 1
+    V[0*10+0][1] = 1
+    W[0*2+1][1] = 1; W[1*2+1][1] = -1
+    
+    # r=2 (M3)
+    U[0*3+0][2] = 1
+    V[0*10+1][2] = 1; V[1*10+1][2] = -1
+    W[1*2+0][2] = 1; W[1*2+1][2] = 1
+    
+    # r=3 (M4)
+    U[1*3+1][3] = 1
+    V[1*10+0][3] = 1; V[0*10+0][3] = -1
+    W[0*2+0][3] = 1; W[0*2+1][3] = 1
+    
+    # r=4 (M5)
+    U[0*3+0][4] = 1; U[0*3+1][4] = 1
+    V[1*10+1][4] = 1
+    W[0*2+0][4] = -1; W[1*2+0][4] = 1
+    
+    # r=5 (M6)
+    U[1*3+0][5] = 1; U[0*3+0][5] = -1
+    V[0*10+0][5] = 1; V[0*10+1][5] = 1
+    W[1*2+1][5] = 1
+    
+    # r=6 (M7)
+    U[0*3+1][6] = 1; U[1*3+1][6] = -1
+    V[1*10+0][6] = 1; V[1*10+1][6] = 1
+    W[0*2+0][6] = 1
+    
+    # Trivial part for k=2 (r=7..10)
+    # r=7: A[0,2] B[2,0] -> C[0,0]
+    U[0*3+2][7] = 1
+    V[2*10+0][7] = 1
+    W[0*2+0][7] = 1
+    
+    # r=8: A[0,2] B[2,1] -> C[0,1]
+    U[0*3+2][8] = 1
+    V[2*10+1][8] = 1
+    W[1*2+0][8] = 1
+    
+    # r=9: A[1,2] B[2,0] -> C[1,0]
+    U[1*3+2][9] = 1
+    V[2*10+0][9] = 1
+    W[0*2+1][9] = 1
+    
+    # r=10: A[1,2] B[2,1] -> C[1,1]
+    U[1*3+2][10] = 1
+    V[2*10+1][10] = 1
+    W[1*2+1][10] = 1
+    
+    # Copy this block structure to all 5 blocks of p=2
+    for b in range(1, 5):
+        offset = b * 11
+        # Copy U entries (same for all blocks)
+        for i in range(n * m):
+            for r_local in range(11):
+                U[i][offset + r_local] = U[i][r_local]
+                
+        # Shift V and W indices
+        for k in range(m):
+            for j_local in range(2):
+                v_idx_local = k * p + j_local
+                v_idx_global = k * p + (2 * b + j_local)
+                for r_local in range(11):
+                    V[v_idx_global][offset + r_local] = V[v_idx_local][r_local]
+                    
+        for i in range(n):
+            for j_local in range(2):
+                w_idx_local = j_local * n + i
+                w_idx_global = (2 * b + j_local) * n + i
+                for r_local in range(11):
+                    W[w_idx_global][offset + r_local] = W[w_idx_local][r_local]
+
+    return U, V, W
+
+
+def _build_strassen55(n, m, p):
+    """
+    Build the rank-55 decomposition using Strassen on the 2x2 sub-block.
+    """
+    rank = 55
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+
+    col = 0
+
+    # Part A: j=0 (first column of A, first row of B)
+    for i in range(n):
+        for k in range(p):
+            u_idx = i * m + 0
+            v_idx = 0 * p + k
+            w_idx = k * n + i
+            U[u_idx][col] = 1
+            V[v_idx][col] = 1
+            W[w_idx][col] = 1
+            col += 1
+
+    # Part B: j=1,2 (last 2 cols of A, last 2 rows of B)
+    for b in range(5):
+        k0 = 2 * b
+        k1 = 2 * b + 1
+
+        u_11 = 0 * m + 1
+        u_12 = 0 * m + 2
+        u_21 = 1 * m + 1
+        u_22 = 1 * m + 2
+
+        v_11 = 1 * p + k0
+        v_12 = 1 * p + k1
+        v_21 = 2 * p + k0
+        v_22 = 2 * p + k1
+
+        w_00 = k0 * n + 0
+        w_01 = k1 * n + 0
+        w_10 = k0 * n + 1
+        w_11 = k1 * n + 1
+
+        # M1 = (a11 + a22)(b11 + b22)
+        U[u_11][col] += 1
+        U[u_22][col] += 1
+        V[v_11][col] += 1
+        V[v_22][col] += 1
+        W[w_00][col] += 1
+        W[w_11][col] += 1
+        col += 1
+
+        # M2 = (a21 + a22)b11
+        U[u_21][col] += 1
+        U[u_22][col] += 1
+        V[v_11][col] += 1
+        W[w_10][col] += 1
+        W[w_11][col] += -1
+        col += 1
+
+        # M3 = a11(b12 - b22)
+        U[u_11][col] += 1
+        V[v_12][col] += 1
+        V[v_22][col] += -1
+        W[w_01][col] += 1
+        W[w_11][col] += 1
+        col += 1
+
+        # M4 = a22(b21 - b11)
+        U[u_22][col] += 1
+        V[v_21][col] += 1
+        V[v_11][col] += -1
+        W[w_00][col] += 1
+        W[w_10][col] += 1
+        col += 1
+
+        # M5 = (a11 + a12)b22
+        U[u_11][col] += 1
+        U[u_12][col] += 1
+        V[v_22][col] += 1
+        W[w_00][col] += -1
+        W[w_01][col] += 1
+        col += 1
+
+        # M6 = (a21 - a11)(b11 + b12)
+        U[u_21][col] += 1
+        U[u_11][col] += -1
+        V[v_11][col] += 1
+        V[v_12][col] += 1
+        W[w_11][col] += 1
+        col += 1
+
+        # M7 = (a12 - a22)(b21 + b22)
+        U[u_12][col] += 1
+        U[u_22][col] += -1
+        V[v_21][col] += 1
+        V[v_22][col] += 1
+        W[w_00][col] += 1
+        col += 1
+
+    assert col == rank, f"Expected {rank} columns, got {col}"
+    return U, V, W
+
+
+def _build_schoolbook(n, m, p):
+    """Build the schoolbook (rank n*m*p) decomposition."""
+    rank = n * m * p
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][col] = 1
+                V[j * p + k][col] = 1
+                W[k * n + i][col] = 1
+                col += 1
+    return U, V, W
+
+
+def _try_merge_strassen_terms(U55, V55, W55, n, m, p, target_rank, deadline):
+    """
+    Try to merge pairs of Strassen terms from different B-blocks.
+    """
+    rank55 = 55
+    U55 = np.array(U55, dtype=np.float64)
+    V55 = np.array(V55, dtype=np.float64)
+    W55 = np.array(W55, dtype=np.float64)
+    
+    for drop_idx in range(rank55):
+        if time.time() > deadline:
+            return None
+        
+        keep_idx = [i for i in range(rank55) if i != drop_idx]
+        U_keep = U55[:, keep_idx]
+        V_keep = V55[:, keep_idx]
+        W_keep = W55[:, keep_idx]
+        
+        n_eq = min(500, (n*m) * (m*p) * (p*n))
+        random.seed(42)
+        a_indices = [random.randint(0, n*m-1) for _ in range(n_eq)]
+        b_indices = [random.randint(0, m*p-1) for _ in range(n_eq)]
+        c_indices = [random.randint(0, p*n-1) for _ in range(n_eq)]
+        
+        A = np.zeros((n_eq, 54), dtype=np.float64)
+        for eq in range(n_eq):
+            a, b, c = a_indices[eq], b_indices[eq], c_indices[eq]
+            for r in range(54):
+                A[eq, r] = U_keep[a, r] * V_keep[b, r] * W_keep[c, r]
+        
+        b_vec = np.zeros(n_eq, dtype=np.float64)
+        for eq in range(n_eq):
+            a, b, c = a_indices[eq], b_indices[eq], c_indices[eq]
+            i = a // m
+            j = a % m
+            j2 = b // p
+            k = b % p
+            k2 = c // n
+            i2 = c % n
+            if i == i2 and j == j2 and k == k2:
+                b_vec[eq] = 1.0
+            b_vec[eq] -= U55[a, drop_idx] * V55[b, drop_idx] * W55[c, drop_idx]
+        
+        try:
+            coeffs, residuals, rank_A, sv = np.linalg.lstsq(A, b_vec, rcond=None)
+        except Exception:
+            continue
+        
+        if len(residuals) > 0 and residuals[0] > 1e-8:
+            continue
+        
+        valid = True
+        for cv in coeffs:
+            if abs(cv * 2 - round(cv * 2)) > 1e-6:
+                valid = False
+                break
+        if not valid:
+            continue
+        
+        U_new = np.zeros((n*m, 54), dtype=np.float64)
+        V_new = np.zeros((m*p, 54), dtype=np.float64)
+        W_new = np.zeros((p*n, 54), dtype=np.float64)
+        for r in range(54):
+            U_new[:, r] = coeffs[r] * U_keep[:, r]
+            V_new[:, r] = coeffs[r] * V_keep[:, r]
+            W_new[:, r] = coeffs[r] * W_keep[:, r]
+        
+        if _verify_fast(U_new, V_new, W_new, n, m, p):
+            if _is_valid_entries(U_new.tolist(), V_new.tolist(), W_new.tolist()):
+                return U_new.tolist(), V_new.tolist(), W_new.tolist()
+    
+    return None
+
+
+def _targeted_search(n, m, p, rank, deadline, values=None):
+    """
+    Targeted search for a rank-`rank` decomposition.
+    """
+    if values is None:
+        values = [0, 0.5, 1, -0.5, -1]
+
+    U55, V55, W55 = _build_strassen55(n, m, p)
+    U55 = np.array(U55, dtype=np.float64)
+    V55 = np.array(V55, dtype=np.float64)
+    W55 = np.array(W55, dtype=np.float64)
+
+    if rank <= 54:
+        result = _try_merge_strassen_terms(U55, V55, W55, n, m, p, rank, deadline)
+        if result is not None:
+            return result
+
+    for trial in range(300):
+        if time.time() > deadline:
+            break
+
+        idx = random.sample(range(55), rank)
+        U_trial = U55[:, idx].copy()
+        V_trial = V55[:, idx].copy()
+        W_trial = W55[:, idx].copy()
+
+        if _verify_fast(U_trial, V_trial, W_trial, n, m, p):
+            if _is_valid_entries(U_trial.tolist(), V_trial.tolist(), W_trial.tolist()):
+                return U_trial.tolist(), V_trial.tolist(), W_trial.tolist()
+
+    for trial in range(300):
+        if time.time() > deadline:
+            break
+
+        U_trial = np.zeros((n * m, rank), dtype=np.float64)
+        V_trial = np.zeros((m * p, rank), dtype=np.float64)
+        W_trial = np.zeros((p * n, rank), dtype=np.float64)
+
+        for r in range(rank):
+            n_terms = random.randint(1, 3)
+            idx = random.sample(range(55), n_terms)
+            coeffs = [random.choice([1, -1]) for _ in range(n_terms)]
+            for c, i in zip(coeffs, idx):
+                U_trial[:, r] += c * U55[:, i]
+                V_trial[:, r] += c * V55[:, i]
+                W_trial[:, r] += c * W55[:, i]
+
+        if _verify_fast(U_trial, V_trial, W_trial, n, m, p):
+            if _is_valid_entries(U_trial.tolist(), V_trial.tolist(), W_trial.tolist()):
+                return U_trial.tolist(), V_trial.tolist(), W_trial.tolist()
+
+    for trial in range(100):
+        if time.time() > deadline:
+            break
+        
+        idx = random.sample(range(55), min(r, 55))
+        U_basis = U55[:, idx]
+        V_basis = V55[:, idx]
+        W_basis = W55[:, idx]
+        
+        n_eq = min(500, (n*m) * (m*p) * (p*n))
+        a_indices = [random.randint(0, n*m-1) for _ in range(n_eq)]
+        b_indices = [random.randint(0, m*p-1) for _ in range(n_eq)]
+        c_indices = [random.randint(0, p*n-1) for _ in range(n_eq)]
+        
+        A = np.zeros((n_eq, len(idx)), dtype=np.float64)
+        b_vec = np.zeros(n_eq, dtype=np.float64)
+        
+        for eq in range(n_eq):
+            a, b, c = a_indices[eq], b_indices[eq], c_indices[eq]
+            i = a // m
+            j = a % m
+            j2 = b // p
+            k = b % p
+            k2 = c // n
+            i2 = c % n
+            target = 1.0 if (i == i2 and j == j2 and k == k2) else 0.0
+            
+            for r in range(len(idx)):
+                A[eq, r] = U_basis[a, r] * V_basis[b, r] * W_basis[c, r]
+            b_vec[eq] = target
+        
+        try:
+            coeffs, residuals, rank_A, sv = np.linalg.lstsq(A, b_vec, rcond=None)
+        except Exception:
+            continue
+        
+        if len(residuals) > 0 and residuals[0] > 1e-8:
+            continue
+        
+        valid = True
+        for cv in coeffs:
+            if abs(cv * 2 - round(cv * 2)) > 1e-6:
+                valid = False
+                break
+        if not valid:
+            continue
+        
+        U_new = U_basis * coeffs
+        V_new = V_basis * coeffs
+        W_new = W_basis * coeffs
+        
+        if _verify_fast(U_new, V_new, W_new, n, m, p):
+            if _is_valid_entries(U_new.tolist(), V_new.tolist(), W_new.tolist()):
+                return U_new.tolist(), V_new.tolist(), W_new.tolist()
+
+    return None
+
+
+def construct():
+    n, m, p = DIMENSIONS
+    deadline = time.time() + 140
+
+    # Start with the known rank-55 Strassen-based decomposition
+    U_best, V_best, W_best = _build_strassen55(n, m, p)
+    best_rank = 55
+
+    if not (_verify_fast(U_best, V_best, W_best, n, m, p) and _is_valid_entries(U_best, V_best, W_best)):
+        U_best, V_best, W_best = _build_schoolbook(n, m, p)
+        best_rank = n * m * p
+
+    values = [0, 0.5, 1, -0.5, -1]
+
+    for r in range(54, 49, -1):
+        if time.time() > deadline - 15:
+            break
+
+        result = _targeted_search(n, m, p, r, deadline - 10)
+        if result is not None:
+            U_best, V_best, W_best = result
+            best_rank = r
+            break
+
+    return {"U": U_best, "V": V_best, "W": W_best}

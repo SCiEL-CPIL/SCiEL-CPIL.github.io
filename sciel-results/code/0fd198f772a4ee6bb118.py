@@ -1,0 +1,3 @@
+    for start in range(n):
+        # ... BFS ...
+        # If cycle found < g, return False immediately

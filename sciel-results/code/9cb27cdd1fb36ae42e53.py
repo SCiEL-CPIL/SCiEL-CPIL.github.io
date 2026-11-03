@@ -1,0 +1,717 @@
+import math
+import time
+import random
+import numpy as np
+from scipy.optimize import minimize, minimize_scalar
+
+N = 12
+DEADLINE = 145.0  # Safety margin before 150s wall-clock kill
+
+# Precompute unit hexagon vertices and edge normals (angle 0)
+_HEX_ANGLES = np.radians(np.arange(0, 360, 60))
+_UNIT_HEX_VERTS = np.column_stack((np.cos(_HEX_ANGLES), np.sin(_HEX_ANGLES)))
+_EDGE_NORMALS = np.zeros((6, 2))
+for _i in range(6):
+    _ex = _UNIT_HEX_VERTS[(_i+1)%6, 0] - _UNIT_HEX_VERTS[_i, 0]
+    _ey = _UNIT_HEX_VERTS[(_i+1)%6, 1] - _UNIT_HEX_VERTS[_i, 1]
+    _nx, _ny = -_ey, _ex
+    _norm = math.sqrt(_nx*_nx + _ny*_ny)
+    _EDGE_NORMALS[_i] = [_nx / _norm, _ny / _norm]
+
+def construct():
+    t0 = time.time()
+    
+    unit_hex_verts = _UNIT_HEX_VERTS
+    edge_normals = _EDGE_NORMALS
+    sqrt3 = math.sqrt(3)
+    
+    # Precompute flat arrays for speed
+    _ux = unit_hex_verts[:, 0]
+    _uy = unit_hex_verts[:, 1]
+    _enx = edge_normals[:, 0]
+    _eny = edge_normals[:, 1]
+    
+    def get_all_vertices(positions, angles_rad):
+        c = np.cos(angles_rad)
+        s = np.sin(angles_rad)
+        rx = _ux[None, :] * c[:, None] - _uy[None, :] * s[:, None]
+        ry = _ux[None, :] * s[:, None] + _uy[None, :] * c[:, None]
+        verts_x = rx + positions[:, 0:1]
+        verts_y = ry + positions[:, 1:2]
+        return np.stack((verts_x, verts_y), axis=-1)
+
+    def hexagons_disjoint_fast(h1, h2):
+        dx = h1[0] - h2[0]
+        dy = h1[1] - h2[1]
+        dist_sq = dx*dx + dy*dy
+        # Two unit hexagons (circumradius 1) are guaranteed disjoint if
+        # center distance > 2 (sum of circumradii).  This early exit avoids
+        # the expensive SAT test for well-separated pairs.
+        if dist_sq > 4.0:
+            return True
+        # Even closer: if distance > 2*sqrt(3)/2*2 = 2*inradius*2?  No.
+        # Inradius of unit hex = sqrt(3)/2.  Two hexagons with parallel flat
+        # sides are disjoint if dist > 2*inradius = sqrt(3) ≈ 1.732.
+        # But with arbitrary rotation the worst-case overlap distance is 2.
+        # So 4.0 is the safe threshold.
+        if dist_sq > 4.0:
+            return True
+        a1 = h1[2]
+        a2 = h2[2]
+        c1, s1 = math.cos(a1), math.sin(a1)
+        c2, s2 = math.cos(a2), math.sin(a2)
+        v1x = h1[0] + _ux * c1 - _uy * s1
+        v1y = h1[1] + _ux * s1 + _uy * c1
+        v2x = h2[0] + _ux * c2 - _uy * s2
+        v2y = h2[1] + _ux * s2 + _uy * c2
+        en1x = _enx * c1 - _eny * s1
+        en1y = _enx * s1 + _eny * c1
+        en2x = _enx * c2 - _eny * s2
+        en2y = _enx * s2 + _eny * c2
+        for i in range(6):
+            nx, ny = en1x[i], en1y[i]
+            p1 = v1x * nx + v1y * ny
+            p2 = v2x * nx + v2y * ny
+            if p1.max() < p2.min() or p2.max() < p1.min():
+                return True
+        for i in range(6):
+            nx, ny = en2x[i], en2y[i]
+            p1 = v1x * nx + v1y * ny
+            p2 = v2x * nx + v2y * ny
+            if p1.max() < p2.min() or p2.max() < p1.min():
+                return True
+        return False
+
+    def compute_min_outer_side(positions, angles_deg):
+        angles_rad = np.radians(angles_deg)
+        all_verts = get_all_vertices(positions, angles_rad)
+        verts_flat = all_verts.reshape(-1, 2)
+        center = np.mean(verts_flat, axis=0)
+        offsets = verts_flat - center
+        
+        def eval_phi(phi_deg):
+            phi = np.radians(phi_deg)
+            normal_angles = phi + np.pi/6 + np.arange(6) * np.pi/3
+            nx = np.cos(normal_angles)
+            ny = np.sin(normal_angles)
+            proj = offsets[:, 0:1] * nx[None, :] + offsets[:, 1:2] * ny[None, :]
+            abs_proj = np.abs(proj)
+            max_projs = np.max(abs_proj, axis=0)
+            side_vals = (2.0 / sqrt3) * max_projs
+            return np.max(side_vals)
+        
+        # Vectorized coarse scan: evaluate all 60 angles at once
+        phi_vals = np.radians(np.arange(0, 60, 1))
+        normal_angles = phi_vals[:, None] + np.pi/6 + np.arange(6) * np.pi/3
+        nx = np.cos(normal_angles)  # (60, 6)
+        ny = np.sin(normal_angles)  # (60, 6)
+        proj = offsets[None, :, 0:1] * nx[:, None, :] + offsets[None, :, 1:2] * ny[:, None, :]
+        abs_proj = np.abs(proj)  # (60, 72, 6)
+        max_projs = np.max(abs_proj, axis=1)  # (60, 6)
+        side_vals = (2.0 / sqrt3) * max_projs  # (60, 6)
+        best_idx = np.argmin(np.max(side_vals, axis=1))
+        best_side = np.max(side_vals[best_idx])
+        best_phi = float(best_idx)
+        
+        # Fine tune with minimize_scalar
+        try:
+            lo = max(0.0, best_phi - 1.0)
+            hi = min(60.0, best_phi + 1.0)
+            res = minimize_scalar(eval_phi, bounds=(lo, hi), method='bounded',
+                                  options={'xatol': 1e-8})
+            if res.success and res.fun < best_side:
+                best_side = res.fun
+                best_phi = res.x
+        except Exception:
+            pass
+            
+        return best_side, best_phi, center[0], center[1]
+
+    def compute_min_outer_side_smooth(positions, angles_deg, beta=50.0):
+        """
+        Compute a smooth surrogate for the minimum outer side length using log-sum-exp.
+        This helps escape local minima in the final polish phase.
+        """
+        angles_rad = np.radians(angles_deg)
+        all_verts = get_all_vertices(positions, angles_rad)
+        verts_flat = all_verts.reshape(-1, 2)
+        center = np.mean(verts_flat, axis=0)
+        offsets = verts_flat - center
+        
+        def eval_phi_smooth(phi_deg):
+            phi = np.radians(phi_deg)
+            normal_angles = phi + np.pi/6 + np.arange(6) * np.pi/3
+            nx = np.cos(normal_angles)
+            ny = np.sin(normal_angles)
+            proj = offsets[:, 0:1] * nx[None, :] + offsets[:, 1:2] * ny[None, :]
+            abs_proj = np.abs(proj)
+            
+            # Soft max over vertices for each of the 6 directions
+            # side_vals[i] = (2/sqrt3) * max_j |proj[j,i]|
+            # Use log-sum-exp for soft max: beta * log(sum(exp(x/beta))) approx max(x) as beta->inf
+            # Here x = abs_proj[:, i]
+            max_abs = np.max(abs_proj, axis=0)
+            # To avoid overflow, subtract max before exp
+            scaled = abs_proj / beta
+            scaled -= scaled.max(axis=0, keepdims=True)
+            log_sum_exp = beta * np.log(np.sum(np.exp(scaled), axis=0))
+            
+            side_vals = (2.0 / sqrt3) * log_sum_exp
+            # Soft max over the 6 directions
+            max_side = np.max(side_vals)
+            scaled_side = side_vals / beta
+            scaled_side -= scaled_side.max()
+            soft_max_side = beta * np.log(np.sum(np.exp(scaled_side)))
+            return soft_max_side
+
+        # Vectorized coarse scan
+        phi_vals = np.radians(np.arange(0, 60, 1))
+        normal_angles = phi_vals[:, None] + np.pi/6 + np.arange(6) * np.pi/3
+        nx = np.cos(normal_angles)  # (60, 6)
+        ny = np.sin(normal_angles)  # (60, 6)
+        proj = offsets[None, :, 0:1] * nx[:, None, :] + offsets[None, :, 1:2] * ny[:, None, :]
+        abs_proj = np.abs(proj)  # (60, 72, 6)
+        
+        # Soft max over vertices
+        scaled = abs_proj / beta
+        max_scaled = scaled.max(axis=1, keepdims=True)
+        scaled -= max_scaled
+        log_sum_exp_verts = beta * np.log(np.sum(np.exp(scaled), axis=1)) + max_scaled.squeeze(1)
+        
+        side_vals = (2.0 / sqrt3) * log_sum_exp_verts  # (60, 6)
+        
+        # Soft max over directions
+        scaled_side = side_vals / beta
+        max_side_scaled = scaled_side.max(axis=1, keepdims=True)
+        scaled_side -= max_side_scaled
+        soft_max_side = beta * np.log(np.sum(np.exp(scaled_side), axis=1)) + max_side_scaled.squeeze(1)
+        
+        best_idx = np.argmin(soft_max_side)
+        best_side = soft_max_side[best_idx]
+        best_phi = float(best_idx)
+        
+        # Fine tune
+        try:
+            lo = max(0.0, best_phi - 1.0)
+            hi = min(60.0, best_phi + 1.0)
+            res = minimize_scalar(eval_phi_smooth, bounds=(lo, hi), method='bounded',
+                                  options={'xatol': 1e-8})
+            if res.success and res.fun < best_side:
+                best_side = res.fun
+                best_phi = res.x
+        except Exception:
+            pass
+            
+        return best_side, best_phi, center[0], center[1]
+
+    def is_valid_configuration(positions, angles_deg):
+        angles_rad = np.radians(angles_deg)
+        for i in range(N):
+            for j in range(i+1, N):
+                h1 = (positions[i][0], positions[i][1], angles_rad[i])
+                h2 = (positions[j][0], positions[j][1], angles_rad[j])
+                if not hexagons_disjoint_fast(h1, h2):
+                    return False
+        return True
+
+    def make_honeycomb():
+        a1 = np.array([sqrt3, 0.0])
+        a2 = np.array([sqrt3/2.0, 1.5])
+        lattice_coords = [
+            (0, 0), (1, 0), (-1, 0), (0, 1), (0, -1),
+            (1, -1), (-1, 1), (2, -1), (-2, 1),
+            (1, 1), (-1, -1), (2, 0),
+        ]
+        positions = np.zeros((N, 2))
+        angles = np.zeros(N)
+        for idx, (i, j) in enumerate(lattice_coords):
+            positions[idx] = i * a1 + j * a2
+        return positions, angles
+
+    def make_ring_config():
+        positions = np.zeros((N, 2))
+        angles = np.zeros(N)
+        for k in range(6):
+            a = k * np.pi / 3
+            positions[k, 0] = 2*sqrt3 * math.cos(a)
+            positions[k, 1] = 2*sqrt3 * math.sin(a)
+        positions[6] = [0, 0]
+        for k in range(5):
+            a = k * 2*np.pi/5 + np.pi/5
+            positions[7+k, 0] = 3.5*sqrt3 * math.cos(a)
+            positions[7+k, 1] = 3.5*sqrt3 * math.sin(a)
+        return positions, angles
+
+    def make_two_rows():
+        positions = np.zeros((N, 2))
+        angles = np.zeros(N)
+        for k in range(6):
+            positions[k, 0] = k * 2*sqrt3
+            positions[k, 1] = 0
+            positions[k+6, 0] = k * 2*sqrt3 + sqrt3/2
+            positions[k+6, 1] = 3.0
+        return positions, angles
+
+    base_positions, base_angles = make_honeycomb()
+
+    best_side = float('inf')
+    best_positions = base_positions.copy()
+    best_angles = base_angles.copy()
+    best_phi = 0.0
+    best_cx = 0.0
+    best_cy = 0.0
+
+    inits = [make_honeycomb(), make_ring_config(), make_two_rows()]
+    for pos_init, ang_init in inits:
+        s, phi, cx, cy = compute_min_outer_side(pos_init, ang_init)
+        if s < best_side:
+            best_side = s
+            best_positions = pos_init.copy()
+            best_angles = ang_init.copy()
+            best_phi = phi
+            best_cx = cx
+            best_cy = cy
+
+    # Strategy: Run SA for 65% of the time, then Polish for the rest
+    sa_time_budget = DEADLINE * 0.65
+    
+    current_positions = best_positions.copy()
+    current_angles = best_angles.copy()
+    current_side = best_side
+    current_phi = best_phi
+    current_cx = best_cx
+    current_cy = best_cy
+
+    T = 0.5
+    T_min = 0.0001
+    cooling = 0.9999
+    step_size = 0.3
+    step_decay = 0.99998
+    
+    step_count = 0
+    max_steps = 200000
+    accept_count = 0
+    total_count = 0
+    # Track best side for adaptive step-size tuning
+    local_best_side = current_side
+    local_best_steps = 0
+    
+    while time.time() - t0 < sa_time_budget and step_count < max_steps:
+        step_count += 1
+        total_count += 1
+        
+        idx = random.randint(0, N - 1)
+        new_positions = current_positions.copy()
+        new_angles = current_angles.copy()
+        
+        dx = random.gauss(0, step_size)
+        dy = random.gauss(0, step_size)
+        da = random.gauss(0, 5.0)
+        
+        new_positions[idx, 0] += dx
+        new_positions[idx, 1] += dy
+        new_angles[idx] += da
+        
+        angles_rad_new = np.radians(new_angles)
+        valid = True
+        h_moved = (new_positions[idx, 0], new_positions[idx, 1], angles_rad_new[idx])
+        for j in range(N):
+            if j == idx:
+                continue
+            h_other = (new_positions[j, 0], new_positions[j, 1], angles_rad_new[j])
+            if not hexagons_disjoint_fast(h_moved, h_other):
+                valid = False
+                break
+        
+        if not valid:
+            T *= cooling
+            if T < T_min: T = T_min
+            step_size *= step_decay
+            if step_size < 0.005: step_size = 0.005
+            continue
+            
+        new_side, new_phi, new_cx, new_cy = compute_min_outer_side(new_positions, new_angles)
+        
+        if new_side < current_side:
+            current_positions = new_positions
+            current_angles = new_angles
+            current_side = new_side
+            current_phi = new_phi
+            current_cx = new_cx
+            current_cy = new_cy
+            accept_count += 1
+            if new_side < best_side:
+                best_side = new_side
+                best_positions = new_positions.copy()
+                best_angles = new_angles.copy()
+                best_phi = new_phi
+                best_cx = new_cx
+                best_cy = new_cy
+        else:
+            delta = new_side - current_side
+            if delta < 0: delta = 0
+            if random.random() < math.exp(-delta / T):
+                current_positions = new_positions
+                current_angles = new_angles
+                current_side = new_side
+                current_phi = new_phi
+                current_cx = new_cx
+                current_cy = new_cy
+                accept_count += 1
+                if new_side < best_side:
+                    best_side = new_side
+                    best_positions = new_positions.copy()
+                    best_angles = new_angles.copy()
+                    best_phi = new_phi
+                    best_cx = new_cx
+                    best_cy = new_cy
+        
+        # Track local improvement for adaptive step sizing
+        if new_side < local_best_side:
+            local_best_side = new_side
+            local_best_steps = step_count
+        
+        if total_count % 500 == 0:
+            acc_rate = accept_count / total_count
+            # If we've been stuck (no improvement in last 500 steps), shrink more aggressively
+            stuck = (step_count - local_best_steps) > 500
+            if acc_rate < 0.1 or stuck:
+                step_size *= 0.7
+                if step_size < 0.005: step_size = 0.005
+                # Also cool faster when stuck
+                T *= 0.95
+                if T < T_min: T = T_min
+            elif acc_rate > 0.5:
+                step_size *= 1.15
+                if step_size > 1.0: step_size = 1.0
+            accept_count = 0
+            total_count = 0
+            
+        T *= cooling
+        if T < T_min: T = T_min
+        step_size *= step_decay
+        if step_size < 0.005: step_size = 0.005
+
+    # Polish Phase
+    remaining_time = DEADLINE - (time.time() - t0)
+    
+    if remaining_time > 2.0:
+        # Multiple small restarts with varying perturbation scales
+        if remaining_time > 20.0:
+            num_restarts = min(int(remaining_time / 8.0), 4)
+            for ri in range(num_restarts):
+                if time.time() - t0 > DEADLINE - 5.0:
+                    break
+                scale = 0.3 + 0.2 * ri
+                restart_pos = best_positions.copy()
+                restart_ang = best_angles.copy()
+                for i in range(N):
+                    restart_pos[i, 0] += random.gauss(0, scale)
+                    restart_pos[i, 1] += random.gauss(0, scale)
+                    restart_ang[i] += random.gauss(0, 8.0)
+                
+                # Quick SA polish from this restart
+                r_pos = restart_pos.copy()
+                r_ang = restart_ang.copy()
+                r_side, r_phi, r_cx, r_cy = compute_min_outer_side(r_pos, r_ang)
+                
+                # Short SA burst (2s budget)
+                r_t0 = time.time()
+                r_T = 0.2
+                r_step = 0.15
+                r_improve = 0
+                for _ in range(2000):
+                    if time.time() - r_t0 > 2.0:
+                        break
+                    idx = random.randint(0, N-1)
+                    np_ = r_pos.copy()
+                    na_ = r_ang.copy()
+                    np_[idx, 0] += random.gauss(0, r_step)
+                    np_[idx, 1] += random.gauss(0, r_step)
+                    na_[idx] += random.gauss(0, 4.0)
+                    ang_r = np.radians(na_)
+                    valid = True
+                    hm = (np_[idx,0], np_[idx,1], ang_r[idx])
+                    for j in range(N):
+                        if j == idx: continue
+                        ho = (np_[j,0], np_[j,1], ang_r[j])
+                        if not hexagons_disjoint_fast(hm, ho):
+                            valid = False
+                            break
+                    if not valid:
+                        continue
+                    ns, _, _, _ = compute_min_outer_side(np_, na_)
+                    if ns < r_side or random.random() < math.exp(-(ns - r_side)/r_T):
+                        r_pos = np_
+                        r_ang = na_
+                        if ns < r_side:
+                            r_side = ns
+                            r_improve += 1
+                    r_T *= 0.999
+                    if r_T < 0.001: r_T = 0.001
+                    r_step *= 0.9999
+                    if r_step < 0.01: r_step = 0.01
+                
+                if r_side < best_side:
+                    best_side = r_side
+                    best_positions = r_pos.copy()
+                    best_angles = r_ang.copy()
+                    best_side, best_phi, best_cx, best_cy = compute_min_outer_side(best_positions, best_angles)
+            remaining_time = DEADLINE - (time.time() - t0)
+        
+        # 1. Coordinate Descent Polish (improved: golden-section search per dimension)
+        def polish_coordinate_descent(pos, ang, time_limit):
+            current_side, _, _, _ = compute_min_outer_side(pos, ang)
+            best_side_cd = current_side
+            best_pos_cd = pos.copy()
+            best_ang_cd = ang.copy()
+            
+            t_start = time.time()
+            step = 0.1
+            min_step = 0.0005
+            golden = (1.0 + math.sqrt(5.0)) / 2.0
+            inv_phi = 1.0 / golden
+            
+            while time.time() - t_start < time_limit and step > min_step:
+                improved = False
+                for idx in range(N):
+                    for dim in range(3):
+                        # Golden-section search along this dimension
+                        # Try to find a better value by shrinking interval
+                        x0 = best_pos_cd[idx, 0] if dim == 0 else (best_pos_cd[idx, 1] if dim == 1 else best_ang_cd[idx])
+                        
+                        # Evaluate at two interior points
+                        def eval_dim(offset):
+                            new_pos = best_pos_cd.copy()
+                            new_ang = best_ang_cd.copy()
+                            if dim == 0:
+                                new_pos[idx, 0] = x0 + offset
+                            elif dim == 1:
+                                new_pos[idx, 1] = x0 + offset
+                            else:
+                                new_ang[idx] = x0 + offset
+                            
+                            angles_rad_new = np.radians(new_ang)
+                            valid = True
+                            h_moved = (new_pos[idx, 0], new_pos[idx, 1], angles_rad_new[idx])
+                            for j in range(N):
+                                if j == idx: continue
+                                h_other = (new_pos[j, 0], new_pos[j, 1], angles_rad_new[j])
+                                if not hexagons_disjoint_fast(h_moved, h_other):
+                                    valid = False
+                                    break
+                            if not valid:
+                                return 1e6
+                            
+                            new_side, _, _, _ = compute_min_outer_side(new_pos, new_ang)
+                            return new_side
+                        
+                        # Initial bracket
+                        a = -step
+                        b = step
+                        fa = eval_dim(a)
+                        fb = eval_dim(b)
+                        
+                        # If either endpoint improves, move toward it
+                        if fa < best_side_cd - 1e-12:
+                            # Shrink toward a
+                            for _ in range(5):
+                                mid = (a + b) / 2.0
+                                fm = eval_dim(mid)
+                                if fm < best_side_cd - 1e-12:
+                                    # Accept mid as new best
+                                    new_pos = best_pos_cd.copy()
+                                    new_ang = best_ang_cd.copy()
+                                    if dim == 0:
+                                        new_pos[idx, 0] = x0 + mid
+                                    elif dim == 1:
+                                        new_pos[idx, 1] = x0 + mid
+                                    else:
+                                        new_ang[idx] = x0 + mid
+                                    best_pos_cd = new_pos
+                                    best_ang_cd = new_ang
+                                    best_side_cd = fm
+                                    improved = True
+                                    b = mid
+                                else:
+                                    a = mid
+                            break
+                        elif fb < best_side_cd - 1e-12:
+                            # Shrink toward b
+                            for _ in range(5):
+                                mid = (a + b) / 2.0
+                                fm = eval_dim(mid)
+                                if fm < best_side_cd - 1e-12:
+                                    new_pos = best_pos_cd.copy()
+                                    new_ang = best_ang_cd.copy()
+                                    if dim == 0:
+                                        new_pos[idx, 0] = x0 + mid
+                                    elif dim == 1:
+                                        new_pos[idx, 1] = x0 + mid
+                                    else:
+                                        new_ang[idx] = x0 + mid
+                                    best_pos_cd = new_pos
+                                    best_ang_cd = new_ang
+                                    best_side_cd = fm
+                                    improved = True
+                                    a = mid
+                                else:
+                                    b = mid
+                            break
+                        
+                        if time.time() - t_start > time_limit:
+                            return best_side_cd, best_pos_cd, best_ang_cd
+                    else:
+                        continue
+                    break
+                else:
+                    step *= 0.7
+                    continue
+                break
+            
+            return best_side_cd, best_pos_cd, best_ang_cd
+
+        cd_time = min(remaining_time * 0.4, 15.0)
+        cd_side, cd_pos, cd_ang = polish_coordinate_descent(best_positions, best_angles, cd_time)
+        
+        if cd_side < best_side:
+            best_side = cd_side
+            best_positions = cd_pos
+            best_angles = cd_ang
+            best_side, best_phi, best_cx, best_cy = compute_min_outer_side(best_positions, best_angles)
+        
+        # 2. Nelder-Mead Polish (tighter tolerances, more iterations)
+        remaining_time = DEADLINE - (time.time() - t0)
+        if remaining_time > 5.0:
+            def polish_objective(params):
+                pos = np.zeros((N, 2))
+                ang = np.zeros(N)
+                for i in range(N):
+                    pos[i, 0] = params[3*i]
+                    pos[i, 1] = params[3*i+1]
+                    ang[i] = params[3*i+2]
+                    
+                angles_rad = np.radians(ang)
+                for i in range(N):
+                    for j in range(i+1, N):
+                        h1 = (pos[i, 0], pos[i, 1], angles_rad[i])
+                        h2 = (pos[j, 0], pos[j, 1], angles_rad[j])
+                        if not hexagons_disjoint_fast(h1, h2):
+                            return 1e6
+                
+                side, phi, cx, cy = compute_min_outer_side(pos, ang)
+                return side
+
+            init_params = np.zeros(3*N)
+            for i in range(N):
+                init_params[3*i] = best_positions[i, 0]
+                init_params[3*i+1] = best_positions[i, 1]
+                init_params[3*i+2] = best_angles[i]
+                
+            try:
+                res = minimize(polish_objective, init_params, method='Nelder-Mead', 
+                               options={'maxiter': 10000, 'xatol': 1e-8, 'fatol': 1e-10})
+                
+                if res.fun < best_side:
+                    new_pos = np.zeros((N, 2))
+                    new_ang = np.zeros(N)
+                    for i in range(N):
+                        new_pos[i, 0] = res.x[3*i]
+                        new_pos[i, 1] = res.x[3*i+1]
+                        new_ang[i] = res.x[3*i+2]
+                    
+                    if is_valid_configuration(new_pos, new_ang):
+                        new_side, new_phi, new_cx, new_cy = compute_min_outer_side(new_pos, new_ang)
+                        if new_side < best_side:
+                            best_side = new_side
+                            best_positions = new_pos
+                            best_angles = new_ang
+                            best_phi = new_phi
+                            best_cx = new_cx
+                            best_cy = new_cy
+            except Exception:
+                pass
+        
+        # 3. Smooth Surrogate Polish (Log-Sum-Exp) with adaptive beta
+        remaining_time = DEADLINE - (time.time() - t0)
+        if remaining_time > 10.0:
+            def smooth_objective(params, beta=20.0):
+                pos = np.zeros((N, 2))
+                ang = np.zeros(N)
+                for i in range(N):
+                    pos[i, 0] = params[3*i]
+                    pos[i, 1] = params[3*i+1]
+                    ang[i] = params[3*i+2]
+                    
+                angles_rad = np.radians(ang)
+                for i in range(N):
+                    for j in range(i+1, N):
+                        h1 = (pos[i, 0], pos[i, 1], angles_rad[i])
+                        h2 = (pos[j, 0], pos[j, 1], angles_rad[j])
+                        if not hexagons_disjoint_fast(h1, h2):
+                            return 1e6
+                
+                side, phi, cx, cy = compute_min_outer_side_smooth(pos, ang, beta=beta)
+                return side
+
+            init_params = np.zeros(3*N)
+            for i in range(N):
+                init_params[3*i] = best_positions[i, 0]
+                init_params[3*i+1] = best_positions[i, 1]
+                init_params[3*i+2] = best_angles[i]
+                
+            # Run smooth polish with decreasing beta for increasing precision
+            for beta_val in [30.0, 15.0, 8.0]:
+                if time.time() - t0 > DEADLINE - 3.0:
+                    break
+                try:
+                    res = minimize(lambda p: smooth_objective(p, beta=beta_val), init_params, 
+                                   method='L-BFGS-B', 
+                                   options={'maxiter': 2000, 'ftol': 1e-12, 'gtol': 1e-10})
+                    
+                    if res.fun < best_side:
+                        new_pos = np.zeros((N, 2))
+                        new_ang = np.zeros(N)
+                        for i in range(N):
+                            new_pos[i, 0] = res.x[3*i]
+                            new_pos[i, 1] = res.x[3*i+1]
+                            new_ang[i] = res.x[3*i+2]
+                        
+                        if is_valid_configuration(new_pos, new_ang):
+                            new_side, new_phi, new_cx, new_cy = compute_min_outer_side(new_pos, new_ang)
+                            if new_side < best_side:
+                                best_side = new_side
+                                best_positions = new_pos
+                                best_angles = new_ang
+                                best_phi = new_phi
+                                best_cx = new_cx
+                                best_cy = new_cy
+                                # Update init for next beta
+                                for i in range(N):
+                                    init_params[3*i] = best_positions[i, 0]
+                                    init_params[3*i+1] = best_positions[i, 1]
+                                    init_params[3*i+2] = best_angles[i]
+                except Exception:
+                    pass
+
+    # Final verification
+    if not is_valid_configuration(best_positions, best_angles):
+        for pos_f, ang_f in inits:
+            if is_valid_configuration(pos_f, ang_f):
+                best_positions = pos_f.copy()
+                best_angles = ang_f.copy()
+                best_side, best_phi, best_cx, best_cy = compute_min_outer_side(best_positions, best_angles)
+                break
+        else:
+            best_positions, best_angles = make_honeycomb()
+            best_side, best_phi, best_cx, best_cy = compute_min_outer_side(best_positions, best_angles)
+    
+    inner = []
+    for i in range(N):
+        inner.append([float(best_positions[i, 0]), float(best_positions[i, 1]), float(best_angles[i])])
+        
+    center = (float(best_cx), float(best_cy))
+    side = float(best_side)
+    angle = float(best_phi)
+    
+    return inner, center, side, angle

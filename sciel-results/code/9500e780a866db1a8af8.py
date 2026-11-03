@@ -1,0 +1,3 @@
+def construct():
+    n, m, p = DIMENSIONS
+    # ...

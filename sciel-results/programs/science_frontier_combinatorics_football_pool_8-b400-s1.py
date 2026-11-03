@@ -1,200 +1,279 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
 # EVOLVE-BLOCK-START
-import random
 import numpy as np
-from collections import defaultdict, deque
 import time
+import random
+import sys
 
 def construct(q, n, radius):
-    """
-    Construct a covering code of length n over alphabet size q with covering radius radius.
-    Uses randomized local search starting from a greedy feasible covering.
-    Improved local search with targeted swap candidates.
-    """
-    if n == 0:
-        return [[]]
+    start_time = time.time()
+    deadline = start_time + 115.0
     
     total_words = q ** n
+    if total_words == 1:
+        return [[0] * n]
     
-    def int_to_word(val, n, q):
-        word = []
-        for _ in range(n):
-            word.append(val % q)
+    # Precompute all neighbors using vectorized approach
+    # For radius=1, each word has 1 + n*(q-1) neighbors
+    # We'll store as a list of arrays for fast access
+    n_neighbors = 1 + n * (q - 1)
+    
+    # Build neighbor table
+    # neighbors[w] = array of neighbor indices
+    neighbors = np.zeros((total_words, n_neighbors), dtype=np.int32)
+    
+    # Convert all words to digit arrays at once
+    all_words = np.zeros((total_words, n), dtype=np.int32)
+    for i in range(total_words):
+        val = i
+        for pos in range(n - 1, -1, -1):
+            all_words[i, pos] = val % q
             val //= q
-        return word
     
-    def word_to_int(word, q):
-        val = 0
-        for i in range(len(word) - 1, -1, -1):
-            val = val * q + word[i]
-        return val
+    # For each word, compute its neighbors
+    for w in range(total_words):
+        neighbors[w, 0] = w
+        idx = 1
+        for pos in range(n):
+            orig = all_words[w, pos]
+            for v in range(q):
+                if v == orig:
+                    continue
+                # Compute new word index
+                # The position pos contributes (v - orig) * q^(n-1-pos)
+                new_val = w + (v - orig) * (q ** (n - 1 - pos))
+                neighbors[w, idx] = new_val
+                idx += 1
     
-    all_words = list(range(total_words))
+    # Convert to list of lists for easier manipulation
+    neighbor_list = [neighbors[w].tolist() for w in range(total_words)]
     
-    # Precompute neighbors
-    neighbors = {}
-    for w in all_words:
-        word = int_to_word(w, n, q)
-        neigh = [w]
-        if radius >= 1:
-            for pos in range(n):
-                for val in range(q):
-                    if val == word[pos]:
-                        continue
-                    new_word = word[:]
-                    new_word[pos] = val
-                    neigh.append(word_to_int(new_word, q))
-        if radius >= 2:
-            for pos1 in range(n):
-                for pos2 in range(pos1 + 1, n):
-                    for val1 in range(q):
-                        if val1 == word[pos1]:
-                            continue
-                        for val2 in range(q):
-                            if val2 == word[pos2]:
-                                continue
-                            new_word = word[:]
-                            new_word[pos1] = val1
-                            new_word[pos2] = val2
-                            new_int = word_to_int(new_word, q)
-                            if new_int not in neigh:
-                                neigh.append(new_int)
-        neighbors[w] = set(neigh)
+    # Also create a set for each word for O(1) membership in swap validation
+    neighbor_sets = [set(neighbors[w]) for w in range(total_words)]
     
-    # Greedy initialization
-    covered = [False] * total_words
+    # Phase 1: Greedy set cover initialization
+    covered = np.zeros(total_words, dtype=bool)
     codewords = []
-    uncovered_count = total_words
-    remaining = set(all_words)
     
-    while uncovered_count > 0:
-        best_word = -1
-        best_new_coverage = -1
-        # Randomize the order of checking to break ties and avoid deterministic local minima
-        # We can shuffle remaining if it's not too large, or just iterate and pick best
-        # For 6561 words, iterating is fine.
-        for w in remaining:
-            new_cov = 0
-            for u in neighbors[w]:
-                if not covered[u]:
-                    new_cov += 1
-            if new_cov > best_new_coverage:
-                best_new_coverage = new_cov
-                best_word = w
-            if new_cov == uncovered_count:
-                break
-        if best_word == -1:
+    # Use vectorized gain computation
+    # For each candidate, gain = sum of uncovered neighbors
+    # We can compute this efficiently
+    
+    remaining = total_words
+    while remaining > 0:
+        if time.time() > deadline - 10.0:
             break
+        
+        # Compute gain for all words at once
+        # gain[w] = number of uncovered words in neighbors[w]
+        gains = np.zeros(total_words, dtype=np.int32)
+        for w in range(total_words):
+            if covered[w]:
+                continue
+            # Count uncovered neighbors
+            nb = neighbors[w]
+            gains[w] = np.sum(~covered[nb])
+        
+        # Pick the word with maximum gain
+        best_word = np.argmax(gains)
+        best_gain = gains[best_word]
+        
+        if best_gain == 0:
+            # Should not happen if remaining > 0, but just in case
+            uncovered = np.where(~covered)[0]
+            if len(uncovered) == 0:
+                break
+            best_word = uncovered[0]
+        
         codewords.append(best_word)
-        remaining.discard(best_word)
+        # Update covered
         for u in neighbors[best_word]:
             if not covered[u]:
                 covered[u] = True
-                uncovered_count -= 1
+                remaining -= 1
     
-    coverage_count = [0] * total_words
-    for cw in codewords:
-        for u in neighbors[cw]:
-            coverage_count[u] += 1
+    # Phase 2: Local search to minimize
+    cw = codewords[:]  # Working list
+    best_cw = cw[:]
+    best_size = len(cw)
     
-    # Helper to try removing redundant codewords
-    def try_remove_redundant():
-        removed_any = False
-        changed = True
-        while changed:
-            changed = False
-            for i in range(len(codewords) - 1, -1, -1):
-                cw = codewords[i]
-                can_remove = True
-                for u in neighbors[cw]:
-                    if coverage_count[u] == 1:
-                        can_remove = False
-                        break
-                if can_remove:
-                    for u in neighbors[cw]:
-                        coverage_count[u] -= 1
-                    codewords.pop(i)
-                    changed = True
-                    removed_any = True
-                    break
-        return removed_any
+    # Compute coverage counts
+    count = np.zeros(total_words, dtype=np.int32)
+    for ci in cw:
+        for u in neighbors[ci]:
+            count[u] += 1
     
-    try_remove_redundant()
-    
-    start_time = time.time()
-    time_limit = 115
-    
-    cw_set = set(codewords)
-    
-    while time.time() - start_time < time_limit:
-        if try_remove_redundant():
-            continue
+    # Local search loop
+    while time.time() < deadline - 3.0:
+        improved = False
         
-        if len(codewords) == 0:
-            break
-            
-        # Try a swap
-        idx = random.randint(0, len(codewords) - 1)
-        old_cw = codewords[idx]
+        # Phase 2a: Remove redundant codewords
+        # A codeword is redundant if all its neighbors are covered by other codewords
+        # i.e., count[u] > 1 for all u in neighbors[ci]
         
-        # Find words uniquely covered by old_cw
-        would_uncover = []
-        for u in neighbors[old_cw]:
-            if coverage_count[u] == 1:
-                would_uncover.append(u)
+        # We'll iterate in random order and remove redundancies
+        indices = list(range(len(cw)))
+        random.shuffle(indices)
         
-        if len(would_uncover) == 0:
-            # Should have been caught by try_remove_redundant, but safety check
-            for u in neighbors[old_cw]:
-                coverage_count[u] -= 1
-            codewords.pop(idx)
-            cw_set.discard(old_cw)
-            continue
-        
-        # Generate candidate new_cw's
-        # 1. Neighbors of old_cw (excluding old_cw itself)
-        # 2. If that fails, try neighbors of the words in would_uncover?
-        # Let's stick to neighbors of old_cw first as they are the most likely to cover the "gap"
-        candidates = list(neighbors[old_cw])
-        random.shuffle(candidates)
-        
-        # Also add a few random global candidates to escape local optima
-        for _ in range(5):
-            candidates.append(random.randint(0, total_words - 1))
-        
-        swap_done = False
-        for new_cw in candidates:
-            if new_cw == old_cw or new_cw in cw_set:
+        removed_this_pass = 0
+        for i in indices:
+            if i >= len(cw):
                 continue
+            ci = cw[i]
             
-            # Check if new_cw covers all would_uncover words
-            valid = True
-            for u in would_uncover:
-                if u not in neighbors[new_cw]:
-                    valid = False
-                    break
-            
-            if valid:
-                # Perform swap
-                for u in neighbors[old_cw]:
-                    coverage_count[u] -= 1
-                for u in neighbors[new_cw]:
-                    coverage_count[u] += 1
-                codewords[idx] = new_cw
-                cw_set.discard(old_cw)
-                cw_set.add(new_cw)
-                swap_done = True
-                break
+            # Check if redundant: all neighbors have count > 1
+            nb = neighbors[ci]
+            if np.all(count[nb] > 1):
+                # Remove ci
+                for u in nb:
+                    count[u] -= 1
+                cw.pop(i)
+                removed_this_pass += 1
+                improved = True
+                
+                if len(cw) < best_size:
+                    best_size = len(cw)
+                    best_cw = cw[:]
         
-        if not swap_done:
-            # If no swap found for this old_cw, we can just continue to next iteration
-            # This might lead to stagnation. 
-            # To improve, we could try a different old_cw or perturb the solution.
-            # For now, just loop.
-            pass
-
-    try_remove_redundant()
+        # Phase 2b: Try swaps to enable more removals
+        if not improved and len(cw) > 0:
+            # Try random swaps
+            swaps_tried = 0
+            max_swaps = 50
+            
+            while swaps_tried < max_swaps and time.time() < deadline - 3.0:
+                swaps_tried += 1
+                
+                i = random.randint(0, len(cw) - 1)
+                ci = cw[i]
+                
+                # Find words uniquely covered by ci (count == 1)
+                nb_ci = neighbors[ci]
+                critical = [u for u in nb_ci if count[u] == 1]
+                
+                if not critical:
+                    # ci is redundant, remove it
+                    for u in nb_ci:
+                        count[u] -= 1
+                    cw.pop(i)
+                    improved = True
+                    if len(cw) < best_size:
+                        best_size = len(cw)
+                        best_cw = cw[:]
+                    break
+                
+                # Try to find a replacement cj that covers all critical words
+                # Sample from neighbors of critical words
+                candidates = set()
+                for u in critical:
+                    for v in neighbors[u]:
+                        if v != ci:
+                            candidates.add(v)
+                
+                if not candidates:
+                    continue
+                
+                # Try a few random candidates
+                cand_list = list(candidates)
+                random.shuffle(cand_list)
+                
+                found_swap = False
+                for cj in cand_list[:20]:  # Try up to 20 candidates
+                    # Check if cj covers all critical words
+                    nb_cj = neighbors[cj]
+                    valid = all(u in neighbor_sets[cj] for u in critical)
+                    
+                    if valid:
+                        # Perform swap
+                        for u in nb_ci:
+                            count[u] -= 1
+                        for u in nb_cj:
+                            count[u] += 1
+                        cw[i] = cj
+                        improved = True
+                        found_swap = True
+                        break
+                
+                if found_swap:
+                    break
+        
+        # If no improvement in this pass, try a different strategy
+        if not improved:
+            # Try to find a codeword that can be replaced by one that enables removal
+            # Pick a codeword with many "wasted" coverage (neighbors with high count)
+            if len(cw) > 0:
+                # Score each codeword by how much it "wastes" coverage
+                scores = []
+                for i, ci in enumerate(cw):
+                    nb = neighbors[ci]
+                    # Waste = sum of (count[u] - 1) for u in nb, i.e., how many extra covers it provides
+                    waste = np.sum(count[nb] - 1)
+                    scores.append((waste, i))
+                
+                # Try replacing the most wasteful codeword
+                scores.sort(reverse=True)
+                for waste, i in scores[:10]:
+                    if waste <= 0:
+                        break
+                    ci = cw[i]
+                    nb_ci = neighbors[ci]
+                    critical = [u for u in nb_ci if count[u] == 1]
+                    
+                    if not critical:
+                        # Redundant, remove
+                        for u in nb_ci:
+                            count[u] -= 1
+                        cw.pop(i)
+                        improved = True
+                        if len(cw) < best_size:
+                            best_size = len(cw)
+                            best_cw = cw[:]
+                        break
+                    
+                    # Try to find replacement
+                    candidates = set()
+                    for u in critical:
+                        for v in neighbors[u]:
+                            if v != ci:
+                                candidates.add(v)
+                    
+                    if not candidates:
+                        continue
+                    
+                    cand_list = list(candidates)
+                    random.shuffle(cand_list)
+                    
+                    found_swap = False
+                    for cj in cand_list[:30]:
+                        valid = all(u in neighbor_sets[cj] for u in critical)
+                        if valid:
+                            # Also check that this swap doesn't create new problems
+                            # (i.e., doesn't leave any word uncovered)
+                            # Since cj covers all critical words of ci, and ci's other neighbors
+                            # have count > 1, the swap is valid.
+                            for u in nb_ci:
+                                count[u] -= 1
+                            nb_cj = neighbors[cj]
+                            for u in nb_cj:
+                                count[u] += 1
+                            cw[i] = cj
+                            improved = True
+                            found_swap = True
+                            break
+                    
+                    if found_swap:
+                        break
     
-    result = [int_to_word(cw, n, q) for cw in codewords]
+    # Convert back to list of lists
+    result = []
+    for ci in best_cw:
+        word = []
+        val = ci
+        for pos in range(n - 1, -1, -1):
+            word.append(val % q)
+            val //= q
+        word.reverse()
+        result.append(word)
+    
     return result
+
 # EVOLVE-BLOCK-END

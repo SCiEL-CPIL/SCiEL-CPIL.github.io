@@ -1,0 +1,1 @@
+BET: {mechanism: "Random regular graph generation + local repair can find smaller n than LUW construction by exploiting the fact that random graphs are locally tree-like, allowing short cycles to be broken efficiently.", q: 0.8, delta: [0.05, 0.2]}

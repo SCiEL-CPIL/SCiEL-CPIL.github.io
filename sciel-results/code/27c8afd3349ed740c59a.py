@@ -1,0 +1,909 @@
+"""Circle packing in perimeter-4 rectangle: pack 21 circles, maximize sum of radii."""
+import numpy as np
+import time
+import random
+from scipy.optimize import minimize
+from scipy.spatial import Delaunay
+
+N = 21
+
+# EVOLVE-BLOCK-START
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140  # Safety margin before 150s limit
+
+    def get_rect_dims(t):
+        t = np.clip(t, 0.1, 0.9)
+        w = 2.0 * t
+        h = 2.0 * (1.0 - t)
+        return w, h
+
+    def evaluate(state):
+        """
+        Returns (score, penalty). Score = sum_r - penalty.
+        Higher score is better. Valid solutions have penalty=0.
+        """
+        t = state[0]
+        w, h = get_rect_dims(t)
+        
+        penalty = 0.0
+        
+        coords = np.zeros((N, 3))
+        for i in range(N):
+            coords[i, 0] = state[1 + 3*i]
+            coords[i, 1] = state[1 + 3*i+1]
+            coords[i, 2] = state[1 + 3*i+2]
+        
+        radii = coords[:, 2]
+        if np.any(radii < 1e-5):
+            radii = np.maximum(radii, 1e-5)
+            penalty += 0.1 * np.sum(radii[radii < 1e-5])
+        
+        sum_r = np.sum(radii)
+        
+        # Boundary violations
+        x = coords[:, 0]
+        y = coords[:, 1]
+        
+        viol_left = np.maximum(0, radii - x)
+        viol_right = np.maximum(0, x + radii - w)
+        viol_bottom = np.maximum(0, radii - y)
+        viol_top = np.maximum(0, y + radii - h)
+        
+        penalty += 500.0 * (np.sum(viol_left) + np.sum(viol_right) + np.sum(viol_bottom) + np.sum(viol_top))
+        
+        # Overlap violations - vectorized using squared distances
+        idx_i, idx_j = np.triu_indices(N, k=1)
+        dx = x[idx_i] - x[idx_j]
+        dy = y[idx_i] - y[idx_j]
+        dist_sq = dx*dx + dy*dy
+        min_dist = radii[idx_i] + radii[idx_j]
+        
+        # Only compute sqrt where needed (where dist_sq < min_dist^2)
+        overlap_mask = dist_sq < min_dist * min_dist
+        if np.any(overlap_mask):
+            dist = np.sqrt(dist_sq[overlap_mask])
+            overlaps = min_dist[overlap_mask] - dist
+            penalty += 1000.0 * np.sum(overlaps)
+        
+        score = sum_r - penalty
+        return score, penalty
+
+    def check_valid(state, eps=1e-7):
+        """
+        Check if state is valid: all circles inside rectangle, no overlaps.
+        """
+        t = state[0]
+        w, h = get_rect_dims(t)
+        
+        coords = np.zeros((N, 3))
+        for i in range(N):
+            coords[i, 0] = state[1 + 3*i]
+            coords[i, 1] = state[1 + 3*i+1]
+            coords[i, 2] = state[1 + 3*i+2]
+        
+        radii = coords[:, 2]
+        if np.any(radii < 1e-6):
+            return False
+        
+        x = coords[:, 0]
+        y = coords[:, 1]
+        
+        # Boundary check
+        if np.any(x - radii < -eps) or np.any(x + radii > w + eps) or \
+           np.any(y - radii < -eps) or np.any(y + radii > h + eps):
+            return False
+        
+        # Overlap check
+        for i in range(N):
+            for j in range(i+1, N):
+                dx = x[i] - x[j]
+                dy = y[i] - y[j]
+                dist_sq = dx*dx + dy*dy
+                min_dist = radii[i] + radii[j] - eps
+                if dist_sq < min_dist * min_dist:
+                    return False
+        return True
+
+    def make_initial_hexagonal(t_init=0.5, jitter=0.0):
+        """
+        Create an initial state using a hexagonal lattice pattern.
+        """
+        w, h = get_rect_dims(t_init)
+        state = np.zeros(1 + 3*N)
+        state[0] = t_init
+        r_est = np.sqrt(0.9069 * w * h / (N * np.pi))
+        r_current = r_est
+        positions = []
+        
+        for attempt in range(20):
+            positions = []
+            y = r_current
+            row_idx = 0
+            while y <= h - r_current + 1e-9:
+                if row_idx % 2 == 0:
+                    x_start = r_current
+                else:
+                    x_start = r_current + r_current
+                x = x_start
+                while x <= w - r_current + 1e-9:
+                    positions.append((x, y, r_current))
+                    x += 2.0 * r_current
+                y += np.sqrt(3) * r_current
+                row_idx += 1
+            if len(positions) >= N:
+                break
+            else:
+                r_current *= 0.95
+        
+        if len(positions) < N:
+            side = 5
+            idx = 0
+            positions = []
+            for i in range(side):
+                for j in range(side):
+                    if idx >= N:
+                        break
+                    gx = (i + 0.5) / side * w
+                    gy = (j + 0.5) / side * h
+                    r = 0.5 / side * min(w, h) * 0.95
+                    positions.append((gx, gy, r))
+                    idx += 1
+        
+        for i in range(N):
+            if i < len(positions):
+                x, y, r = positions[i]
+                if jitter > 0:
+                    x += random.uniform(-jitter, jitter)
+                    y += random.uniform(-jitter, jitter)
+                state[1 + 3*i] = x
+                state[1 + 3*i + 1] = y
+                state[1 + 3*i + 2] = r
+            else:
+                state[1 + 3*i] = w/2
+                state[1 + 3*i + 1] = h/2
+                state[1 + 3*i + 2] = 0.01
+        return state
+
+    def make_initial_grid(t_init=0.5, jitter=0.0):
+        """
+        Create an initial state using a square grid pattern.
+        """
+        w, h = get_rect_dims(t_init)
+        state = np.zeros(1 + 3*N)
+        state[0] = t_init
+        
+        # Try different grid configurations
+        best_positions = None
+        for rows in range(3, 8):
+            cols = int(np.ceil(N / rows))
+            if rows * cols < N:
+                continue
+            positions = []
+            for i in range(rows):
+                for j in range(cols):
+                    if len(positions) >= N:
+                        break
+                    gx = (j + 0.5) / cols * w
+                    gy = (i + 0.5) / rows * h
+                    r = 0.5 * min(w / cols, h / rows) * 0.9
+                    positions.append((gx, gy, r))
+            if len(positions) >= N:
+                if best_positions is None or np.mean([p[2] for p in positions]) > np.mean([p[2] for p in best_positions]):
+                    best_positions = positions
+        
+        if best_positions is None:
+            # Fallback
+            side = 5
+            positions = []
+            for i in range(side):
+                for j in range(side):
+                    if len(positions) >= N:
+                        break
+                    gx = (i + 0.5) / side * w
+                    gy = (j + 0.5) / side * h
+                    r = 0.5 / side * min(w, h) * 0.95
+                    positions.append((gx, gy, r))
+            best_positions = positions
+        
+        for i in range(N):
+            x, y, r = best_positions[i]
+            if jitter > 0:
+                x += random.uniform(-jitter, jitter)
+                y += random.uniform(-jitter, jitter)
+            state[1 + 3*i] = x
+            state[1 + 3*i + 1] = y
+            state[1 + 3*i + 2] = r
+        return state
+
+    def make_initial_random(t_init=0.5):
+        """
+        Create a random initial state with non-overlapping circles.
+        """
+        w, h = get_rect_dims(t_init)
+        state = np.zeros(1 + 3*N)
+        state[0] = t_init
+        
+        positions = []
+        max_attempts = 1000
+        r_est = np.sqrt(0.9069 * w * h / (N * np.pi))
+        
+        for i in range(N):
+            placed = False
+            for attempt in range(max_attempts):
+                r = r_est * random.uniform(0.8, 1.2)
+                x = random.uniform(r, w - r)
+                y = random.uniform(r, h - r)
+                
+                # Check against existing circles
+                valid = True
+                for (px, py, pr) in positions:
+                    dx = x - px
+                    dy = y - py
+                    if dx*dx + dy*dy < (r + pr)**2:
+                        valid = False
+                        break
+                
+                if valid:
+                    positions.append((x, y, r))
+                    placed = True
+                    break
+            
+            if not placed:
+                # Fallback: place at center with small radius
+                positions.append((w/2, h/2, 0.01))
+        
+        for i in range(N):
+            x, y, r = positions[i]
+            state[1 + 3*i] = x
+            state[1 + 3*i + 1] = y
+            state[1 + 3*i + 2] = r
+        return state
+
+    def get_delaunay_contacts(state, tol=0.05):
+        """
+        Get Delaunay neighbor pairs and identify tight contacts.
+        Returns list of (i, j, tightness) where tightness = min_dist - dist (positive means overlap)
+        """
+        x = state[1:1+3*N:3]
+        y = state[2:1+3*N:3]
+        radii = state[3:1+3*N:3]
+        
+        points = np.column_stack([x, y])
+        try:
+            tri = Delaunay(points)
+            # Get unique edges from triangles
+            edges = set()
+            for simplex in tri.simplices:
+                for a in range(3):
+                    for b in range(a+1, 3):
+                        i, j = simplex[a], simplex[b]
+                        if i > j:
+                            i, j = j, i
+                        edges.add((i, j))
+            
+            contacts = []
+            for i, j in edges:
+                dx = x[i] - x[j]
+                dy = y[i] - y[j]
+                dist = np.sqrt(dx*dx + dy*dy)
+                min_dist = radii[i] + radii[j]
+                tightness = min_dist - dist
+                if tightness > -tol:  # near-contact or overlapping
+                    contacts.append((i, j, tightness))
+            return contacts
+        except Exception:
+            return []
+
+    def polish_gradient(state, time_limit, max_iter=2000):
+        """
+        Gradient-based polish using smooth penalty formulation with Delaunay-guided contacts.
+        Encourages equal radii slightly to find cleaner solutions.
+        """
+        idx_i, idx_j = np.triu_indices(N, k=1)
+        n_pairs = len(idx_i)
+        
+        def objective_and_grad(s):
+            t = s[0]
+            w, h = get_rect_dims(t)
+            
+            radii = s[3:1+3*N:3]
+            x = s[1:1+3*N:3]
+            y = s[2:1+3*N:3]
+            
+            # Negative sum of radii (we minimize)
+            obj = -np.sum(radii)
+            
+            # Small penalty for radius variance to encourage equal radii
+            mean_r = np.mean(radii)
+            obj += 0.01 * np.sum((radii - mean_r)**2)
+            
+            # Smooth boundary penalties using softplus
+            beta_b = 0.002
+            viol_l = radii - x
+            viol_r = x + radii - w
+            viol_b = radii - y
+            viol_t = y + radii - h
+            
+            sl = beta_b * np.log1p(np.exp(np.clip(viol_l / beta_b, -500, 500)))
+            sr = beta_b * np.log1p(np.exp(np.clip(viol_r / beta_b, -500, 500)))
+            sb = beta_b * np.log1p(np.exp(np.clip(viol_b / beta_b, -500, 500)))
+            st = beta_b * np.log1p(np.exp(np.clip(viol_t / beta_b, -500, 500)))
+            
+            obj += 1000.0 * (np.sum(sl**2) + np.sum(sr**2) + np.sum(sb**2) + np.sum(st**2))
+            
+            # Overlap penalty - smooth, only for near-contact pairs (Delaunay-guided)
+            dx = x[idx_i] - x[idx_j]
+            dy = y[idx_i] - y[idx_j]
+            dist_sq = dx*dx + dy*dy
+            min_dist = radii[idx_i] + radii[idx_j]
+            
+            dist = np.sqrt(dist_sq + 1e-12)
+            overlap_amount = min_dist - dist
+            
+            # Focus penalty on near-contact pairs (within 2*max_radius)
+            max_r = np.max(radii)
+            near_mask = dist < 2.5 * max_r
+            if not np.any(near_mask):
+                near_mask = np.ones(n_pairs, dtype=bool)
+            
+            beta_o = 0.005
+            so_all = beta_o * np.log1p(np.exp(np.clip(overlap_amount / beta_o, -500, 500)))
+            so = np.where(near_mask, so_all, 0.0)
+            obj += 5000.0 * np.sum(so**2)
+            
+            # Gradient calculation
+            grad = np.zeros_like(s)
+            
+            # d(-sum_r)/dr_i = -1
+            grad[3:1+3*N:3] += -1.0
+            
+            # Gradient for variance penalty: 0.02 * (r_i - mean_r)
+            grad[3:1+3*N:3] += 0.02 * (radii - mean_r)
+
+            # Boundary gradients
+            sig_l = 1.0 / (1.0 + np.exp(-np.clip(viol_l / beta_b, -500, 500)))
+            sig_r = 1.0 / (1.0 + np.exp(-np.clip(viol_r / beta_b, -500, 500)))
+            sig_b = 1.0 / (1.0 + np.exp(-np.clip(viol_b / beta_b, -500, 500)))
+            sig_t = 1.0 / (1.0 + np.exp(-np.clip(viol_t / beta_b, -500, 500)))
+            
+            grad[1:1+3*N:3] += 2000.0 * sl * sig_l * (-1.0)
+            grad[1:1+3*N:3] += 2000.0 * sr * sig_r * (1.0)
+            grad[2:1+3*N:3] += 2000.0 * sb * sig_b * (-1.0)
+            grad[2:1+3*N:3] += 2000.0 * st * sig_t * (1.0)
+            
+            grad[3:1+3*N:3] += 2000.0 * sl * sig_l * (1.0)
+            grad[3:1+3*N:3] += 2000.0 * sr * sig_r * (1.0)
+            grad[3:1+3*N:3] += 2000.0 * sb * sig_b * (1.0)
+            grad[3:1+3*N:3] += 2000.0 * st * sig_t * (1.0)
+            
+            # Overlap gradients (distance-based), only for near pairs
+            sig_o = 1.0 / (1.0 + np.exp(-np.clip(overlap_amount / beta_o, -500, 500)))
+            factor = 10000.0 * so * sig_o
+            
+            inv_dist = 1.0 / np.maximum(dist, 1e-10)
+            
+            # Apply only to near-contact pairs
+            fx = factor * (-dx * inv_dist)
+            fy = factor * (-dy * inv_dist)
+            
+            np.add.at(grad[1:1+3*N:3], idx_i, fx)
+            np.add.at(grad[1:1+3*N:3], idx_j, -fx)
+            np.add.at(grad[2:1+3*N:3], idx_i, fy)
+            np.add.at(grad[2:1+3*N:3], idx_j, -fy)
+            np.add.at(grad[3:1+3*N:3], idx_i, factor)
+            np.add.at(grad[3:1+3*N:3], idx_j, factor)
+            
+            return obj, grad
+        
+        def objective(s):
+            return objective_and_grad(s)[0]
+        
+        def gradient(s):
+            return objective_and_grad(s)[1]
+        
+        bounds = [(0.1, 0.9)]
+        for i in range(N):
+            bounds.append((0, 2.0))  # x
+            bounds.append((0, 2.0))  # y
+            bounds.append((1e-4, 0.5))  # r
+        
+        try:
+            result = minimize(
+                objective,
+                state,
+                jac=gradient,
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={'maxiter': max_iter, 'ftol': 1e-15, 'gtol': 1e-13, 'maxls': 80}
+            )
+            if result.success or result.fun < objective(state):
+                return result.x
+        except Exception:
+            pass
+        
+        return state
+
+    def polish_slsqp(state, time_limit, max_iter=1000):
+        """
+        Final high-precision polish using SLSQP with explicit constraints.
+        """
+        def objective(s):
+            radii = s[3:1+3*N:3]
+            return -np.sum(radii)
+        
+        def jac(s):
+            grad = np.zeros_like(s)
+            grad[3:1+3*N:3] = -1.0
+            return grad
+        
+        # Inequality constraints: g(s) >= 0
+        constraints = []
+        t_val = state[0]
+        w, h = get_rect_dims(t_val)
+        
+        # Boundary constraints
+        for i in range(N):
+            ri = 1 + 3*i
+            # x_i - r_i >= 0
+            constraints.append({
+                'type': 'ineq',
+                'fun': lambda s, i=i: s[1+3*i] - s[3+3*i],
+                'jac': lambda s, i=i: np.array([0.0 if k != 1+3*i else 1.0, 
+                                                0.0 if k != 2+3*i else 0.0,
+                                                0.0 if k != 3+3*i else -1.0] for k in range(len(s)))
+            })
+        
+        # This approach is too slow for SLSQP with many constraints.
+        # Instead, use a penalty-based approach with tighter tolerances.
+        
+        def obj_penalty(s):
+            t = s[0]
+            w, h = get_rect_dims(t)
+            radii = s[3:1+3*N:3]
+            x = s[1:1+3*N:3]
+            y = s[2:1+3*N:3]
+            
+            obj = -np.sum(radii)
+            
+            # Tight boundary penalties
+            beta = 0.001
+            viol_l = np.maximum(0, radii - x)
+            viol_r = np.maximum(0, x + radii - w)
+            viol_b = np.maximum(0, radii - y)
+            viol_t = np.maximum(0, y + radii - h)
+            obj -= 5000.0 * (np.sum(viol_l**2) + np.sum(viol_r**2) + np.sum(viol_b**2) + np.sum(viol_t**2))
+            
+            # Tight overlap penalties
+            idx_i, idx_j = np.triu_indices(N, k=1)
+            dx = x[idx_i] - x[idx_j]
+            dy = y[idx_i] - y[idx_j]
+            dist = np.sqrt(dx*dx + dy*dy + 1e-12)
+            min_dist = radii[idx_i] + radii[idx_j]
+            overlap = np.maximum(0, min_dist - dist)
+            obj -= 10000.0 * np.sum(overlap**2)
+            
+            return obj
+        
+        def jac_penalty(s):
+            t = s[0]
+            w, h = get_rect_dims(t)
+            radii = s[3:1+3*N:3]
+            x = s[1:1+3*N:3]
+            y = s[2:1+3*N:3]
+            
+            grad = np.zeros_like(s)
+            grad[3:1+3*N:3] = -1.0
+            
+            # Boundary gradients
+            grad[1:1+3*N:3] += 10000.0 * np.where(radii - x > 0, radii - x, 0) * (-1)
+            grad[1:1+3*N:3] += 10000.0 * np.where(x + radii - w > 0, x + radii - w, 0)
+            grad[2:1+3*N:3] += 10000.0 * np.where(radii - y > 0, radii - y, 0) * (-1)
+            grad[2:1+3*N:3] += 10000.0 * np.where(y + radii - h > 0, y + radii - h, 0)
+            
+            grad[3:1+3*N:3] += 10000.0 * np.where(radii - x > 0, radii - x, 0)
+            grad[3:1+3*N:3] += 10000.0 * np.where(x + radii - w > 0, x + radii - w, 0)
+            grad[3:1+3*N:3] += 10000.0 * np.where(radii - y > 0, radii - y, 0)
+            grad[3:1+3*N:3] += 10000.0 * np.where(y + radii - h > 0, y + radii - h, 0)
+            
+            # Overlap gradients
+            idx_i, idx_j = np.triu_indices(N, k=1)
+            dx = x[idx_i] - x[idx_j]
+            dy = y[idx_i] - y[idx_j]
+            dist = np.sqrt(dx*dx + dy*dy + 1e-12)
+            min_dist = radii[idx_i] + radii[idx_j]
+            overlap = np.maximum(0, min_dist - dist)
+            
+            inv_dist = 1.0 / np.maximum(dist, 1e-10)
+            fx = 20000.0 * overlap * (-dx * inv_dist)
+            fy = 20000.0 * overlap * (-dy * inv_dist)
+            
+            np.add.at(grad[1:1+3*N:3], idx_i, fx)
+            np.add.at(grad[1:1+3*N:3], idx_j, -fx)
+            np.add.at(grad[2:1+3*N:3], idx_i, fy)
+            np.add.at(grad[2:1+3*N:3], idx_j, -fy)
+            np.add.at(grad[3:1+3*N:3], idx_i, 20000.0 * overlap)
+            np.add.at(grad[3:1+3*N:3], idx_j, 20000.0 * overlap)
+            
+            return grad
+        
+        bounds = [(0.1, 0.9)]
+        for i in range(N):
+            bounds.append((0, 2.0))
+            bounds.append((0, 2.0))
+            bounds.append((1e-4, 0.5))
+        
+        try:
+            result = minimize(
+                obj_penalty,
+                state,
+                jac=jac_penalty,
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={'maxiter': max_iter, 'ftol': 1e-18, 'gtol': 1e-15, 'maxls': 100}
+            )
+            if result.fun < obj_penalty(state):
+                return result.x
+        except Exception:
+            pass
+        
+        return state
+
+    def force_relax(state, time_limit, max_iter=5000):
+        """
+        Force-directed relaxation: vectorized version for speed.
+        """
+        best_state = state.copy()
+        best_score, _ = evaluate(best_state)
+        
+        idx_i, idx_j = np.triu_indices(N, k=1)
+        n_pairs = len(idx_i)
+        
+        step_size = 0.005
+        patience = 0
+        max_patience = 200
+        
+        for it in range(max_iter):
+            if time.time() > time_limit:
+                break
+            
+            t = best_state[0]
+            w, h = get_rect_dims(t)
+            
+            x = best_state[1:1+3*N:3].copy()
+            y = best_state[2:1+3*N:3].copy()
+            radii = best_state[3:1+3*N:3].copy()
+            
+            fx = np.zeros(N)
+            fy = np.zeros(N)
+            fr = np.zeros(N)
+            
+            # Boundary forces (vectorized)
+            viol_l = np.maximum(0, radii - x)
+            viol_r = np.maximum(0, x + radii - w)
+            viol_b = np.maximum(0, radii - y)
+            viol_t = np.maximum(0, y + radii - h)
+            fx += 10.0 * viol_l - 10.0 * viol_r
+            fy += 10.0 * viol_b - 10.0 * viol_t
+            
+            # Pair forces (vectorized)
+            dx = x[idx_i] - x[idx_j]
+            dy = y[idx_i] - y[idx_j]
+            dist_sq = dx*dx + dy*dy
+            dist = np.sqrt(dist_sq + 1e-12)
+            target = radii[idx_i] + radii[idx_j]
+            diff = dist - target
+            
+            # Force magnitude
+            k_spring = np.where(diff < 0, 50.0, 2.0)
+            force_mag = k_spring * diff
+            
+            # Direction unit vectors
+            inv_dist = 1.0 / np.maximum(dist, 1e-10)
+            fx_dir = dx * inv_dist
+            fy_dir = dy * inv_dist
+            
+            # Apply forces to pairs using np.add.at for accumulation
+            np.add.at(fx, idx_i, force_mag * fx_dir)
+            np.add.at(fy, idx_i, force_mag * fy_dir)
+            np.add.at(fx, idx_j, -force_mag * fx_dir)
+            np.add.at(fy, idx_j, -force_mag * fy_dir)
+            
+            # Radii forces: encourage equal radii and growth if space allows
+            mean_r = np.mean(radii)
+            fr += -0.1 * (radii - mean_r) # Pull towards mean
+            fr_inc = np.where(diff > 0.01, 0.1, np.where(diff < -0.01, -0.5, 0.0))
+            np.add.at(fr, idx_i, fr_inc)
+            np.add.at(fr, idx_j, fr_inc)
+            
+            # Update
+            x_new = x + step_size * fx
+            y_new = y + step_size * fy
+            r_new = radii + step_size * 0.5 * fr
+            
+            # Clamp
+            max_r = 0.5 * min(w, h)
+            x_new = np.clip(x_new, radii, w - radii)
+            y_new = np.clip(y_new, radii, h - radii)
+            r_new = np.clip(r_new, 1e-4, max_r)
+            
+            # Build new state
+            new_state = best_state.copy()
+            new_state[1:1+3*N:3] = x_new
+            new_state[2:1+3*N:3] = y_new
+            new_state[3:1+3*N:3] = r_new
+            
+            new_score, _ = evaluate(new_state)
+            
+            if new_score > best_score:
+                best_state = new_state
+                best_score = new_score
+                patience = 0
+                step_size = min(0.01, step_size * 1.02)
+            else:
+                patience += 1
+                step_size = max(0.001, step_size * 0.95)
+            
+            if patience > max_patience:
+                break
+        
+        return best_state
+
+    def local_optimize(state, time_limit):
+        """
+        Run simulated annealing to improve state.
+        """
+        best_state = state.copy()
+        best_score, _ = evaluate(best_state)
+        
+        T_start = 0.5
+        T_end = 1e-5
+        alpha = 0.9995
+        
+        T = T_start
+        
+        while time.time() < time_limit:
+            if time.time() > time_limit - 2:
+                break
+            
+            # Generate neighbor
+            new_state = best_state.copy()
+            var_idx = random.randint(0, len(new_state)-1)
+            
+            if var_idx == 0:
+                new_state[0] += random.gauss(0, 0.02)
+                if new_state[0] < 0.05 or new_state[0] > 0.95:
+                    T *= alpha
+                    if T < T_end:
+                        T = T_end
+                    continue
+            else:
+                circle_idx = (var_idx - 1) // 3
+                comp = (var_idx - 1) % 3
+                
+                scale = T / T_start * 0.1 + 0.01
+                
+                if comp == 0:
+                    new_state[var_idx] += random.gauss(0, scale)
+                elif comp == 1:
+                    new_state[var_idx] += random.gauss(0, scale)
+                else:
+                    new_state[var_idx] += random.gauss(0, scale * 0.3)
+                    if new_state[var_idx] < 1e-4:
+                        new_state[var_idx] = 1e-4
+                    w, h = get_rect_dims(new_state[0])
+                    max_r = 0.5 * min(w, h)
+                    if new_state[var_idx] > max_r:
+                        new_state[var_idx] = max_r
+            
+            new_score, new_penalty = evaluate(new_state)
+            
+            if new_score > best_score or random.random() < np.exp((new_score - best_score) / T):
+                best_state = new_state
+                best_score = new_score
+            else:
+                pass
+            
+            T *= alpha
+            if T < T_end:
+                T = T_end
+        
+        return best_state, best_score
+
+    # Main algorithm
+    best_state = None
+    best_score = -np.inf
+    
+    # Multiple restarts with different aspect ratios and initializations
+    num_restarts = 17
+    
+    for restart in range(num_restarts):
+        if time.time() > deadline - 45:
+            break
+        
+        # Vary aspect ratio for diversity
+        t_init = 0.5 + random.uniform(-0.25, 0.25)
+        
+        # Choose initialization strategy based on restart index
+        init_strategy = restart % 3
+        if init_strategy == 0:
+            state = make_initial_hexagonal(t_init, jitter=0.02)
+        elif init_strategy == 1:
+            state = make_initial_grid(t_init, jitter=0.02)
+        else:
+            state = make_initial_random(t_init)
+        
+        # Time budget for this restart
+        remaining = deadline - 50 - time.time()
+        if remaining < 12:
+            break
+        
+        # Allocate time for SA and polish
+        sa_time = max(6, remaining * 0.40)
+        sa_deadline = time.time() + sa_time
+        
+        state, score = local_optimize(state, sa_deadline)
+        
+        # Force-directed relaxation phase (now vectorized, faster)
+        if time.time() < deadline - 30:
+            force_deadline = time.time() + min(8, (deadline - 30 - time.time()) * 0.35)
+            force_state = force_relax(state, force_deadline)
+            force_score, _ = evaluate(force_state)
+            if force_score > score:
+                state = force_state
+                score = force_score
+        
+        # Gradient polish phase
+        if time.time() < deadline - 15:
+            for polish_iter in range(5):
+                if time.time() > deadline - 12:
+                    break
+                polish_deadline = time.time() + min(8, (deadline - 12 - time.time()) / (5 - polish_iter))
+                polished = polish_gradient(state, polish_deadline, max_iter=3000)
+                pol_score, pol_pen = evaluate(polished)
+                if pol_score > score:
+                    state = polished
+                    score = pol_score
+                else:
+                    # Try force relaxation again from this state
+                    if time.time() < deadline - 14:
+                        force_deadline2 = time.time() + min(4, (deadline - 14 - time.time()) * 0.5)
+                        force_state2 = force_relax(state, force_deadline2)
+                        force_score2, _ = evaluate(force_state2)
+                        if force_score2 > score:
+                            state = force_state2
+                            score = force_score2
+                            polished = polish_gradient(state, time.time() + 4, max_iter=2000)
+                            pol_score2, _ = evaluate(polished)
+                            if pol_score2 > score:
+                                state = polished
+                                score = pol_score2
+                    break
+        
+        if score > best_score:
+            best_score = score
+            best_state = state.copy()
+    
+    # Final high-precision polish on the best solution
+    if best_state is not None and time.time() < deadline - 8:
+        # Force relaxation first to potentially find better topology
+        if time.time() < deadline - 12:
+            force_final = force_relax(best_state, time.time() + 5)
+            ff_score, _ = evaluate(force_final)
+            if ff_score > best_score:
+                best_state = force_final
+                best_score = ff_score
+        
+        # Multiple polish passes with decreasing tolerance
+        polish_passes = 3
+        for p in range(polish_passes):
+            if time.time() > deadline - 4:
+                break
+            remaining_time = deadline - 4 - time.time()
+            if remaining_time < 2:
+                break
+            polish_deadline = time.time() + min(10, remaining_time / (polish_passes - p))
+            polished = polish_gradient(best_state, polish_deadline, max_iter=5000)
+            pol_score, pol_pen = evaluate(polished)
+            if pol_score > best_score:
+                best_state = polished
+                best_score = pol_score
+            else:
+                # If polish didn't help, try a short force relaxation then polish again
+                if time.time() < deadline - 6:
+                    force_retry = force_relax(best_state, time.time() + 3)
+                    fr_score, _ = evaluate(force_retry)
+                    if fr_score > best_score:
+                        best_state = force_retry
+                        best_score = fr_score
+                    break
+        
+        # Final SLSQP-style high-precision polish
+        if time.time() < deadline - 3:
+            slsqp_deadline = time.time() + min(8, deadline - 3 - time.time())
+            slsqp_state = polish_slsqp(best_state, slsqp_deadline, max_iter=3000)
+            slsqp_score, slsqp_pen = evaluate(slsqp_state)
+            if slsqp_score > best_score:
+                best_state = slsqp_state
+                best_score = slsqp_score
+    
+    # Final validity check and repair if needed
+    if best_state is None:
+        best_state = make_initial_hexagonal(0.5)
+    elif not check_valid(best_state):
+        # Try to repair by shrinking radii and re-polishing
+        repair = best_state.copy()
+        repaired = False
+        for shrink in range(50):
+            if check_valid(repair):
+                repaired = True
+                break
+            for i in range(N):
+                repair[1 + 3*i + 2] *= 0.98
+            # Quick reposition
+            t_r = repair[0]
+            w_r, h_r = get_rect_dims(t_r)
+            for i in range(N):
+                r_r = repair[1 + 3*i + 2]
+                x_r = repair[1 + 3*i]
+                y_r = repair[1 + 3*i + 1]
+                x_r = max(r_r, min(w_r - r_r, x_r))
+                y_r = max(r_r, min(h_r - r_r, y_r))
+                repair[1 + 3*i] = x_r
+                repair[1 + 3*i + 1] = y_r
+        if repaired:
+            best_state = repair
+        else:
+            best_state = make_initial_hexagonal(0.5)
+            # Final polish on fallback
+            if time.time() < deadline - 2:
+                polished = polish_gradient(best_state, time.time() + 5, max_iter=3000)
+                pol_score, _ = evaluate(polished)
+                if pol_score > evaluate(best_state)[0]:
+                    best_state = polished
+    
+    # Extract result
+    result = np.zeros((N, 3))
+    for i in range(N):
+        result[i, 0] = best_state[1 + 3*i]
+        result[i, 1] = best_state[1 + 3*i+1]
+        result[i, 2] = best_state[1 + 3*i+2]
+    
+    # Final clamp to ensure validity
+    t_final = best_state[0]
+    w_final, h_final = get_rect_dims(t_final)
+    for i in range(N):
+        x = result[i, 0]
+        y = result[i, 1]
+        r = result[i, 2]
+        
+        if x - r < 0:
+            x = r
+        if x + r > w_final:
+            x = w_final - r
+        result[i, 0] = max(0, min(w_final, x))
+        
+        if y - r < 0:
+            y = r
+        if y + r > h_final:
+            y = h_final - r
+        result[i, 1] = max(0, min(h_final, y))
+        
+        max_r = 0.5 * min(w_final, h_final)
+        result[i, 2] = max(1e-6, min(max_r, r))
+    
+    # Final validity verification and emergency repair
+    if not check_valid(result.ravel()[:0] if False else np.concatenate([[best_state[0]], result.ravel()])):
+        # Emergency: shrink all radii slightly
+        for i in range(N):
+            result[i, 2] *= 0.995
+            x = result[i, 0]
+            y = result[i, 1]
+            r = result[i, 2]
+            result[i, 0] = max(r, min(w_final - r, x))
+            result[i, 1] = max(r, min(h_final - r, y))
+    
+    return result
+
+# EVOLVE-BLOCK-END

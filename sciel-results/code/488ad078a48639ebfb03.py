@@ -1,0 +1,347 @@
+import time
+import random
+import math
+from collections import Counter
+
+def construct(n_rows, k):
+    start_time = time.time()
+    deadline = start_time + 140.0  # Safety margin before 150s kill
+
+    def _scope(rows):
+        return max(a for r in rows for a in r[1:])
+
+    def _valid(rows, k):
+        seen = set()
+        for r in rows:
+            if r[0] != 0 or len(r) != k + 1:
+                return False
+            for i in range(len(r)):
+                for j in range(i + 1, len(r)):
+                    d = r[j] - r[i]
+                    if d <= 0 or d in seen:
+                        return False
+                    seen.add(d)
+        return True
+
+    def _build_diff_counts(rows):
+        counts = Counter()
+        for r in rows:
+            for i in range(len(r)):
+                for j in range(i + 1, len(r)):
+                    d = r[j] - r[i]
+                    counts[d] += 1
+        return counts
+
+    def _remove_row_diffs(diff_counts, row):
+        for i in range(len(row)):
+            for j in range(i + 1, len(row)):
+                d = row[j] - row[i]
+                diff_counts[d] -= 1
+                if diff_counts[d] == 0:
+                    del diff_counts[d]
+
+    def _add_row_diffs(diff_counts, row):
+        for i in range(len(row)):
+            for j in range(i + 1, len(row)):
+                d = row[j] - row[i]
+                diff_counts[d] = diff_counts.get(d, 0) + 1
+
+    def _fast_greedy(k, n_rows, rng, spread=False):
+        used = 0
+        rows = []
+        for _ in range(n_rows):
+            row = [0]
+            x = 0
+            while len(row) < k + 1:
+                x += 1
+                new = 0
+                for a in row:
+                    new |= (1 << (x - a))
+                if (used & new) == 0:
+                    row.append(x)
+                    used |= new
+                    if spread:
+                        x += max(1, (k - len(row) + 1) * 2 - 2)
+            rows.append(row)
+        return rows
+
+    def _row_rebuild(row, k, diff_counts, rng, max_scope):
+        best_row = None
+        best_score = float('inf')
+        
+        for attempt in range(8):
+            new_row = [0]
+            x = 0
+            local_diffs = set()
+            ok = True
+            for j in range(1, k + 1):
+                found = False
+                start = x + 1
+                if attempt > 0 and rng.random() < 0.4:
+                    start = x + rng.randint(1, 4)
+                for t in range(start, max_scope + 1):
+                    conflicts = 0
+                    new_diffs = []
+                    for a in new_row:
+                        d = t - a
+                        if d <= 0:
+                            continue
+                        new_diffs.append(d)
+                        if diff_counts.get(d, 0) > 0:
+                            conflicts += 1
+                    if conflicts == 0:
+                        new_row.append(t)
+                        local_diffs.update(new_diffs)
+                        x = t
+                        found = True
+                        break
+                    elif attempt < 3 and conflicts <= 1 and rng.random() < 0.15:
+                        new_row.append(t)
+                        local_diffs.update(new_diffs)
+                        x = t
+                        found = True
+                        break
+                if not found:
+                    ok = False
+                    break
+            if ok and len(new_row) == k + 1:
+                score = 0
+                for i in range(len(new_row)):
+                    for j in range(i + 1, len(new_row)):
+                        d = new_row[j] - new_row[i]
+                        if diff_counts.get(d, 0) > 0:
+                            score += 1
+                if score < best_score:
+                    best_score = score
+                    best_row = list(new_row)
+                if best_score == 0:
+                    break
+        
+        return best_row
+
+    def _sa_optimize(rows, k, iters, rng, deadline, polish=False):
+        n_rows = len(rows)
+        current_rows = [list(r) for r in rows]
+        current_scope = _scope(current_rows)
+        best_rows = [list(r) for r in current_rows]
+        best_scope = current_scope
+        
+        diff_counts = _build_diff_counts(current_rows)
+        
+        def get_cost(rows, dc):
+            scope = _scope(rows)
+            collisions = sum(max(0, c - 1) for c in dc.values())
+            return scope + 500 * collisions
+
+        current_cost = get_cost(current_rows, diff_counts)
+        best_cost = current_cost
+        
+        if polish:
+            T = 0.5
+            cooling = 0.9999
+            min_T = 0.01
+        else:
+            T = 8.0
+            cooling = 0.9995
+            min_T = 0.05
+        
+        for it in range(iters):
+            if time.time() > deadline:
+                break
+                
+            r = rng.random()
+            
+            if r < 0.15:
+                # Row rebuild move
+                i = rng.randint(0, n_rows - 1)
+                old_row = list(current_rows[i])
+                _remove_row_diffs(diff_counts, old_row)
+                
+                new_row = _row_rebuild(old_row, k, diff_counts, rng, current_scope + 5)
+                if new_row is None:
+                    _add_row_diffs(diff_counts, old_row)
+                    continue
+                
+                _add_row_diffs(diff_counts, new_row)
+                current_rows[i] = new_row
+                new_cost = get_cost(current_rows, diff_counts)
+                
+                if new_cost < current_cost or rng.random() < math.exp(-(new_cost - current_cost) / max(T, min_T)):
+                    current_cost = new_cost
+                    if new_cost < best_cost:
+                        best_cost = new_cost
+                        best_scope = _scope(current_rows)
+                        best_rows = [list(r) for r in current_rows]
+                else:
+                    _remove_row_diffs(diff_counts, new_row)
+                    _add_row_diffs(diff_counts, old_row)
+                    current_rows[i] = old_row
+                    
+            elif r < 0.35:
+                # Scope compression: try to reduce the max element
+                max_val = current_scope
+                max_row_idx = -1
+                max_pos_idx = -1
+                for ri in range(n_rows):
+                    for pi in range(k, 0, -1):
+                        if current_rows[ri][pi] == max_val:
+                            max_row_idx = ri
+                            max_pos_idx = pi
+                            break
+                    if max_row_idx >= 0:
+                        break
+                
+                if max_row_idx < 0:
+                    continue
+                    
+                i = max_row_idx
+                j = max_pos_idx
+                old_val = current_rows[i][j]
+                
+                # Try to decrease this value
+                prev_val = current_rows[i][j-1]
+                new_val = rng.randint(prev_val + 1, old_val - 1)
+                
+                if new_val <= prev_val or new_val >= old_val:
+                    continue
+                
+                _remove_row_diffs(diff_counts, current_rows[i])
+                current_rows[i][j] = new_val
+                _add_row_diffs(diff_counts, current_rows[i])
+                
+                new_cost = get_cost(current_rows, diff_counts)
+                
+                if new_cost < current_cost or rng.random() < math.exp(-(new_cost - current_cost) / max(T, min_T)):
+                    current_cost = new_cost
+                    if new_cost < best_cost:
+                        best_cost = new_cost
+                        best_scope = _scope(current_rows)
+                        best_rows = [list(r) for r in current_rows]
+                else:
+                    _remove_row_diffs(diff_counts, current_rows[i])
+                    current_rows[i][j] = old_val
+                    _add_row_diffs(diff_counts, current_rows[i])
+                    
+            else:
+                # Single-element move
+                i = rng.randint(0, n_rows - 1)
+                j = rng.randint(1, k)
+                old_val = current_rows[i][j]
+                
+                delta = rng.randint(-5, 5)
+                if delta == 0:
+                    continue
+                
+                new_val = old_val + delta
+                if new_val <= 0:
+                    continue
+                if j > 0 and new_val <= current_rows[i][j-1]:
+                    continue
+                if j < k and new_val >= current_rows[i][j+1]:
+                    continue
+                
+                _remove_row_diffs(diff_counts, current_rows[i])
+                current_rows[i][j] = new_val
+                _add_row_diffs(diff_counts, current_rows[i])
+                
+                new_cost = get_cost(current_rows, diff_counts)
+                
+                if new_cost < current_cost or rng.random() < math.exp(-(new_cost - current_cost) / max(T, min_T)):
+                    current_cost = new_cost
+                    if new_cost < best_cost:
+                        best_cost = new_cost
+                        best_scope = _scope(current_rows)
+                        best_rows = [list(r) for r in current_rows]
+                else:
+                    _remove_row_diffs(diff_counts, current_rows[i])
+                    current_rows[i][j] = old_val
+                    _add_row_diffs(diff_counts, current_rows[i])
+                
+            T *= cooling
+            if T < min_T:
+                T = min_T
+        
+        return best_rows, best_scope
+
+    def _local_polish(rows, k, rng, deadline):
+        n_rows = len(rows)
+        current_rows = [list(r) for r in rows]
+        current_scope = _scope(current_rows)
+        best_rows = [list(r) for r in current_rows]
+        best_scope = current_scope
+        
+        diff_counts = _build_diff_counts(current_rows)
+        
+        for _ in range(20000):
+            if time.time() > deadline:
+                break
+            
+            i = rng.randint(0, n_rows - 1)
+            j = rng.randint(1, k)
+            old_val = current_rows[i][j]
+            
+            # Try small deltas
+            for delta in range(-3, 4):
+                if delta == 0:
+                    continue
+                
+                new_val = old_val + delta
+                if new_val <= 0:
+                    continue
+                if j > 0 and new_val <= current_rows[i][j-1]:
+                    continue
+                if j < k and new_val >= current_rows[i][j+1]:
+                    continue
+                
+                _remove_row_diffs(diff_counts, current_rows[i])
+                current_rows[i][j] = new_val
+                _add_row_diffs(diff_counts, current_rows[i])
+                
+                new_scope = _scope(current_rows)
+                if new_scope < best_scope:
+                    best_scope = new_scope
+                    best_rows = [list(r) for r in current_rows]
+                    break
+                else:
+                    _remove_row_diffs(diff_counts, current_rows[i])
+                    current_rows[i][j] = old_val
+                    _add_row_diffs(diff_counts, current_rows[i])
+        
+        return best_rows, best_scope
+
+    # Phase 1: Generate diverse starting points
+    best_rows = None
+    best_scope = float('inf')
+    
+    for seed in range(20):
+        if time.time() > deadline - 30:
+            break
+        rng = random.Random(seed)
+        rows = _fast_greedy(k, n_rows, rng, spread=(seed % 3 == 0))
+        scope = _scope(rows)
+        if scope < best_scope:
+            best_scope = scope
+            best_rows = [list(r) for r in rows]
+    
+    if best_rows is None:
+        # Fallback
+        rng = random.Random(0)
+        best_rows = _fast_greedy(k, n_rows, rng)
+        best_scope = _scope(best_rows)
+    
+    # Phase 2: Simulated Annealing
+    for seed in range(5):
+        if time.time() > deadline - 10:
+            break
+        rng = random.Random(1000 + seed)
+        candidate_rows, candidate_scope = _sa_optimize(best_rows, k, 50000, rng, deadline - 5, polish=False)
+        if candidate_scope < best_scope:
+            best_scope = candidate_scope
+            best_rows = candidate_rows
+    
+    # Phase 3: Local Polish
+    if time.time() < deadline - 2:
+        rng = random.Random(2000)
+        best_rows, best_scope = _local_polish(best_rows, k, rng, deadline)
+    
+    return best_rows
