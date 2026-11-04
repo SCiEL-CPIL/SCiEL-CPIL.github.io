@@ -1,288 +1,647 @@
+# EVOLVE-BLOCK-START
 import numpy as np
+from scipy.optimize import minimize, differential_evolution
 import time
-import sys
+import itertools
 
 N = 11
-SQRT3 = np.sqrt(3)
-H = SQRT3 / 2
 
-# Precompute triples (i, j, k)
-_triples = []
-for i in range(N):
-    for j in range(i + 1, N):
-        for k in range(j + 1, N):
-            _triples.append((i, j, k))
-_triples = np.array(_triples)
-_N_TRIPLES = len(_triples)
+# Vertices of the equilateral triangle in Cartesian
+V0 = np.array([0.0, 0.0])
+V1 = np.array([1.0, 0.0])
+V2 = np.array([0.5, np.sqrt(3) / 2])
+TRI_AREA = 0.5 * np.sqrt(3) / 2
 
-# For fast updates, we need to know which triples involve a specific point k.
-# triples_containing[k] is a list of indices in _triples that include k.
-_triples_containing = [[] for _ in range(N)]
-for idx, (i, j, k) in enumerate(_triples):
-    _triples_containing[i].append(idx)
-    _triples_containing[j].append(idx)
-    _triples_containing[k].append(idx)
+# Precompute indices for all triples
+_IDX_TRIPLES = np.array([(i, j, k) for i in range(N) for j in range(i+1, N) for k in range(j+1, N)])
+N_TRIPLES = len(_IDX_TRIPLES)
 
-def _bary_to_cart(bary_pts):
+def _bary_to_cart(u, v):
     """
-    bary_pts: (N, 2) array of (u, v). w = 1 - u - v.
-    Returns (N, 2) Cartesian points.
-    Vertices: A(0,0), B(1,0), C(0.5, H)
-    P = u*A + v*B + w*C = u*(0,0) + v*(1,0) + w*(0.5, H)
-    x = v + 0.5*w = v + 0.5*(1-u-v) = 0.5 + 0.5v - 0.5u
-    y = H*w = H*(1-u-v)
+    Convert barycentric coordinates (u, v) to Cartesian.
+    w = 1 - u - v
+    Point = u*V0 + v*V1 + w*V2
     """
-    u = bary_pts[:, 0]
-    v = bary_pts[:, 1]
     w = 1.0 - u - v
-    x = v + 0.5 * w
-    y = H * w
-    return np.column_stack([x, y])
+    x = v * 1.0 + w * 0.5
+    y = w * np.sqrt(3) / 2
+    return np.column_stack((x, y))
 
-def _calc_areas(bary_pts):
+def _all_dets_from_bary(bary):
     """
-    Calculate areas for all 165 triples.
-    Area = 0.5 * |det| * Area_Total (Area_Total is constant, ignore for maximization)
-    Det of [[u_i, v_i, w_i], [u_j, v_j, w_j], [u_k, v_k, w_k]]
+    Compute all 165 determinants (twice the area in barycentric coords).
     """
-    u = bary_pts[:, 0]
-    v = bary_pts[:, 1]
+    u = bary[:, 0]
+    v = bary[:, 1]
+    w = 1.0 - u - v
+    P = np.column_stack((u, v, w))
+    
+    i_idx = _IDX_TRIPLES[:, 0]
+    j_idx = _IDX_TRIPLES[:, 1]
+    k_idx = _IDX_TRIPLES[:, 2]
+    
+    Pi = P[i_idx]
+    Pj = P[j_idx]
+    Pk = P[k_idx]
+    
+    det = (Pi[:, 0] * (Pj[:, 1] * Pk[:, 2] - Pj[:, 2] * Pk[:, 1])
+           - Pi[:, 1] * (Pj[:, 0] * Pk[:, 2] - Pj[:, 2] * Pk[:, 0])
+           + Pi[:, 2] * (Pj[:, 0] * Pk[:, 1] - Pj[:, 1] * Pk[:, 0]))
+           
+    return det
+
+def _min_area_ratio_from_bary(bary):
+    """
+    Returns the minimum absolute determinant (proportional to area ratio).
+    """
+    u = bary[:, 0]
+    v = bary[:, 1]
     w = 1.0 - u - v
     
-    ui = u[_triples[:, 0]]
-    vi = v[_triples[:, 0]]
-    wi = 1.0 - ui - vi
-    
-    uj = u[_triples[:, 1]]
-    vj = v[_triples[:, 1]]
-    wj = 1.0 - uj - vj
-    
-    uk = u[_triples[:, 2]]
-    vk = v[_triples[:, 2]]
-    wk = 1.0 - uk - vk
-    
-    # det = u_i(v_j w_k - v_j w_k) - v_i(u_j w_k - w_j u_k) + w_i(u_j v_k - v_j u_k)
-    # This is standard expansion.
-    det = (ui * (vj * wk - vj * wj) - 
-           vi * (uj * wk - wj * uk) + 
-           wi * (uj * vk - vj * uk))
-           
-    # Wait, vj*wj is wrong. v_j * w_k.
-    # Let's re-verify determinant expansion for rows r1, r2, r3:
-    # | a b c |
-    # | d e f |
-    # | g h i |
-    # = a(ei - fh) - b(di - fg) + c(dh - eg)
-    # Here:
-    # r1: ui, vi, wi
-    # r2: uj, vj, wj
-    # r3: uk, vk, wk
-    
-    # term1 = ui * (vj * wk - vj * wk? No, vj * wk - wj * vk)
-    # term2 = vi * (uj * wk - wj * uk)
-    # term3 = wi * (uj * vk - vj * uk)
-    
-    det = (ui * (vj * wk - wj * vk) - 
-           vi * (uj * wk - wj * uk) + 
-           wi * (uj * vk - vj * uk))
-           
-    areas = 0.5 * np.abs(det)
-    return areas
-
-def _update_areas_for_point(bary_pts, k, current_areas):
-    """
-    Update areas for triples involving point k.
-    Returns new areas array (copy) and the index of min area.
-    """
-    new_areas = current_areas.copy()
-    relevant_triple_indices = _triples_containing[k]
-    
-    if not relevant_triple_indices:
-        return new_areas, np.argmin(new_areas)
+    if np.any(u < -1e-9) or np.any(v < -1e-9) or np.any(w < -1e-9):
+        return -1.0
         
-    # Extract bary coords for all points involved in these triples
-    # We need u, v, w for points i, j, k for each triple.
-    # Since k is fixed, we can pre-fetch its coords.
-    uk = bary_pts[k, 0]
-    vk = bary_pts[k, 1]
-    wk = 1.0 - uk - vk
-    
-    # Get the other two points for each relevant triple
-    # triple is (i, j, k). We need to know which position k is in.
-    # To avoid branching, we can just recompute the determinant for these few triples.
-    
-    # indices in _triples array
-    idxs = relevant_triple_indices
-    ti = _triples[idxs, 0]
-    tj = _triples[idxs, 1]
-    tk = _triples[idxs, 2]
-    
-    # We know one of ti, tj, tk is k.
-    # Let's just compute determinants using full vectorization on these small subsets.
-    u_all = bary_pts[:, 0]
-    v_all = bary_pts[:, 1]
-    w_all = 1.0 - u_all - v_all
-    
-    u1 = u_all[ti]
-    v1 = v_all[ti]
-    w1 = w_all[ti]
-    
-    u2 = u_all[tj]
-    v2 = v_all[tj]
-    w2 = w_all[tj]
-    
-    u3 = u_all[tk]
-    v3 = v_all[tk]
-    w3 = w_all[tk]
-    
-    det = (u1 * (v2 * w3 - w2 * v3) - 
-           v1 * (u2 * w3 - w2 * u3) + 
-           w1 * (u2 * v3 - v2 * u3))
-           
-    new_areas[idxs] = 0.5 * np.abs(det)
-    
-    min_idx = np.argmin(new_areas)
-    return new_areas, min_idx
+    dets = _all_dets_from_bary(bary)
+    return np.min(np.abs(dets))
 
-def construct():
-    start_time = time.time()
-    deadline = start_time + 140.0  # 10s safety margin
+def _project_to_bary_simplex(bary):
+    """
+    Project points to the valid barycentric simplex.
+    """
+    u = np.maximum(0, bary[:, 0])
+    v = np.maximum(0, bary[:, 1])
+    s = u + v
+    mask = s > 1.0
+    if np.any(mask):
+        u[mask] /= s[mask]
+        v[mask] /= s[mask]
+    return np.column_stack((u, v))
+
+def _objective_smooth(x, beta, penalty_lambda=50.0):
+    """
+    Smooth objective for L-BFGS-B using log-sum-exp soft-min.
+    x: (2N,) array of u, v coords.
+    """
+    bary = x.reshape(N, 2)
+    u = bary[:, 0]
+    v = bary[:, 1]
+    w = 1.0 - u - v
     
-    best_min_area = 0.0
-    best_bary_pts = None
+    # Penalty for invalid barycentric coords
+    penalty = 0.0
+    excess = np.maximum(0, u + v - 1.0)
+    penalty += penalty_lambda * np.sum(excess**2)
     
-    rng = np.random.default_rng(123)
+    dets = _all_dets_from_bary(bary)
+    areas = np.abs(dets)
     
-    # Helper to check if bary points are valid
-    def is_valid_bary(pts):
-        u = pts[:, 0]
-        v = pts[:, 1]
-        w = 1.0 - u - v
-        return np.all(u >= -1e-9) and np.all(v >= -1e-9) and np.all(w >= -1e-9)
+    if len(areas) == 0:
+        return penalty
+        
+    m = np.min(areas)
+    shifted = areas - m
+    # Soft min: m - (1/beta) * log(sum(exp(-beta * (areas - m))))
+    # = m - (1/beta) * log(sum(exp(-beta * shifted)))
+    max_exp = np.max(-beta * shifted)
+    log_sum_exp = max_exp + np.log(np.sum(np.exp(-beta * shifted - max_exp)))
     
-    # Simulated Annealing / Local Search parameters
-    # We will run multiple restarts.
-    # Each restart runs SA for a fixed number of iterations or time budget.
+    smooth_min = m - (1.0 / beta) * log_sum_exp
     
-    max_restarts = 50 # Upper bound, time is the real limit
+    return -smooth_min + penalty
+
+def _epigraph_objective(x, beta, penalty_lambda=50.0):
+    """
+    Epigraph formulation: minimize -t subject to t <= areas[i] for all i.
+    Uses soft constraints via log-sum-exp.
+    x: (2N+1,) array: first 2N are u,v coords, last is t.
+    """
+    bary = x[:2*N].reshape(N, 2)
+    t = x[2*N]
+    u = bary[:, 0]
+    v = bary[:, 1]
+    w = 1.0 - u - v
     
-    for restart in range(max_restarts):
+    penalty = 0.0
+    excess = np.maximum(0, u + v - 1.0)
+    penalty += penalty_lambda * np.sum(excess**2)
+    
+    dets = _all_dets_from_bary(bary)
+    areas = np.abs(dets)
+    
+    if len(areas) == 0:
+        return penalty + 100.0 * t
+        
+    # Soft constraint: t <= min(areas) approximately
+    # Use: -t + (1/beta)*log(sum(exp(-beta*(areas - t))))
+    shifted = areas - t
+    max_exp = np.max(-beta * shifted)
+    log_sum_exp = max_exp + np.log(np.sum(np.exp(-beta * shifted - max_exp)))
+    
+    return -t + (1.0 / beta) * log_sum_exp + penalty
+
+def _objective_slsqp(x):
+    """
+    Objective for SLSQP: minimize -min_area.
+    x: (2N,) array.
+    """
+    bary = x.reshape(N, 2)
+    u = np.clip(bary[:, 0], 0, None)
+    v = np.clip(bary[:, 1], 0, None)
+    s = u + v
+    mask = s > 1.0
+    if np.any(mask):
+        u[mask] /= s[mask]
+        v[mask] /= s[mask]
+    
+    bary_clamped = np.column_stack((u, v))
+    dets = _all_dets_from_bary(bary_clamped)
+    min_area = np.min(np.abs(dets))
+    return -min_area
+
+def _local_optimize_nm(x0, bounds, maxiter=300, xatol=1e-8, fatol=1e-8):
+    """Run Nelder-Mead local optimization from x0."""
+    try:
+        res = minimize(
+            _objective_slsqp, x0, method='Nelder-Mead',
+            options={'maxiter': maxiter, 'xatol': xatol, 'fatol': fatol, 'adaptive': True}
+        )
+        return res.x
+    except Exception:
+        return x0
+
+def _local_optimize_slsqp(x0, bounds, maxiter=200):
+    """Run SLSQP local optimization from x0."""
+    try:
+        res = minimize(
+            _objective_slsqp, x0, method='SLSQP',
+            bounds=bounds,
+            options={'maxiter': maxiter, 'ftol': 1e-10}
+        )
+        return res.x
+    except Exception:
+        return x0
+
+def _structured_init_fps():
+    """
+    Farthest Point Sampling on a grid of barycentric coordinates.
+    """
+    n_grid = 25
+    candidates = []
+    for i in range(n_grid + 1):
+        for j in range(n_grid + 1 - i):
+            u = i / n_grid
+            v = j / n_grid
+            candidates.append([u, v])
+    candidates = np.array(candidates)
+    
+    selected = [np.array([1/3, 1/3])]
+    
+    for _ in range(N - 1):
+        dists = []
+        for c in candidates:
+            min_d = np.min(np.linalg.norm(c - selected, axis=1))
+            dists.append(min_d)
+        dists = np.array(dists)
+        max_idx = np.argmax(dists)
+        selected.append(candidates[max_idx])
+        
+    return np.array(selected)
+
+def _simulated_annealing(x0, deadline, max_steps=5000, t0=0.1, t_end=1e-6):
+    """
+    Simulated annealing with topological swaps and local jitter.
+    """
+    rng = np.random.RandomState(789)
+    current = x0.copy()
+    current_score = _min_area_ratio_from_bary(current)
+    best = current.copy()
+    best_score = current_score
+    
+    # Cooling schedule
+    alpha = (t_end / t0) ** (1.0 / max_steps)
+    temperature = t0
+    
+    for step in range(max_steps):
         if time.time() > deadline:
             break
             
-        # Initialize random points
-        # Use Dirichlet to generate valid barycentric coords
-        # Shape (N, 3)
-        bary3 = rng.dirichlet([1, 1, 1], size=N)
-        bary2 = bary3[:, :2] # u, v
+        # Generate neighbor
+        neighbor = current.copy()
+        move_type = rng.random()
         
-        current_areas = _calc_areas(bary2)
-        current_min_area = np.min(current_areas)
+        if move_type < 0.3:
+            # Topological swap: swap barycentric coords of two random points
+            i, j = rng.choice(N, size=2, replace=False)
+            neighbor[i], neighbor[j] = neighbor[j].copy(), neighbor[i].copy()
+        elif move_type < 0.7:
+            # Local jitter: Gaussian perturbation of one point
+            i = rng.randint(N)
+            noise = rng.normal(0, 0.05, size=2)
+            neighbor[i] += noise
+            neighbor[i] = np.clip(neighbor[i], 0, None)
+            s = neighbor[i, 0] + neighbor[i, 1]
+            if s > 1.0:
+                neighbor[i] /= s
+        else:
+            # Global jitter: perturb multiple points slightly
+            n_pts = rng.randint(2, 5)
+            idxs = rng.choice(N, size=n_pts, replace=False)
+            for i in idxs:
+                noise = rng.normal(0, 0.03, size=2)
+                neighbor[i] += noise
+                neighbor[i] = np.clip(neighbor[i], 0, None)
+                s = neighbor[i, 0] + neighbor[i, 1]
+                if s > 1.0:
+                    neighbor[i] /= s
         
-        if current_min_area > best_min_area:
-            best_min_area = current_min_area
-            best_bary_pts = bary2.copy()
-            
-        # Run Local Search (SA)
-        # Temperature
-        T = 0.01
-        T_min = 1e-6
-        cooling = 0.995
+        neighbor = _project_to_bary_simplex(neighbor)
+        neighbor_score = _min_area_ratio_from_bary(neighbor)
         
-        # Adaptive step size
-        step_size = 0.05
+        if neighbor_score < 0:
+            continue
+            
+        # Acceptance criterion
+        if neighbor_score > current_score:
+            current = neighbor
+            current_score = neighbor_score
+            if current_score > best_score:
+                best_score = current_score
+                best = current.copy()
+        else:
+            # Accept worse solution with probability exp((new - old) / T)
+            delta = neighbor_score - current_score
+            if delta > 0 or rng.random() < np.exp(delta / max(temperature, 1e-10)):
+                current = neighbor
+                current_score = neighbor_score
         
-        # Pre-allocate for speed?
-        # The loop is tight.
+        temperature *= alpha
         
-        iters = 0
-        max_iters = 100000 # Cap iterations per restart to prevent infinite loop if time check fails
+    return best, best_score
+
+def _final_polish(x0, bounds, time_budget=30.0):
+    """
+    Final high-precision polish: SLSQP with very tight tolerances,
+    then a second SLSQP pass, then Nelder-Mead with adaptive.
+    """
+    start = time.time()
+    current = x0.copy()
+    best_score = _min_area_ratio_from_bary(current.reshape(N, 2))
+    
+    # Pass 1: SLSQP with tight tolerance
+    if time.time() - start < time_budget * 0.4:
+        try:
+            res = minimize(
+                _objective_slsqp, current, method='SLSQP',
+                bounds=bounds,
+                options={'maxiter': 1000, 'ftol': 1e-14, 'disp': False}
+            )
+            cand = _project_to_bary_simplex(res.x.reshape(N, 2))
+            sc = _min_area_ratio_from_bary(cand)
+            if sc > best_score:
+                best_score = sc
+                current = cand.flatten()
+        except Exception:
+            pass
+    
+    # Pass 2: SLSQP again from improved point
+    if time.time() - start < time_budget * 0.7:
+        try:
+            res = minimize(
+                _objective_slsqp, current, method='SLSQP',
+                bounds=bounds,
+                options={'maxiter': 500, 'ftol': 1e-14, 'disp': False}
+            )
+            cand = _project_to_bary_simplex(res.x.reshape(N, 2))
+            sc = _min_area_ratio_from_bary(cand)
+            if sc > best_score:
+                best_score = sc
+                current = cand.flatten()
+        except Exception:
+            pass
+    
+    # Pass 3: Nelder-Mead with very tight tolerance
+    if time.time() - start < time_budget * 0.9:
+        try:
+            res = minimize(
+                _objective_slsqp, current, method='Nelder-Mead',
+                options={'maxiter': 2000, 'xatol': 1e-12, 'fatol': 1e-12, 'adaptive': True, 'disp': False}
+            )
+            cand = _project_to_bary_simplex(res.x.reshape(N, 2))
+            sc = _min_area_ratio_from_bary(cand)
+            if sc > best_score:
+                best_score = sc
+                current = cand.flatten()
+        except Exception:
+            pass
+    
+    # Pass 4: Final SLSQP
+    if time.time() - start < time_budget:
+        try:
+            res = minimize(
+                _objective_slsqp, current, method='SLSQP',
+                bounds=bounds,
+                options={'maxiter': 300, 'ftol': 1e-14, 'disp': False}
+            )
+            cand = _project_to_bary_simplex(res.x.reshape(N, 2))
+            sc = _min_area_ratio_from_bary(cand)
+            if sc > best_score:
+                best_score = sc
+                current = cand.flatten()
+        except Exception:
+            pass
+    
+    return current
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 145.0  # Safety margin before 150s kill
+    
+    def time_left():
+        return deadline - time.time()
         
-        while time.time() < deadline and iters < max_iters:
-            iters += 1
+    best_x = None
+    best_score = -float('inf')
+    
+    inits = []
+    
+    # 1. FPS Init
+    inits.append(_structured_init_fps().flatten())
+    
+    # 2. Random Inits
+    rng = np.random.RandomState(42)
+    for _ in range(15):
+        pts = np.zeros((N, 2))
+        for i in range(N):
+            u = rng.random()
+            v = rng.random()
+            while u + v > 1.0:
+                u = rng.random()
+                v = rng.random()
+            pts[i, 0] = u
+            pts[i, 1] = v
+        inits.append(pts.flatten())
+        
+    # 3. Magic Init
+    magic_pts = [
+        [1.0, 0.0], [0.0, 1.0], [0.0, 0.0],
+        [1/3, 1/3],
+        [0.5, 0.0], [0.0, 0.5], [0.5, 0.5],
+        [0.25, 0.0], [0.0, 0.25], [0.25, 0.25], [0.5, 0.25],
+    ]
+    inits.append(np.array(magic_pts).flatten())
+    
+    # 4. Structured Starts from Inspiration
+    bary1 = np.array([
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.5, 0.0],
+        [0.5, 0.5],
+        [0.0, 0.5],
+        [1/3, 1/3],
+        [0.25, 0.0],
+        [0.75, 0.0],
+        [0.25, 0.25],
+        [0.5, 0.75],
+    ])
+    inits.append(_project_to_bary_simplex(bary1).flatten())
+    
+    bary2 = np.array([
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.333, 0.0],
+        [0.667, 0.0],
+        [0.0, 0.333],
+        [0.0, 0.667],
+        [0.333, 0.333],
+        [0.667, 0.333],
+        [0.333, 0.667],
+        [0.5, 0.5],
+    ])
+    inits.append(_project_to_bary_simplex(bary2).flatten())
+    
+    rng3 = np.random.RandomState(123)
+    bary3 = np.array([
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.25, 0.0],
+        [0.75, 0.0],
+        [0.0, 0.25],
+        [0.0, 0.75],
+        [0.25, 0.25],
+        [0.5, 0.25],
+        [0.25, 0.5],
+        [0.5, 0.5],
+    ])
+    bary3 += rng3.normal(0, 0.02, size=bary3.shape)
+    inits.append(_project_to_bary_simplex(bary3).flatten())
+    
+    rng4 = np.random.RandomState(456)
+    bary4 = []
+    bary4.append([0.0, 0.0])
+    bary4.append([1.0, 0.0])
+    bary4.append([0.0, 1.0])
+    bary4.append([1/3, 1/3])
+    for _ in range(7):
+        u = rng4.uniform(0.1, 0.9)
+        v = rng4.uniform(0.1, 0.9)
+        if u + v < 0.85:
+            bary4.append([u, v])
+        else:
+            bary4.append([u * 0.8, v * 0.8])
+    inits.append(_project_to_bary_simplex(np.array(bary4[:N])).flatten())
+    
+    bary5 = np.array([
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.3, 0.0],
+        [0.7, 0.0],
+        [0.0, 0.3],
+        [0.0, 0.7],
+        [0.3, 0.3],
+        [0.7, 0.3],
+        [0.3, 0.7],
+        [0.5, 0.5],
+    ])
+    inits.append(_project_to_bary_simplex(bary5).flatten())
+    
+    bounds = [(0, 1)] * (2 * N)
+    
+    # Phase 1: Local optimization from structured inits
+    for init in inits:
+        if time_left() < 5:
+            break
             
-            # Pick random point
-            k = rng.integers(0, N)
+        try:
+            init_bary = init.reshape(N, 2)
+            init_bary = _project_to_bary_simplex(init_bary)
             
-            # Generate perturbation
-            # Simple Gaussian noise
-            du = rng.normal(0, step_size)
-            dv = rng.normal(0, step_size)
+            best_local_x = init_bary
+            best_local_score = _min_area_ratio_from_bary(init_bary)
             
-            new_u = bary2[k, 0] + du
-            new_v = bary2[k, 1] + dv
-            
-            # Check validity
-            new_w = 1.0 - new_u - new_v
-            if new_u < 0 or new_v < 0 or new_w < 0:
-                # Option 1: Reject
-                # Option 2: Project (complex)
-                # Let's reject for simplicity, or clamp
-                # Clamping can lead to stuck points. Rejecting is safer for SA.
-                continue
-            
-            # Update point
-            old_u = bary2[k, 0]
-            old_v = bary2[k, 1]
-            
-            bary2[k, 0] = new_u
-            bary2[k, 1] = new_v
-            
-            # Update areas
-            new_areas, min_idx = _update_areas_for_point(bary2, k, current_areas)
-            new_min_area = new_areas[min_idx]
-            
-            # Check improvement
-            delta = new_min_area - current_min_area
-            
-            if delta >= 0:
-                # Accept
-                current_areas = new_areas
-                current_min_area = new_min_area
+            # Strategy: Multi-method refinement
+            # 1. SLSQP
+            if time_left() > 10:
+                x_slsqp = _local_optimize_slsqp(init_bary.flatten(), bounds, maxiter=200)
+                bary_slsqp = _project_to_bary_simplex(x_slsqp.reshape(N, 2))
+                score_slsqp = _min_area_ratio_from_bary(bary_slsqp)
+                if score_slsqp > best_local_score:
+                    best_local_score = score_slsqp
+                    best_local_x = bary_slsqp
+                    init_bary = bary_slsqp
+
+            # 2. Nelder-Mead
+            if time_left() > 10:
+                x_nm = _local_optimize_nm(init_bary.flatten(), bounds, maxiter=300)
+                bary_nm = _project_to_bary_simplex(x_nm.reshape(N, 2))
+                score_nm = _min_area_ratio_from_bary(bary_nm)
+                if score_nm > best_local_score:
+                    best_local_score = score_nm
+                    best_local_x = bary_nm
+                    init_bary = bary_nm
+
+            # 3. L-BFGS-B with Smooth Objective (annealing)
+            if time_left() > 10:
+                current_x = init_bary.flatten()
+                betas = [50.0, 100.0, 300.0, 800.0, 2000.0]
+                for beta in betas:
+                    if time_left() < 5:
+                        break
+                    res = minimize(
+                        _objective_smooth,
+                        current_x,
+                        args=(beta,),
+                        method='L-BFGS-B',
+                        bounds=bounds,
+                        options={'maxiter': 400, 'ftol': 1e-12, 'gtol': 1e-10}
+                    )
+                    x_opt = res.x.reshape(N, 2)
+                    x_opt = _project_to_bary_simplex(x_opt)
+                    score = _min_area_ratio_from_bary(x_opt)
+                    if score > best_local_score:
+                        best_local_score = score
+                        best_local_x = x_opt
+                        current_x = x_opt.flatten()
+
+            if best_local_score > best_score:
+                best_score = best_local_score
+                best_x = best_local_x
                 
-                if current_min_area > best_min_area:
-                    best_min_area = current_min_area
-                    best_bary_pts = bary2.copy()
+        except Exception:
+            pass
+
+    # Phase 1.5: Simulated Annealing from best solution
+    if time_left() > 30 and best_x is not None:
+        try:
+            sa_deadline = time.time() + min(25.0, time_left() * 0.5)
+            sa_best, sa_score = _simulated_annealing(
+                best_x.copy(), sa_deadline, max_steps=3000, t0=0.05, t_end=1e-6
+            )
+            if sa_score > best_score:
+                best_score = sa_score
+                best_x = sa_best
+        except Exception:
+            pass
+
+    # Phase 2: Differential Evolution for global search
+    if time_left() > 25:
+        try:
+            de_bounds = [(0, 1)] * (2 * N)
+            
+            def de_objective(x):
+                bary = x.reshape(N, 2)
+                bary = _project_to_bary_simplex(bary)
+                score = _min_area_ratio_from_bary(bary)
+                if score < 0:
+                    return 1.0  # Penalty for invalid
+                return -score
+            
+            # Run differential evolution with limited population and iterations
+            res_de = differential_evolution(
+                de_objective,
+                de_bounds,
+                seed=42,
+                maxiter=25,
+                popsize=12,
+                tol=1e-6,
+                mutation=(0.3, 1.0),
+                recombination=0.8,
+                polish=False,
+                update_interval=1,
+                callback=None,
+                init='sobol'
+            )
+            
+            if res_de.success or res_de.fun < -best_score:
+                de_bary = _project_to_bary_simplex(res_de.x.reshape(N, 2))
+                de_score = _min_area_ratio_from_bary(de_bary)
+                if de_score > best_score:
+                    best_score = de_score
+                    best_x = de_bary
                     
-                # Slightly increase step size if improving? Or keep same?
-                # Keep same for now.
-            else:
-                # SA Acceptance
-                if T > T_min:
-                    if np.random.random() < np.exp(delta / T):
-                        # Accept
-                        current_areas = new_areas
-                        current_min_area = new_min_area
-                    else:
-                        # Reject, revert
-                        bary2[k, 0] = old_u
-                        bary2[k, 1] = old_v
-                else:
-                    # Reject, revert
-                    bary2[k, 0] = old_u
-                    bary2[k, 1] = old_v
-            
-            T *= cooling
-            
-            # Adaptive step size: if many rejections, decrease step?
-            # Simple heuristic: every 1000 iters, halve step size if no recent improvement?
-            # For simplicity, we'll just use fixed cooling.
-            
-            if iters % 1000 == 0:
-                step_size *= 0.95 # Slowly shrink step size to allow convergence
+        except Exception:
+            pass
+
+    # Phase 2.5: Second SA pass from DE result if improved
+    if time_left() > 20 and best_x is not None:
+        try:
+            sa_deadline2 = time.time() + min(20.0, time_left() * 0.4)
+            sa_best2, sa_score2 = _simulated_annealing(
+                best_x.copy(), sa_deadline2, max_steps=2000, t0=0.03, t_end=1e-7
+            )
+            if sa_score2 > best_score:
+                best_score = sa_score2
+                best_x = sa_best2
+        except Exception:
+            pass
+
+    # Phase 3: Random restarts with SLSQP if time remains
+    if time_left() > 15:
+        for _ in range(8):
+            if time_left() < 8:
+                break
+            try:
+                pts = np.zeros((N, 2))
+                for i in range(N):
+                    u = rng.random()
+                    v = rng.random()
+                    while u + v > 1.0:
+                        u = rng.random()
+                        v = rng.random()
+                    pts[i, 0] = u
+                    pts[i, 1] = v
+                init_bary = _project_to_bary_simplex(pts)
                 
-    if best_bary_pts is None:
-        # Fallback
-        bary3 = np.ones((N, 3)) / 3.0
-        best_bary_pts = bary3[:, :2]
-        
-    # Convert to Cartesian
-    cart_pts = _bary_to_cart(best_bary_pts)
+                x_slsqp = _local_optimize_slsqp(init_bary.flatten(), bounds, maxiter=100)
+                bary_slsqp = _project_to_bary_simplex(x_slsqp.reshape(N, 2))
+                score_slsqp = _min_area_ratio_from_bary(bary_slsqp)
+                
+                if score_slsqp > best_score:
+                    best_score = score_slsqp
+                    best_x = bary_slsqp
+            except Exception:
+                pass
+
+    if best_x is None:
+        best_x = _structured_init_fps()
     
-    # Ensure strict validity (clip tiny negatives)
-    # The evaluator might check strict inequalities.
-    # Our barycentric generation and rejection should handle this,
-    # but let's do a final safety check and projection if needed.
-    # Actually, if we rejected any negative bary, we are safe.
+    # Final high-precision polish on the best solution
+    if time_left() > 12:
+        try:
+            bounds_final = [(0, 1)] * (2 * N)
+            polished = _final_polish(best_x.flatten(), bounds_final, time_budget=min(35.0, time_left() - 8))
+            polished_bary = _project_to_bary_simplex(polished.reshape(N, 2))
+            polished_score = _min_area_ratio_from_bary(polished_bary)
+            if polished_score > best_score:
+                best_x = polished_bary
+                best_score = polished_score
+        except Exception:
+            pass
     
-    return cart_pts
+    cart_points = _bary_to_cart(best_x[:, 0], best_x[:, 1])
+    
+    return cart_points
+# EVOLVE-BLOCK-END

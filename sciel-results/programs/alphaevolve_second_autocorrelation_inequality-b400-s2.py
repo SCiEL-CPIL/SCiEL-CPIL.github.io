@@ -1,124 +1,202 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-N = 50
+"""Optimized program for the second autocorrelation inequality task."""
 import numpy as np
 from scipy.optimize import minimize
 import time
 
-def _score(h):
-    """Compute the ratio ||f||_2^2 / (||f||_1 * ||f*f||_inf) for step heights h."""
-    h = np.array(h, dtype=float)
-    n = len(h)
-    w = 1.0 / (2.0 * n)  # interval width: [-1/4, 1/4] divided into n intervals
+N = 50
+_DEADLINE = 115.0  # seconds, safety margin before 120s kill
+
+def _autoconvolution_peak(h):
+    """Compute the supremum norm of the autoconvolution of h."""
+    conv = np.convolve(h, h, mode='full')
+    return np.max(conv)
+
+def _l2_norm_sq(h):
+    """Squared L2 norm."""
+    return np.sum(h**2)
+
+def _l1_norm(h):
+    """L1 norm."""
+    return np.sum(h)
+
+def _ratio(h):
+    """Compute the ratio: squared L2 norm / (L1 norm * sup norm of autoconvolution)."""
+    l2sq = _l2_norm_sq(h)
+    l1 = _l1_norm(h)
+    peak = _autoconvolution_peak(h)
+    if l1 == 0 or peak == 0:
+        return 0.0
+    return l2sq / (l1 * peak)
+
+def _smooth_max(x, sigma=1.0):
+    """Smooth approximation of max using log-sum-exp."""
+    x_max = np.max(x)
+    if x_max == 0:
+        return 0.0
+    x_shifted = x - x_max
+    log_sum_exp = x_max + np.log(np.sum(np.exp(x_shifted / sigma))) * sigma
+    return log_sum_exp
+
+def _objective_complex(g_flat):
+    """
+    Objective to minimize: negative of the ratio.
+    g_flat is a real vector of length 2*N representing complex g.
+    h = |g|^2.
+    """
+    g = g_flat.reshape(N, 2)
+    h = g[:, 0]**2 + g[:, 1]**2
     
-    # L2^2 and L1
-    l2_sq = np.sum(h**2) * w
-    l1 = np.sum(h) * w
+    # Normalize h to have L1 norm 1 to ensure scale invariance and stability
+    l1 = np.sum(h)
+    if l1 == 0:
+        return 0.0
+    h = h / l1
     
-    if l1 < 1e-15:
+    l2sq = np.sum(h**2)
+    conv = np.convolve(h, h, mode='full')
+    peak = _smooth_max(conv, sigma=0.01)
+    
+    if peak == 0:
         return 0.0
     
-    # Autoconvolution: (f*f)(t) = sum_i sum_j h_i h_j * overlap(t, interval_i, interval_j)
-    # For step functions, we can compute this efficiently
-    # The autoconvolution is a piecewise linear function
-    # We need its maximum value
+    return -l2sq / peak  # Since l1 is 1, ratio is l2sq / peak
+
+def _optimize_complex(g0, time_limit):
+    """Run L-BFGS-B optimization on complex parameters."""
+    start_time = time.time()
     
-    # Compute autoconvolution on a fine grid
-    # Support is [-1/2, 1/2]
-    n_grid = 10001
-    t = np.linspace(-0.5, 0.5, n_grid)
-    dt = t[1] - t[0]
+    # No bounds, as g can be any real number
+    result = minimize(
+        _objective_complex,
+        g0,
+        method='L-BFGS-B',
+        options={'maxiter': 500, 'ftol': 1e-12, 'gtol': 1e-8, 'maxfun': 2000}
+    )
     
-    # f(t) values on grid
-    # Intervals are centered at: -1/4 + (i + 0.5)*w for i=0..n-1
-    centers = -0.25 + (np.arange(n) + 0.5) * w
-    f_grid = np.zeros(n_grid)
-    for i in range(n):
-        lo = centers[i] - w/2
-        hi = centers[i] + w/2
-        mask = (t >= lo) & (t < hi)
-        f_grid[mask] += h[i]
+    elapsed = time.time() - start_time
+    if elapsed > time_limit:
+        # Return h corresponding to initial g0 if timeout
+        g = g0.reshape(N, 2)
+        h = g[:, 0]**2 + g[:, 1]**2
+        return h
     
-    # Convolve using FFT
-    f_fft = np.fft.fft(f_grid, n=2*n_grid)
-    conv_fft = f_fft * f_fft
-    conv = np.real(np.fft.ifft(conv_fft))[:n_grid] * dt
-    
-    max_conv = np.max(conv)
-    
-    if max_conv < 1e-15:
-        return 0.0
-    
-    return l2_sq / (l1 * max_conv)
+    g_opt = result.x.reshape(N, 2)
+    h_opt = g_opt[:, 0]**2 + g_opt[:, 1]**2
+    return h_opt
 
 def construct():
+    """Construct 50 nonnegative heights to maximize the ratio."""
     start_time = time.time()
-    deadline = start_time + 110  # Safety margin
     
-    # Start with single spike (known to give ratio ~100)
-    best_h = np.zeros(N)
-    best_h[25] = 1.0  # Middle spike
-    best_score = _score(best_h)
+    best_h = np.ones(N)
+    best_score = _ratio(best_h)
     
-    # Try various profiles
-    candidates = []
+    # Generate diverse initializations for h, then convert to g
+    initializations_h = []
     
-    # Single spike at different positions
-    for pos in range(N):
-        h = np.zeros(N)
-        h[pos] = 1.0
-        candidates.append(h)
+    # 1. Uniform
+    initializations_h.append(np.ones(N))
     
-    # Two spikes
-    for i in range(N):
-        for j in range(i+1, N):
-            h = np.zeros(N)
-            h[i] = 1.0
-            h[j] = 1.0
-            candidates.append(h)
+    # 2. Gaussian-like
+    x = np.linspace(-1, 1, N)
+    initializations_h.append(np.exp(-x**2 / 0.1))
+    initializations_h.append(np.exp(-x**2 / 0.5))
+    initializations_h.append(np.exp(-x**2 / 2.0))
     
-    # Triangular profiles
-    for width in [1, 2, 3, 5, 10]:
-        for center in range(width//2, N - width//2):
-            h = np.zeros(N)
-            for i in range(N):
-                dist = abs(i - center)
-                if dist <= width//2:
-                    h[i] = 1.0 - 2.0*dist/width
-            if np.sum(h) > 0:
-                candidates.append(h)
+    # 3. Bimodal
+    initializations_h.append(np.exp(-((x - 0.4)**2) / 0.1) + np.exp(-((x + 0.4)**2) / 0.1))
+    initializations_h.append(np.exp(-((x - 0.6)**2) / 0.05) + np.exp(-((x + 0.6)**2) / 0.05))
     
-    # Gaussian-like profiles
-    for sigma in [1, 2, 3, 5]:
-        for center in [N//4, N//2, 3*N//4]:
-            i = np.arange(N)
-            h = np.exp(-0.5 * ((i - center)/sigma)**2)
-            candidates.append(h)
+    # 4. Triangle / tent
+    initializations_h.append(1 - np.abs(x))
     
-    # Evaluate candidates
-    for h in candidates:
-        if time.time() > deadline:
+    # 5. Cosine window
+    initializations_h.append(0.5 + 0.5 * np.cos(np.pi * x))
+    
+    # 6. Random smooth
+    for seed in [1, 2, 3, 4, 5]:
+        rng_local = np.random.RandomState(seed)
+        h_rand = np.abs(rng_local.randn(N))
+        kernel = np.ones(5) / 5
+        h_smooth = np.convolve(h_rand, kernel, mode='same')
+        initializations_h.append(h_smooth)
+    
+    # 7. Peak in center
+    h_center = np.zeros(N)
+    h_center[N//2 - 2:N//2 + 3] = 1.0
+    initializations_h.append(h_center)
+    
+    # 8. Peak at edges
+    h_edge = np.zeros(N)
+    h_edge[0:3] = 1.0
+    h_edge[-3:] = 1.0
+    initializations_h.append(h_edge)
+    
+    # 9. Alternating
+    h_alt = np.ones(N)
+    h_alt[::2] = 0.5
+    initializations_h.append(h_alt)
+    
+    # 10. Linear ramp
+    initializations_h.append(np.linspace(0.1, 1.0, N))
+    initializations_h.append(np.linspace(1.0, 0.1, N))
+    
+    # 11. DFT-based
+    for seed in [10, 20, 30]:
+        rng_local = np.random.RandomState(seed)
+        z = rng_local.randn(N) + 1j * rng_local.randn(N)
+        H = np.fft.fft(z)
+        h_dft = np.abs(H)**2
+        h_dft = h_dft / np.max(h_dft)
+        initializations_h.append(h_dft)
+        
+    # 12. More structured patterns
+    initializations_h.append(np.sin(np.pi * (x + 1) / 2)**2)
+    initializations_h.append(np.cos(np.pi * x / 2)**2)
+
+    time_per_opt = 8.0  # seconds per optimization attempt
+
+    for i, h0 in enumerate(initializations_h):
+        elapsed = time.time() - start_time
+        if elapsed + time_per_opt > _DEADLINE:
             break
-        s = _score(h)
-        if s > best_score:
-            best_score = s
-            best_h = h.copy()
+        
+        # Convert h0 to g0
+        # h0 = |g0|^2 => g0 = sqrt(h0) * exp(i * phase)
+        # We can just use real g0 = sqrt(h0), imag g0 = 0
+        g0_real = np.sqrt(h0)
+        g0_imag = np.zeros(N)
+        g0_flat = np.concatenate([g0_real, g0_imag])
+        
+        h_opt = _optimize_complex(g0_flat, time_per_opt)
+        
+        score = _ratio(h_opt)
+        if score > best_score:
+            best_score = score
+            best_h = h_opt
     
-    # Local optimization from best candidate
-    if time.time() < deadline - 5:
-        def neg_score(h):
-            h = np.abs(h)  # Enforce nonnegativity
-            return -_score(h)
-        
-        result = minimize(neg_score, best_h, method='Nelder-Mead', 
-                         options={'maxiter': 5000, 'xatol': 1e-8, 'fatol': 1e-10,
-                                  'adaptive': True})
-        
-        if result.success or -result.fun > best_score:
-            h_opt = np.abs(result.x)
-            s_opt = _score(h_opt)
-            if s_opt > best_score:
-                best_score = s_opt
+    # Final polish: run a few more iterations from the best solution
+    elapsed = time.time() - start_time
+    if elapsed < _DEADLINE - 10:
+        # Try small perturbations around the best
+        for pert_seed in [100, 200, 300]:
+            elapsed = time.time() - start_time
+            if elapsed + 5 > _DEADLINE:
+                break
+            rng_local = np.random.RandomState(pert_seed)
+            # Perturb in g-space
+            g_best_real = np.sqrt(best_h)
+            g_best_imag = np.zeros(N)
+            
+            pert_real = g_best_real + rng_local.randn(N) * 0.05
+            pert_imag = rng_local.randn(N) * 0.05
+            
+            g_pert_flat = np.concatenate([pert_real, pert_imag])
+            
+            h_opt = _optimize_complex(g_pert_flat, 5.0)
+            score = _ratio(h_opt)
+            if score > best_score:
+                best_score = score
                 best_h = h_opt
     
     return list(best_h)
-# EVOLVE-BLOCK-END

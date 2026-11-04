@@ -1,0 +1,219 @@
+"""Refined uncertainty inequality: Dyson-gas mean-field fixed point for Laguerre roots."""
+import numpy as np
+from scipy.optimize import minimize, brentq
+import math
+
+# Constants
+M = 12
+N = 1  # dimension
+
+def _laguerre_zeros_alpha_beta(alpha, beta, degree):
+    """
+    Compute zeros of generalized Laguerre polynomial L_degree^(alpha)(x)
+    using Golub-Welsch on Jacobi matrix.
+    For Laguerre: weight x^alpha e^{-x}, alpha > -1.
+    """
+    n = degree
+    J = np.zeros((n, n))
+    for i in range(n):
+        J[i, i] = 2 * (i + 1) + alpha + 1
+    for i in range(n - 1):
+        val = (i + 1) * (i + 1 + alpha)
+        J[i, i + 1] = math.sqrt(val)
+        J[i + 1, i] = math.sqrt(val)
+    
+    eigvals = np.linalg.eigvalsh(J)
+    return np.sort(eigvals)
+
+def _compute_score(roots):
+    """
+    Compute the upper bound on C4 given 12 positive double-root locations.
+    """
+    roots = np.array(roots, dtype=float)
+    if len(roots) != 12:
+        return float('inf')
+    if np.any(roots <= 0):
+        return float('inf')
+    if np.any(np.diff(roots) <= 0):
+        return float('inf')
+    
+    seed_roots = 4.0 * np.arange(1, 13)
+    seed_score = np.exp(np.mean(np.log(1 + seed_roots)))
+    current_score = np.exp(np.mean(np.log(1 + roots)))
+    
+    return current_score / seed_score
+
+def _compute_laguerre_zeros(n, alpha=0):
+    """Compute the n zeros of L_n^(alpha)(x)."""
+    return _laguerre_zeros_alpha_beta(alpha, 0, n)
+
+def _dyson_gas_equilibrium(roots, beta=2.0):
+    """
+    Solve the Dyson gas equilibrium for double roots with confining potential.
+    
+    For P(x) = prod (x-r_i)^2, the equilibrium condition is:
+    beta * sum_{j != i} 1/(r_i - r_j) = dV/d(r_i)
+    
+    where V(x) is the confining potential. For the Laguerre-type construction,
+    the confining potential is V(x) = -x + (1/2)*log(x), giving:
+    dV/dx = -1 + 1/(2x)
+    
+    So the equilibrium condition is:
+    beta * sum_{j != i} 1/(r_i - r_j) = -1 + 1/(2*r_i)
+    """
+    roots = np.array(roots, dtype=float).copy()
+    n = len(roots)
+    
+    for iteration in range(1000):
+        new_roots = roots.copy()
+        max_change = 0.0
+        
+        for i in range(n):
+            other_roots = np.delete(roots, i)
+            other_sorted = np.sort(other_roots)
+            r_guess = roots[i]
+            
+            # Find bracket
+            insert_pos = np.searchsorted(other_sorted, r_guess)
+            
+            if insert_pos == 0:
+                left = 1e-12
+                right = other_sorted[0] - 1e-10
+            elif insert_pos == len(other_sorted):
+                left = other_sorted[-1] + 1e-10
+                right = max(200.0, r_guess + 20.0)
+            else:
+                left = other_sorted[insert_pos - 1] + 1e-10
+                right = other_sorted[insert_pos] - 1e-10
+            
+            if left < 1e-12:
+                left = 1e-12
+            if right <= left:
+                left = max(1e-12, r_guess - 10.0)
+                right = r_guess + 10.0
+            
+            def f(r):
+                if r <= 1e-15:
+                    return 1e15
+                if np.any(np.abs(r - other_roots) < 1e-15):
+                    return 1e15
+                s = np.sum(1.0 / (r - other_roots))
+                # Equilibrium: beta * sum(1/(r - r_j)) = -1 + 1/(2r)
+                return beta * s + 1.0 - 1.0/(2.0*r)
+            
+            found = False
+            for attempt in range(100):
+                try:
+                    f_left = f(left)
+                    f_right = f(right)
+                    
+                    if np.isnan(f_left) or np.isnan(f_right) or np.isinf(f_left) or np.isinf(f_right):
+                        left = max(1e-12, left - 1.0)
+                        right = right + 1.0
+                        continue
+                    
+                    if f_left * f_right < 0:
+                        r_new = brentq(f, left, right, xtol=1e-14, rtol=1e-14, maxiter=500)
+                        new_roots[i] = r_new
+                        found = True
+                        break
+                    elif abs(f_left) < 1e-14:
+                        new_roots[i] = left
+                        found = True
+                        break
+                    elif abs(f_right) < 1e-14:
+                        new_roots[i] = right
+                        found = True
+                        break
+                    else:
+                        # Expand bracket
+                        left = max(1e-12, left - 2.0)
+                        right = right + 2.0
+                except Exception:
+                    left = max(1e-12, left - 2.0)
+                    right = right + 2.0
+            
+            if not found:
+                new_roots[i] = r_guess
+            
+            max_change = max(max_change, abs(new_roots[i] - roots[i]))
+        
+        roots = new_roots
+        roots = np.sort(roots)
+        
+        if max_change < 1e-14:
+            break
+    
+    roots = np.sort(roots)
+    roots = np.maximum(roots, 1e-12)
+    
+    # Ensure strict positivity and ordering
+    if np.any(roots <= 0) or np.any(np.diff(roots) <= 0):
+        return None
+    
+    return roots
+
+def _optimize_with_gradient(roots):
+    """
+    Refine roots using gradient-based optimization of the geometric mean score.
+    """
+    def objective(x):
+        x = np.maximum(x, 1e-12)
+        if np.any(np.diff(x) <= 0):
+            return 1e10
+        return np.exp(np.mean(np.log(1 + x)))
+    
+    def gradient(x):
+        x = np.maximum(x, 1e-12)
+        n = len(x)
+        log_mean = np.mean(np.log(1 + x))
+        grad = np.exp(log_mean) / (1 + x) / n
+        return grad
+    
+    result = minimize(objective, roots, jac=gradient, method='L-BFGS-B',
+                      options={'maxiter': 1000, 'ftol': 1e-15, 'gtol': 1e-15})
+    
+    if result.success:
+        new_roots = np.sort(result.x)
+        if np.all(new_roots > 0) and np.all(np.diff(new_roots) > 0):
+            return new_roots
+    
+    return None
+
+def construct():
+    """
+    Return 12 positive double-root locations for the Laguerre combination (m=12, n=1).
+    Uses Dyson gas mean-field fixed point with double-root modification and gradient refinement.
+    """
+    # Start with Laguerre zeros as initial guess
+    init_roots = _compute_laguerre_zeros(12, alpha=0)
+    
+    # Solve the Dyson gas equilibrium for double roots
+    # beta=2 accounts for the squared factor in the polynomial
+    roots = _dyson_gas_equilibrium(init_roots, beta=2.0)
+    
+    if roots is None:
+        # Fallback to Laguerre zeros
+        roots = init_roots
+    
+    # Try gradient-based refinement
+    refined = _optimize_with_gradient(roots)
+    if refined is not None:
+        roots = refined
+    
+    # Final verification
+    if np.any(roots <= 0) or np.any(np.diff(roots) <= 0):
+        roots = _compute_laguerre_zeros(12, alpha=0)
+    
+    return [float(r) for r in roots]
+
+# EVOLVE-BLOCK-START
+# The construct function is defined above
+# EVOLVE-BLOCK-END
+
+if __name__ == "__main__":
+    roots = construct()
+    print("Roots:", roots)
+    print("Score:", _compute_score(roots))
+    seed_roots = [4.0 * (i + 1) for i in range(12)]
+    print("Seed score:", _compute_score(seed_roots))

@@ -1,0 +1,197 @@
+import numpy as np
+import time
+import sys
+from scipy.optimize import least_squares
+
+DIMENSIONS = [2, 3, 7]
+
+# EVOLVE-BLOCK-START
+def construct():
+    n, m, p = DIMENSIONS
+    N_U = n * m
+    N_V = m * p
+    N_W = p * n
+    
+    start_time = time.time()
+    deadline = 140.0 # 10s margin
+
+    # Helper to create schoolbook solution
+    def get_schoolbook():
+        rank = n * m * p
+        U = [[0] * rank for _ in range(N_U)]
+        V = [[0] * rank for _ in range(N_V)]
+        W = [[0] * rank for _ in range(N_W)]
+        column = 0
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    U[i * m + j][column] = 1
+                    V[j * p + k][column] = 1
+                    W[k * n + i][column] = 1
+                    column += 1
+        return {"U": U, "V": V, "W": W}
+
+    best_result = get_schoolbook()
+
+    # Step 1: Find rank-11 decomposition for 2x3x3
+    def find_2x3x3_rank11():
+        nn, mm, pp = 2, 3, 3
+        NU, NV, NW = nn*mm, mm*pp, pp*nn
+        R = 11
+        
+        # Target Tensor
+        T = np.zeros((NU, NV, NW), dtype=np.float64)
+        for i in range(nn):
+            for j in range(mm):
+                for k in range(pp):
+                    alpha = i * mm + j
+                    beta = j * pp + k
+                    gamma = k * nn + i
+                    T[alpha, beta, gamma] = 1.0
+        T_flat = T.flatten()
+        
+        def make_residual_func(R):
+            def res(params):
+                len_U = NU * R
+                len_V = NV * R
+                U = params[:len_U].reshape(NU, R)
+                V = params[len_U:len_U+len_V].reshape(NV, R)
+                W = params[len_U+len_V:].reshape(NW, R)
+                T_calc = np.einsum('ar,br,cr->abc', U, V, W)
+                return (T_calc.flatten() - T_flat)
+            return res
+        
+        res_func = make_residual_func(R)
+        total_vars = (NU + NV + NW) * R
+        
+        best_sol = None
+        best_cost = np.inf
+        
+        # Try a few restarts
+        for _ in range(50):
+            if time.time() > deadline - 20: # Leave time for rest
+                break
+            x0 = np.random.uniform(-1, 1, total_vars)
+            try:
+                sol = least_squares(res_func, x0, method='lm', max_nfev=1000)
+                if sol.cost < best_cost:
+                    best_cost = sol.cost
+                    best_sol = sol.x
+            except Exception:
+                continue
+        
+        if best_sol is None or best_cost > 1e-6:
+            return None
+        
+        # Round to half-integers
+        x_rounded = np.round(best_sol * 2) / 2.0
+        res_rounded = res_func(x_rounded)
+        if np.linalg.norm(res_rounded) < 1e-9:
+            len_U = NU * R
+            len_V = NV * R
+            U = x_rounded[:len_U].reshape(NU, R)
+            V = x_rounded[len_U:len_U+len_V].reshape(NV, R)
+            W = x_rounded[len_U+len_V:].reshape(NW, R)
+            return U, V, W
+            
+        return None
+
+    # Step 2: Get rank-6 decomposition for 2x3x1 (Trivial)
+    def get_2x3x1_rank6():
+        nn, mm, pp = 2, 3, 1
+        NU, NV, NW = nn*mm, mm*pp, pp*nn
+        R = 6
+        U = np.zeros((NU, R))
+        V = np.zeros((NV, R))
+        W = np.zeros((NW, R))
+        
+        col = 0
+        for j in range(mm):
+            # Term a_0j * b_j -> c_0
+            U[0*mm + j, col] = 1
+            V[j*pp + 0, col] = 1 # V index j
+            W[0*nn + 0, col] = 1 # W index 0
+            col += 1
+            # Term a_1j * b_j -> c_1
+            U[1*mm + j, col] = 1
+            V[j*pp + 0, col] = 1
+            W[1*nn + 0, col] = 1
+            col += 1
+            
+        return U, V, W
+
+    # Attempt to find the rank-11 block
+    U11, V11, W11 = None, None, None
+    if time.time() < deadline - 30:
+        res11 = find_2x3x3_rank11()
+        if res11 is not None:
+            U11, V11, W11 = res11
+
+    if U11 is not None:
+        # Construct full 2x3x7 solution
+        # Split B (3x7) into B1 (3x3), B2 (3x3), B3 (3x1)
+        # C (2x7) into C1 (2x3), C2 (2x3), C3 (2x1)
+        
+        R_total = 11 + 11 + 6
+        U_full = np.zeros((N_U, R_total))
+        V_full = np.zeros((N_V, R_total))
+        W_full = np.zeros((N_W, R_total))
+        
+        # Block 1: Cols 0-2 of B, Cols 0-2 of C
+        # U is same
+        U_full[:, 0:11] = U11
+        # V maps local (j, k in 0..2) to global (j, k in 0..2)
+        # V11 has rows indexed by j*3+k. Global V rows are j*7+k.
+        for j in range(3):
+            for k in range(3):
+                local_idx = j * 3 + k
+                global_idx = j * 7 + k
+                V_full[global_idx, 0:11] = V11[local_idx, :]
+        # W maps local (k, i) to global (k, i). k in 0..2, i in 0..1.
+        # W11 has rows indexed by k*2+i. Global W rows are k*2+i. (Same structure)
+        W_full[:, 0:11] = W11
+        
+        # Block 2: Cols 3-5 of B, Cols 3-5 of C
+        U_full[:, 11:22] = U11
+        for j in range(3):
+            for k in range(3):
+                local_idx = j * 3 + k
+                global_idx = j * 7 + (k + 3)
+                V_full[global_idx, 11:22] = V11[local_idx, :]
+        # W for C2: Cols 3-5. Global W index is (k+3)*2 + i?
+        # No, W index is k*n + i. Here k is 3,4,5.
+        # So rows 3*2+0=6, 3*2+1=7, 4*2+0=8, ...
+        # W11 rows are 0..5 (k=0,1,2).
+        # We need to shift W11 to rows 6..11.
+        W_full[6:12, 11:22] = W11
+        
+        # Block 3: Col 6 of B, Col 6 of C
+        U6, V6, W6 = get_2x3x1_rank6()
+        U_full[:, 22:28] = U6
+        # V6 rows indexed by j (0..2). Global V index j*7 + 6.
+        for j in range(3):
+            local_idx = j
+            global_idx = j * 7 + 6
+            V_full[global_idx, 22:28] = V6[local_idx, :]
+        # W6 rows indexed by i (0..1). Global W index 6*2 + i = 12 + i.
+        W_full[12:14, 22:28] = W6
+        
+        # Verify
+        T_calc = np.einsum('ar,br,cr->abc', U_full, V_full, W_full)
+        
+        # Build Target
+        T_target = np.zeros((N_U, N_V, N_W), dtype=np.float64)
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    T_target[i*m+j, j*p+k, k*n+i] = 1.0
+                    
+        if np.allclose(T_calc, T_target, atol=1e-9):
+            return {
+                "U": U_full.tolist(),
+                "V": V_full.tolist(),
+                "W": W_full.tolist()
+            }
+            
+    return best_result
+# EVOLVE-BLOCK-END

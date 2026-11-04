@@ -1,0 +1,221 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+import time
+
+DIMENSIONS = [4, 4, 4]
+
+# EVOLVE-BLOCK-START
+import time
+
+_START_TIME = time.time()
+_DEADLINE = 140.0  # Safety margin before 150s limit
+
+def construct():
+    """
+    Constructs a rank-49 decomposition for 4x4 matrix multiplication
+    using the tensor product (Kronecker product) of the rank-7 Strassen 
+    decomposition for 2x2 matrices.
+    
+    Rank 49 is a known valid upper bound. The Kronecker product of two 
+    rank-7 decompositions yields a rank-49 decomposition.
+    """
+    # Deadline guard: return immediately if we're close to the limit
+    # This is a fixed construction, so it should be instantaneous.
+    if time.time() - _START_TIME > _DEADLINE:
+        # Fallback: return schoolbook rank-64 if somehow we hit deadline
+        n, m, p = DIMENSIONS
+        rank = n * m * p
+        U = [[0]*rank for _ in range(n*m)]
+        V = [[0]*rank for _ in range(m*p)]
+        W = [[0]*rank for _ in range(p*n)]
+        for i in range(n):
+            for j in range(m):
+                c = i*m + j
+                U[i*m + j][c] = 1
+                for k in range(p):
+                    V[j*p + k][c] = 1
+                    W[k*n + i][c] = 1
+        return {"U": U, "V": V, "W": W}
+    
+    n, m, p = DIMENSIONS
+    
+    # Define the 2x2 Strassen decomposition matrices
+    # U2[i, j, c], V2[j, k, c], W2[k, i, c]
+    # c ranges from 0 to 6
+    # Indices for 2x2 matrix are flattened: 0:(0,0), 1:(0,1), 2:(1,0), 3:(1,1)
+    
+    U2 = [[0]*7 for _ in range(4)]
+    V2 = [[0]*7 for _ in range(4)]
+    W2 = [[0]*7 for _ in range(4)]
+    
+    # M0: (A00+A11)(B00+B11)
+    # A00=0, A11=3, B00=0, B11=3
+    U2[0][0] = 1; U2[3][0] = 1
+    V2[0][0] = 1; V2[3][0] = 1
+    # W2[k*n+i, c] -> W2[0*2+0, 0]=1 (C00), W2[1*2+1, 0]=1 (C11)
+    W2[0][0] = 1; W2[3][0] = 1
+    
+    # M1: (A10+A11)B00
+    # A10=2, A11=3, B00=0
+    U2[2][1] = 1; U2[3][1] = 1
+    V2[0][1] = 1
+    # C10 (1,0) gets +1, C11 (1,1) gets -1? 
+    # Standard Strassen:
+    # C00 = M0 - M1 + M2 + M3
+    # C01 = M4 + M1
+    # C10 = M2 - M4 + M0
+    # C11 = M3 - M1 + M0 - M5 ? No.
+    # Let's use the standard definitions:
+    # M1 = (A00+A11)(B00+B11)
+    # M2 = (A10+A11)B00
+    # M3 = A00(B01-B11)
+    # M4 = A11(B10-B00)
+    # M5 = (A00+A01)B11
+    # M6 = (A10-A00)(B00+B01)
+    # M7 = (A01-A11)(B10+B11)
+    # C00 = M1 - M4 + M5 + M7
+    # C01 = M2 + M4
+    # C10 = M3 - M5 + M6
+    # C11 = M1 - M2 + M3 + M6
+    
+    # Let's re-map carefully with 0-indexed M0..M6
+    # M0 = (A00+A11)(B00+B11)
+    # M1 = (A10+A11)B00
+    # M2 = A00(B01-B11)
+    # M3 = A11(B10-B00)
+    # M4 = (A00+A01)B11
+    # M5 = (A10-A00)(B00+B01)
+    # M6 = (A01-A11)(B10+B11)
+    
+    # C00 = M0 - M3 + M4 + M6
+    # C01 = M1 + M3
+    # C10 = M2 - M4 + M5
+    # C11 = M0 - M1 + M2 + M5
+    
+    # Reset W2
+    W2 = [[0]*7 for _ in range(4)]
+    
+    # M0: C00(+1), C11(+1)
+    W2[0][0] = 1  # C00 (k=0, i=0)
+    W2[3][0] = 1  # C11 (k=1, i=1)
+    
+    # M1: C01(+1), C11(-1)
+    W2[2][1] = 1  # C01 (k=1, i=0) -> index 1*2+0 = 2
+    W2[3][1] = -1 # C11 (k=1, i=1) -> index 1*2+1 = 3
+    
+    # M2: C10(+1), C11(+1)
+    W2[1][2] = 1  # C10 (k=0, i=1) -> index 0*2+1 = 1
+    W2[3][2] = 1  # C11 (k=1, i=1) -> index 3
+    
+    # M3: C00(-1), C01(+1)
+    W2[0][3] = -1 # C00
+    W2[2][3] = 1  # C01
+    
+    # M4: C00(+1), C10(-1)
+    W2[0][4] = 1  # C00
+    W2[1][4] = -1 # C10
+    
+    # M5: C10(+1), C11(+1)
+    W2[1][5] = 1  # C10
+    W2[3][5] = 1  # C11
+    
+    # M6: C00(+1), C11? No, C11 doesn't use M6 in this set?
+    # Wait, C11 = M0 - M1 + M2 + M5.
+    # Let's check C00 = M0 - M3 + M4 + M6.
+    # So M6 contributes to C00.
+    W2[0][6] = 1  # C00
+    
+    # Verify U2 and V2 definitions again
+    # M0: (A00+A11)(B00+B11)
+    U2[0][0] = 1; U2[3][0] = 1
+    V2[0][0] = 1; V2[3][0] = 1
+    
+    # M1: (A10+A11)B00
+    U2[2][1] = 1; U2[3][1] = 1
+    V2[0][1] = 1
+    
+    # M2: A00(B01-B11)
+    U2[0][2] = 1
+    V2[1][2] = 1; V2[3][2] = -1
+    
+    # M3: A11(B10-B00)
+    U2[3][3] = 1
+    V2[2][3] = 1; V2[0][3] = -1
+    
+    # M4: (A00+A01)B11
+    U2[0][4] = 1; U2[1][4] = 1
+    V2[3][4] = 1
+    
+    # M5: (A10-A00)(B00+B01)
+    U2[2][5] = 1; U2[0][5] = -1
+    V2[0][5] = 1; V2[1][5] = 1
+    
+    # M6: (A01-A11)(B10+B11)
+    U2[1][6] = 1; U2[3][6] = -1
+    V2[2][6] = 1; V2[3][6] = 1
+    
+    rank = 49
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    
+    # Construct U: (n*m) x rank
+    # U[i, j, c] where i,j are 4x4 indices, c is rank index (c1*7+c2)
+    # U[i, j, c1*7+c2] = U2[i1, j1, c1] * U2[i2, j2, c2]
+    # i = 2*i1 + i2, j = 2*j1 + j2
+    for i in range(n):
+        i1 = i // 2
+        i2 = i % 2
+        for j in range(m):
+            j1 = j // 2
+            j2 = j % 2
+            for c1 in range(7):
+                u1 = U2[i1 * 2 + j1][c1]
+                if u1 == 0:
+                    continue
+                for c2 in range(7):
+                    u2 = U2[i2 * 2 + j2][c2]
+                    if u2 == 0:
+                        continue
+                    U[i * m + j][c1 * 7 + c2] = u1 * u2
+
+    # Construct V: (m*p) x rank
+    # V[j, k, c] where j,k are 4x4 indices
+    # j = 2*j1 + j2, k = 2*k1 + k2
+    for j in range(m):
+        j1 = j // 2
+        j2 = j % 2
+        for k in range(p):
+            k1 = k // 2
+            k2 = k % 2
+            for c1 in range(7):
+                v1 = V2[j1 * 2 + k1][c1]
+                if v1 == 0:
+                    continue
+                for c2 in range(7):
+                    v2 = V2[j2 * 2 + k2][c2]
+                    if v2 == 0:
+                        continue
+                    V[j * p + k][c1 * 7 + c2] = v1 * v2
+
+    # Construct W: (p*n) x rank
+    # W[k, i, c] where k,i are 4x4 indices
+    # k = 2*k1 + k2, i = 2*i1 + i2
+    # Trace convention W[k*n+i, r]
+    for k in range(p):
+        k1 = k // 2
+        k2 = k % 2
+        for i in range(n):
+            i1 = i // 2
+            i2 = i % 2
+            for c1 in range(7):
+                w1 = W2[k1 * 2 + i1][c1]
+                if w1 == 0:
+                    continue
+                for c2 in range(7):
+                    w2 = W2[k2 * 2 + i2][c2]
+                    if w2 == 0:
+                        continue
+                    W[k * n + i][c1 * 7 + c2] = w1 * w2
+
+    return {"U": U, "V": V, "W": W}
+# EVOLVE-BLOCK-END

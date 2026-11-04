@@ -186,7 +186,7 @@ def _objective_and_grad(x, T, edge_indices=None):
     return obj, grad_pts.ravel()
 
 def _force_relax(pts, n_steps=2000, deadline=None):
-    """Fast force-directed relaxation with Hertzian overlap^4 repulsion."""
+    """Fast force-directed relaxation with adaptive target separation using spatial hashing."""
     pos = pts.copy().astype(np.float64)
     best_pos = pos.copy()
     best_r = _compute_radius(best_pos)
@@ -204,29 +204,41 @@ def _force_relax(pts, n_steps=2000, deadline=None):
 
         forces = np.zeros_like(pos)
 
-        # Pairwise repulsion using Hertzian overlap^4 potential
-        diff = pos[:, np.newaxis, :] - pos[np.newaxis, :, :]
-        dists = np.linalg.norm(diff, axis=2)
-        np.fill_diagonal(dists, np.inf)
+        # Adaptive target separation
+        target = 2.0 * (r_est + 0.001)
+        
+        # Spatial hashing for O(N) neighbor search
+        cell_size = max(target, 0.01)
+        grid = {}
+        for i in range(n):
+            cx = int(pos[i, 0] / cell_size)
+            cy = int(pos[i, 1] / cell_size)
+            key = (cx, cy)
+            if key not in grid:
+                grid[key] = []
+            grid[key].append(i)
 
-        # Target separation: 2 * r_est
-        target = 2.0 * r_est
-        mask = dists < target
-        # Safe distances
-        safe_dists = np.where(mask, dists, 1.0)
-
-        # Hertzian overlap: (target - dist)^4 when dist < target
-        excess = np.where(mask, target - dists, 0.0)
-        overlap4 = excess ** 4
-
-        # Force magnitude: derivative of (target-d)^4 / d = 4*(target-d)^3
-        force_mag = np.where(mask, 4.0 * excess**3 / safe_dists, 0.0)
-
-        # Unit vectors
-        unit_vecs = diff / safe_dists[:, :, np.newaxis]
-
-        # Sum forces
-        forces += np.sum(force_mag[:, :, np.newaxis] * unit_vecs, axis=1)
+        # For each point, check neighbors in 3x3 cells
+        for i in range(n):
+            cx = int(pos[i, 0] / cell_size)
+            cy = int(pos[i, 1] / cell_size)
+            
+            for dx in [-1, 0, 1]:
+                for dy in [-1, 0, 1]:
+                    key = (cx + dx, cy + dy)
+                    if key not in grid:
+                        continue
+                    for j in grid[key]:
+                        if j <= i:
+                            continue
+                        diff = pos[i] - pos[j]
+                        dist = np.linalg.norm(diff)
+                        if dist < target and dist > 1e-10:
+                            excess = target - dist
+                            force_mag = 4.0 * excess**3 / dist
+                            unit_vec = diff / dist
+                            forces[i] += force_mag * unit_vec
+                            forces[j] -= force_mag * unit_vec
 
         # Boundary force: push inward if too close to wall
         norms = np.linalg.norm(pos, axis=1)
@@ -377,6 +389,70 @@ def _local_polish(pts, deadline=None):
         except Exception:
             pass
     
+    # NEW: Active Set Tightening
+    # Identify active constraints: boundary points and min-distance pairs
+    if deadline is None or time.time() < deadline - 1.0:
+        try:
+            active_pts = best_pts.copy()
+            current_r = _compute_radius(active_pts)
+            
+            for _ in range(20):
+                # Find min constraint
+                norms = np.linalg.norm(active_pts, axis=1)
+                min_norm_idx = np.argmax(norms)
+                min_boundary = 1.0 - norms[min_norm_idx]
+                
+                d = cdist(active_pts, active_pts)
+                np.fill_diagonal(d, np.inf)
+                min_pair_val, min_pair_idx = np.unravel_index(np.argmin(d), d.shape)
+                min_pair = d[min_pair_val, min_pair_idx] / 2.0
+                
+                if min_pair < min_boundary:
+                    # Pair is limiting
+                    i, j = min_pair_val, min_pair_idx
+                    diff = active_pts[i] - active_pts[j]
+                    dist = np.linalg.norm(diff)
+                    if dist < 1e-10: continue
+                    unit_vec = diff / dist
+                    # Move i and j apart
+                    step_size = 1e-5
+                    active_pts[i] += 0.5 * step_size * unit_vec
+                    active_pts[j] -= 0.5 * step_size * unit_vec
+                else:
+                    # Boundary is limiting
+                    i = min_norm_idx
+                    norm_i = np.linalg.norm(active_pts[i])
+                    if norm_i < 1e-10: continue
+                    unit_vec = -active_pts[i] / norm_i
+                    # Move i inward? No, we want to maximize r.
+                    # If boundary is limiting, we should move it OUTWARD? 
+                    # Wait, r = min(1-|c|, d/2).
+                    # If 1-|c| is the min, increasing r requires decreasing |c|? No.
+                    # r is the radius of the circles. The circles must be INSIDE.
+                    # So 1-|c| >= r. To increase r, we need to increase 1-|c|? No, that means moving IN.
+                    # But if we move in, we might violate pair distances.
+                    # Actually, if boundary is the bottleneck, it means the point is too close to the edge.
+                    # To allow a larger r, we must move the point INWARD.
+                    # But wait, if we move inward, 1-|c| increases.
+                    # So yes, move inward.
+                    step_size = 1e-5
+                    active_pts[i] += step_size * unit_vec # unit_vec is inward (-pos/norm)
+                
+                # Project into disk
+                norms = np.linalg.norm(active_pts, axis=1)
+                mask_out = norms > 1.0
+                if np.any(mask_out):
+                    active_pts[mask_out] = active_pts[mask_out] / norms[mask_out, np.newaxis] * 0.9999
+
+                new_r = _compute_radius(active_pts)
+                if new_r > best_r:
+                    best_r = new_r
+                    best_pts = active_pts.copy()
+                else:
+                    break
+        except Exception:
+            pass
+
     return best_pts, best_r
 
 def _anneal_restart(pts, seed, deadline=None):

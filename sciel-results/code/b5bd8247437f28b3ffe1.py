@@ -1,0 +1,232 @@
+import numpy as np
+import time
+
+DIMENSIONS = [4, 4, 9]
+
+def _build_strassen_2x2():
+    """
+    Build Strassen decomposition for 2x2 x 2x2 matrix multiplication.
+    Returns U (4,7), V (4,7), W (4,7) where:
+    T[i,k,j] = sum_r U[i*2+k, r] * V[k*2+j, r] * W[j*2+i, r]
+    """
+    U = np.zeros((4, 7))
+    V = np.zeros((4, 7))
+    W = np.zeros((4, 7))
+    
+    # M1 = (A11+A22)(B11+B22)
+    U[0, 0] = 1; U[3, 0] = 1
+    V[0, 0] = 1; V[3, 0] = 1
+    W[0, 0] = 1; W[3, 0] = 1
+    
+    # M2 = (A21+A22)B11
+    U[2, 1] = 1; U[3, 1] = 1
+    V[0, 1] = 1
+    W[1, 1] = 1; W[3, 1] = -1
+    
+    # M3 = A11(B12-B22)
+    U[0, 2] = 1
+    V[1, 2] = 1; V[3, 2] = -1
+    W[2, 2] = 1; W[3, 2] = 1
+    
+    # M4 = A22(B21-B11)
+    U[3, 3] = 1
+    V[2, 3] = 1; V[0, 3] = -1
+    W[0, 3] = 1; W[1, 3] = 1
+    
+    # M5 = (A11+A12)B22
+    U[0, 4] = 1; U[1, 4] = 1
+    V[3, 4] = 1
+    W[0, 4] = -1; W[2, 4] = 1
+    
+    # M6 = (A21-A11)(B11+B12)
+    U[2, 5] = 1; U[0, 5] = -1
+    V[0, 5] = 1; V[1, 5] = 1
+    W[3, 5] = 1
+    
+    # M7 = (A12-A22)(B21+B22)
+    U[1, 6] = 1; U[3, 6] = -1
+    V[2, 6] = 1; V[3, 6] = 1
+    W[0, 6] = 1
+    
+    return U, V, W
+
+def _build_4x4x4_strassen():
+    """
+    Build Strassen-based rank-49 decomposition for 4x4 x 4x4.
+    """
+    U2, V2, W2 = _build_strassen_2x2()
+    
+    U = np.zeros((16, 49))
+    V = np.zeros((16, 49))
+    W = np.zeros((16, 49))
+    
+    big_mults = [
+        {'A': [((0,0), 1), ((1,1), 1)], 'B': [((0,0), 1), ((1,1), 1)], 'C': [((0,0), 1), ((1,1), 1)]},
+        {'A': [((1,0), 1), ((1,1), 1)], 'B': [((0,0), 1)], 'C': [((0,1), 1), ((1,1), -1)]},
+        {'A': [((0,0), 1)], 'B': [((0,1), 1), ((1,1), -1)], 'C': [((1,0), 1), ((1,1), 1)]},
+        {'A': [((1,1), 1)], 'B': [((1,0), 1), ((0,0), -1)], 'C': [((0,0), 1), ((0,1), 1)]},
+        {'A': [((0,0), 1), ((0,1), 1)], 'B': [((1,1), 1)], 'C': [((0,0), -1), ((1,0), 1)]},
+        {'A': [((1,0), 1), ((0,0), -1)], 'B': [((0,0), 1), ((0,1), 1)], 'C': [((1,1), 1)]},
+        {'A': [((0,1), 1), ((1,1), -1)], 'B': [((1,0), 1), ((1,1), 1)], 'C': [((0,0), 1)]},
+    ]
+    
+    for big_idx, big in enumerate(big_mults):
+        base_r = big_idx * 7
+        for small_idx in range(7):
+            r = base_r + small_idx
+            for (bi, bk), sign_A in big['A']:
+                for i2 in range(2):
+                    for k2 in range(2):
+                        i = 2 * bi + i2
+                        k = 2 * bk + k2
+                        U[i * 4 + k, r] += sign_A * U2[i2 * 2 + k2, small_idx]
+            for (bk, bj), sign_B in big['B']:
+                for k2 in range(2):
+                    for j2 in range(2):
+                        k = 2 * bk + k2
+                        j = 2 * bj + j2
+                        V[k * 4 + j, r] += sign_B * V2[k2 * 2 + j2, small_idx]
+            for (bj, bi), sign_C in big['C']:
+                for j2 in range(2):
+                    for i2 in range(2):
+                        j = 2 * bj + j2
+                        i = 2 * bi + i2
+                        W[j * 4 + i, r] += sign_C * W2[j2 * 2 + i2, small_idx]
+    
+    return U, V, W
+
+def _build_4x4x1_rank4():
+    """
+    Build rank-4 decomposition for 4x4 x 4x1.
+    T[i,k,j] = 1 for all i,k,j (since j=0 only, T[i,k,0]=1)
+    Wait, the tensor for matrix multiplication A(4x4) * B(4x1) = C(4x1)
+    is T[i,k,j] where i=0..3, k=0..3, j=0..0.
+    Actually the tensor is M[i,k,j] = 1 if the multiplication is standard.
+    For 4x4 * 4x1, the "tensor" is just the identity in a sense.
+    C[i,0] = sum_k A[i,k] * B[k,0].
+    The tensor T[i,k,0] = 1 for all i,k.
+    
+    We need T[i,k,j] = sum_r U[i*4+k, r] * V[k*1+j, r] * W[j*4+i, r]
+    Here j is always 0.
+    T[i,k,0] = sum_r U[i*4+k, r] * V[k, r] * W[i, r] = 1 for all i,k.
+    
+    If we set rank = 4, r = 0,1,2,3.
+    Let U[i*4+k, r] = delta_{k,r}
+    V[k, r] = delta_{k,r}
+    W[i, r] = delta_{i,r}
+    Then sum_r delta_{k,r} * delta_{k,r} * delta_{i,r} = sum_r delta_{k,r} * delta_{i,r} = delta_{ki}.
+    This is NOT 1 for all i,k. It's 1 only when i=k.
+    
+    So rank 4 doesn't work with this simple construction.
+    The rank of 4x4 x 4x1 is actually 4? 
+    Wait, the tensor for n x m x p matrix multiplication has rank >= max(n, m, p)?
+    Actually, the rank of the matrix multiplication tensor M_{n,m,p} is at least max(n, m, p).
+    For 4x4 x 4x1, max is 4.
+    But we need T[i,k,0] = 1 for all i,k.
+    
+    Let's try:
+    U[i*4+k, r] = 1
+    V[k, r] = 1
+    W[i, r] = 1/sqrt(4) ? No, must be integer/half-integer.
+    
+    Actually, the decomposition must be exact.
+    Let's use the fact that sum_{r} U[i*4+k, r] V[k, r] W[i, r] = 1.
+    
+    Try rank 4:
+    U[i*4+k, r] = 1
+    V[k, r] = 1
+    W[i, r] = 1/4
+    Then sum_{r=0}^3 1 * 1 * 1/4 = 4 * 1/4 = 1.
+    This works!
+    
+    U[i*4+k, r] = 1 for all i,k,r
+    V[k, r] = 1 for all k,r
+    W[i, r] = 1/4 for all i,r
+    """
+    U = np.ones((16, 4))
+    V = np.ones((4, 4))
+    W = np.ones((4, 4)) * 0.25
+    
+    return U, V, W
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140
+    
+    n, m, p = DIMENSIONS  # n=4, m=4, p=9
+    
+    # Build 4x4 x 4x4 Strassen decomposition (rank 49)
+    U44, V44, W44 = _build_4x4x4_strassen()
+    
+    # Build 4x4 x 4x1 rank-4 decomposition
+    U41, V41, W41 = _build_4x4x1_rank4()
+    
+    # Split B into B1 (4x4) + B2 (4x4) + B3 (4x1)
+    # C = A*B1 + A*B2 + A*B3
+    # Rank: 49 + 49 + 4 = 102
+    
+    total_rank = 49 + 49 + 4
+    
+    U = np.zeros((16, total_rank))
+    V = np.zeros((36, total_rank))  # m*p = 4*9 = 36
+    W = np.zeros((36, total_rank))  # p*n = 9*4 = 36
+    
+    # Part 1: A*B1 where B1 is columns 0-3 of B
+    U[:, 0:49] = U44
+    for k in range(4):
+        for j in range(4):
+            V[k * 9 + j, 0:49] = V44[k * 4 + j, :]
+    for j in range(4):
+        for i in range(4):
+            W[j * 4 + i, 0:49] = W44[j * 4 + i, :]
+    
+    # Part 2: A*B2 where B2 is columns 4-7 of B
+    U[:, 49:98] = U44
+    for k in range(4):
+        for j in range(4):
+            V[k * 9 + (j + 4), 49:98] = V44[k * 4 + j, :]
+    for j in range(4):
+        for i in range(4):
+            W[(j + 4) * 4 + i, 49:98] = W44[j * 4 + i, :]
+    
+    # Part 3: A*B3 where B3 is column 8 of B
+    U[:, 98:102] = U41
+    for k in range(4):
+        V[k * 9 + 8, 98:102] = V41[k, :]
+    for i in range(4):
+        W[8 * 4 + i, 98:102] = W41[i, :]
+    
+    # Validate
+    A_test = np.random.randn(4, 4)
+    B_test = np.random.randn(4, 9)
+    C_expected = A_test @ B_test
+    
+    C_computed = np.zeros((4, 9))
+    for r in range(total_rank):
+        a_vec = np.zeros(4)
+        b_vec = np.zeros(9)
+        for i in range(4):
+            a_vec[i] = sum(U[i * 4 + k, r] * A_test[i, k] for k in range(4))
+        for j in range(9):
+            b_vec[j] = sum(V[k * 9 + j, r] * B_test[k, j] for k in range(4))
+        for i in range(4):
+            for j in range(9):
+                C_computed[i, j] += W[j * 4 + i, r] * a_vec[i] * b_vec[j]
+    
+    if not np.allclose(C_computed, C_expected, atol=1e-10):
+        # Fallback to schoolbook
+        rank = n * m * p
+        U = np.zeros((n * m, rank))
+        V = np.zeros((m * p, rank))
+        W = np.zeros((p * n, rank))
+        idx = 0
+        for i in range(n):
+            for j in range(p):
+                for k in range(m):
+                    U[i * m + k, idx] = 1
+                    V[k * p + j, idx] = 1
+                    W[j * n + i, idx] = 1
+                    idx += 1
+        return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}
+    
+    return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}

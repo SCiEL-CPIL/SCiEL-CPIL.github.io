@@ -1,0 +1,268 @@
+import numpy as np
+import time
+import math
+from scipy.optimize import minimize
+from scipy.spatial import cKDTree
+
+N = 150
+
+def _log_energy(points):
+    """Compute log(1/d) energy using math.fsum for accuracy."""
+    n = len(points)
+    diff = points[:, np.newaxis, :] - points[np.newaxis, :, :]
+    dists_sq = np.sum(diff * diff, axis=-1)
+    np.fill_diagonal(dists_sq, 1.0)
+    iu = np.triu_indices(n, k=1)
+    log_dists = 0.5 * np.log(dists_sq[iu])
+    return -math.fsum(log_dists.tolist())
+
+def _project_to_sphere(points):
+    """Project points onto unit sphere."""
+    norms = np.linalg.norm(points, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-15)
+    return points / norms
+
+def _energy_and_grad(x):
+    """Energy and gradient for L-BFGS-B. x is flat array of shape (N*3,)."""
+    points = x.reshape(N, 3)
+    points = _project_to_sphere(points)
+    
+    n = len(points)
+    diff = points[:, np.newaxis, :] - points[np.newaxis, :, :]
+    dists_sq = np.sum(diff * diff, axis=-1)
+    np.fill_diagonal(dists_sq, 1.0)
+    
+    # E = -sum_{i<j} log(d_ij)
+    # dE/dx_i = sum_{j!=i} (x_j - x_i) / d_ij^2
+    weights = np.zeros_like(dists_sq)
+    mask = ~np.eye(n, dtype=bool)
+    weights[mask] = 1.0 / dists_sq[mask]
+    
+    sum_weights = np.sum(weights, axis=1)
+    weighted_sum = weights @ points
+    
+    grads = weighted_sum - points * sum_weights[:, np.newaxis]
+    
+    # Project gradient to tangent space
+    dot_products = np.sum(grads * points, axis=1, keepdims=True)
+    grads_tangent = grads - dot_products * points
+    
+    # Compute energy with math.fsum
+    iu = np.triu_indices(n, k=1)
+    log_dists = 0.5 * np.log(dists_sq[iu])
+    energy = -math.fsum(log_dists.tolist())
+    
+    return energy, grads_tangent.flatten()
+
+def _fibonacci_sphere(n):
+    """Generate Fibonacci sphere points."""
+    i = np.arange(n) + 0.5
+    z = 1.0 - 2.0 * i / n
+    phi = np.pi * (1.0 + np.sqrt(5.0)) * i
+    r = np.sqrt(1.0 - z * z)
+    return np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
+
+def _random_uniform_sphere(n, seed=42):
+    """Generate random uniform points on sphere."""
+    rng = np.random.RandomState(seed)
+    points = rng.randn(n, 3)
+    norms = np.linalg.norm(points, axis=1, keepdims=True)
+    return points / norms
+
+def _lbfgs_polish(points, max_iter=2000, ftol=1e-12, gtol=1e-10, time_limit=10.0):
+    """Polish a point configuration using L-BFGS-B."""
+    start = time.time()
+    x0 = points.flatten()
+    e0 = _log_energy(points)
+    try:
+        res = minimize(
+            _energy_and_grad,
+            x0,
+            method='L-BFGS-B',
+            jac=True,
+            options={
+                'maxiter': max_iter,
+                'maxfun': max_iter * 10,
+                'ftol': ftol,
+                'gtol': gtol,
+                'maxls': 50
+            }
+        )
+        if res.success or res.fun < e0:
+            p_res = _project_to_sphere(res.x.reshape(N, 3))
+            e_check = _log_energy(p_res)
+            if e_check < e0 and time.time() - start < time_limit:
+                return p_res
+    except Exception:
+        pass
+    return points
+
+def _riemannian_cg(points, max_iter=5000, time_limit=30.0):
+    """Riemannian conjugate gradient on the sphere."""
+    start = time.time()
+    pts = points.copy()
+    n = len(pts)
+    
+    # Compute initial gradient
+    diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
+    dists_sq = np.sum(diff * diff, axis=-1)
+    np.fill_diagonal(dists_sq, 1.0)
+    weights = np.zeros_like(dists_sq)
+    mask = ~np.eye(n, dtype=bool)
+    weights[mask] = 1.0 / dists_sq[mask]
+    sum_weights = np.sum(weights, axis=1)
+    weighted_sum = weights @ pts
+    grads = weighted_sum - pts * sum_weights[:, np.newaxis]
+    dot_products = np.sum(grads * pts, axis=1, keepdims=True)
+    g = grads - dot_products * pts
+    
+    p_dir = -g.copy()
+    e0 = _log_energy(pts)
+    best_pts = pts.copy()
+    best_e = e0
+    
+    for it in range(max_iter):
+        if time.time() - start > time_limit:
+            break
+        
+        # Line search: find optimal step size in tangent direction
+        best_step = 0.0
+        best_step_e = e0
+        for step in [0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0]:
+            # Move in tangent direction: p_new = pts + step * p_dir, then project
+            new_pts = pts + step * p_dir
+            new_pts = _project_to_sphere(new_pts)
+            new_e = _log_energy(new_pts)
+            if new_e < best_step_e:
+                best_step_e = new_e
+                best_step = step
+        
+        if best_step == 0.0:
+            break
+        
+        pts = _project_to_sphere(pts + best_step * p_dir)
+        e0 = _log_energy(pts)
+        
+        if e0 < best_e:
+            best_e = e0
+            best_pts = pts.copy()
+        
+        # Compute new gradient
+        diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
+        dists_sq = np.sum(diff * diff, axis=-1)
+        np.fill_diagonal(dists_sq, 1.0)
+        weights = np.zeros_like(dists_sq)
+        mask = ~np.eye(n, dtype=bool)
+        weights[mask] = 1.0 / dists_sq[mask]
+        sum_weights = np.sum(weights, axis=1)
+        weighted_sum = weights @ pts
+        grads = weighted_sum - pts * sum_weights[:, np.newaxis]
+        dot_products = np.sum(grads * pts, axis=1, keepdims=True)
+        g_new = grads - dot_products * pts
+        
+        # Check convergence
+        if np.linalg.norm(g_new) < 1e-10:
+            break
+        
+        # Riemannian conjugate gradient update
+        g_old = g
+        g = g_new
+        
+        # Beta coefficient (Polak-Ribiere)
+        beta = np.sum(g * (g - g_old)) / max(np.sum(g_old * g_old), 1e-15)
+        beta = max(0.0, beta)
+        
+        # Parallel transport old direction
+        p_dir = -g + beta * p_dir
+        # Project to tangent space
+        dot_p = np.sum(p_dir * pts, axis=1, keepdims=True)
+        p_dir = p_dir - dot_p * pts
+    
+    return best_pts, best_e
+
+def _basin_hopping(points, max_iter=100, time_limit=60.0, rng=None):
+    """Basin hopping to escape local minima."""
+    if rng is None:
+        rng = np.random.RandomState(12345)
+    
+    start = time.time()
+    best_pts = points.copy()
+    best_e = _log_energy(best_pts)
+    current_pts = best_pts.copy()
+    current_e = best_e
+    
+    for it in range(max_iter):
+        if time.time() - start > time_limit:
+            break
+        
+        # Random perturbation with adaptive scale
+        scale = 0.1 * (1.0 - it / max_iter) + 0.01
+        noise = rng.randn(N, 3) * scale
+        new_pts = _project_to_sphere(current_pts + noise)
+        
+        # Local minimization with limited iterations to keep it fast
+        polished, e_polish = _riemannian_cg(new_pts, max_iter=500, time_limit=2.0)
+        
+        if e_polish < current_e:
+            current_pts = polished
+            current_e = e_polish
+            if e_polish < best_e:
+                best_e = e_polish
+                best_pts = polished.copy()
+    
+    return best_pts, best_e
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 145.0  # 5s safety margin
+    
+    # Initializations
+    inits = [
+        _fibonacci_sphere(N),
+        _random_uniform_sphere(N, seed=1),
+        _random_uniform_sphere(N, seed=2),
+        _random_uniform_sphere(N, seed=3),
+        _random_uniform_sphere(N, seed=42),
+    ]
+    
+    best_points = inits[0].copy()
+    best_energy = _log_energy(best_points)
+    
+    # First pass: Riemannian CG optimization on all initializations
+    for idx, init in enumerate(inits):
+        if time.time() > deadline - 60.0:
+            break
+        
+        polished, e_polish = _riemannian_cg(init, max_iter=3000, time_limit=15.0)
+        
+        if e_polish < best_energy:
+            best_energy = e_polish
+            best_points = polished.copy()
+    
+    # Second pass: basin hopping with Riemannian CG
+    if time.time() < deadline - 30.0:
+        bh_result, bh_energy = _basin_hopping(best_points, max_iter=80, time_limit=deadline - time.time() - 20.0)
+        if bh_energy < best_energy:
+            best_energy = bh_energy
+            best_points = bh_result.copy()
+    
+    # Third pass: final high-precision L-BFGS polish
+    if time.time() < deadline - 10.0:
+        final_polished = _lbfgs_polish(best_points, max_iter=5000, ftol=1e-14, gtol=1e-12, time_limit=deadline - time.time() - 5.0)
+        e_final = _log_energy(final_polished)
+        if e_final < best_energy:
+            best_points = final_polished.copy()
+    
+    best_points = _project_to_sphere(best_points)
+    
+    if not np.all(np.isfinite(best_points)):
+        return _fibonacci_sphere(N)
+    
+    # Check for points too close
+    diff = best_points[:, np.newaxis, :] - best_points[np.newaxis, :, :]
+    dists_sq = np.sum(diff * diff, axis=-1)
+    iu = np.triu_indices(N, k=1)
+    if np.min(dists_sq[iu]) < 1e-18:
+        return _fibonacci_sphere(N)
+    
+    return best_points

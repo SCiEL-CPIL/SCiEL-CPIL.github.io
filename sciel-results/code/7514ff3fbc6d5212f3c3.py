@@ -1,0 +1,20 @@
+"""Tensor decomposition for 3x3 by 3x8 matrix multiplication."""
+DIMENSIONS = [3, 3, 8]
+
+def construct():
+    # Schoolbook decomposition: rank = n*m*p = 72
+    # U[i*m+j, c] * V[j*p+k, c] * W[k*n+i, c] = delta for each (i,j,k)
+    n, m, p = DIMENSIONS
+    rank = n * m * p
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    column = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][column] = 1
+                V[j * p + k][column] = 1
+                W[k * n + i][column] = 1
+                column += 1
+    return {"U": U, "V": V, "W": W}

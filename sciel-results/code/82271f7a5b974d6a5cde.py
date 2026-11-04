@@ -1,0 +1,180 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+import time
+import numpy as np
+
+DIMENSIONS = [3, 5, 5]
+
+# EVOLVE-BLOCK-START
+def construct():
+    n, m, p = DIMENSIONS
+    deadline = time.time() + 115  # safety margin before 120s limit
+
+    # Strassen patterns for 2x2x2 (7 rank-1 terms)
+    # U entries: (local_i, local_j, coeff)  -> A[i,j]
+    # V entries: (local_j, local_k, coeff)  -> B[j,k]
+    # W entries: (local_k, local_i, coeff)  -> C[k,i]  (trace convention W[k*n+i])
+    strassen_patterns = [
+        {
+            'U': [(0,0,1), (1,1,1)],
+            'V': [(0,0,1), (1,1,1)],
+            'W': [(0,0,1), (1,1,1)]
+        },
+        {
+            'U': [(1,0,1), (1,1,1)],
+            'V': [(0,0,1)],
+            'W': [(0,1,1), (1,1,-1)]
+        },
+        {
+            'U': [(0,0,1)],
+            'V': [(0,1,1), (1,1,-1)],
+            'W': [(1,0,1), (1,1,1)]
+        },
+        {
+            'U': [(1,1,1)],
+            'V': [(1,0,1), (0,0,-1)],
+            'W': [(0,0,1), (0,1,1)]
+        },
+        {
+            'U': [(0,0,1), (0,1,1)],
+            'V': [(1,1,1)],
+            'W': [(0,0,-1), (1,0,1)]
+        },
+        {
+            'U': [(1,0,1), (0,0,-1)],
+            'V': [(0,0,1), (0,1,1)],
+            'W': [(1,1,1)]
+        },
+        {
+            'U': [(0,1,1), (1,1,-1)],
+            'V': [(1,0,1), (1,1,1)],
+            'W': [(0,0,1)]
+        }
+    ]
+
+    def get_splits(d):
+        """All compositions of d into parts of size 1 or 2."""
+        results = []
+        def helper(remaining, current):
+            if remaining == 0:
+                results.append(current[:])
+                return
+            if remaining >= 1:
+                current.append(1)
+                helper(remaining - 1, current)
+                current.pop()
+            if remaining >= 2:
+                current.append(2)
+                helper(remaining - 2, current)
+                current.pop()
+        helper(d, [])
+        return results
+
+    def build_decomposition(n_splits, m_splits, p_splits):
+        """Build the full decomposition for given splits. Returns (dict, rank)."""
+        n_off = [0]
+        for s in n_splits[:-1]:
+            n_off.append(n_off[-1] + s)
+        m_off = [0]
+        for s in m_splits[:-1]:
+            m_off.append(m_off[-1] + s)
+        p_off = [0]
+        for s in p_splits[:-1]:
+            p_off.append(p_off[-1] + s)
+
+        U_entries = []
+        V_entries = []
+        W_entries = []
+        rank = 0
+
+        for i_b in range(len(n_splits)):
+            for j_b in range(len(m_splits)):
+                for k_b in range(len(p_splits)):
+                    nb, mb, pb = n_splits[i_b], m_splits[j_b], p_splits[k_b]
+                    i_off = n_off[i_b]
+                    j_off = m_off[j_b]
+                    k_off = p_off[k_b]
+
+                    if nb == 2 and mb == 2 and pb == 2:
+                        for pattern in strassen_patterns:
+                            col = rank
+                            for li, lj, val in pattern['U']:
+                                gi = i_off + li
+                                gj = j_off + lj
+                                U_entries.append((gi * m + gj, col, val))
+                            for lj, lk, val in pattern['V']:
+                                gj = j_off + lj
+                                gk = k_off + lk
+                                V_entries.append((gj * p + gk, col, val))
+                            for lk, li, val in pattern['W']:
+                                gk = k_off + lk
+                                gi = i_off + li
+                                W_entries.append((gk * n + gi, col, val))
+                            rank += 1
+                    else:
+                        # Schoolbook for all other blocks
+                        for li in range(nb):
+                            for lj in range(mb):
+                                for lk in range(pb):
+                                    col = rank
+                                    gi = i_off + li
+                                    gj = j_off + lj
+                                    gk = k_off + lk
+                                    U_entries.append((gi * m + gj, col, 1))
+                                    V_entries.append((gj * p + gk, col, 1))
+                                    W_entries.append((gk * n + gi, col, 1))
+                                    rank += 1
+
+        # Build dense matrices
+        U = [[0] * rank for _ in range(n * m)]
+        V = [[0] * rank for _ in range(m * p)]
+        W = [[0] * rank for _ in range(p * n)]
+
+        for idx, col, val in U_entries:
+            U[idx][col] = val
+        for idx, col, val in V_entries:
+            V[idx][col] = val
+        for idx, col, val in W_entries:
+            W[idx][col] = val
+
+        return {"U": U, "V": V, "W": W}, rank
+
+    # Generate all possible splits for each dimension (parts of 1 or 2)
+    n_split_options = get_splits(n)
+    m_split_options = get_splits(m)
+    p_split_options = get_splits(p)
+
+    best_rank = float('inf')
+    best_result = None
+
+    for ns in n_split_options:
+        if time.time() > deadline:
+            break
+        for ms in m_split_options:
+            if time.time() > deadline:
+                break
+            for ps in p_split_options:
+                if time.time() > deadline:
+                    break
+                result, r = build_decomposition(ns, ms, ps)
+                if r < best_rank:
+                    best_rank = r
+                    best_result = result
+
+    # Fallback to schoolbook if something went wrong
+    if best_result is None:
+        rank = n * m * p
+        U = [[0] * rank for _ in range(n * m)]
+        V = [[0] * rank for _ in range(m * p)]
+        W = [[0] * rank for _ in range(p * n)]
+        col = 0
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    U[i * m + j][col] = 1
+                    V[j * p + k][col] = 1
+                    W[k * n + i][col] = 1
+                    col += 1
+        best_result = {"U": U, "V": V, "W": W}
+
+    return best_result
+# EVOLVE-BLOCK-END

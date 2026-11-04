@@ -3,10 +3,10 @@ import math
 import time
 import random
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, differential_evolution
 
 N = 12
-TIME_LIMIT = 115.0  # safety margin below 120s
+TIME_LIMIT = 135.0  # safety margin below 150s
 
 def _hex_vertices(cx, cy, angle_deg, side=1.0):
     """Vertices of a regular hexagon centered at (cx,cy) with rotation angle_deg."""
@@ -41,15 +41,33 @@ def _axes_from_polygon(verts):
         axes.append((nx, ny))
     return axes
 
-def _separating_axis_check(vertsA, vertsB):
+def _separating_axis_check(vertsA, vertsB, tol=1e-9):
     """Check if two convex polygons overlap using SAT. Return True if they overlap (not disjoint)."""
     axes = _axes_from_polygon(vertsA) + _axes_from_polygon(vertsB)
     for axis in axes:
         minA, maxA = _project_polygon(vertsA, axis)
         minB, maxB = _project_polygon(vertsB, axis)
-        if maxA <= minB + 1e-9 or maxB <= minA + 1e-9:
+        if maxA <= minB + tol or maxB <= minA + tol:
             return False
     return True
+
+def _hex_normals(angle_deg):
+    """
+    Pre-computed edge normals for a unit hexagon with given rotation.
+    The edges of a regular hexagon (vertices at 0, 60, ...) have normals at 30, 90, 150, 210, 270, 330.
+    """
+    a = math.radians(angle_deg)
+    ca, sa = math.cos(a), math.sin(a)
+    normals = []
+    for k in range(6):
+        theta = math.radians(30 + 60 * k)
+        nx = math.cos(theta)
+        ny = math.sin(theta)
+        # Rotate normal
+        rnx = ca * nx - sa * ny
+        rny = sa * nx + ca * ny
+        normals.append((rnx, rny))
+    return normals
 
 def _outer_hex_side(centers_angles, center, angle_deg):
     """Compute minimum side length S of outer hexagon containing all inner hexagons."""
@@ -71,136 +89,67 @@ def _outer_hex_side(centers_angles, center, angle_deg):
                     max_need = val
     return max_need
 
-def _sdf_hex_point(px, py, angle_deg, side=1.0):
-    """Signed distance from point (px,py) to hexagon centered at origin with rotation angle_deg."""
-    a = math.radians(angle_deg)
-    ca, sa = math.cos(a), math.sin(a)
-    # Transform point into hexagon's local frame
-    lx = ca * px + sa * py
-    ly = -sa * px + ca * py
-    abs_lx = abs(lx)
-    abs_ly = abs(ly)
-    apothem = side * math.sqrt(3) / 2.0
-    # Hexagon in local frame: |x| <= apothem, |y| <= apothem/sqrt(3) for the "flat" sides
-    # Actually for a regular hexagon with side length s:
-    # The hexagon is the intersection of 6 half-planes
-    # Let's use the standard SDF for a regular hexagon
-    # Vertices at angles 0, 60, 120, 180, 240, 300 degrees from center
-    # In local frame, vertices are at (s*cos(k*60), s*sin(k*60)) for k=0..5
-    # The hexagon can be described as: for each edge, the point must be on the interior side
-    # Edge normals point outward at angles 30, 90, 150, 210, 270, 330 degrees
-    # Distance from center to each edge (apothem) = s * sqrt(3)/2
-    # For a point (lx, ly), the signed distance to the hexagon:
-    # We check all 6 edges and take the max of the signed distances (inside = negative)
-    min_dist = float('inf')
-    for k in range(6):
-        theta = math.radians(30 + 60 * k)
-        nx, ny = math.cos(theta), math.sin(theta)
-        # Signed distance from point to this edge line (positive = outside)
-        d = nx * lx + ny * ly - apothem
-        if d < min_dist:
-            min_dist = d
-    # But this gives the distance to the nearest edge, not the true SDF
-    # For a convex polygon, the SDF is: if inside, -min distance to edges; if outside, min distance to polygon
-    # Let's use a simpler approach: check if point is inside, then compute distance appropriately
-    # Point is inside if for all edges, nx*lx + ny*ly <= apothem
-    inside = True
-    for k in range(6):
-        theta = math.radians(30 + 60 * k)
-        nx, ny = math.cos(theta), math.sin(theta)
-        if nx * lx + ny * ly > apothem + 1e-12:
-            inside = False
-            break
-    if inside:
-        # Distance to nearest edge (negative)
-        max_proj = 0.0
-        for k in range(6):
-            theta = math.radians(30 + 60 * k)
-            nx, ny = math.cos(theta), math.sin(theta)
-            proj = nx * lx + ny * ly
-            if proj > max_proj:
-                max_proj = proj
-        return -(apothem - max_proj)
-    else:
-        # Outside: compute distance to nearest point on polygon
-        # Project onto each edge and compute distance
-        min_d = float('inf')
-        for k in range(6):
-            # Edge from vertex k to vertex k+1
-            t1 = math.radians(60 * k)
-            t2 = math.radians(60 * (k + 1))
-            v1 = (side * math.cos(t1), side * math.sin(t1))
-            v2 = (side * math.cos(t2), side * math.sin(t2))
-            # Point-to-segment distance
-            dx, dy = v2[0] - v1[0], v2[1] - v1[1]
-            len2 = dx * dx + dy * dy
-            if len2 < 1e-12:
-                continue
-            t = max(0.0, min(1.0, ((lx - v1[0]) * dx + (ly - v1[1]) * dy) / len2))
-            qx, qy = v1[0] + t * dx, v1[1] + t * dy
-            d = math.hypot(lx - qx, ly - qy)
-            if d < min_d:
-                min_d = d
-        return min_d
-
-def _sdf_hex_hex(cx1, cy1, a1, cx2, cy2, a2, side=1.0):
-    """Approximate SDF between two hexagons using vertex sampling."""
-    # Sample vertices of hex1 and compute distance to hex2
-    verts1 = _hex_vertices(cx1, cy1, a1, side)
-    verts2 = _hex_vertices(cx2, cy2, a2, side)
-    min_d = float('inf')
-    # For each vertex of hex1, compute distance to hex2
-    for (vx, vy) in verts1:
-        d = _sdf_hex_point(vx - cx2, vy - cy2, a2, side)
-        if d < min_d:
-            min_d = d
-    # For each vertex of hex2, compute distance to hex1
-    for (vx, vy) in verts2:
-        d = _sdf_hex_point(vx - cx1, vy - cy1, a1, side)
-        if d < min_d:
-            min_d = d
-    return min_d
-
-def _smooth_collision_penalty(cfg, center, angle, sigma=0.1):
-    """Smooth penalty for collisions using soft-min of SDFs."""
-    m = len(cfg)
-    total_penalty = 0.0
-    for i in range(m):
-        for j in range(i + 1, m):
-            d = _sdf_hex_hex(cfg[i][0], cfg[i][1], cfg[i][2], 
-                            cfg[j][0], cfg[j][1], cfg[j][2])
-            # Soft penalty: exp(-d/sigma) is large when d < 0 (overlapping)
-            if d < 2.0 * sigma:
-                penalty = math.exp(-d / sigma) - 1.0
-                total_penalty += penalty
-    return total_penalty
-
-def _is_valid(centers_angles):
+def _is_valid(centers_angles, tol=1e-9):
     """Check all pairs of hexagons are disjoint."""
     m = len(centers_angles)
     polys = [_hex_vertices(p[0], p[1], p[2]) for p in centers_angles]
+    normals = [_hex_normals(p[2]) for p in centers_angles]
     for i in range(m):
         for j in range(i + 1, m):
-            if _separating_axis_check(polys[i], polys[j]):
+            axes = normals[i] + normals[j]
+            sep = False
+            for axis in axes:
+                minA, maxA = _project_polygon(polys[i], axis)
+                minB, maxB = _project_polygon(polys[j], axis)
+                if maxA <= minB + tol or maxB <= minA + tol:
+                    sep = True
+                    break
+            if not sep:
                 return False
     return True
 
-def _smooth_objective(v, cfg_shape=None):
-    """Smooth objective for L-BFGS-B: outer side + collision penalty."""
-    N_local = 12
-    cfg = []
-    for i in range(N_local):
-        cfg.append([v[3*i], v[3*i+1], v[3*i+2]])
-    center = (v[3*N_local], v[3*N_local+1])
-    angle = v[3*N_local+2]
+def _sdf_distance(p1x, p1y, a1, p2x, p2y, a2):
+    """
+    Compute the signed distance between two unit hexagons.
+    Positive means separated, negative means overlapping.
+    """
+    dx = p2x - p1x
+    dy = p2y - p1y
+    dist = math.hypot(dx, dy)
     
-    s = _outer_hex_side(cfg, center, angle)
-    penalty = _smooth_collision_penalty(cfg, center, angle, sigma=0.05)
-    return s + 10.0 * penalty
+    if dist < 1e-10:
+        return 0.0
+    
+    def hex_radius(angle_deg, direction_deg):
+        a_rad = math.radians(angle_deg)
+        d_rad = math.radians(direction_deg)
+        dx_dir = math.cos(d_rad)
+        dy_dir = math.sin(d_rad)
+        
+        max_val = 0.0
+        for k in range(6):
+            theta = math.radians(60 * k)
+            vx = math.cos(theta)
+            vy = math.sin(theta)
+            ca = math.cos(a_rad)
+            sa = math.sin(a_rad)
+            rvx = ca * vx - sa * vy
+            rvy = sa * vx + ca * vy
+            dot = rvx * dx_dir + rvy * dy_dir
+            if dot > max_val:
+                max_val = dot
+        return max_val
+    
+    dir_deg = math.degrees(math.atan2(dy, dx))
+    r1 = hex_radius(a1, dir_deg)
+    r2 = hex_radius(a2, dir_deg + 180)
+    
+    return dist - r1 - r2
 
 def construct():
     t0 = time.time()
     random.seed(42)
+    np.random.seed(42)
     
     def make_hex_lattice():
         """3x4 hexagonal lattice with offset."""
@@ -226,22 +175,55 @@ def construct():
             pts.append([x, y, angle_deg])
         return pts
     
-    def make_cluster():
-        """Tight cluster: central hex + ring of 6 + outer 5."""
+    def make_flower():
+        """Flower pattern: 1 center + 6 inner ring + 5 outer."""
         pts = []
-        # Central
         pts.append([0.0, 0.0, 0.0])
-        # Inner ring of 6
-        R1 = 2.0 * math.sqrt(3) / 2.0  # touching distance for unit hexagons
+        R1 = math.sqrt(3)
         for i in range(6):
             theta = 2 * math.pi * i / 6
             x = R1 * math.cos(theta)
             y = R1 * math.sin(theta)
             pts.append([x, y, 0.0])
-        # Outer 5
-        R2 = 2.0 * math.sqrt(3)
+        R2 = 2 * math.sqrt(3)
         for i in range(5):
             theta = 2 * math.pi * (i + 0.5) / 5
+            x = R2 * math.cos(theta)
+            y = R2 * math.sin(theta)
+            pts.append([x, y, 0.0])
+        return pts
+    
+    def make_dense_cluster():
+        """Tight cluster arrangement."""
+        pts = []
+        pts.append([0.0, 0.0, 0.0])
+        for i in range(6):
+            theta = 2 * math.pi * i / 6
+            x = math.sqrt(3) * math.cos(theta)
+            y = math.sqrt(3) * math.sin(theta)
+            pts.append([x, y, 0.0])
+        for i in range(5):
+            theta = 2 * math.pi * (i + 0.5) / 5
+            x = 2 * math.sqrt(3) * math.cos(theta)
+            y = 2 * math.sqrt(3) * math.sin(theta)
+            pts.append([x, y, 0.0])
+        return pts
+    
+    def make_hexagonal_12():
+        """12 hexagons in a hexagonal pattern: center + 5 + 6."""
+        pts = []
+        pts.append([0.0, 0.0, 0.0])
+        # Inner ring of 5
+        R1 = math.sqrt(3)
+        for i in range(5):
+            theta = 2 * math.pi * i / 5 + math.pi/5
+            x = R1 * math.cos(theta)
+            y = R1 * math.sin(theta)
+            pts.append([x, y, 0.0])
+        # Outer ring of 6
+        R2 = 2 * math.sqrt(3)
+        for i in range(6):
+            theta = 2 * math.pi * i / 6
             x = R2 * math.cos(theta)
             y = R2 * math.sin(theta)
             pts.append([x, y, 0.0])
@@ -251,10 +233,34 @@ def construct():
         """Return outer side if valid, else None."""
         if not _is_valid(cfg):
             return None
-        return _outer_hex_side(cfg, center, angle)
+        return _outer_hex_side(cfg, tuple(center), angle)
     
-    def nelder_mead_polish(cfg_init, center_init, angle_init, time_budget):
-        """Nelder-Mead optimization to polish the configuration."""
+    def smooth_objective(v, beta=80.0):
+        """
+        Smooth objective using soft-min for overlap constraints.
+        v contains: [x1,y1,a1, ..., xN,yN,aN, cx,cy, cangle]
+        """
+        cfg = []
+        for i in range(N):
+            cfg.append([v[3*i], v[3*i+1], v[3*i+2]])
+        center = [v[3*N], v[3*N+1]]
+        angle = v[3*N+2]
+        
+        outer_side = _outer_hex_side(cfg, tuple(center), angle)
+        
+        total_penalty = 0.0
+        m = len(cfg)
+        for i in range(m):
+            for j in range(i + 1, m):
+                d = _sdf_distance(cfg[i][0], cfg[i][1], cfg[i][2], 
+                                  cfg[j][0], cfg[j][1], cfg[j][2])
+                if d < 0:
+                    total_penalty += math.exp(-beta * (-d))
+        
+        return outer_side + 15.0 * total_penalty
+    
+    def lbfgs_polish(cfg_init, center_init, angle_init, time_budget):
+        """L-BFGS-B optimization using smooth objective."""
         def flatten(cfg, center, angle):
             v = []
             for p in cfg:
@@ -270,73 +276,30 @@ def construct():
             angle = v[3*N+2]
             return cfg, center, angle
         
-        def objective(v):
-            cfg, center, angle = unflatten(v)
-            s = full_score(cfg, tuple(center), angle)
-            if s is None:
-                return 1e6
-            return s
-        
         v0 = flatten(cfg_init, center_init, angle_init)
-        n_params = len(v0)
-        simplex = [v0[:]]
-        step = 0.05
-        for i in range(n_params):
-            vi = v0[:]
-            vi[i] += step
-            simplex.append(vi)
         
-        alpha_nm = 1.0
-        gamma_nm = 2.0
-        rho_nm = 0.5
-        sigma_nm = 0.5
-        
-        best_f = min(objective(v) for v in simplex)
-        best_v = min(simplex, key=objective)
-        
-        max_iters = 2000
-        iter_count = 0
-        while iter_count < max_iters and time.time() - t0 < time_budget:
-            simplex.sort(key=lambda v: objective(v))
-            f_best = objective(simplex[0])
+        start_time = time.time()
+        def callback(xk):
+            return time.time() - start_time > (time_budget - 2.0)
+
+        try:
+            result = minimize(
+                smooth_objective,
+                v0,
+                method='L-BFGS-B',
+                callback=callback,
+                options={'maxiter': 500, 'maxfun': 5000, 'ftol': 1e-14, 'gtol': 1e-10}
+            )
             
-            if f_best < best_f:
-                best_f = f_best
-                best_v = simplex[0][:]
+            v_opt = result.x
+            cfg_opt, center_opt, angle_opt = unflatten(v_opt)
             
-            f_max = objective(simplex[-1])
-            if abs(f_max - f_best) < 1e-8:
-                break
-            
-            centroid = [sum(v[i] for v in simplex[:-1]) / n_params for i in range(n_params)]
-            
-            xr = [centroid[i] + alpha_nm * (centroid[i] - simplex[-1][i]) for i in range(n_params)]
-            fr = objective(xr)
-            
-            if fr < f_best:
-                xe = [centroid[i] + gamma_nm * (centroid[i] - simplex[-1][i]) for i in range(n_params)]
-                fe = objective(xe)
-                if fe < fr:
-                    simplex[-1] = xe
-                else:
-                    simplex[-1] = xr
-            elif fr < objective(simplex[-2]):
-                simplex[-1] = xr
-            else:
-                if fr < objective(simplex[-1]):
-                    xc = [centroid[i] + rho_nm * (simplex[-1][i] - centroid[i]) for i in range(n_params)]
-                else:
-                    xc = [centroid[i] + rho_nm * (centroid[i] - simplex[-1][i]) for i in range(n_params)]
-                fc = objective(xc)
-                if fc < min(fr, objective(simplex[-1])):
-                    simplex[-1] = xc
-                else:
-                    for i in range(1, len(simplex)):
-                        simplex[i] = [simplex[0][j] + sigma_nm * (simplex[i][j] - simplex[0][j]) for j in range(n_params)]
-            
-            iter_count += 1
-        
-        return best_v, best_f
+            score = full_score(cfg_opt, tuple(center_opt), angle_opt)
+            if score is not None:
+                return v_opt, score
+        except Exception:
+            pass
+        return v0, None
     
     # Try multiple initial configurations
     best_cfg = None
@@ -344,14 +307,15 @@ def construct():
     best_center = [0.0, 0.0]
     best_angle = 0.0
     
-    inits = [make_hex_lattice(), make_ring(), make_cluster()]
+    inits = [make_hex_lattice(), make_ring(), make_flower(), make_dense_cluster(), make_hexagonal_12()]
     for init in inits:
-        s = full_score(init, (0.0, 0.0), 0.0)
-        if s is not None and s < best_score:
-            best_score = s
-            best_cfg = [row[:] for row in init]
-            best_center = [0.0, 0.0]
-            best_angle = 0.0
+        for c_angle in [0.0, 30.0, 15.0]:
+            s = full_score(init, (0.0, 0.0), c_angle)
+            if s is not None and s < best_score:
+                best_score = s
+                best_cfg = [row[:] for row in init]
+                best_center = [0.0, 0.0]
+                best_angle = c_angle
     
     if best_cfg is None:
         cfg = []
@@ -368,44 +332,38 @@ def construct():
     cur_score = best_score
     
     # Simulated Annealing phase
-    T = 0.8
-    T_end = 0.003
-    alpha_sa = 0.9997
+    T = 0.6
+    T_end = 0.002
+    alpha_sa = 0.9998
     
-    # Time allocation: SA gets most time, then NM polish
-    nm_time_budget = TIME_LIMIT - 8.0  # leave 8s for NM + safety
+    sa_time_budget = TIME_LIMIT - 25.0
     
-    while time.time() - t0 < nm_time_budget:
+    while time.time() - t0 < sa_time_budget:
         r = random.random()
         
         if r < 0.45:
-            # Move one hexagon
             idx = random.randrange(N)
             old_x, old_y = cfg[idx][0], cfg[idx][1]
-            step = 0.15 * (1.0 + 0.5 * T)
+            step = 0.12 * (1.0 + 0.5 * T)
             cfg[idx][0] += random.gauss(0, step)
             cfg[idx][1] += random.gauss(0, step)
         elif r < 0.65:
-            # Rotate one hexagon
             idx = random.randrange(N)
             old_ang = cfg[idx][2]
-            cfg[idx][2] += random.gauss(0, 4.0 + 3.0 * T)
+            cfg[idx][2] += random.gauss(0, 3.0 + 3.0 * T)
         elif r < 0.75:
-            # Move center
             old_cx, old_cy = center[0], center[1]
-            step = 0.08 * (1.0 + 0.5 * T)
+            step = 0.06 * (1.0 + 0.5 * T)
             center[0] += random.gauss(0, step)
             center[1] += random.gauss(0, step)
         elif r < 0.85:
-            # Rotate outer
             old_angle = angle
-            angle += random.gauss(0, 1.5 + 1.5 * T)
+            angle += random.gauss(0, 1.0 + 1.0 * T)
         else:
-            # Perturb two hexagons
             idx1, idx2 = random.sample(range(N), 2)
             old_x1, old_y1 = cfg[idx1][0], cfg[idx1][1]
             old_x2, old_y2 = cfg[idx2][0], cfg[idx2][1]
-            step = 0.12 * (1.0 + 0.5 * T)
+            step = 0.10 * (1.0 + 0.5 * T)
             cfg[idx1][0] += random.gauss(0, step)
             cfg[idx1][1] += random.gauss(0, step)
             cfg[idx2][0] += random.gauss(0, step)
@@ -448,59 +406,91 @@ def construct():
         
         T = max(T_end, T * alpha_sa)
     
-    # L-BFGS-B polish with smooth objective
+    # L-BFGS-B polish
     remaining_time = TIME_LIMIT - (time.time() - t0)
-    if remaining_time > 8.0:
+    if remaining_time > 10.0:
         try:
-            v0 = []
-            for p in best_cfg:
-                v0.extend([p[0], p[1], p[2]])
-            v0.extend([best_center[0], best_center[1], best_angle])
-            
-            res = minimize(
-                _smooth_objective,
-                v0,
-                method='L-BFGS-B',
-                options={'maxiter': 500, 'ftol': 1e-12, 'gtol': 1e-10, 'maxfun': 2000}
+            lbfgs_v, lbfgs_score = lbfgs_polish(
+                best_cfg, best_center, best_angle, remaining_time - 2.0
             )
-            
-            v_lbfgs = res.x
-            cfg_lbfgs = []
-            for i in range(N):
-                cfg_lbfgs.append([v_lbfgs[3*i], v_lbfgs[3*i+1], v_lbfgs[3*i+2]])
-            center_lbfgs = [v_lbfgs[3*N], v_lbfgs[3*N+1]]
-            angle_lbfgs = v_lbfgs[3*N+2]
-            
-            lbfgs_score = full_score(cfg_lbfgs, tuple(center_lbfgs), angle_lbfgs)
             if lbfgs_score is not None and lbfgs_score < best_score:
-                best_score = lbfgs_score
-                best_cfg = cfg_lbfgs
-                best_center = center_lbfgs
-                best_angle = angle_lbfgs
+                cfg_lbfgs = []
+                for i in range(N):
+                    cfg_lbfgs.append([lbfgs_v[3*i], lbfgs_v[3*i+1], lbfgs_v[3*i+2]])
+                center_lbfgs = [lbfgs_v[3*N], lbfgs_v[3*N+1]]
+                angle_lbfgs = lbfgs_v[3*N+2]
+                
+                verify_score = full_score(cfg_lbfgs, tuple(center_lbfgs), angle_lbfgs)
+                if verify_score is not None and verify_score < best_score:
+                    best_score = verify_score
+                    best_cfg = cfg_lbfgs
+                    best_center = center_lbfgs
+                    best_angle = angle_lbfgs
         except Exception:
             pass
     
-    # Final tight Nelder-Mead polish
+    # Second LBFGS polish with tighter settings
     remaining_time = TIME_LIMIT - (time.time() - t0)
-    if remaining_time > 3.0:
+    if remaining_time > 5.0:
         try:
-            polished_v, polished_f = nelder_mead_polish(
-                best_cfg, best_center, best_angle, TIME_LIMIT - 2.0
-            )
-            cfg_polished = []
-            for i in range(N):
-                cfg_polished.append([polished_v[3*i], polished_v[3*i+1], polished_v[3*i+2]])
-            center_polished = [polished_v[3*N], polished_v[3*N+1]]
-            angle_polished = polished_v[3*N+2]
+            def flatten(cfg, center, angle):
+                v = []
+                for p in cfg:
+                    v.extend([p[0], p[1], p[2]])
+                v.extend([center[0], center[1], angle])
+                return v
             
-            polished_score = full_score(cfg_polished, tuple(center_polished), angle_polished)
-            if polished_score is not None and polished_score < best_score:
-                best_score = polished_score
-                best_cfg = cfg_polished
-                best_center = center_polished
-                best_angle = angle_polished
+            def unflatten(v):
+                cfg = []
+                for i in range(N):
+                    cfg.append([v[3*i], v[3*i+1], v[3*i+2]])
+                center = [v[3*N], v[3*N+1]]
+                angle = v[3*N+2]
+                return cfg, center, angle
+            
+            v0 = flatten(best_cfg, best_center, best_angle)
+            start_time = time.time()
+            def callback(xk):
+                return time.time() - start_time > (remaining_time - 2.0)
+
+            result = minimize(
+                smooth_objective,
+                v0,
+                method='L-BFGS-B',
+                callback=callback,
+                options={'maxiter': 2000, 'maxfun': 20000, 'ftol': 1e-16, 'gtol': 1e-12}
+            )
+            
+            v_opt = result.x
+            cfg_opt = []
+            for i in range(N):
+                cfg_opt.append([v_opt[3*i], v_opt[3*i+1], v_opt[3*i+2]])
+            center_opt = [v_opt[3*N], v_opt[3*N+1]]
+            angle_opt = v_opt[3*N+2]
+            
+            verify_score = full_score(cfg_opt, tuple(center_opt), angle_opt)
+            if verify_score is not None and verify_score < best_score:
+                best_score = verify_score
+                best_cfg = cfg_opt
+                best_center = center_opt
+                best_angle = angle_opt
         except Exception:
             pass
+    
+    # Final micro-polish: try small perturbations of the best solution
+    remaining_time = TIME_LIMIT - (time.time() - t0)
+    if remaining_time > 2.0:
+        for _ in range(20):
+            if time.time() - t0 > TIME_LIMIT - 1.0:
+                break
+            cfg_trial = [row[:] for row in best_cfg]
+            idx = random.randrange(N)
+            cfg_trial[idx][0] += random.gauss(0, 0.01)
+            cfg_trial[idx][1] += random.gauss(0, 0.01)
+            s = full_score(cfg_trial, tuple(best_center), best_angle)
+            if s is not None and s < best_score:
+                best_score = s
+                best_cfg = cfg_trial
     
     inner = [[float(p[0]), float(p[1]), float(p[2])] for p in best_cfg]
     return inner, (float(best_center[0]), float(best_center[1])), float(best_score), float(best_angle)

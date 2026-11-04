@@ -1,0 +1,504 @@
+import numpy as np
+from scipy.optimize import minimize
+import time
+import itertools
+
+N = 11
+
+# Vertices of the equilateral triangle in Cartesian
+V0 = np.array([0.0, 0.0])
+V1 = np.array([1.0, 0.0])
+V2 = np.array([0.5, np.sqrt(3) / 2])
+TRI_AREA = 0.5 * np.sqrt(3) / 2  # area of equilateral triangle with side 1
+
+# Precompute indices for all triples
+_IDX_TRIPLES = np.array([(i, j, k) for i in range(N) for j in range(i+1, N) for k in range(j+1, N)])
+n_triples = len(_IDX_TRIPLES)  # 165
+
+def _all_dets_from_bary(bary):
+    """
+    Compute all 165 determinants (twice the area in barycentric coords).
+    """
+    u = bary[:, 0]
+    v = bary[:, 1]
+    w = 1.0 - u - v
+    P = np.column_stack((u, v, w))
+    
+    i_idx = _IDX_TRIPLES[:, 0]
+    j_idx = _IDX_TRIPLES[:, 1]
+    k_idx = _IDX_TRIPLES[:, 2]
+    
+    Pi = P[i_idx]
+    Pj = P[j_idx]
+    Pk = P[k_idx]
+    
+    det = (Pi[:, 0] * (Pj[:, 1] * Pk[:, 2] - Pj[:, 2] * Pk[:, 1])
+           - Pi[:, 1] * (Pj[:, 0] * Pk[:, 2] - Pj[:, 2] * Pk[:, 0])
+           + Pi[:, 2] * (Pj[:, 0] * Pk[:, 1] - Pj[:, 1] * Pk[:, 0]))
+           
+    return det
+
+def _min_area_ratio_from_bary(bary):
+    """
+    Returns the minimum absolute determinant (proportional to area ratio).
+    """
+    u = bary[:, 0]
+    v = bary[:, 1]
+    w = 1.0 - u - v
+    
+    if np.any(u < -1e-9) or np.any(v < -1e-9) or np.any(w < -1e-9):
+        return -1.0
+        
+    dets = _all_dets_from_bary(bary)
+    return np.min(np.abs(dets))
+
+def _bary_to_cart(u, v):
+    """
+    Convert barycentric coordinates (u, v) to Cartesian.
+    w = 1 - u - v
+    Point = u*V0 + v*V1 + w*V2
+    """
+    w = 1.0 - u - v
+    x = v * 1.0 + w * 0.5
+    y = w * np.sqrt(3) / 2
+    return np.column_stack((x, y))
+
+def _project_to_bary_simplex(bary):
+    """
+    Project points to the valid barycentric simplex.
+    """
+    u = np.maximum(0, bary[:, 0])
+    v = np.maximum(0, bary[:, 1])
+    s = u + v
+    mask = s > 1.0
+    if np.any(mask):
+        u[mask] /= s[mask]
+        v[mask] /= s[mask]
+    return np.column_stack((u, v))
+
+def _det_gradient(bary):
+    """
+    Compute gradient of all determinants with respect to barycentric coordinates.
+    Returns: grad_dets of shape (n_triples, N, 2)
+    """
+    n_triples = len(_IDX_TRIPLES)
+    grad_dets = np.zeros((n_triples, N, 2))
+    
+    i_idx = _IDX_TRIPLES[:, 0]
+    j_idx = _IDX_TRIPLES[:, 1]
+    k_idx = _IDX_TRIPLES[:, 2]
+    
+    for t in range(n_triples):
+        i, j, k = i_idx[t], j_idx[t], k_idx[t]
+        ui, vi = bary[i, 0], bary[i, 1]
+        uj, vj = bary[j, 0], bary[j, 1]
+        uk, vk = bary[k, 0], bary[k, 1]
+        wi, wj, wk = 1-ui-vi, 1-uj-vj, 1-uk-vk
+        
+        # det = ui*(vj*wk - wj*vk) - vi*(uj*wk - wj*uk) + wi*(uj*vk - vj*uk)
+        # Gradient w.r.t. ui: (vj*wk - wj*vk)
+        # Gradient w.r.t. vi: -(uj*wk - wj*uk)
+        # Gradient w.r.t. wi: (uj*vk - vj*uk)
+        # But wi = 1-ui-vi, so d/dui(wi) = -1, d/dvi(wi) = -1
+        
+        # d(det)/dui = (vj*wk - wj*vk) - (uj*vk - vj*uk)
+        # d(det)/dvi = -(uj*wk - wj*uk) - (uj*vk - vj*uk)
+        # d(det)/duj = -vi*(wk - wj) + wi*(vk - vj)
+        # d(det)/dvj = ui*(wk - wj) - wi*(uk - uj)
+        # d(det)/duk = -vi*(wj - wj) + wi*(vj - vj) = 0... let me redo
+        # d(det)/duk = -vi*(-wj) + wi*(-vj) = vi*wj - wi*vj
+        # d(det)/dvk = ui*(-wj) - wi*(-uj) = -ui*wj + wi*uj
+        
+        g_ui = (vj*wk - wj*vk) - (uj*vk - vj*uk)
+        g_vi = -(uj*wk - wj*uk) - (uj*vk - vj*uk)
+        g_uj = -vi*(wk - wj) + wi*(vk - vj)
+        g_vj = ui*(wk - wj) - wi*(uk - uj)
+        g_uk = vi*wj - wi*vj
+        g_vk = -ui*wj + wi*uj
+        
+        grad_dets[t, i, 0] += g_ui
+        grad_dets[t, i, 1] += g_vi
+        grad_dets[t, j, 0] += g_uj
+        grad_dets[t, j, 1] += g_vj
+        grad_dets[t, k, 0] += g_uk
+        grad_dets[t, k, 1] += g_vk
+    
+    return grad_dets
+
+def _softmin_objective_and_grad(x, beta, penalty_lambda=100.0):
+    """
+    Soft-min objective with full gradient for L-BFGS-B.
+    x: (2N,) array of u, v coords.
+    Returns: (objective_value, gradient)
+    """
+    bary = x.reshape(N, 2)
+    u = bary[:, 0]
+    v = bary[:, 1]
+    
+    # Penalty for invalid barycentric coords
+    penalty = 0.0
+    grad = np.zeros(2 * N)
+    
+    # Penalty for u+v > 1
+    excess = np.maximum(0, u + v - 1.0)
+    penalty += penalty_lambda * np.sum(excess**2)
+    mask = (u + v - 1.0) > 0
+    if np.any(mask):
+        grad[mask, 0] += 2 * penalty_lambda * excess[mask]
+        grad[mask, 1] += 2 * penalty_lambda * excess[mask]
+    
+    # Penalty for u < 0
+    excess_u = np.maximum(0, -u)
+    penalty += penalty_lambda * np.sum(excess_u**2)
+    mask_u = u < 0
+    if np.any(mask_u):
+        grad[mask_u, 0] += 2 * penalty_lambda * excess_u[mask_u]
+    
+    # Penalty for v < 0
+    excess_v = np.maximum(0, -v)
+    penalty += penalty_lambda * np.sum(excess_v**2)
+    mask_v = v < 0
+    if np.any(mask_v):
+        grad[mask_v, 1] += 2 * penalty_lambda * excess_v[mask_v]
+    
+    dets = _all_dets_from_bary(bary)
+    areas = np.abs(dets)
+    signs = np.sign(dets)
+    # Handle zero dets: use +1 as default
+    signs[signs == 0] = 1.0
+    
+    m = np.min(areas)
+    shifted = areas - m
+    exps = np.exp(-beta * shifted)
+    sum_exps = np.sum(exps)
+    log_sum_exp = np.log(sum_exps)
+    weights = exps / sum_exps
+    
+    smooth_min = m - (1.0 / beta) * log_sum_exp
+    
+    # Gradient computation
+    # d(smooth_min)/dx = d(m)/dx - (1/beta) * d(log_sum_exp)/dx
+    # d(log_sum_exp)/dx = sum(-beta * d(areas_i)/dx * weights_i)
+    # So d(smooth_min)/dx = d(m)/dx + sum(d(areas_i)/dx * weights_i)
+    # And d(-smooth_min)/dx = -d(m)/dx - sum(d(areas_i)/dx * weights_i)
+    
+    # d(areas_i)/dx = signs_i * d(dets_i)/dx
+    grad_dets = _det_gradient(bary)  # shape (n_triples, N, 2)
+    
+    # Weighted sum of gradients
+    # For each triple t, contribution is weights[t] * signs[t] * grad_dets[t]
+    # Sum over all triples to get gradient w.r.t. each coordinate
+    weighted_grad = np.sum(weights[:, np.newaxis, np.newaxis] * signs[:, np.newaxis, np.newaxis] * grad_dets, axis=0)
+    
+    # d(m)/dx is the gradient of the minimum area (subgradient)
+    # At the minimum, the subgradient is the average of gradients of all areas at minimum
+    min_mask = (areas - m) < 1e-12
+    if np.any(min_mask):
+        min_grad = np.mean(grad_dets[min_mask] * signs[min_mask, np.newaxis, np.newaxis], axis=0)
+    else:
+        min_grad = np.zeros((N, 2))
+    
+    # d(-smooth_min)/dx = -min_grad - weighted_grad
+    obj_grad = -min_grad - weighted_grad
+    grad += obj_grad.reshape(2 * N)
+    
+    return -smooth_min + penalty, grad
+
+def _objective_slsqp(x):
+    """
+    Objective for SLSQP: minimize -min_area.
+    x: (2N,) array.
+    """
+    bary = x.reshape(N, 2)
+    u = np.clip(bary[:, 0], 0, None)
+    v = np.clip(bary[:, 1], 0, None)
+    s = u + v
+    mask = s > 1.0
+    if np.any(mask):
+        u[mask] /= s[mask]
+        v[mask] /= s[mask]
+    
+    bary_clamped = np.column_stack((u, v))
+    dets = _all_dets_from_bary(bary_clamped)
+    min_area = np.min(np.abs(dets))
+    return -min_area
+
+def _structured_init_fps():
+    """
+    Farthest Point Sampling on a grid of barycentric coordinates.
+    """
+    n_grid = 20
+    candidates = []
+    for i in range(n_grid + 1):
+        for j in range(n_grid + 1 - i):
+            u = i / n_grid
+            v = j / n_grid
+            candidates.append([u, v])
+    candidates = np.array(candidates)
+    
+    selected = [np.array([1/3, 1/3])]
+    
+    for _ in range(N - 1):
+        dists = []
+        for c in candidates:
+            min_d = np.min(np.linalg.norm(c - np.array(selected), axis=1))
+            dists.append(min_d)
+        dists = np.array(dists)
+        max_idx = np.argmax(dists)
+        selected.append(candidates[max_idx])
+        
+    return np.array(selected)
+
+def _local_optimize_nm(x0, maxiter=300, xatol=1e-8, fatol=1e-8):
+    """Run Nelder-Mead local optimization from x0."""
+    try:
+        res = minimize(
+            _objective_slsqp, x0, method='Nelder-Mead',
+            options={'maxiter': maxiter, 'xatol': xatol, 'fatol': fatol, 'adaptive': True}
+        )
+        return res.x
+    except Exception:
+        return x0
+
+def _polish_pass(x0, time_budget=10.0):
+    """Final high-precision polish using tight tolerances."""
+    start = time.time()
+    x_curr = x0.copy()
+    
+    # Tight Nelder-Mead
+    try:
+        res = minimize(
+            _objective_slsqp, x_curr, method='Nelder-Mead',
+            options={'maxiter': 500, 'xatol': 1e-12, 'fatol': 1e-14, 'adaptive': True}
+        )
+        x_curr = res.x
+    except Exception:
+        pass
+    
+    if time.time() - start > time_budget * 0.6:
+        return x_curr
+    
+    # Tight SLSQP
+    try:
+        res = minimize(
+            _objective_slsqp, x_curr, method='SLSQP',
+            bounds=[(0, 1)] * (2 * N),
+            options={'maxiter': 300, 'ftol': 1e-15}
+        )
+        x_curr = res.x
+    except Exception:
+        pass
+    
+    return x_curr
+
+def _local_optimize_lbfgs(x0, maxiter=200, gtol=1e-9):
+    """Run L-BFGS-B local optimization from x0 with beta annealing."""
+    try:
+        # Beta annealing: start with lower beta (smoother), increase for precision
+        betas = [20.0, 50.0, 100.0, 200.0]
+        x_curr = x0.copy()
+        for beta in betas:
+            res = minimize(
+                _softmin_objective_and_grad, x_curr, method='L-BFGS-B',
+                args=(beta,),
+                bounds=[(0, 1)] * (2 * N),
+                options={'maxiter': maxiter, 'gtol': gtol, 'maxls': 50}
+            )
+            x_curr = res.x
+        return x_curr
+    except Exception:
+        return x0
+
+def _local_optimize_slsqp(x0, maxiter=200):
+    """Run SLSQP local optimization from x0."""
+    try:
+        res = minimize(
+            _objective_slsqp, x0, method='SLSQP',
+            bounds=[(0, 1)] * (2 * N),
+            options={'maxiter': maxiter, 'ftol': 1e-10}
+        )
+        return res.x
+    except Exception:
+        return x0
+
+def score(points):
+    """Compute the raw score: min triangle area / TRI_AREA."""
+    bary = np.zeros((N, 2))
+    for i in range(N):
+        p = points[i]
+        # Convert Cartesian to barycentric
+        # p = u*V0 + v*V1 + w*V2, w = 1-u-v
+        # x = v + w*0.5, y = w*sqrt(3)/2
+        # w = y / (sqrt(3)/2) = 2y/sqrt(3)
+        # v = x - w*0.5 = x - y/sqrt(3)
+        # u = 1 - v - w
+        w = 2 * p[1] / np.sqrt(3)
+        v = p[0] - w * 0.5
+        u = 1 - v - w
+        bary[i] = [u, v]
+    
+    dets = _all_dets_from_bary(bary)
+    min_area = np.min(np.abs(dets))
+    return min_area / (2 * TRI_AREA)  # det is 2*area in barycentric, so area = det/2
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140.0  # Safety margin before 150s kill
+    
+    def time_left():
+        return deadline - time.time()
+        
+    best_x = None
+    best_score = -float('inf')
+    
+    inits = []
+    
+    # 1. FPS Init
+    inits.append(_structured_init_fps().flatten())
+    
+    # 2. Random Inits
+    rng = np.random.RandomState(42)
+    for _ in range(15):
+        pts = np.zeros((N, 2))
+        for i in range(N):
+            u = rng.random()
+            v = rng.random()
+            while u + v > 1.0:
+                u = rng.random()
+                v = rng.random()
+            pts[i, 0] = u
+            pts[i, 1] = v
+        inits.append(pts.flatten())
+        
+    # 3. Magic Init
+    magic_pts = [
+        [1.0, 0.0], [0.0, 1.0], [0.0, 0.0],
+        [1/3, 1/3],
+        [0.5, 0.0], [0.0, 0.5], [0.5, 0.5],
+        [0.25, 0.0], [0.0, 0.25], [0.25, 0.25], [0.5, 0.25],
+    ]
+    inits.append(np.array(magic_pts).flatten())
+    
+    # 4. Structured Starts
+    # Start 1: Hexagonal lattice pattern
+    bary1 = np.array([
+        [0.0, 0.0],    # V0
+        [1.0, 0.0],    # V1
+        [0.0, 1.0],    # V2
+        [0.5, 0.0],    # mid V0-V1
+        [0.5, 0.5],    # mid V1-V2
+        [0.0, 0.5],    # mid V2-V0
+        [1/3, 1/3],    # centroid
+        [0.25, 0.0],   # 1/4 V0-V1
+        [0.75, 0.0],   # 3/4 V0-V1
+        [0.25, 0.25],  # interior
+        [0.5, 0.75],   # interior
+    ])
+    inits.append(_project_to_bary_simplex(bary1).flatten())
+    
+    # Start 2: Concentric hexagons
+    bary2 = np.array([
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.333, 0.0],
+        [0.667, 0.0],
+        [0.0, 0.333],
+        [0.0, 0.667],
+        [0.333, 0.333],
+        [0.667, 0.333],
+        [0.333, 0.667],
+        [0.5, 0.5],
+    ])
+    inits.append(_project_to_bary_simplex(bary2).flatten())
+    
+    # Start 3: Symmetric grid with jitter
+    rng3 = np.random.RandomState(123)
+    bary3 = np.array([
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.25, 0.0],
+        [0.75, 0.0],
+        [0.0, 0.25],
+        [0.0, 0.75],
+        [0.25, 0.25],
+        [0.5, 0.25],
+        [0.25, 0.5],
+        [0.5, 0.5],
+    ])
+    bary3 += rng3.normal(0, 0.02, size=bary3.shape)
+    inits.append(_project_to_bary_simplex(bary3).flatten())
+    
+    # Start 4: Random with structured bias
+    rng4 = np.random.RandomState(456)
+    bary4 = []
+    bary4.append([0.0, 0.0])
+    bary4.append([1.0, 0.0])
+    bary4.append([0.0, 1.0])
+    bary4.append([1/3, 1/3])
+    for _ in range(7):
+        u = rng4.uniform(0.1, 0.9)
+        v = rng4.uniform(0.1, 0.9)
+        if u + v < 0.85:
+            bary4.append([u, v])
+        else:
+            bary4.append([u * 0.8, v * 0.8])
+    inits.append(_project_to_bary_simplex(np.array(bary4[:N])).flatten())
+    
+    # Optimize each initial point
+    for init in inits:
+        if time_left() < 8.0:
+            break
+        
+        x0 = _project_to_bary_simplex(init.reshape(N, 2)).flatten()
+        
+        # Try multiple optimization methods
+        for opt_func in [_local_optimize_nm, _local_optimize_lbfgs, _local_optimize_slsqp]:
+            if time_left() < 8.0:
+                break
+            
+            try:
+                x_opt = opt_func(x0)
+                x_opt = _project_to_bary_simplex(x_opt.reshape(N, 2)).flatten()
+                
+                # Evaluate
+                bary_opt = x_opt.reshape(N, 2)
+                s = _min_area_ratio_from_bary(bary_opt) / (2 * TRI_AREA)
+                
+                if s > best_score:
+                    best_score = s
+                    best_x = x_opt.copy()
+                    
+                # Warm start for next method
+                x0 = x_opt
+            except Exception:
+                pass
+    
+    # Final polish pass on best solution
+    if best_x is not None and time_left() > 15.0:
+        try:
+            polished = _polish_pass(best_x, time_budget=min(time_left() - 10.0, 30.0))
+            polished = _project_to_bary_simplex(polished.reshape(N, 2)).flatten()
+            bary_polished = polished.reshape(N, 2)
+            s_polished = _min_area_ratio_from_bary(bary_polished) / (2 * TRI_AREA)
+            if s_polished > best_score:
+                best_score = s_polished
+                best_x = polished.copy()
+        except Exception:
+            pass
+    
+    # If we found a good solution, convert to Cartesian
+    if best_x is not None:
+        bary_best = best_x.reshape(N, 2)
+        pts_best = _bary_to_cart(bary_best[:, 0], bary_best[:, 1])
+        return pts_best
+    
+    # Fallback: return random valid points
+    pts = []
+    for _ in range(N):
+        u, v = np.random.random(2)
+        while u + v > 1:
+            u, v = np.random.random(2)
+        pts.append([u + 0.5*v, np.sqrt(3)/2*v])
+    return np.array(pts)

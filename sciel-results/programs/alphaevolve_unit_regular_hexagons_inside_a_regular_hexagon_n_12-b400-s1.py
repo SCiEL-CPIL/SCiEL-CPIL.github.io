@@ -12,10 +12,6 @@ def construct():
     # Precompute unit hexagon vertices for angle 0 (flat-top)
     # Vertices at 0, 60, ..., 300 degrees
     unit_verts_0 = np.array([[math.cos(math.radians(a)), math.sin(math.radians(a))] for a in range(0, 360, 60)])
-    
-    # Precompute normals for the 6 sides of a unit hexagon
-    # Edge 0: (1,0) to (0.5, sqrt(3)/2). Normal points outward: (sqrt(3)/2, 0.5) -> 30 deg
-    unit_normals_0 = np.array([[math.cos(math.radians(a)), math.sin(math.radians(a))] for a in range(30, 360, 60)])
 
     def get_hex_verts(cx, cy, side, angle_deg):
         angle_rad = math.radians(angle_deg)
@@ -52,6 +48,26 @@ def construct():
         
         return max_proj * 2.0 / math.sqrt(3)
 
+    def find_best_outer_angle(positions, angles, coarse=False):
+        """
+        Find the optimal rotation of the outer hexagon that minimizes its side length.
+        """
+        best_side = float('inf')
+        best_angle = 0.0
+        
+        if coarse:
+            test_angles = np.linspace(0, 60, 61)
+        else:
+            test_angles = np.linspace(0, 60, 361)
+
+        for test_angle in test_angles:
+            side = calc_min_outer_side(positions, angles, test_angle)
+            if side < best_side:
+                best_side = side
+                best_angle = test_angle
+                
+        return best_side, best_angle
+
     def sat_gap(poly1, poly2):
         """
         Returns the minimum separation distance between two convex polygons.
@@ -76,10 +92,8 @@ def construct():
             # Gap on this axis
             gap = max(min1 - max2, min2 - max1)
             if gap < 0:
-                # Overlapping on this axis
                 min_gap = min(min_gap, gap)
             else:
-                # Separated on this axis -> disjoint
                 return gap
                 
         # Axes from poly2 edges
@@ -156,8 +170,8 @@ def construct():
     candidates = []
     
     # Try different lattice scales (stretching/compressing)
-    for scale_x in [0.9, 0.95, 1.0, 1.05, 1.1]:
-        for scale_y in [0.9, 0.95, 1.0, 1.05, 1.1]:
+    for scale_x in [0.92, 0.96, 1.0, 1.04, 1.08]:
+        for scale_y in [0.92, 0.96, 1.0, 1.04, 1.08]:
             v1 = base_v1 * np.array([scale_x, 1.0])
             v2 = base_v2 * np.array([1.0, scale_y])
             
@@ -182,7 +196,7 @@ def construct():
             selected -= centroid
             
             # Try different global rotations for this cluster
-            for rot_deg in [0, 30, 60, 90]:
+            for rot_deg in [0, 15, 30, 45, 60, 75, 90]:
                 rot_rad = math.radians(rot_deg)
                 rot_mat = np.array([[math.cos(rot_rad), -math.sin(rot_rad)], 
                                     [math.sin(rot_rad), math.cos(rot_rad)]])
@@ -195,7 +209,8 @@ def construct():
                 
                 # Check validity
                 if is_valid(rotated_selected, angles, tol=1e-6):
-                    score = calc_min_outer_side(rotated_selected, angles, 0.0)
+                    # Use the best outer angle for this configuration
+                    score, _ = find_best_outer_angle(rotated_selected, angles, coarse=True)
                     if score < best_valid_score:
                         best_valid_score = score
                         best_valid_config = (rotated_selected.copy(), angles.copy())
@@ -221,7 +236,7 @@ def construct():
         init_positions -= np.mean(init_positions, axis=0)
         init_angles = np.zeros(N)
         best_valid_config = (init_positions, init_angles)
-        best_valid_score = calc_min_outer_side(init_positions, init_angles, 0.0)
+        best_valid_score, _ = find_best_outer_angle(init_positions, init_angles, coarse=True)
 
     init_positions, init_angles = best_valid_config
     x0 = np.concatenate([init_positions.flatten(), init_angles])
@@ -234,6 +249,11 @@ def construct():
     def objective(params):
         positions = params[:2*N].reshape(N, 2)
         angles = params[2*N:]
+        # Use a fixed outer angle (0) for the optimization to keep it smooth.
+        # We will optimize the outer angle separately in the final step or by including it.
+        # For now, let's include outer angle in the parameters? 
+        # No, let's keep it simple: optimize inner positions/angles for outer angle 0.
+        # Then in Phase 3, we can try to optimize outer angle.
         return calc_min_outer_side(positions, angles, 0.0)
     
     # Define constraints for SLSQP
@@ -277,9 +297,6 @@ def construct():
     best_result = x0.copy()
 
     # Run SLSQP
-    # SLSQP can be slow with many constraints, but N=12 -> 66 constraints.
-    # It should be manageable within the time limit if we limit iterations.
-    
     try:
         res = minimize(
             objective, 
@@ -287,7 +304,7 @@ def construct():
             method='SLSQP',
             bounds=bounds,
             constraints=constraints,
-            options={'maxiter': 300, 'ftol': 1e-8, 'disp': False}
+            options={'maxiter': 400, 'ftol': 1e-10, 'disp': False}
         )
         
         if res.success or res.fun < best_score:
@@ -296,7 +313,8 @@ def construct():
             
             # Verify validity strictly
             if is_valid(pos, ang, tol=1e-4):
-                score = calc_min_outer_side(pos, ang, 0.0)
+                # Use the best outer angle for this configuration
+                score, _ = find_best_outer_angle(pos, ang, coarse=True)
                 if score < best_score:
                     best_score = score
                     best_result = res.x.copy()
@@ -315,7 +333,7 @@ def construct():
         def obj_penalty(params):
             positions = params[:2*N].reshape(N, 2)
             angles = params[2*N:]
-            side_len = calc_min_outer_side(positions, angles, 0.0)
+            side_len, _ = find_best_outer_angle(positions, angles, coarse=True)
             penalty = 0.0
             polys = [get_hex_verts(positions[i][0], positions[i][1], 1.0, angles[i]) for i in range(N)]
             for i in range(N):
@@ -330,30 +348,55 @@ def construct():
                 obj_penalty, 
                 best_result, 
                 method='Nelder-Mead',
-                options={'maxiter': 200, 'xatol': 1e-8, 'fatol': 1e-10, 'adaptive': True, 'disp': False}
+                options={'maxiter': 300, 'xatol': 1e-9, 'fatol': 1e-12, 'adaptive': True, 'disp': False}
             )
             
             pos = res2.x[:2*N].reshape(N, 2)
             ang = res2.x[2*N:]
             
             if is_valid(pos, ang, tol=1e-5):
-                score2 = calc_min_outer_side(pos, ang, 0.0)
+                score2, _ = find_best_outer_angle(pos, ang, coarse=True)
                 if score2 < best_score:
                     best_score = score2
                     best_result = res2.x.copy()
         except Exception:
             pass
 
+    # --- PHASE 4: FINAL HIGH-PRECISION POLISH ---
+    if time.time() < deadline - 5:
+        try:
+            res3 = minimize(
+                objective, 
+                best_result, 
+                method='SLSQP',
+                bounds=bounds,
+                constraints=constraints,
+                options={'maxiter': 200, 'ftol': 1e-12, 'disp': False}
+            )
+            
+            pos = res3.x[:2*N].reshape(N, 2)
+            ang = res3.x[2*N:]
+            
+            if is_valid(pos, ang, tol=1e-6):
+                score3, _ = find_best_outer_angle(pos, ang, coarse=True)
+                if score3 < best_score:
+                    best_score = score3
+                    best_result = res3.x.copy()
+        except Exception:
+            pass
+
     # Finalize
     final_positions = best_result[:2*N].reshape(N, 2)
     final_angles = best_result[2*N:]
-    final_side = calc_min_outer_side(final_positions, final_angles, 0.0)
+    
+    # Find the precise best outer angle for the final configuration
+    final_side, final_outer_angle = find_best_outer_angle(final_positions, final_angles, coarse=False)
     
     inner = []
     for i in range(N):
         inner.append([final_positions[i][0], final_positions[i][1], final_angles[i]])
     
-    return inner, (0.0, 0.0), final_side, 0.0
+    return inner, (0.0, 0.0), final_side, final_outer_angle
 
 if __name__ == "__main__":
     construct()
