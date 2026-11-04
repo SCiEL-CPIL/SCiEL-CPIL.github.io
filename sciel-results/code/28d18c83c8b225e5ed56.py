@@ -1,0 +1,234 @@
+import time
+import numpy as np
+from collections import deque
+
+_T0 = time.time()
+_DEADLINE = _T0 + 105.0
+
+def _deadline():
+    return time.time() >= _DEADLINE
+
+def _field_ops(q):
+    if q == 4:
+        table = [[0, 0, 0, 0], [0, 1, 2, 3], [0, 2, 3, 1], [0, 3, 1, 2]]
+        return (lambda x, y: x ^ y), (lambda x, y: x ^ y), (lambda x, y: table[x][y])
+    return ((lambda x, y: (x + y) % q),
+            (lambda x, y: (x - y) % q),
+            (lambda x, y: (x * y) % q))
+
+def _luw_rule(d):
+    rule = {2: (1, 1), 3: (2, 1), 4: (1, 2)}
+    for c in range(5, d + 1):
+        r, c0 = (c - 5) % 4, c - (c - 5) % 4
+        rule[c] = [(1, c0 - 2), (c0 - 1, 1), (c0, 1), (1, c0 + 1)][r]
+    return rule
+
+def _luw_graph(d, q):
+    add, sub, mul = _field_ops(q)
+    rule = _luw_rule(d)
+    rc = [None] * (d + 1)
+    for c in range(2, d + 1):
+        rc[c] = rule[c]
+
+    def neighbours(vertex):
+        side, x = vertex
+        for first in range(q):
+            y = [None, first] + [0] * (d - 1)
+            for c in range(2, d + 1):
+                a, b = rc[c]
+                y[c] = add(x[c], mul(y[a], x[b])) if side == 0 else sub(x[c], mul(x[a], y[b]))
+            yield 1 - side, tuple(y)
+
+    start = (0, (None,) + (0,) * d)
+    index, order = {start: 0}, [start]
+    for vertex in order:
+        for other in neighbours(vertex):
+            if other not in index:
+                index[other] = len(order)
+                order.append(other)
+    
+    adj = [set() for _ in range(len(order))]
+    for vertex in order:
+        i = index[vertex]
+        for other in neighbours(vertex):
+            j = index[other]
+            adj[i].add(j)
+            
+    edges = [(i, j) for i in range(len(order)) for j in adj[i] if i < j]
+    return len(order), edges, adj
+
+def _girth(adj, g):
+    """Compute girth using BFS from each vertex, stopping early if girth < g."""
+    n = len(adj)
+    if n == 0:
+        return 0
+    # Use array-based depth tracking for speed
+    best = None
+    for start in range(n):
+        if _deadline():
+            return best
+        # BFS from start
+        dist = [-1] * n
+        dist[start] = 0
+        q = deque()
+        q.append(start)
+        found_girth = None
+        while q:
+            u = q.popleft()
+            du = dist[u]
+            if du >= g:
+                continue
+            for v in adj[u]:
+                if dist[v] == -1:
+                    dist[v] = du + 1
+                    q.append(v)
+                elif v != start and du + 1 > dist[v]:
+                    # Cycle found
+                    cand = du + dist[v] + 1
+                    if found_girth is None or cand < found_girth:
+                        found_girth = cand
+                    if found_girth <= g:
+                        return found_girth
+        if found_girth is not None:
+            if best is None or found_girth < best:
+                best = found_girth
+            if best <= g:
+                return best
+    return best
+
+def _random_regular_graph(n, k, seed=None):
+    """Generate a random k-regular graph on n vertices using configuration model + rejection."""
+    if seed is not None:
+        rng = np.random.RandomState(seed)
+    else:
+        rng = np.random.RandomState()
+    
+    # Configuration model
+    half_edges = n * k
+    # Create stubs: each vertex i has k stubs
+    stubs = []
+    for i in range(n):
+        stubs.extend([i] * k)
+    
+    # Try to create a simple graph
+    for attempt in range(50):
+        perm = rng.permutation(half_edges)
+        adj = [set() for _ in range(n)]
+        valid = True
+        for i in range(0, half_edges, 2):
+            u = stubs[perm[i]]
+            v = stubs[perm[i + 1]]
+            if u == v:
+                valid = False
+                break
+            if v in adj[u]:
+                valid = False
+                break
+            adj[u].add(v)
+            adj[v].add(u)
+        if valid:
+            # Verify all degrees
+            if all(len(adj[i]) == k for i in range(n)):
+                edges = []
+                for i in range(n):
+                    for j in adj[i]:
+                        if i < j:
+                            edges.append((i, j))
+                return n, edges, adj
+    return None
+
+def construct(k, g):
+    candidates = []
+    if k == 4:
+        qs = [4]
+    else:
+        qs = [k]
+    for q in qs:
+        d0 = g - 5
+        if d0 % 2 == 0:
+            d0 += 1
+        d0 = max(3, d0)
+        for d in (d0, d0 + 2, d0 + 4):
+            candidates.append((d, q))
+            
+    seen = set()
+    ordered = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+
+    best = None
+    best_n = float('inf')
+    
+    # First try LUW constructions
+    for (d, q) in ordered:
+        if _deadline():
+            break
+        try:
+            n, edges, adj = _luw_graph(d, q)
+        except Exception:
+            continue
+            
+        deg = [0] * n
+        seen_edges = set()
+        valid = True
+        for (i, j) in edges:
+            if i == j or i < 0 or i >= n or j < 0 or j >= n:
+                valid = False
+                break
+            a, b = (i, j) if i < j else (j, i)
+            if (a, b) in seen_edges:
+                valid = False
+                break
+            seen_edges.add((a, b))
+            deg[a] += 1
+            deg[b] += 1
+        if not valid or not all(x == k for x in deg):
+            continue
+            
+        gi = _girth(adj, g)
+        if gi is None or gi < g:
+            continue
+            
+        if n < best_n:
+            best_n = n
+            best = (n, edges)
+    
+    # Try random regular graphs if time permits
+    if not _deadline():
+        # For k=5, g=9, try various sizes
+        # Start with smaller sizes and increase
+        min_n = 2 * k * (g - 1)  # rough lower bound
+        for trial_n in range(min_n, min_n + 200, 10):
+            if _deadline():
+                break
+            if trial_n < best_n and trial_n % k == 0:
+                try:
+                    result = _random_regular_graph(trial_n, k, seed=trial_n)
+                    if result is not None:
+                        rn, redges, radj = result
+                        # Verify girth
+                        gi = _girth(radj, g)
+                        if gi is not None and gi >= g:
+                            if rn < best_n:
+                                best_n = rn
+                                best = (rn, redges)
+                except Exception:
+                    pass
+
+    if best is None:
+        for (d, q) in ordered:
+            try:
+                n, edges, adj = _luw_graph(d, q)
+                deg = [0] * n
+                for (i, j) in edges:
+                    deg[i] += 1
+                    deg[j] += 1
+                if all(x == k for x in deg):
+                    return n, edges
+            except Exception:
+                continue
+        return 0, []
+        
+    return best

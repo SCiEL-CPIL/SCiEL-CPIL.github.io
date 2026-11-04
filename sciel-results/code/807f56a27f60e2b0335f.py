@@ -1,0 +1,1 @@
+BET: {mechanism: "Hybrid decomposition: Rank-49 Strassen for the 4x4x4 core plus Rank-36 schoolbook for the remainder, totaling rank 85, which is significantly lower than the schoolbook rank of 100.", q: 0.95, delta: [0.05, 0.15]}

@@ -1,0 +1,3 @@
+rank = n * m * p
+...
+return {"U": U, "V": V, "W": W}

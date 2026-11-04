@@ -1,0 +1,273 @@
+"""Matrix multiplication 3x5x5 rank-minimal tensor decomposition.
+
+Strategy:
+  1. Hierarchical block decomposition: split each dimension into 2+1 (for 3)
+     or 2+3 (for 5), giving 8 blocks.  Each block uses the best known
+     decomposition for its local size:
+       - 2x2x2: Strassen rank 7
+       - other sizes: schoolbook (rank = ni*mi*pi)
+     This gives a deterministic rank-74 construction.
+  2. A focused search for a lower-rank decomposition: we fix the 2x2x2
+     Strassen core (7 columns) and then try to express the remaining tensor
+     entries using a small number of additional columns.  We search over
+     structured integer/half-integer patterns for U and V, solve for W, and
+     verify.
+  3. Return the best valid decomposition found.
+"""
+import numpy as np
+import time
+
+DIMENSIONS = [3, 5, 5]
+
+# EVOLVE-BLOCK-START
+
+def _strassen_2x2x2():
+    """Rank-7 Strassen decomposition for 2x2x2 matrix multiplication.
+    U: (4,7), V: (4,7), W: (4,7); indexing U[i*2+j,c], V[j*2+k,c], W[k*2+i,c]."""
+    U = np.zeros((4, 7))
+    V = np.zeros((4, 7))
+    W = np.zeros((4, 7))
+    U[:, 0] = [1, 0, 0, 1]; V[:, 0] = [1, 0, 0, 1]; W[:, 0] = [1, 0, 0, 1]
+    U[:, 1] = [0, 0, 1, 1]; V[:, 1] = [1, 0, 0, 0]; W[:, 1] = [0, 1, 0, -1]
+    U[:, 2] = [1, 0, 0, 0]; V[:, 2] = [0, 1, 0, -1]; W[:, 2] = [0, 0, 1, 1]
+    U[:, 3] = [0, 0, 0, 1]; V[:, 3] = [-1, 0, 1, 0]; W[:, 3] = [1, 1, 0, 0]
+    U[:, 4] = [1, 1, 0, 0]; V[:, 4] = [0, 0, 0, 1]; W[:, 4] = [-1, 0, 1, 0]
+    U[:, 5] = [-1, 0, 1, 0]; V[:, 5] = [1, 1, 0, 0]; W[:, 5] = [0, 0, 0, 1]
+    U[:, 6] = [0, 1, 0, -1]; V[:, 6] = [0, 0, 1, 1]; W[:, 6] = [1, 0, 0, 0]
+    return U, V, W
+
+
+def _schoolbook_local(ni, mi, pi):
+    """Schoolbook local decomposition for ni x mi x pi."""
+    rank = ni * mi * pi
+    U = np.zeros((ni * mi, rank))
+    V = np.zeros((mi * pi, rank))
+    W = np.zeros((pi * ni, rank))
+    col = 0
+    for i in range(ni):
+        for j in range(mi):
+            for k in range(pi):
+                U[i * mi + j, col] = 1
+                V[j * pi + k, col] = 1
+                W[k * ni + i, col] = 1
+                col += 1
+    return U, V, W
+
+
+def _embed_block(U_loc, V_loc, W_loc, n, m, p, n_off, m_off, p_off, ni, mi, pi):
+    """Embed a local ni x mi x pi decomposition into global dimensions."""
+    r = U_loc.shape[1]
+    U_g = np.zeros((n * m, r))
+    V_g = np.zeros((m * p, r))
+    W_g = np.zeros((p * n, r))
+    for li in range(ni):
+        for lj in range(mi):
+            U_g[(n_off + li) * m + (m_off + lj), :] = U_loc[li * mi + lj, :]
+    for lj in range(mi):
+        for lk in range(pi):
+            V_g[(m_off + lj) * p + (p_off + lk), :] = V_loc[lj * pi + lk, :]
+    for lk in range(pi):
+        for li in range(ni):
+            W_g[(p_off + lk) * n + (n_off + li), :] = W_loc[lk * ni + li, :]
+    return U_g, V_g, W_g
+
+
+def _independent_block_decomp(n, m, p):
+    """Independent block decomposition: Strassen on 2x2x2, schoolbook elsewhere.
+    Returns U, V, W (numpy arrays)."""
+    n_parts = [2, 1]
+    m_parts = [2, 3]
+    p_parts = [2, 3]
+    n_offsets = [0, 2]
+    m_offsets = [0, 2]
+    p_offsets = [0, 2]
+
+    total_rank = 0
+    block_ranks = {}
+    for i, ni in enumerate(n_parts):
+        for j, mi in enumerate(m_parts):
+            for k, pi in enumerate(p_parts):
+                if ni == 2 and mi == 2 and pi == 2:
+                    block_ranks[(i, j, k)] = 7
+                else:
+                    block_ranks[(i, j, k)] = ni * mi * pi
+                total_rank += block_ranks[(i, j, k)]
+
+    U = np.zeros((n * m, total_rank))
+    V = np.zeros((m * p, total_rank))
+    W = np.zeros((p * n, total_rank))
+    col = 0
+    for i, ni in enumerate(n_parts):
+        for j, mi in enumerate(m_parts):
+            for k, pi in enumerate(p_parts):
+                r = block_ranks[(i, j, k)]
+                if ni == 2 and mi == 2 and pi == 2:
+                    U_loc, V_loc, W_loc = _strassen_2x2x2()
+                else:
+                    U_loc, V_loc, W_loc = _schoolbook_local(ni, mi, pi)
+                U_g, V_g, W_g = _embed_block(
+                    U_loc, V_loc, W_loc, n, m, p,
+                    n_offsets[i], m_offsets[j], p_offsets[k],
+                    ni, mi, pi
+                )
+                U[:, col:col + r] += U_g
+                V[:, col:col + r] += V_g
+                W[:, col:col + r] += W_g
+                col += r
+    return U, V, W, total_rank
+
+
+def _verify(U, V, W, n, m, p, tol=1e-9):
+    """Check that the decomposition exactly represents matrix multiplication."""
+    T = np.zeros((n, m, p), dtype=np.float64)
+    for r in range(U.shape[1]):
+        u = U[:, r].reshape(n, m)
+        v = V[:, r].reshape(m, p)
+        w = W[:, r].reshape(p, n)
+        for i in range(n):
+            for j in range(m):
+                T[i, j, :] += u[i, j] * v[j, :] * w[:, i]
+    return np.max(np.abs(T - 1.0)) < tol
+
+
+def _try_lower_rank(n, m, p, deadline, max_rank_try=74, min_rank_try=70):
+    """
+    Search for a decomposition with rank < 74 by fixing a Strassen-like core
+    and solving for the remaining factors.  We try several structured patterns.
+    Returns (U, V, W, rank) or None.
+    """
+    rng = np.random.RandomState(12345)
+
+    # Precompute the linear system structure
+    eq_indices = []
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                eq_indices.append((i, j, k))
+    n_eqs = len(eq_indices)
+
+    for R in range(max_rank_try - 1, min_rank_try - 1, -1):
+        if time.time() > deadline - 25:
+            break
+
+        for attempt in range(100):
+            if time.time() > deadline - 20:
+                break
+
+            # Generate structured U and V
+            if attempt % 5 == 0:
+                # Sparse integer pattern
+                U_rand = np.zeros((n * m, R))
+                V_rand = np.zeros((m * p, R))
+                mask_u = rng.rand(n * m, R) < 0.25
+                mask_v = rng.rand(m * p, R) < 0.25
+                U_rand[mask_u] = rng.choice([-1.0, 1.0], size=mask_u.sum())
+                V_rand[mask_v] = rng.choice([-1.0, 1.0], size=mask_v.sum())
+            elif attempt % 5 == 1:
+                # Small integer entries
+                U_rand = rng.randint(-1, 2, (n * m, R)).astype(np.float64)
+                V_rand = rng.randint(-1, 2, (m * p, R)).astype(np.float64)
+            elif attempt % 5 == 2:
+                # Binary pattern
+                U_rand = (rng.rand(n * m, R) < 0.4).astype(np.float64)
+                V_rand = (rng.rand(m * p, R) < 0.4).astype(np.float64)
+            elif attempt % 5 == 3:
+                # Strassen-like core in first 7 columns, rest random
+                U_core, V_core, W_core = _strassen_2x2x2()
+                U_rand = np.zeros((n * m, R))
+                V_rand = np.zeros((m * p, R))
+                # Embed Strassen core
+                for li in range(2):
+                    for lj in range(2):
+                        U_rand[li * m + lj, :7] = U_core[li * 2 + lj, :]
+                        V_rand[lj * p + li, :7] = V_core[lj * 2 + li, :]
+                # Fill remaining with small random integers
+                U_rand[:, 7:] = rng.randint(-1, 2, (n * m, R - 7)).astype(np.float64)
+                V_rand[:, 7:] = rng.randint(-1, 2, (m * p, R - 7)).astype(np.float64)
+            else:
+                # Mixed pattern
+                U_rand = np.zeros((n * m, R))
+                V_rand = np.zeros((m * p, R))
+                mask_u = rng.rand(n * m, R) < 0.3
+                mask_v = rng.rand(m * p, R) < 0.3
+                U_rand[mask_u] = rng.choice([-1.0, 0.0, 1.0], size=mask_u.sum())
+                V_rand[mask_v] = rng.choice([-1.0, 0.0, 1.0], size=mask_v.sum())
+
+            # Build A matrix: A[eq, (k*n+i)*R + r] = U[i*m+j, r] * V[j*p+k, r]
+            n_vars = p * n * R
+            A = np.zeros((n_eqs, n_vars), dtype=np.float64)
+            b = np.ones(n_eqs, dtype=np.float64)
+
+            for eq, (i, j, k) in enumerate(eq_indices):
+                u_row = i * m + j
+                v_row = j * p + k
+                w_row = k * n + i
+                for r in range(R):
+                    A[eq, w_row * R + r] = U_rand[u_row, r] * V_rand[v_row, r]
+
+            # Solve A W_flat = b
+            try:
+                W_flat, residuals, rank_A, s = np.linalg.lstsq(A, b, rcond=None)
+            except Exception:
+                continue
+
+            W_rand = W_flat.reshape(p * n, R)
+
+            # Check if W is close to half-integers
+            W_check = W_rand * 2.0
+            dist = np.abs(W_check - np.round(W_check))
+            max_dist = np.max(dist)
+            if max_dist > 1e-4:
+                continue
+
+            W_int = np.round(W_check) / 2.0
+
+            # Validate the full decomposition
+            if _verify(U_rand, V_rand, W_int, n, m, p):
+                return U_rand, V_rand, W_int, R
+
+    return None
+
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140  # Safety margin before 150s kill
+
+    n, m, p = DIMENSIONS
+
+    # 1. Independent block decomposition (rank 74) as baseline
+    U_ind, V_ind, W_ind, rank_ind = _independent_block_decomp(n, m, p)
+
+    # Verify baseline
+    if not _verify(U_ind, V_ind, W_ind, n, m, p):
+        # Fallback to pure schoolbook (rank 75)
+        rank = n * m * p
+        U_ind = np.zeros((n * m, rank))
+        V_ind = np.zeros((m * p, rank))
+        W_ind = np.zeros((p * n, rank))
+        col = 0
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    U_ind[i * m + j, col] = 1.0
+                    V_ind[j * p + k, col] = 1.0
+                    W_ind[k * n + i, col] = 1.0
+                    col += 1
+        rank_ind = rank
+
+    best_U, best_V, best_W, best_rank = U_ind, V_ind, W_ind, rank_ind
+
+    # 2. Try to find a better (lower rank) decomposition via search
+    if time.time() < deadline - 30:
+        result = _try_lower_rank(n, m, p, deadline, max_rank_try=best_rank, min_rank_try=70)
+        if result is not None:
+            U_new, V_new, W_new, R_new = result
+            if R_new < best_rank:
+                best_U, best_V, best_W, best_rank = U_new, V_new, W_new, R_new
+
+    def to_list(mat):
+        return [[float(mat[i, j]) for j in range(mat.shape[1])] for i in range(mat.shape[0])]
+
+    return {"U": to_list(best_U), "V": to_list(best_V), "W": to_list(best_W)}
+
+# EVOLVE-BLOCK-END

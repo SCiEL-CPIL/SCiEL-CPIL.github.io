@@ -101,7 +101,6 @@ def _objective_smooth(x, beta, penalty_lambda=50.0):
     m = np.min(areas)
     shifted = areas - m
     # Soft min: m - (1/beta) * log(sum(exp(-beta * (areas - m))))
-    # = m - (1/beta) * log(sum(exp(-beta * shifted)))
     max_exp = np.max(-beta * shifted)
     log_sum_exp = max_exp + np.log(np.sum(np.exp(-beta * shifted - max_exp)))
     
@@ -132,7 +131,10 @@ def _epigraph_objective(x, beta, penalty_lambda=50.0):
         return penalty + 100.0 * t
         
     # Soft constraint: t <= min(areas) approximately
-    # Use: -t + (1/beta)*log(sum(exp(-beta*(areas - t))))
+    # We want to maximize t, so we minimize -t.
+    # The term (1/beta)*log(sum(exp(-beta*(areas - t)))) acts as a smooth max(0, t - area) penalty
+    # If t > area, exp(-beta*(area-t)) = exp(beta*(t-area)) is large, so log sum is large, penalty increases.
+    # If t < min(area), all terms are small (exp of negative), log sum is negative/zero, penalty is small.
     shifted = areas - t
     max_exp = np.max(-beta * shifted)
     log_sum_exp = max_exp + np.log(np.sum(np.exp(-beta * shifted - max_exp)))
@@ -180,6 +182,39 @@ def _local_optimize_slsqp(x0, bounds, maxiter=200):
         return res.x
     except Exception:
         return x0
+
+def _local_optimize_epigraph_lbfgsb(x0, beta_start=50, beta_end=2000, num_steps=5, maxiter_per_step=200):
+    """
+    Refine using L-BFGS-B on the epigraph formulation with annealed beta.
+    x0: (2N,) array of barycentric coords.
+    Returns: (2N,) array of refined barycentric coords.
+    """
+    # Initialize t to the current min area
+    min_area = _min_area_ratio_from_bary(x0.reshape(N, 2))
+    if min_area < 0:
+        min_area = 0.0
+    x_full = np.append(x0, min_area)
+    
+    bounds_full = [(0, 1)] * (2 * N) + [(0, 1)]
+    
+    current_x = x_full
+    betas = np.linspace(beta_start, beta_end, num_steps)
+    
+    for beta in betas:
+        try:
+            res = minimize(
+                _epigraph_objective,
+                current_x,
+                args=(beta,),
+                method='L-BFGS-B',
+                bounds=bounds_full,
+                options={'maxiter': maxiter_per_step, 'ftol': 1e-12, 'gtol': 1e-10}
+            )
+            current_x = res.x
+        except Exception:
+            pass
+            
+    return current_x[:2*N]
 
 def _structured_init_fps():
     """
@@ -280,22 +315,21 @@ def _simulated_annealing(x0, deadline, max_steps=5000, t0=0.1, t_end=1e-6):
 
 def _final_polish(x0, bounds, time_budget=30.0):
     """
-    Final high-precision polish: SLSQP with very tight tolerances,
-    then a second SLSQP pass, then Nelder-Mead with adaptive.
+    Final high-precision polish: 
+    1. Epigraph L-BFGS-B with annealed beta.
+    2. SLSQP with very tight tolerances.
+    3. Nelder-Mead with adaptive.
+    4. Final SLSQP.
     """
     start = time.time()
     current = x0.copy()
     best_score = _min_area_ratio_from_bary(current.reshape(N, 2))
     
-    # Pass 1: SLSQP with tight tolerance
+    # Pass 1: Epigraph L-BFGS-B
     if time.time() - start < time_budget * 0.4:
         try:
-            res = minimize(
-                _objective_slsqp, current, method='SLSQP',
-                bounds=bounds,
-                options={'maxiter': 1000, 'ftol': 1e-14, 'disp': False}
-            )
-            cand = _project_to_bary_simplex(res.x.reshape(N, 2))
+            refined = _local_optimize_epigraph_lbfgsb(current.flatten())
+            cand = _project_to_bary_simplex(refined.reshape(N, 2))
             sc = _min_area_ratio_from_bary(cand)
             if sc > best_score:
                 best_score = sc
@@ -303,13 +337,13 @@ def _final_polish(x0, bounds, time_budget=30.0):
         except Exception:
             pass
     
-    # Pass 2: SLSQP again from improved point
+    # Pass 2: SLSQP with tight tolerance
     if time.time() - start < time_budget * 0.7:
         try:
             res = minimize(
                 _objective_slsqp, current, method='SLSQP',
                 bounds=bounds,
-                options={'maxiter': 500, 'ftol': 1e-14, 'disp': False}
+                options={'maxiter': 1000, 'ftol': 1e-14, 'disp': False}
             )
             cand = _project_to_bary_simplex(res.x.reshape(N, 2))
             sc = _min_area_ratio_from_bary(cand)
@@ -351,6 +385,156 @@ def _final_polish(x0, bounds, time_budget=30.0):
             pass
     
     return current
+
+def _ga_population_init(rng, pop_size=40):
+    """Generate initial GA population with diverse strategies."""
+    pop = []
+    
+    # Strategy 1: Random
+    for _ in range(pop_size // 4):
+        pts = np.zeros((N, 2))
+        for i in range(N):
+            u = rng.random()
+            v = rng.random()
+            while u + v > 1.0:
+                u = rng.random()
+                v = rng.random()
+            pts[i, 0] = u
+            pts[i, 1] = v
+        pop.append(_project_to_bary_simplex(pts))
+    
+    # Strategy 2: Grid-based
+    for _ in range(pop_size // 4):
+        bary = np.array([
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [0.5, 0.0],
+            [0.5, 0.5],
+            [0.0, 0.5],
+            [1/3, 1/3],
+            [0.25, 0.0],
+            [0.75, 0.0],
+            [0.25, 0.25],
+            [0.5, 0.75],
+        ])
+        bary += rng.normal(0, 0.05, size=bary.shape)
+        pop.append(_project_to_bary_simplex(bary))
+    
+    # Strategy 3: FPS
+    for _ in range(pop_size // 4):
+        fps = _structured_init_fps()
+        fps += rng.normal(0, 0.03, size=fps.shape)
+        pop.append(_project_to_bary_simplex(fps))
+    
+    # Strategy 4: Concentrated center
+    for _ in range(pop_size // 4):
+        bary = np.array([
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1/3, 1/3],
+            [0.4, 0.4],
+            [0.3, 0.5],
+            [0.5, 0.3],
+            [0.35, 0.35],
+            [0.45, 0.4],
+            [0.4, 0.3],
+            [0.3, 0.4],
+        ])
+        bary += rng.normal(0, 0.04, size=bary.shape)
+        pop.append(_project_to_bary_simplex(bary))
+    
+    return pop
+
+def _ga_crossover(parent1, parent2, rng, cx_rate=0.8):
+    """BLX-Alpha crossover."""
+    if rng.random() > cx_rate:
+        return parent1.copy(), parent2.copy()
+    
+    child1 = parent1.copy()
+    child2 = parent2.copy()
+    
+    alpha = 0.5
+    for i in range(N):
+        for j in range(2):
+            lo = min(parent1[i, j], parent2[i, j])
+            hi = max(parent1[i, j], parent2[i, j])
+            child1[i, j] = rng.uniform(lo - alpha * (hi - lo), hi + alpha * (hi - lo))
+            child2[i, j] = rng.uniform(lo - alpha * (hi - lo), hi + alpha * (hi - lo))
+    
+    return _project_to_bary_simplex(child1), _project_to_bary_simplex(child2)
+
+def _ga_mutation(individual, rng, mut_rate=0.3, sigma=0.08):
+    """Gaussian mutation."""
+    child = individual.copy()
+    for i in range(N):
+        for j in range(2):
+            if rng.random() < mut_rate:
+                child[i, j] += rng.normal(0, sigma)
+    return _project_to_bary_simplex(child)
+
+def _ga_evolve(rng, pop_size=40, max_generations=50, deadline=None):
+    """
+    Genetic algorithm with BLX-Alpha crossover and Gaussian mutation.
+    Returns the best individual found.
+    """
+    pop = _ga_population_init(rng, pop_size)
+    scores = [_min_area_ratio_from_bary(ind) for ind in pop]
+    
+    best_idx = np.argmax(scores)
+    best_ind = pop[best_idx].copy()
+    best_score = scores[best_idx]
+    
+    for gen in range(max_generations):
+        if deadline and time.time() > deadline:
+            break
+        
+        # Sort by fitness
+        order = np.argsort(scores)[::-1]
+        pop = [pop[i] for i in order]
+        scores = [scores[i] for i in order]
+        
+        # Elitism: keep top 5
+        elite = [ind.copy() for ind in pop[:5]]
+        elite_scores = scores[:5]
+        
+        new_pop = elite.copy()
+        
+        # Tournament selection and reproduction
+        while len(new_pop) < pop_size:
+            # Tournament selection
+            t1 = pop[rng.randint(0, 10)]
+            t2 = pop[rng.randint(0, 10)]
+            p1 = t1 if _min_area_ratio_from_bary(t1) > _min_area_ratio_from_bary(t2) else t2
+            
+            t3 = pop[rng.randint(0, 10)]
+            t4 = pop[rng.randint(0, 10)]
+            p2 = t3 if _min_area_ratio_from_bary(t3) > _min_area_ratio_from_bary(t4) else t4
+            
+            # Crossover
+            c1, c2 = _ga_crossover(p1, p2, rng)
+            
+            # Mutation
+            c1 = _ga_mutation(c1, rng)
+            c2 = _ga_mutation(c2, rng)
+            
+            new_pop.append(c1)
+            if len(new_pop) < pop_size:
+                new_pop.append(c2)
+        
+        # Evaluate new population
+        scores = [_min_area_ratio_from_bary(ind) for ind in new_pop]
+        
+        # Update best
+        gen_best_idx = np.argmax(scores)
+        if scores[gen_best_idx] > best_score:
+            best_score = scores[gen_best_idx]
+            best_ind = new_pop[gen_best_idx].copy()
+        
+        pop = new_pop
+    
+    return best_ind, best_score
 
 def construct():
     start_time = time.time()
@@ -503,28 +687,18 @@ def construct():
                     best_local_x = bary_nm
                     init_bary = bary_nm
 
-            # 3. L-BFGS-B with Smooth Objective (annealing)
+            # 3. Epigraph L-BFGS-B (New/Enhanced)
             if time_left() > 10:
-                current_x = init_bary.flatten()
-                betas = [50.0, 100.0, 300.0, 800.0, 2000.0]
-                for beta in betas:
-                    if time_left() < 5:
-                        break
-                    res = minimize(
-                        _objective_smooth,
-                        current_x,
-                        args=(beta,),
-                        method='L-BFGS-B',
-                        bounds=bounds,
-                        options={'maxiter': 400, 'ftol': 1e-12, 'gtol': 1e-10}
-                    )
-                    x_opt = res.x.reshape(N, 2)
-                    x_opt = _project_to_bary_simplex(x_opt)
-                    score = _min_area_ratio_from_bary(x_opt)
-                    if score > best_local_score:
-                        best_local_score = score
-                        best_local_x = x_opt
-                        current_x = x_opt.flatten()
+                try:
+                    refined = _local_optimize_epigraph_lbfgsb(init_bary.flatten())
+                    bary_ref = _project_to_bary_simplex(refined.reshape(N, 2))
+                    score_ref = _min_area_ratio_from_bary(bary_ref)
+                    if score_ref > best_local_score:
+                        best_local_score = score_ref
+                        best_local_x = bary_ref
+                        init_bary = bary_ref
+                except Exception:
+                    pass
 
             if best_local_score > best_score:
                 best_score = best_local_score
@@ -533,10 +707,22 @@ def construct():
         except Exception:
             pass
 
-    # Phase 1.5: Simulated Annealing from best solution
-    if time_left() > 30 and best_x is not None:
+    # Phase 1.5: Genetic Algorithm for global search
+    if time_left() > 40:
         try:
-            sa_deadline = time.time() + min(25.0, time_left() * 0.5)
+            ga_rng = np.random.RandomState(999)
+            ga_deadline = time.time() + min(35.0, time_left() * 0.6)
+            ga_best, ga_score = _ga_evolve(ga_rng, pop_size=40, max_generations=60, deadline=ga_deadline)
+            if ga_score > best_score:
+                best_score = ga_score
+                best_x = ga_best
+        except Exception:
+            pass
+
+    # Phase 1.7: Simulated Annealing from best solution
+    if time_left() > 25 and best_x is not None:
+        try:
+            sa_deadline = time.time() + min(20.0, time_left() * 0.5)
             sa_best, sa_score = _simulated_annealing(
                 best_x.copy(), sa_deadline, max_steps=3000, t0=0.05, t_end=1e-6
             )
@@ -564,12 +750,12 @@ def construct():
                 de_objective,
                 de_bounds,
                 seed=42,
-                maxiter=25,
-                popsize=12,
+                maxiter=30,
+                popsize=15,
                 tol=1e-6,
                 mutation=(0.3, 1.0),
                 recombination=0.8,
-                polish=False,
+                polish=True,
                 update_interval=1,
                 callback=None,
                 init='sobol'
@@ -588,7 +774,7 @@ def construct():
     # Phase 2.5: Second SA pass from DE result if improved
     if time_left() > 20 and best_x is not None:
         try:
-            sa_deadline2 = time.time() + min(20.0, time_left() * 0.4)
+            sa_deadline2 = time.time() + min(15.0, time_left() * 0.4)
             sa_best2, sa_score2 = _simulated_annealing(
                 best_x.copy(), sa_deadline2, max_steps=2000, t0=0.03, t_end=1e-7
             )
@@ -632,7 +818,7 @@ def construct():
     if time_left() > 12:
         try:
             bounds_final = [(0, 1)] * (2 * N)
-            polished = _final_polish(best_x.flatten(), bounds_final, time_budget=min(35.0, time_left() - 8))
+            polished = _final_polish(best_x.flatten(), bounds_final, time_budget=min(30.0, time_left() - 8))
             polished_bary = _project_to_bary_simplex(polished.reshape(N, 2))
             polished_score = _min_area_ratio_from_bary(polished_bary)
             if polished_score > best_score:

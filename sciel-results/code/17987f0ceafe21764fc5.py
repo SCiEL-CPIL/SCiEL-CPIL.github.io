@@ -1,0 +1,6 @@
+# M7 = (a01-a11)(b10+b11)
+add_u(a01[0], a01[1], offset+6, 1)
+add_u(a11[0], a11[1], offset+6, -1)
+add_v(b10[0], b10[1], offset+6, 1)
+add_v(b11[0], b11[1], offset+6, 1)
+add_w(c00[0], c00[1], offset+6, 1)

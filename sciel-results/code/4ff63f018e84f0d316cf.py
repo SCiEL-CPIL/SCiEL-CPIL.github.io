@@ -1,0 +1,6 @@
+def add_strassen(u_base, v_base, w_indices, offset):
+    # w_indices: [w_00, w_01, w_10, w_11]
+    # ...
+    W[w_indices[0]][offset] += 1 # C00
+    W[w_indices[3]][offset] += 1 # C11
+    # ...

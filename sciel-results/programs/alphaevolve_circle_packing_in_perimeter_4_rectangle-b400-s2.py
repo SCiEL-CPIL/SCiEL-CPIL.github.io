@@ -1,18 +1,12 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-N = 21
-
-# EVOLVE-BLOCK-START
 import numpy as np
-import time
 from scipy.optimize import minimize
+import time
 
-DEADLINE = 140.0  # seconds, safety margin before 150s kill
-
-# Adaptive smooth-max: start coarse, tighten over iterations
-_SMOOTH_EPS = [1e-3, 1e-4, 1e-5, 1e-6, 1e-7]
+N = 21
+DEADLINE_MARGIN = 10.0  # safety margin before 150s kill
 
 
-def _check_validity(circles, W, H):
+def _check_validity(circles, W, H, tol=1e-9):
     """Check if circles are valid: inside rectangle, no overlaps."""
     if len(circles) != N:
         return False
@@ -20,19 +14,19 @@ def _check_validity(circles, W, H):
         x, y, r = circles[i]
         if r <= 0:
             return False
-        if x - r < -1e-9 or y - r < -1e-9 or x + r > W + 1e-9 or y + r > H + 1e-9:
+        if x - r < -tol or y - r < -tol or x + r > W + tol or y + r > H + tol:
             return False
     for i in range(N):
         for j in range(i + 1, N):
             dx = circles[i][0] - circles[j][0]
             dy = circles[i][1] - circles[j][1]
             dist = np.sqrt(dx * dx + dy * dy)
-            if dist < circles[i][2] + circles[j][2] - 1e-9:
+            if dist < circles[i][2] + circles[j][2] - tol:
                 return False
     return True
 
 
-def _separate_circles(circles, W, H, max_iter=2000, tol=1e-12):
+def _separate_circles(circles, W, H, max_iter=3000, tol=1e-12):
     """
     Directly resolve overlaps and boundary violations using pairwise repulsion.
     Returns (circles, is_valid).
@@ -98,6 +92,7 @@ def _separate_circles(circles, W, H, max_iter=2000, tol=1e-12):
 def _objective_and_grad(params, W, H, eps=1e-4, boundary_weight=200.0, overlap_weight=200.0):
     """
     Objective: minimize -sum(r) + penalties for violations.
+    Uses log-sum-exp based smooth max for better gradient behavior.
     Returns (obj, grad) with analytical gradient.
     """
     n = N
@@ -110,42 +105,44 @@ def _objective_and_grad(params, W, H, eps=1e-4, boundary_weight=200.0, overlap_w
     grad = np.zeros_like(params)
     grad[2::3] = -1.0
 
-    def _smooth_max_grad(v):
-        smax = 0.5 * (v + np.sqrt(v ** 2 + eps ** 2))
-        grad_smax = 0.5 * (1.0 + v / np.sqrt(v ** 2 + eps ** 2))
-        return smax, grad_smax
+    def _soft_max(v, scale):
+        """Soft max of v and 0 using log-sum-exp: scale * log(1 + exp(v/scale))."""
+        v_safe = np.clip(v / scale, -50, 50)
+        smax = scale * np.log1p(np.exp(v_safe))
+        sig = 1.0 / (1.0 + np.exp(-v_safe))
+        return smax, sig
 
     # x - r >= 0  => violation = r - x
     v = r - x
-    smax, gsmax = _smooth_max_grad(v)
+    smax, gsmax = _soft_max(v, eps)
     obj += boundary_weight * np.sum(smax ** 2)
     grad[0::3] += -2.0 * boundary_weight * smax * gsmax
     grad[2::3] += 2.0 * boundary_weight * smax * gsmax
 
     # y - r >= 0
     v = r - y
-    smax, gsmax = _smooth_max_grad(v)
+    smax, gsmax = _soft_max(v, eps)
     obj += boundary_weight * np.sum(smax ** 2)
     grad[1::3] += -2.0 * boundary_weight * smax * gsmax
     grad[2::3] += 2.0 * boundary_weight * smax * gsmax
 
     # x + r <= W
     v = x + r - W
-    smax, gsmax = _smooth_max_grad(v)
+    smax, gsmax = _soft_max(v, eps)
     obj += boundary_weight * np.sum(smax ** 2)
     grad[0::3] += 2.0 * boundary_weight * smax * gsmax
     grad[2::3] += 2.0 * boundary_weight * smax * gsmax
 
     # y + r <= H
     v = y + r - H
-    smax, gsmax = _smooth_max_grad(v)
+    smax, gsmax = _soft_max(v, eps)
     obj += boundary_weight * np.sum(smax ** 2)
     grad[1::3] += 2.0 * boundary_weight * smax * gsmax
     grad[2::3] += 2.0 * boundary_weight * smax * gsmax
 
     # r >= 0
     v = -r
-    smax, gsmax = _smooth_max_grad(v)
+    smax, gsmax = _soft_max(v, eps)
     obj += boundary_weight * np.sum(smax ** 2)
     grad[2::3] += -2.0 * boundary_weight * smax * gsmax
 
@@ -163,7 +160,7 @@ def _objective_and_grad(params, W, H, eps=1e-4, boundary_weight=200.0, overlap_w
     r_sum = r[iu] + r[ju]
 
     v_vec = r_sum - dist_ij
-    smax_vec, gsmax_vec = _smooth_max_grad(v_vec)
+    smax_vec, gsmax_vec = _soft_max(v_vec, eps)
     obj += overlap_weight * np.sum(smax_vec ** 2)
 
     factor_vec = 2.0 * overlap_weight * smax_vec * gsmax_vec
@@ -186,7 +183,7 @@ def _objective_and_grad(params, W, H, eps=1e-4, boundary_weight=200.0, overlap_w
 
 
 def _local_optimize(circles, W, H, max_iter=3000):
-    """Use L-BFGS-B with analytical gradients to locally optimize."""
+    """Use L-BFGS-B with analytical gradients to locally optimize. Two-stage: coarse then fine."""
     params = circles.flatten()
     r_max = min(W, H) / 2
     bounds = []
@@ -195,18 +192,29 @@ def _local_optimize(circles, W, H, max_iter=3000):
         bounds.append((1e-6, H - 1e-6))
         bounds.append((1e-6, r_max))
 
+    # Stage 1: coarser eps for faster convergence
     result = minimize(
-        _objective_and_grad, params, args=(W, H, 1e-4, 200.0, 200.0),
+        _objective_and_grad, params, args=(W, H, 5e-4, 150.0, 150.0),
         method='L-BFGS-B',
         jac=True,
         bounds=bounds,
-        options={'maxiter': max_iter, 'ftol': 1e-14, 'gtol': 1e-12, 'maxls': 200}
+        options={'maxiter': max_iter // 2, 'ftol': 1e-12, 'gtol': 1e-10, 'maxls': 200}
+    )
+    params = result.x
+
+    # Stage 2: tighter eps for precision
+    result = minimize(
+        _objective_and_grad, params, args=(W, H, 1e-5, 400.0, 400.0),
+        method='L-BFGS-B',
+        jac=True,
+        bounds=bounds,
+        options={'maxiter': max_iter // 2, 'ftol': 1e-14, 'gtol': 1e-12, 'maxls': 300}
     )
     return result.x.reshape(N, 3)
 
 
 def _polish(circles, W, H, max_iter=8000):
-    """Multi-pass polish with progressively tighter smooth-max eps."""
+    """Multi-pass polish with progressively tighter smooth-max eps and increasing penalty."""
     params = circles.flatten()
     r_max = min(W, H) / 2
     bounds = []
@@ -215,302 +223,185 @@ def _polish(circles, W, H, max_iter=8000):
         bounds.append((1e-6, H - 1e-6))
         bounds.append((1e-6, r_max))
 
-    # Progressive refinement: 5 passes with decreasing eps
-    eps_schedule = _SMOOTH_EPS
-    n_passes = len(eps_schedule)
-    iter_per_pass = max(500, max_iter // n_passes)
+    # Progressive refinement: 6 passes with decreasing eps and increasing weight
+    eps_schedule = [1e-3, 5e-4, 1e-4, 5e-5, 1e-5, 5e-6]
+    weight_schedule = [200.0, 300.0, 400.0, 500.0, 600.0, 800.0]
 
-    for p in range(n_passes):
-        eps_val = eps_schedule[p]
+    for eps, wt in zip(eps_schedule, weight_schedule):
         result = minimize(
-            _objective_and_grad, params, args=(W, H, eps_val, 200.0, 200.0),
+            _objective_and_grad, params, args=(W, H, eps, wt, wt),
             method='L-BFGS-B',
             jac=True,
             bounds=bounds,
-            options={'maxiter': iter_per_pass, 'ftol': 1e-14, 'gtol': 1e-12, 'maxls': 200}
+            options={'maxiter': max_iter // len(eps_schedule), 'ftol': 1e-14, 'gtol': 1e-12, 'maxls': 300}
         )
         params = result.x
 
-    return result.x.reshape(N, 3)
+    return params.reshape(N, 3)
 
 
-def _high_precision_polish(circles, W, H, max_iter=12000):
-    """Ultra-tight final polish for the best candidate."""
-    params = circles.flatten()
-    r_max = min(W, H) / 2
-    bounds = []
-    for i in range(N):
-        bounds.append((1e-6, W - 1e-6))
-        bounds.append((1e-6, H - 1e-6))
-        bounds.append((1e-6, r_max))
+def _hexagonal_start(w, h, num_circles, seed=None):
+    if seed is not None:
+        rng = np.random.RandomState(seed)
+    else:
+        rng = np.random.RandomState(42)
 
-    # Two very tight passes
-    for eps_val in [1e-6, 1e-7]:
-        result = minimize(
-            _objective_and_grad, params, args=(W, H, eps_val, 500.0, 500.0),
-            method='L-BFGS-B',
-            jac=True,
-            bounds=bounds,
-            options={'maxiter': max_iter // 2, 'ftol': 1e-15, 'gtol': 1e-13, 'maxls': 300}
-        )
-        params = result.x
+    # Estimate radius based on area packing density
+    r_est = np.sqrt(0.9069 * w * h / (num_circles * np.pi))
 
-    return result.x.reshape(N, 3)
+    # We want to place circles such that they don't overlap initially.
+    # Let's use a grid of potential centers.
+    s = 2 * r_est * 1.05
+
+    # Generate grid points
+    nx = int(np.ceil(w / s)) + 2
+    ny = int(np.ceil(h / s)) + 2
+
+    xs = np.linspace(-s, w + s, nx)
+    ys = np.linspace(-s, h + s, ny)
+
+    points = []
+    for i, x in enumerate(xs):
+        for j, y in enumerate(ys):
+            if i % 2 == 1:
+                y_offset = y + s / 2
+            else:
+                y_offset = y
+            points.append([x, y_offset])
+
+    points = np.array(points)
+
+    # Filter points that are reasonably inside
+    valid_mask = (points[:, 0] >= 0) & (points[:, 0] <= w) & \
+                 (points[:, 1] >= 0) & (points[:, 1] <= h)
+    points = points[valid_mask]
+
+    if len(points) > num_circles:
+        cx, cy = w/2, h/2
+        dist_to_center = np.sqrt((points[:, 0] - cx)**2 + (points[:, 1] - cy)**2)
+        sorted_idx = np.argsort(dist_to_center)
+        points = points[sorted_idx[:num_circles]]
+    elif len(points) < num_circles:
+        missing = num_circles - len(points)
+        extra_points = rng.rand(missing, 2) * np.array([w, h])
+        points = np.vstack([points, extra_points])
+
+    order = rng.permutation(num_circles)
+    points = points[order]
+
+    radii = np.full(num_circles, r_est * 0.9)
+
+    return points, radii
 
 
-def _hexagonal_initialization(W, H):
-    """
-    Create a hexagonal lattice initial configuration.
-    This provides a high-quality starting point close to optimal packing.
-    """
-    circles = []
+def _random_start(w, h, num_circles, seed=None):
+    if seed is not None:
+        rng = np.random.RandomState(seed)
+    else:
+        rng = np.random.RandomState(0)
+
+    pos = rng.rand(num_circles, 2) * np.array([w, h])
+    max_r = min(w, h) / 2.0
+    radii = rng.rand(num_circles) * 0.1 * max_r
+
+    return pos, radii
+
+
+def _pack_for_aspect(w, h, start_time, deadline):
+    best_score = 0
     best_circles = None
-    best_count = 0
-    
-    for trial_r in np.linspace(0.08, 0.25, 20):
-        dx = 2 * trial_r * 1.001
-        dy = 2 * trial_r * np.sqrt(3) / 2 * 1.001
-        
-        row = 0
-        y_pos = trial_r + dy / 2
-        while y_pos + trial_r <= H + 1e-9 and len(circles) < N:
-            offset = 0.0 if row % 2 == 0 else dx / 2
-            x_pos = trial_r + offset
-            row += 1
-            while x_pos + trial_r <= W + 1e-9 and len(circles) < N:
-                circles.append([x_pos, y_pos, trial_r])
-                x_pos += dx
-            y_pos += dy
-        
-        if len(circles) > best_count:
-            best_count = len(circles)
-            best_circles = circles.copy()
-        
-        circles = []
-    
-    if best_circles is None or len(best_circles) == 0:
-        side = int(np.ceil(np.sqrt(N)))
-        for i in range(side):
-            for j in range(side):
-                if len(circles) >= N:
-                    break
-                cx = (i + 0.5) * W / side
-                cy = (j + 0.5) * H / side
-                r = min(W, H) / (2 * side) - 1e-4
-                circles.append([cx, cy, r])
-    
-    if len(circles) > N:
-        circles = circles[:N]
-    
-    while len(circles) < N:
-        best_x, best_y, best_r = W/2, H/2, 0.01
-        for _ in range(50):
-            tx = np.random.uniform(0.05, W - 0.05)
-            ty = np.random.uniform(0.05, H - 0.05)
-            min_dist = min(W, H)
-            for c in circles:
-                d = np.sqrt((tx - c[0])**2 + (ty - c[1])**2)
-                min_dist = min(min_dist, d - c[2])
-            min_dist = min(min_dist, tx, W - tx, ty, H - ty)
-            if min_dist > best_r:
-                best_r = min_dist * 0.9
-                best_x, best_y = tx, ty
-        best_r = max(0.01, best_r)
-        circles.append([best_x, best_y, best_r])
-    
-    return np.array(circles[:N])
 
+    max_r = min(w, h) / 2.0
 
-def _grid_initialization(W, H):
-    """Create a grid-based initial configuration."""
-    side = int(np.ceil(np.sqrt(N)))
-    cells = []
-    for i in range(side):
-        for j in range(side):
-            if len(cells) >= N:
+    initializations = []
+
+    # 1. Hexagonal lattice start
+    if time.time() < deadline - 15:
+        pos_hex, rad_hex = _hexagonal_start(w, h, N, seed=42)
+        circles_hex = np.column_stack([pos_hex, rad_hex])
+        initializations.append(circles_hex)
+
+        # Repair initial hex to ensure validity for baseline
+        circles_hex, valid_hex = _separate_circles(circles_hex, w, h)
+        if valid_hex:
+            score_hex = np.sum(circles_hex[:, 2])
+            if score_hex > best_score:
+                best_score = score_hex
+                best_circles = circles_hex.copy()
+
+    # 2. Random restarts
+    if time.time() < deadline - 10:
+        for seed in [123, 456, 789, 1011, 2023, 3456, 7890, 1234]:
+            if time.time() > deadline - 5:
                 break
-            cx = (i + 0.5) * W / side
-            cy = (j + 0.5) * H / side
-            r = min(W, H) / (2 * side) - 1e-4
-            cells.append([cx, cy, r])
-    return np.array(cells[:N])
+            pos_rand, rad_rand = _random_start(w, h, N, seed=seed)
+            circles_rand = np.column_stack([pos_rand, rad_rand])
+            initializations.append(circles_rand)
 
+    for idx, circles_init in enumerate(initializations):
+        if time.time() > deadline - 10:
+            break
 
-def _random_initialization(W, H, rng):
-    """Create a random initial configuration."""
-    circles = []
-    max_r = min(W, H) / 4
-    for _ in range(N):
-        r = rng.uniform(0.02, max_r)
-        x = rng.uniform(r, W - r)
-        y = rng.uniform(r, H - r)
-        circles.append([x, y, r])
-    return np.array(circles)
+        try:
+            # Local optimization with analytical gradients
+            circles_opt = _local_optimize(circles_init, w, h, max_iter=2000)
 
+            # Repair to ensure validity
+            circles_opt, valid_opt = _separate_circles(circles_opt, w, h)
 
-def _best_known(W, H, time_budget=30.0):
-    """Return the best configuration found so far for given W, H."""
-    start = time.time()
-    
-    # Try hexagonal initialization first
-    circles_hex = _hexagonal_initialization(W, H)
-    best_val = -np.sum(circles_hex[:, 2])
-    best_circles = circles_hex.copy()
-    
-    # Also try grid initialization
-    circles_grid = _grid_initialization(W, H)
-    if -np.sum(circles_grid[:, 2]) > best_val:
-        best_val = -np.sum(circles_grid[:, 2])
-        best_circles = circles_grid.copy()
+            if valid_opt:
+                # Polish phase
+                if time.time() < deadline - 5:
+                    circles_polished = _polish(circles_opt, w, h, max_iter=4000)
+                    circles_polished, valid_polished = _separate_circles(circles_polished, w, h)
+                    if valid_polished:
+                        circles_opt = circles_polished
 
-    # Try local optimization with L-BFGS-B on hex init
-    circles_opt = _local_optimize(circles_hex, W, H, max_iter=3000)
-    circles_opt[:, 0] = np.clip(circles_opt[:, 0], circles_opt[:, 2], W - circles_opt[:, 2])
-    circles_opt[:, 1] = np.clip(circles_opt[:, 1], circles_opt[:, 2], H - circles_opt[:, 2])
-    circles_opt[:, 2] = np.clip(circles_opt[:, 2], 0.001, min(W, H) / 2)
-    circles_opt, valid_opt = _separate_circles(circles_opt, W, H)
-    if valid_opt:
-        s = np.sum(circles_opt[:, 2])
-        if s > -best_val:
-            best_val = -s
-            best_circles = circles_opt.copy()
+                score_opt = np.sum(circles_opt[:, 2])
+                if score_opt > best_score:
+                    best_score = score_opt
+                    best_circles = circles_opt.copy()
 
-    # Try local optimization on grid init if time permits
-    if time.time() - start < time_budget - 10:
-        circles_opt2 = _local_optimize(circles_grid, W, H, max_iter=2000)
-        circles_opt2[:, 0] = np.clip(circles_opt2[:, 0], circles_opt2[:, 2], W - circles_opt2[:, 2])
-        circles_opt2[:, 1] = np.clip(circles_opt2[:, 1], circles_opt2[:, 2], H - circles_opt2[:, 2])
-        circles_opt2[:, 2] = np.clip(circles_opt2[:, 2], 0.001, min(W, H) / 2)
-        circles_opt2, valid_opt2 = _separate_circles(circles_opt2, W, H)
-        if valid_opt2:
-            s = np.sum(circles_opt2[:, 2])
-            if s > -best_val:
-                best_val = -s
-                best_circles = circles_opt2.copy()
+        except Exception:
+            continue
 
-    # Final polish if time permits
-    if time.time() - start < time_budget - 3:
-        polished = _polish(best_circles, W, H, max_iter=6000)
-        polished[:, 0] = np.clip(polished[:, 0], polished[:, 2], W - polished[:, 2])
-        polished[:, 1] = np.clip(polished[:, 1], polished[:, 2], H - polished[:, 2])
-        polished[:, 2] = np.clip(polished[:, 2], 0.001, min(W, H) / 2)
-        polished, valid_polish = _separate_circles(polished, W, H)
-        if valid_polish:
-            s = np.sum(polished[:, 2])
-            if s > -best_val:
-                best_val = -s
-                best_circles = polished.copy()
-
-    return best_circles, -best_val
+    return best_circles, best_score
 
 
 def construct():
     start_time = time.time()
-    best_score = -np.inf
-    best_result = None
-    best_W, best_H = 1.0, 1.0
+    deadline = start_time + 150.0 - DEADLINE_MARGIN  # Safety margin
 
-    # Try different aspect ratios
-    aspect_ratios = [0.82, 0.88, 0.92, 0.96, 1.0, 1.04, 1.08, 1.12, 1.18, 1.28, 1.42, 1.65]
+    best_global_score = 0
+    best_global_result = None
 
-    rng = np.random.default_rng(42)
+    np.random.seed(42)
+
+    # Try a range of aspect ratios
+    aspect_ratios = np.linspace(0.8, 1.25, 10)
 
     for ar in aspect_ratios:
-        elapsed = time.time() - start_time
-        if elapsed > DEADLINE - 15:
+        if time.time() > deadline - 10:
             break
-        
-        if 0.92 <= ar <= 1.08:
-            time_budget = 18.0
-        elif 0.8 <= ar <= 1.4:
-            time_budget = 13.0
-        else:
-            time_budget = 10.0
-        
-        W = 2.0 * ar / (ar + 1.0)
-        H = 2.0 / (ar + 1.0)
 
-        circles, score = _best_known(W, H, time_budget=time_budget)
-        if score > best_score:
-            best_score = score
-            best_result = circles.copy()
-            best_W, best_H = W, H
+        w = 2 * ar / (1 + ar)
+        h = 2 / (1 + ar)
 
-        # Try random restarts if time permits
-        remaining = DEADLINE - 10 - (time.time() - start_time)
-        if remaining > 5:
-            n_restarts = max(1, int(remaining / 6))
-            for _ in range(n_restarts):
-                if time.time() - start_time > DEADLINE - 10:
-                    break
-                circ_rand = _random_initialization(W, H, rng)
-                circ_opt = _local_optimize(circ_rand, W, H, max_iter=1000)
-                circ_opt[:, 0] = np.clip(circ_opt[:, 0], circ_opt[:, 2], W - circ_opt[:, 2])
-                circ_opt[:, 1] = np.clip(circ_opt[:, 1], circ_opt[:, 2], H - circ_opt[:, 2])
-                circ_opt[:, 2] = np.clip(circ_opt[:, 2], 0.001, min(W, H) / 2)
-                circ_opt, valid_rand = _separate_circles(circ_opt, W, H)
-                if valid_rand:
-                    s = np.sum(circ_opt[:, 2])
-                    if s > best_score:
-                        best_score = s
-                        best_result = circ_opt.copy()
-                        best_W, best_H = W, H
+        circles, score = _pack_for_aspect(w, h, start_time, deadline)
 
-    # Final high-precision polish on the best result
-    if best_result is not None and time.time() - start_time < DEADLINE - 15:
-        polished = _polish(best_result, best_W, best_H, max_iter=10000)
-        polished[:, 0] = np.clip(polished[:, 0], polished[:, 2], best_W - polished[:, 2])
-        polished[:, 1] = np.clip(polished[:, 1], polished[:, 2], best_H - polished[:, 2])
-        polished[:, 2] = np.clip(polished[:, 2], 0.001, min(best_W, best_H) / 2)
-        polished, valid_final = _separate_circles(polished, best_W, best_H, max_iter=1000)
-        if valid_final:
-            s = np.sum(polished[:, 2])
-            if s > best_score:
-                best_score = s
-                best_result = polished.copy()
+        if circles is not None and score > best_global_score:
+            # Double check validity
+            if _check_validity(circles, w, h):
+                best_global_score = score
+                best_global_result = circles.copy()
 
-    # Ultra-tight final polish
-    if best_result is not None and time.time() - start_time < DEADLINE - 6:
-        hp = _high_precision_polish(best_result, best_W, best_H, max_iter=8000)
-        hp[:, 0] = np.clip(hp[:, 0], hp[:, 2], best_W - hp[:, 2])
-        hp[:, 1] = np.clip(hp[:, 1], hp[:, 2], best_H - hp[:, 2])
-        hp[:, 2] = np.clip(hp[:, 2], 0.001, min(best_W, best_H) / 2)
-        hp, valid_hp = _separate_circles(hp, best_W, best_H, max_iter=1500)
-        if valid_hp:
-            s = np.sum(hp[:, 2])
-            if s > best_score:
-                best_score = s
-                best_result = hp.copy()
+    # Fallback if no valid result found
+    if best_global_result is None:
+        w = 1.0
+        h = 1.0
+        pos, radii = _hexagonal_start(w, h, N, seed=42)
+        circles = np.column_stack([pos, radii])
+        circles, _ = _separate_circles(circles, w, h)
+        best_global_result = circles
 
-    # Final fallback: simple grid in square
-    if best_result is None:
-        side = 5
-        cells = []
-        for i in range(side):
-            for j in range(side):
-                if len(cells) >= N:
-                    break
-                cx = (i + 0.5) / side
-                cy = (j + 0.5) / side
-                r = 0.5 / side - 1e-3
-                cells.append([cx, cy, r])
-        best_result = np.array(cells[:N])
-        best_W, best_H = 1.0, 1.0
-
-    # Ensure the result is valid; if not, fall back to a safe grid
-    if not _check_validity(best_result, best_W, best_H):
-        side = 5
-        cells = []
-        for i in range(side):
-            for j in range(side):
-                if len(cells) >= N:
-                    break
-                cx = (i + 0.5) / side
-                cy = (j + 0.5) / side
-                r = 0.5 / side - 1e-3
-                cells.append([cx, cy, r])
-        best_result = np.array(cells[:N])
-        best_W, best_H = 1.0, 1.0
-
-    return best_result
-# EVOLVE-BLOCK-END
+    return best_global_result

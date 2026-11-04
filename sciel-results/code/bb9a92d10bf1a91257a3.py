@@ -1,0 +1,488 @@
+import numpy as np
+import time
+import math
+from scipy.optimize import minimize
+
+N = 12
+DEADLINE = 135.0  # Safety margin below 150s
+
+def _hex_vertices(cx, cy, side=1.0, rot_deg=0.0):
+    angles = np.radians(np.array([0, 60, 120, 180, 240, 300])) + np.radians(rot_deg)
+    x = cx + side * np.cos(angles)
+    y = cy + side * np.sin(angles)
+    return np.column_stack((x, y))
+
+def _hex_edge_normals(rot_deg):
+    base = np.radians(np.array([30, 90, 150, 210, 270, 330])) + np.radians(rot_deg)
+    return np.column_stack((np.cos(base), np.sin(base)))
+
+def _sat_overlap_fast(v1, v2, n1, n2):
+    min_overlap = float('inf')
+    for k in range(6):
+        n = n1[k]
+        proj1 = v1 @ n
+        proj2 = v2 @ n
+        min1, max1 = np.min(proj1), np.max(proj1)
+        min2, max2 = np.min(proj2), np.max(proj2)
+        
+        if max1 < min2 or max2 < min1:
+            gap = min2 - max1 if min2 > max1 else min1 - max2
+            return gap
+        
+        overlap = min(max1, max2) - max(min1, min2)
+        if overlap < min_overlap:
+            min_overlap = overlap
+            
+    for k in range(6):
+        n = n2[k]
+        proj1 = v1 @ n
+        proj2 = v2 @ n
+        min1, max1 = np.min(proj1), np.max(proj1)
+        min2, max2 = np.min(proj2), np.max(proj2)
+        
+        if max1 < min2 or max2 < min1:
+            gap = min2 - max1 if min2 > max1 else min1 - max2
+            return gap
+            
+        overlap = min(max1, max2) - max(min1, min2)
+        if overlap < min_overlap:
+            min_overlap = overlap
+            
+    return -min_overlap
+
+def _outer_hex_side_fast(points, outer_rot_deg):
+    angles = np.radians(np.array([30, 90, 150, 210, 270, 330]) + outer_rot_deg)
+    normals = np.column_stack((np.cos(angles), np.sin(angles)))
+    proj = points @ normals.T
+    max_proj = np.max(np.abs(proj))
+    return (2.0 / np.sqrt(3.0)) * max_proj
+
+def _check_disjoint(inner, tol=1e-9):
+    n = len(inner)
+    verts = []
+    norms = []
+    for i in range(n):
+        x, y, rot = inner[i]
+        v = _hex_vertices(x, y, 1.0, rot)
+        nm = _hex_edge_normals(rot)
+        verts.append(v)
+        norms.append(nm)
+        
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = _sat_overlap_fast(verts[i], verts[j], norms[i], norms[j])
+            if d < -tol:
+                return False
+    return True
+
+def _make_hex_grid(rows, cols, rot_offset=0.0, gap=0.0):
+    pts = []
+    sqrt3 = np.sqrt(3)
+    spacing_x = sqrt3 + gap
+    spacing_y = 1.5 + gap * 0.5
+    for r in range(rows):
+        y = r * spacing_y
+        for c in range(cols):
+            x = c * spacing_x
+            if r % 2 == 1:
+                x += spacing_x / 2.0
+            pts.append([x, y, rot_offset])
+    pts = np.array(pts)
+    pts[:, 0] -= np.mean(pts[:, 0])
+    pts[:, 1] -= np.mean(pts[:, 1])
+    return pts
+
+def _make_ring(gap=0.0, inner_rot=0.0, outer_rot=0.0):
+    pts = []
+    sqrt3 = np.sqrt(3)
+    d1 = sqrt3 + gap
+    d2 = 2 * sqrt3 + gap
+    
+    pts.append([0, 0, inner_rot])
+    for k in range(6):
+        ang = np.radians(60 * k)
+        pts.append([d1 * np.cos(ang), d1 * np.sin(ang), inner_rot])
+    for k in range(5):
+        ang = np.radians(60 * k + 30)
+        pts.append([d2 * np.cos(ang), d2 * np.sin(ang), outer_rot])
+        
+    pts = np.array(pts)
+    pts[:, 0] -= np.mean(pts[:, 0])
+    pts[:, 1] -= np.mean(pts[:, 1])
+    return pts
+
+def _make_ring2(gap=0.0):
+    """Alternative ring: center + 6 around + 5 in gaps"""
+    pts = []
+    sqrt3 = np.sqrt(3)
+    d1 = sqrt3 + gap
+    d2 = 1.5 * sqrt3 + gap
+    
+    pts.append([0, 0, 0.0])
+    for k in range(6):
+        ang = np.radians(60 * k)
+        pts.append([d1 * np.cos(ang), d1 * np.sin(ang), 0.0])
+    for k in range(5):
+        ang = np.radians(60 * k + 30)
+        pts.append([d2 * np.cos(ang), d2 * np.sin(ang), 0.0])
+        
+    pts = np.array(pts)
+    pts[:, 0] -= np.mean(pts[:, 0])
+    pts[:, 1] -= np.mean(pts[:, 1])
+    return pts
+
+def _objective(p, t0, deadline, beta=100.0):
+    if time.time() - t0 > deadline:
+        return 1e6
+    
+    inner = p[:36].reshape(12, 3)
+    ox = p[36]
+    oy = p[37]
+    oang = p[38]
+    
+    verts_list = []
+    norms_list = []
+    for i in range(12):
+        cx, cy, rot = inner[i]
+        v = _hex_vertices(cx, cy, 1.0, rot)
+        nm = _hex_edge_normals(rot)
+        verts_list.append(v)
+        norms_list.append(nm)
+    
+    overlaps = []
+    for i in range(12):
+        for j in range(i + 1, 12):
+            d = _sat_overlap_fast(verts_list[i], verts_list[j], norms_list[i], norms_list[j])
+            if d < 0:
+                overlaps.append(-d)
+                
+    if overlaps:
+        p_arr = np.array(overlaps)
+        scaled = 2.0 * p_arr / beta
+        max_s = np.max(scaled)
+        if max_s > 500:
+            penalty = np.sum(p_arr**2)
+        else:
+            lse = max_s + np.log(np.sum(np.exp(scaled - max_s)))
+            penalty = beta * lse
+    else:
+        penalty = 0.0
+
+    all_pts = np.vstack(verts_list)
+    all_pts[:, 0] -= ox
+    all_pts[:, 1] -= oy
+    
+    L = _outer_hex_side_fast(all_pts, oang)
+    
+    return L + 100.0 * penalty
+
+def _objective_nm(p, t0, deadline, beta=100.0):
+    if time.time() - t0 > deadline:
+        return 1e6
+    
+    inner = p[:36].reshape(12, 3)
+    ox = p[36]
+    oy = p[37]
+    oang = p[38]
+    
+    verts_list = []
+    norms_list = []
+    for i in range(12):
+        cx, cy, rot = inner[i]
+        v = _hex_vertices(cx, cy, 1.0, rot)
+        nm = _hex_edge_normals(rot)
+        verts_list.append(v)
+        norms_list.append(nm)
+    
+    overlaps = []
+    for i in range(12):
+        for j in range(i + 1, 12):
+            d = _sat_overlap_fast(verts_list[i], verts_list[j], norms_list[i], norms_list[j])
+            if d < 0:
+                overlaps.append(-d)
+                
+    if overlaps:
+        p_arr = np.array(overlaps)
+        scaled = 3.0 * p_arr / beta
+        max_s = np.max(scaled)
+        if max_s > 500:
+            penalty = np.sum(p_arr**2)
+        else:
+            lse = max_s + np.log(np.sum(np.exp(scaled - max_s)))
+            penalty = beta * lse
+    else:
+        penalty = 0.0
+
+    all_pts = np.vstack(verts_list)
+    all_pts[:, 0] -= ox
+    all_pts[:, 1] -= oy
+    
+    L = _outer_hex_side_fast(all_pts, oang)
+    
+    return L + 100.0 * penalty
+
+def _optimize_outer_rotation(inner, t0, deadline):
+    """Golden-section search for optimal outer rotation angle."""
+    if time.time() - t0 > deadline:
+        return 0.0
+    
+    all_pts = np.vstack([_hex_vertices(inner[i,0], inner[i,1], 1.0, inner[i,2]) for i in range(12)])
+    all_pts[:, 0] -= np.mean(all_pts[:, 0])
+    all_pts[:, 1] -= np.mean(all_pts[:, 1])
+    
+    def f(theta):
+        L = _outer_hex_side_fast(all_pts, theta)
+        return L
+    
+    # Golden section search over [0, 60] degrees (symmetry)
+    gr = (np.sqrt(5) - 1) / 2  # golden ratio conjugate
+    a, b = 0.0, 60.0
+    c = b - gr * (b - a)
+    d = a + gr * (b - a)
+    fc = f(c)
+    fd = f(d)
+    
+    for _ in range(40):
+        if time.time() - t0 > deadline:
+            break
+        if fc < fd:
+            b = d
+            d = c
+            fd = fc
+            c = b - gr * (b - a)
+            fc = f(c)
+        else:
+            a = c
+            c = d
+            fc = fd
+            d = a + gr * (b - a)
+            fd = f(d)
+    
+    best_theta = (a + b) / 2.0
+    return best_theta
+
+def _polish(params, t0, deadline):
+    if time.time() - t0 > deadline - 10:
+        return params
+    
+    # Stage 1: L-BFGS-B with moderate penalty
+    try:
+        res = minimize(
+            _objective,
+            params,
+            args=(t0, deadline - 10, 50.0),
+            method='L-BFGS-B',
+            options={
+                'maxiter': 500,
+                'ftol': 1e-12,
+                'gtol': 1e-10,
+                'maxfun': 5000
+            }
+        )
+        if res.fun < _objective(params, t0, deadline, 50.0):
+            params = res.x
+    except Exception:
+        pass
+    
+    # Stage 2: L-BFGS-B with higher penalty to enforce strict disjointness
+    if time.time() - t0 < deadline - 5:
+        try:
+            res = minimize(
+                _objective,
+                params,
+                args=(t0, deadline - 5, 200.0),
+                method='L-BFGS-B',
+                options={
+                    'maxiter': 500,
+                    'ftol': 1e-14,
+                    'gtol': 1e-12,
+                    'maxfun': 5000
+                }
+            )
+            if res.fun < _objective(params, t0, deadline, 200.0):
+                params = res.x
+        except Exception:
+            pass
+            
+    # Stage 3: Optimize outer rotation separately
+    if time.time() - t0 < deadline - 2:
+        inner = params[:36].reshape(12, 3)
+        best_rot = _optimize_outer_rotation(inner, t0, deadline - 2)
+        params[38] = best_rot
+        
+    # Stage 4: Final Nelder-Mead polish
+    if time.time() - t0 < deadline - 1:
+        try:
+            res = minimize(
+                _objective_nm,
+                params,
+                args=(t0, deadline - 1, 500.0),
+                method='Nelder-Mead',
+                options={
+                    'maxiter': 1000,
+                    'xatol': 1e-14,
+                    'fatol': 1e-14,
+                    'adaptive': True
+                }
+            )
+            if res.fun < _objective_nm(params, t0, deadline, 500.0):
+                params = res.x
+        except Exception:
+            pass
+    
+    return params
+
+def construct():
+    t0 = time.time()
+    
+    def time_left():
+        return DEADLINE - (time.time() - t0)
+    
+    # Generate diverse initial configurations
+    configs = []
+    gap = 0.03
+    
+    # Standard grids
+    configs.append(_make_hex_grid(4, 3, gap=gap))
+    configs.append(_make_hex_grid(3, 4, gap=gap))
+    configs.append(_make_hex_grid(2, 6, gap=gap))
+    configs.append(_make_hex_grid(6, 2, gap=gap))
+    
+    # Rotated grids
+    configs.append(_make_hex_grid(4, 3, rot_offset=30, gap=gap))
+    configs.append(_make_hex_grid(3, 4, rot_offset=30, gap=gap))
+    
+    # Ring structures with different rotations
+    configs.append(_make_ring(gap=gap))
+    configs.append(_make_ring(gap=gap, inner_rot=30, outer_rot=0))
+    configs.append(_make_ring(gap=gap, inner_rot=0, outer_rot=30))
+    configs.append(_make_ring2(gap=gap))
+    
+    # Perturbed configurations
+    np.random.seed(42)
+    for seed in [42, 123, 456]:
+        np.random.seed(seed)
+        base = _make_ring(gap=gap)
+        perturbed = base.copy()
+        perturbed[:, :2] += np.random.randn(12, 2) * 0.02
+        configs.append(perturbed)
+        
+    best_L = float('inf')
+    best_params = None
+    
+    for cfg in configs:
+        if time_left() < 15:
+            break
+            
+        # Try a few outer rotations
+        for oang in [0.0, 30.0, 15.0, 45.0, 10.0]:
+            if time_left() < 10:
+                break
+                
+            init_params = np.concatenate((cfg.flatten(), [0.0, 0.0, oang]))
+            
+            try:
+                # Initial optimization
+                res = minimize(
+                    _objective,
+                    init_params,
+                    args=(t0, DEADLINE - 10, 50.0),
+                    method='L-BFGS-B',
+                    options={
+                        'maxiter': 300,
+                        'ftol': 1e-10,
+                        'gtol': 1e-8,
+                        'maxfun': 2000
+                    }
+                )
+                
+                # Check validity
+                inner = res.x[:36].reshape(12, 3)
+                if _check_disjoint(inner, tol=1e-8):
+                    ox = res.x[36]
+                    oy = res.x[37]
+                    oang_val = res.x[38]
+                    all_pts = np.vstack([_hex_vertices(inner[i,0], inner[i,1], 1.0, inner[i,2]) for i in range(12)])
+                    all_pts[:, 0] -= ox
+                    all_pts[:, 1] -= oy
+                    L = _outer_hex_side_fast(all_pts, oang_val)
+                    
+                    if L < best_L:
+                        best_L = L
+                        best_params = res.x.copy()
+            except Exception:
+                pass
+                
+    if best_params is not None and time_left() > 20:
+        # Polish the best candidate
+        best_params = _polish(best_params, t0, DEADLINE)
+        
+        inner = best_params[:36].reshape(12, 3)
+        if _check_disjoint(inner, tol=1e-9):
+            ox = best_params[36]
+            oy = best_params[37]
+            oang_val = best_params[38]
+            all_pts = np.vstack([_hex_vertices(inner[i,0], inner[i,1], 1.0, inner[i,2]) for i in range(12)])
+            all_pts[:, 0] -= ox
+            all_pts[:, 1] -= oy
+            L = _outer_hex_side_fast(all_pts, oang_val)
+            
+            if L < best_L:
+                best_L = L
+                
+    # Additional polish pass if time remains
+    if best_params is not None and time_left() > 10:
+        best_params = _polish(best_params, t0, DEADLINE)
+        
+        inner = best_params[:36].reshape(12, 3)
+        if _check_disjoint(inner, tol=1e-9):
+            ox = best_params[36]
+            oy = best_params[37]
+            oang_val = best_params[38]
+            all_pts = np.vstack([_hex_vertices(inner[i,0], inner[i,1], 1.0, inner[i,2]) for i in range(12)])
+            all_pts[:, 0] -= ox
+            all_pts[:, 1] -= oy
+            L = _outer_hex_side_fast(all_pts, oang_val)
+            
+            if L < best_L:
+                best_L = L
+
+    if best_params is None:
+        cfg = _make_hex_grid(4, 3, gap=0.5)
+        best_params = np.concatenate((cfg.flatten(), [0.0, 0.0, 0.0]))
+        inner = [[float(p[0]), float(p[1]), float(p[2])] for p in cfg]
+        outer_center = (0.0, 0.0)
+        outer_angle = 0.0
+        all_pts = np.vstack([_hex_vertices(p[0], p[1], 1.0, p[2]) for p in inner])
+        outer_side = _outer_hex_side_fast(all_pts, outer_angle)
+        return inner, outer_center, outer_side, outer_angle
+
+    inner = []
+    for i in range(12):
+        x = best_params[i * 3]
+        y = best_params[i * 3 + 1]
+        r = best_params[i * 3 + 2]
+        inner.append([float(x), float(y), float(r)])
+    
+    outer_center = (float(best_params[36]), float(best_params[37]))
+    outer_angle = float(best_params[38])
+    
+    # Final validity check
+    if not _check_disjoint(inner, tol=1e-9):
+        cfg = _make_hex_grid(4, 3, gap=0.5)
+        inner = [[float(p[0]), float(p[1]), float(p[2])] for p in cfg]
+        outer_center = (0.0, 0.0)
+        outer_angle = 0.0
+        all_pts = np.vstack([_hex_vertices(p[0], p[1], 1.0, p[2]) for p in inner])
+        outer_side = _outer_hex_side_fast(all_pts, outer_angle)
+        return inner, outer_center, outer_side, outer_angle
+
+    all_pts = np.vstack([_hex_vertices(p[0], p[1], 1.0, p[2]) for p in inner])
+    all_pts[:, 0] -= outer_center[0]
+    all_pts[:, 1] -= outer_center[1]
+    outer_side = _outer_hex_side_fast(all_pts, outer_angle)
+    
+    # Add a tiny epsilon to ensure strict containment if on the boundary
+    outer_side *= 1.00005
+    
+    return inner, outer_center, outer_side, outer_angle

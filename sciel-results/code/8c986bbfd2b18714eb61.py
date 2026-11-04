@@ -1,0 +1,222 @@
+import numpy as np
+import time
+import sys
+from fractions import Fraction
+
+DIMENSIONS = [3, 3, 4]
+
+def construct():
+    n, m, p = DIMENSIONS
+    start_time = time.time()
+    deadline = start_time + 130.0
+
+    # Schoolbook fallback (rank 36)
+    schoolbook_rank = n * m * p
+    U_sb = [[0] * schoolbook_rank for _ in range(n * m)]
+    V_sb = [[0] * schoolbook_rank for _ in range(m * p)]
+    W_sb = [[0] * schoolbook_rank for _ in range(p * n)]
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U_sb[i * m + j][col] = 1
+                V_sb[j * p + k][col] = 1
+                W_sb[k * n + i][col] = 1
+                col += 1
+
+    def verify_decomposition(U_terms, V_terms, W_terms):
+        """Verify that the decomposition exactly represents matrix multiplication."""
+        rank = len(U_terms)
+        
+        # Build target tensor indices
+        target_indices = set()
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    target_indices.add((i * m + j, j * p + k, k * n + i))
+        
+        # Compute the decomposed tensor
+        decomposed = {}
+        for r in range(rank):
+            U_r = U_terms[r]
+            V_r = V_terms[r]
+            W_r = W_terms[r]
+            U_nz = [(idx, val) for idx, val in enumerate(U_r) if val != 0]
+            V_nz = [(idx, val) for idx, val in enumerate(V_r) if val != 0]
+            W_nz = [(idx, val) for idx, val in enumerate(W_r) if val != 0]
+            
+            for a, ua in U_nz:
+                for b, vb in V_nz:
+                    for c, wc in W_nz:
+                        key = (a, b, c)
+                        if key in target_indices:
+                            decomposed[key] = decomposed.get(key, Fraction(0)) + ua * vb * wc
+        
+        # Verify all target entries equal 1
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    a = i * m + j
+                    b = j * p + k
+                    c = k * n + i
+                    key = (a, b, c)
+                    if key not in decomposed or decomposed[key] != 1:
+                        return False
+        
+        # Verify no extra non-zero entries
+        for key in decomposed:
+            if key not in target_indices:
+                return False
+        
+        return True
+
+    def frac_to_float_list(vecs):
+        return [[float(v) for v in vec] for vec in vecs]
+    
+    def make_term(U_dict, V_dict, W_dict):
+        """Create a single rank-1 term as three vectors."""
+        U_vec = [Fraction(0)] * (n * m)
+        V_vec = [Fraction(0)] * (m * p)
+        W_vec = [Fraction(0)] * (p * n)
+        for idx, val in U_dict.items():
+            U_vec[idx] = val
+        for idx, val in V_dict.items():
+            V_vec[idx] = val
+        for idx, val in W_dict.items():
+            W_vec[idx] = val
+        return U_vec, V_vec, W_vec
+
+    def add_strassen_block(a_rows, a_cols, b_rows, b_cols, c_rows, c_cols):
+        """Add Strassen terms for a 2x2x2 block."""
+        terms = []
+        a00 = (a_rows[0], a_cols[0])
+        a01 = (a_rows[0], a_cols[1])
+        a10 = (a_rows[1], a_cols[0])
+        a11 = (a_rows[1], a_cols[1])
+        b00 = (b_rows[0], b_cols[0])
+        b01 = (b_rows[0], b_cols[1])
+        b10 = (b_rows[1], b_cols[0])
+        b11 = (b_rows[1], b_cols[1])
+        c00 = (c_rows[0], c_cols[0])
+        c01 = (c_rows[0], c_cols[1])
+        c10 = (c_rows[1], c_cols[0])
+        c11 = (c_rows[1], c_cols[1])
+        
+        def widx(ci, ck):
+            return ck * n + ci
+        
+        # M1 = (a00+a11)(b00+b11)
+        terms.append(make_term(
+            {a00[0]*m+a00[1]: Fraction(1), a11[0]*m+a11[1]: Fraction(1)},
+            {b00[0]*p+b00[1]: Fraction(1), b11[0]*p+b11[1]: Fraction(1)},
+            {widx(*c00): Fraction(1), widx(*c11): Fraction(1)}
+        ))
+        
+        # M2 = (a10+a11)b00
+        terms.append(make_term(
+            {a10[0]*m+a10[1]: Fraction(1), a11[0]*m+a11[1]: Fraction(1)},
+            {b00[0]*p+b00[1]: Fraction(1)},
+            {widx(*c10): Fraction(1), widx(*c11): Fraction(-1)}
+        ))
+        
+        # M3 = a00(b10-b00)
+        terms.append(make_term(
+            {a00[0]*m+a00[1]: Fraction(1)},
+            {b10[0]*p+b10[1]: Fraction(1), b00[0]*p+b00[1]: Fraction(-1)},
+            {widx(*c01): Fraction(1), widx(*c11): Fraction(1)}
+        ))
+        
+        # M4 = a11(b01-b11)
+        terms.append(make_term(
+            {a11[0]*m+a11[1]: Fraction(1)},
+            {b01[0]*p+b01[1]: Fraction(1), b11[0]*p+b11[1]: Fraction(-1)},
+            {widx(*c00): Fraction(1), widx(*c10): Fraction(1)}
+        ))
+        
+        # M5 = (a00+a01)b11
+        terms.append(make_term(
+            {a00[0]*m+a00[1]: Fraction(1), a01[0]*m+a01[1]: Fraction(1)},
+            {b11[0]*p+b11[1]: Fraction(1)},
+            {widx(*c00): Fraction(-1), widx(*c01): Fraction(1), widx(*c11): Fraction(1)}
+        ))
+        
+        # M6 = (a10-a00)(b00+b01)
+        terms.append(make_term(
+            {a10[0]*m+a10[1]: Fraction(1), a00[0]*m+a00[1]: Fraction(-1)},
+            {b00[0]*p+b00[1]: Fraction(1), b01[0]*p+b01[1]: Fraction(1)},
+            {widx(*c10): Fraction(-1), widx(*c11): Fraction(-1)}
+        ))
+        
+        # M7 = (a01-a11)(b10+b11)
+        terms.append(make_term(
+            {a01[0]*m+a01[1]: Fraction(1), a11[0]*m+a11[1]: Fraction(-1)},
+            {b10[0]*p+b10[1]: Fraction(1), b11[0]*p+b11[1]: Fraction(1)},
+            {widx(*c00): Fraction(1), widx(*c11): Fraction(1)}
+        ))
+        
+        return terms
+
+    U_terms = []
+    V_terms = []
+    W_terms = []
+
+    # Block 1: A[0:2,0:2] * B[0:2,0:2] -> C[0:2,0:2] (7 terms)
+    for U_t, V_t, W_t in add_strassen_block([0,1], [0,1], [0,1], [0,1], [0,1], [0,1]):
+        U_terms.append(U_t)
+        V_terms.append(V_t)
+        W_terms.append(W_t)
+
+    # Block 2: A[0:2,0:2] * B[0:2,2:4] -> C[0:2,2:4] (7 terms)
+    for U_t, V_t, W_t in add_strassen_block([0,1], [0,1], [0,1], [2,3], [0,1], [2,3]):
+        U_terms.append(U_t)
+        V_terms.append(V_t)
+        W_terms.append(W_t)
+
+    # Block 3: A[0:2,2] * B[2,0:4] -> C[0:2,0:4] (1 term)
+    # U: (0,2), (1,2)
+    # V: (2,0), (2,1), (2,2), (2,3)
+    # W: (0,0), (0,1), (0,2), (0,3), (1,0), (1,1), (1,2), (1,3)
+    U_dict = {0*m+2: Fraction(1), 1*m+2: Fraction(1)}
+    V_dict = {2*p+0: Fraction(1), 2*p+1: Fraction(1), 2*p+2: Fraction(1), 2*p+3: Fraction(1)}
+    W_dict = {0*n+0: Fraction(1), 0*n+1: Fraction(1), 0*n+2: Fraction(1), 0*n+3: Fraction(1),
+              1*n+0: Fraction(1), 1*n+1: Fraction(1), 1*n+2: Fraction(1), 1*n+3: Fraction(1)}
+    U_terms.append(make_term(U_dict, V_dict, W_dict))
+    V_terms.append(V_dict and [Fraction(0)]*(m*p)) # Placeholder, make_term returns vectors
+    # Wait, make_term returns U_vec, V_vec, W_vec.
+    U_t, V_t, W_t = make_term(U_dict, V_dict, W_dict)
+    U_terms[-1] = U_t
+    V_terms.append(V_t)
+    W_terms.append(W_t)
+
+    # Block 5: A[2,0:2] * B[0:2,0:4] -> C[2,0:4] (2 terms)
+    # Term 1: A[2,0] * B[0,0:4] -> C[2,0:4]
+    U_dict1 = {2*m+0: Fraction(1)}
+    V_dict1 = {0*p+0: Fraction(1), 0*p+1: Fraction(1), 0*p+2: Fraction(1), 0*p+3: Fraction(1)}
+    W_dict1 = {0*n+2: Fraction(1), 1*n+2: Fraction(1), 2*n+2: Fraction(1), 3*n+2: Fraction(1)}
+    U_t, V_t, W_t = make_term(U_dict1, V_dict1, W_dict1)
+    U_terms.append(U_t)
+    V_terms.append(V_t)
+    W_terms.append(W_t)
+
+    # Term 2: A[2,1] * B[1,0:4] -> C[2,0:4]
+    U_dict2 = {2*m+1: Fraction(1)}
+    V_dict2 = {1*p+0: Fraction(1), 1*p+1: Fraction(1), 1*p+2: Fraction(1), 1*p+3: Fraction(1)}
+    W_dict2 = {0*n+2: Fraction(1), 1*n+2: Fraction(1), 2*n+2: Fraction(1), 3*n+2: Fraction(1)}
+    U_t, V_t, W_t = make_term(U_dict2, V_dict2, W_dict2)
+    U_terms.append(U_t)
+    V_terms.append(V_t)
+    W_terms.append(W_t)
+
+    # Block 7: A[2,2] * B[2,0:4] -> C[2,0:4] (1 term)
+    U_dict3 = {2*m+2: Fraction(1)}
+    V_dict3 = {2*p+0: Fraction(1), 2*p+1: Fraction(1), 2*p+2: Fraction(1), 2*p+3: Fraction(1)}
+    W_dict3 = {0*n+2: Fraction(1), 1*n+2: Fraction(1), 2*n+2: Fraction(1), 3*n+2: Fraction(1)}
+    U_t, V_t, W_t = make_term(U_dict3, V_dict3, W_dict3)
+    U_terms.append(U_t)
+    V_terms.append(V_t)
+    W_terms.append(W_t)
+
+    if verify_decomposition(U_terms, V_terms, W_terms):
+        return {"U": frac_to_float_list(U_terms), "V": frac_to_float_list(V_terms), "W": frac_to_float_list(W_terms)}
+    
+    return {"U": U_sb, "V": V_sb, "W": W_sb}

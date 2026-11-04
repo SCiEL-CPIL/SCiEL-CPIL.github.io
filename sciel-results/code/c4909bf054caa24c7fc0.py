@@ -1,0 +1,280 @@
+"""Tensor decomposition for 2x3 * 3x10 matrix multiplication."""
+import time
+import numpy as np
+
+DIMENSIONS = [2, 3, 10]
+
+# EVOLVE-BLOCK-START
+
+
+def _build_trivial(n, m, p):
+    """Return the rank-nmp trivial decomposition as (U, V, W) lists."""
+    rank = n * m * p
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    for r in range(rank):
+        i = r // (m * p)
+        rem = r % (m * p)
+        j = rem // p
+        k = rem % p
+        idx_u = i * m + j
+        idx_v = j * p + k
+        idx_w = k * n + i
+        U[idx_u][r] = 1
+        V[idx_v][r] = 1
+        W[idx_w][r] = 1
+    return U, V, W, rank
+
+
+def _validate(n, m, p, U, V, W):
+    """Verify that sum_r U[i*m+j][r] * V[j*p+k][r] * W[k*n+i][r] == 1 for all i,j,k."""
+    U_arr = np.array(U, dtype=float)
+    V_arr = np.array(V, dtype=float)
+    W_arr = np.array(W, dtype=float)
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                lhs = np.dot(U_arr[i * m + j] * V_arr[j * p + k], W_arr[k * n + i])
+                if not np.isclose(lhs, 1.0, atol=1e-9):
+                    return False
+    return True
+
+
+def _build_strassen(n, m, p):
+    """
+    Build a rank-55 decomposition for 2x3 * 3x10 using Strassen on 2x2x2 blocks.
+    
+    Split:
+      A (2x3) = [A_left (2x2) | A_right (2x1)]
+      B (3x10) = [B_top (2x10); B_bottom (1x10)]
+    
+    C = A_left @ B_top + A_right @ B_bottom
+    
+    For A_left @ B_top (2x2 x 2x10): split B_top into 5 blocks of 2x2 columns.
+      Each 2x2 x 2x2 block uses Strassen (7 rank-1 terms).
+      Total: 5 * 7 = 35 terms.
+    
+    For A_right @ B_bottom (2x1 x 1x10): schoolbook, 2*1*10 = 20 terms.
+    
+    Total rank: 55.
+    """
+    assert n == 2 and m == 3 and p == 10
+    
+    rank = 55
+    U = [[0] * rank for _ in range(n * m)]  # 6 x 55
+    V = [[0] * rank for _ in range(m * p)]  # 30 x 55
+    W = [[0] * rank for _ in range(p * n)]  # 20 x 55
+    
+    r = 0  # current rank index
+    
+    # --- Part 1: A_left (2x2) @ B_top (2x10) via Strassen on 5 2x2 blocks ---
+    # A_left entries: A[0,0], A[0,1], A[1,0], A[1,1]
+    #   U indices: 0*3+0=0, 0*3+1=1, 1*3+0=3, 1*3+1=4
+    # B_top entries: B[0,k], B[1,k] for k=0..9
+    #   V indices: 0*10+k = k, 1*10+k = 10+k
+    
+    # Strassen's 7 products for 2x2 x 2x2:
+    # Given A = [[a,b],[c,d]], B = [[e,f],[g,h]]
+    # m1 = (a+d)(e+h)
+    # m2 = (c+d)e
+    # m3 = a(f-h)
+    # m4 = d(g-e)
+    # m5 = (a+b)h
+    # m6 = (c-a)(e+f)
+    # m7 = (b-d)(g+h)
+    # C = [[m1+m4-m5+m7, m3+m5],
+    #      [m2+m4,        m1-m2+m3+m6]]
+    
+    # For block b (b=0..4), columns 2b and 2b+1 of B_top:
+    # A_left = [[A00, A01], [A10, A11]]
+    # B_block = [[B0_{2b}, B0_{2b+1}], [B1_{2b}, B1_{2b+1}]]
+    
+    # Strassen coefficients for U (A_left part):
+    strassen_u = [
+        [(0, 1), (4, 1)],       # m1: A00 + A11
+        [(3, 1), (4, 1)],       # m2: A10 + A11
+        [(0, 1)],               # m3: A00
+        [(4, 1)],               # m4: A11
+        [(0, 1), (1, 1)],       # m5: A00 + A01
+        [(3, 1), (0, -1)],      # m6: A10 - A00
+        [(1, 1), (4, -1)],      # m7: A01 - A11
+    ]
+    
+    # Strassen coefficients for V (B_block part):
+    strassen_v = [
+        [(0, 1), (11, 1)],      # m1: B0_{2b} + B1_{2b+1}
+        [(0, 1)],               # m2: B0_{2b}
+        [(1, 1), (11, -1)],     # m3: B0_{2b+1} - B1_{2b+1}
+        [(10, 1), (0, -1)],     # m4: B1_{2b} - B0_{2b}
+        [(11, 1)],              # m5: B1_{2b+1}
+        [(0, 1), (1, 1)],       # m6: B0_{2b} + B0_{2b+1}
+        [(10, 1), (11, 1)],     # m7: B1_{2b} + B1_{2b+1}
+    ]
+    
+    # W contributions: (w_row, coeff) for each m_s
+    # C[0, 2b]   = m1 + m4 - m5 + m7  -> W row (2b)*2 + 0 = 4b
+    # C[0, 2b+1] = m3 + m5            -> W row (2b+1)*2 + 0 = 4b+2
+    # C[1, 2b]   = m2 + m4            -> W row (2b)*2 + 1 = 4b+1
+    # C[1, 2b+1] = m1 - m2 + m3 + m6  -> W row (2b+1)*2 + 1 = 4b+3
+    
+    strassen_w = [
+        [(0, 1), (3, 1)],       # m1 -> C[0,2b] and C[1,2b+1]
+        [(1, 1), (3, -1)],      # m2 -> C[1,2b] and C[1,2b+1]
+        [(2, 1), (3, 1)],       # m3 -> C[0,2b+1] and C[1,2b+1]
+        [(0, 1), (1, 1)],       # m4 -> C[0,2b] and C[1,2b]
+        [(0, -1), (2, 1)],      # m5 -> C[0,2b] and C[0,2b+1]
+        [(3, 1)],               # m6 -> C[1,2b+1]
+        [(0, 1)],               # m7 -> C[0,2b]
+    ]
+    
+    for b in range(5):
+        col0 = 2 * b
+        col1 = 2 * b + 1
+        
+        for s in range(7):
+            # U contributions
+            for (u_row, coeff) in strassen_u[s]:
+                U[u_row][r] += coeff
+            
+            # V contributions (adjust indices for block b)
+            for (v_row_offset, coeff) in strassen_v[s]:
+                if v_row_offset == 0:
+                    v_row = col0
+                elif v_row_offset == 1:
+                    v_row = col1
+                elif v_row_offset == 10:
+                    v_row = 10 + col0
+                elif v_row_offset == 11:
+                    v_row = 10 + col1
+                else:
+                    raise ValueError(f"Unexpected v_row_offset {v_row_offset}")
+                V[v_row][r] += coeff
+            
+            # W contributions (adjust row indices for block b)
+            for (w_row_offset, coeff) in strassen_w[s]:
+                if w_row_offset == 0:
+                    w_row = col0 * 2 + 0
+                elif w_row_offset == 1:
+                    w_row = col0 * 2 + 1
+                elif w_row_offset == 2:
+                    w_row = col1 * 2 + 0
+                elif w_row_offset == 3:
+                    w_row = col1 * 2 + 1
+                else:
+                    raise ValueError(f"Unexpected w_row_offset {w_row_offset}")
+                W[w_row][r] += coeff
+            
+            r += 1
+    
+    # --- Part 2: A_right (2x1) @ B_bottom (1x10) schoolbook ---
+    # A_right: A[0,2], A[1,2] -> U rows 0*3+2=2, 1*3+2=5
+    # B_bottom: B[2,k] for k=0..9 -> V rows 2*10+k = 20+k
+    # C[i,k] for i in {0,1}, k in 0..9 -> W rows k*2+i
+    
+    for i in range(2):
+        for k in range(10):
+            U[i * 3 + 2][r] = 1
+            V[2 * 10 + k][r] = 1
+            W[k * 2 + i][r] = 1
+            r += 1
+    
+    assert r == rank, f"Expected rank {rank}, got {r}"
+    
+    return U, V, W, rank
+
+
+def _build_optimized(n, m, p):
+    """
+    Build a potentially lower-rank decomposition for 2x3 * 3x10.
+    
+    Key insight: The 2x1 @ 1x10 part has rank 20, but we can potentially
+    reduce this by sharing computation across the 10 output columns.
+    
+    Strategy: Use a linear change of basis on the output to diagonalize
+    part of the computation.
+    
+    Alternative: Recognize that A_right @ B_bottom = outer product of
+    A_right (2x1) and B_bottom (1x10), which can be done in rank 2
+    (one rank-1 for each row of the output) using the fact that
+    C[i,k] = A[i,2] * B[2,k].
+    
+    Actually, the minimal rank for 2x1 @ 1x10 is 2*10 = 20 for the
+    standard decomposition, but we can potentially reduce it by using
+    the structure more cleverly.
+    
+    For now, return the same rank-55 decomposition but with a cleaner
+    implementation that's structured differently.
+    """
+    assert n == 2 and m == 3 and p == 10
+    
+    # For 2x3 * 3x10, the theoretical minimum rank is at least 60/2 = 30
+    # (from lower bounds), but we know rank 55 works.
+    # 
+    # Let's try a different decomposition:
+    # Split A into A1 (2x2) and A2 (2x1)
+    # Split B into B1 (2x10) and B2 (1x10)
+    # 
+    # C = A1 @ B1 + A2 @ B2
+    # 
+    # For A1 @ B1: 2x2 @ 2x10
+    #   We can split B1 into 5 blocks of 2x2 and use Strassen: rank 35
+    #   Or we can try to do better.
+    # 
+    # For A2 @ B2: 2x1 @ 1x10
+    #   This is just A2_i * B2_k for each i,k
+    #   Minimal rank is 20 (can't be lower since we need to produce
+    #   all 20 products independently)
+    # 
+    # Total: 35 + 20 = 55
+    # 
+    # Can we do better? The lower bound for 2x2 @ 2x10 is...
+    # Using the rank of matrix multiplication:
+    # rank(M_{2,2,10}) >= max(rank(M_{2,2,2}), ...) 
+    # Actually, for 2x2 @ 2xp, the rank is 7p/2 if p is even? No.
+    # 
+    # Let me think differently. The tensor M_{2,3,10} has rank at least
+    # the border rank, which is at least the max of the ranks of its
+    # sub-tensors.
+    # 
+    # For now, I'll return the rank-55 decomposition but with a
+    # completely different code structure.
+    
+    rank = 55
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    
+    # Precompute all the Strassen indices
+    r = 0
+    
+    # Part 1: 2x2 @ 2x10 using 5 Strassen blocks
+    for block in range(5):
+        base_col = block * 2
+        for step in range(7):
+            # This is a placeholder - we'll use the same logic as _build_strassen
+            # but with different variable names and structure
+            pass
+    
+    # This approach is getting complicated. Let's just use the working
+    # _build_strassen function.
+    return _build_strassen(n, m, p)
+
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 100  # safety margin under 120s cap
+
+    n, m, p = DIMENSIONS
+
+    # Use Strassen-based decomposition for 2x3*3x10: rank 55
+    U, V, W, rank = _build_strassen(n, m, p)
+
+    # Validate
+    if not _validate(n, m, p, U, V, W):
+        # Fall back to trivial if validation fails
+        U, V, W, rank = _build_trivial(n, m, p)
+
+    return {"U": U, "V": V, "W": W}
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,84 @@
+import numpy as np
+import time
+
+DIMENSIONS = [2, 3, 6]
+_START_TIME = time.time()
+TIME_LIMIT = 140.0  # Safety margin before 150s kill
+
+def _time_remaining():
+    return TIME_LIMIT - (time.time() - _START_TIME)
+
+def construct():
+    n, m, p = DIMENSIONS
+    rank = 33
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    
+    col = 0
+    
+    # Part 1: A_1 (col 0) * B_1 (row 0): 2x1x6 schoolbook, rank 12
+    for k in range(p):
+        U[0][col] = 1
+        V[k][col] = 1
+        W[2*k][col] = 1
+        col += 1
+        U[3][col] = 1
+        V[k][col] = 1
+        W[2*k + 1][col] = 1
+        col += 1
+    
+    # Part 2: A_2 (cols 1,2) * B_2 (rows 1,2): 2x2x6 via 3 Strassen 2x2x2 blocks
+    for x in range(3):
+        cs = 2 * x
+        # M1: (a00+a11)*(b00+b11)
+        U[1][col] = 1; U[5][col] = 1
+        V[6 + cs][col] = 1; V[12 + cs + 1][col] = 1
+        W[2*cs][col] = 1; W[2*cs + 3][col] = 1
+        col += 1
+        # M2: (a10+a11)*b00
+        U[4][col] = 1; U[5][col] = 1
+        V[6 + cs][col] = 1
+        W[2*cs + 1][col] = 1; W[2*cs + 3][col] = -1
+        col += 1
+        # M3: a00*(b01-b11)
+        U[1][col] = 1
+        V[6 + cs + 1][col] = 1; V[12 + cs + 1][col] = -1
+        W[2*cs + 2][col] = 1; W[2*cs + 3][col] = 1
+        col += 1
+        # M4: a11*(b10-b00)
+        U[5][col] = 1
+        V[12 + cs][col] = 1; V[6 + cs][col] = -1
+        W[2*cs][col] = 1; W[2*cs + 1][col] = 1
+        col += 1
+        # M5: (a00+a01)*b11
+        U[1][col] = 1; U[2][col] = 1
+        V[12 + cs + 1][col] = 1
+        W[2*cs][col] = -1; W[2*cs + 2][col] = 1
+        col += 1
+        # M6: (a10-a00)*(b00+b01)
+        U[4][col] = 1; U[1][col] = -1
+        V[6 + cs][col] = 1; V[6 + cs + 1][col] = 1
+        W[2*cs + 3][col] = 1
+        col += 1
+        # M7: (a01-a11)*(b10+b11)
+        U[2][col] = 1; U[5][col] = -1
+        V[12 + cs][col] = 1; V[12 + cs + 1][col] = 1
+        W[2*cs][col] = 1
+        col += 1
+    
+    # Quick verification
+    if _time_remaining() > 5.0:
+        U_arr = np.array(U, dtype=float)
+        V_arr = np.array(V, dtype=float)
+        W_arr = np.array(W, dtype=float)
+        T_est = np.einsum('ir,jr,kr->ijk', U_arr, V_arr, W_arr)
+        T_target = np.zeros((n*m, m*p, p*n))
+        for r in range(n):
+            for s in range(m):
+                for c in range(p):
+                    T_target[r*m+s, s*p+c, c*n+r] = 1
+        if np.max(np.abs(T_est - T_target)) > 1e-9:
+            raise ValueError("Decomposition verification failed")
+    
+    return {"U": U, "V": V, "W": W}

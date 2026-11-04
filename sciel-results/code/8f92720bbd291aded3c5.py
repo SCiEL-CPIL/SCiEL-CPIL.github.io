@@ -1,0 +1,1 @@
+BET: {mechanism: "Multiple passes of greedy column removal with faster numpy-based verification should identify more linearly dependent columns than the single-pass approach, potentially reducing rank from ~77 to a lower value", q: 0.4, delta: [0.0, 0.05]}

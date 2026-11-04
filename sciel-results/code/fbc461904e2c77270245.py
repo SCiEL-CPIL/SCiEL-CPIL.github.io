@@ -1,0 +1,175 @@
+"""Rank-minimal exact tensor decomposition for 4x4 * 4x6 matrix multiplication.
+
+Uses the Kronecker product structure:
+  T_{4,4,6} = T_{2,2,2} ⊗ T_{2,2,3}
+
+The 4×4×6 matrix multiplication tensor decomposes as the tensor product of:
+  - T_{2,2,2}: the 2×2×2 matrix multiplication tensor (rank 7, Strassen)
+  - T_{2,2,3}: the 2×2 × 2×3 matrix multiplication tensor (rank 11)
+
+Total rank: 7 × 11 = 77.
+
+The 2×2×3 sub-problem uses Strassen (rank 7) for the 2×2×2 part plus
+schoolbook (rank 4) for the 2×2×2×1 part.
+"""
+
+import numpy as np
+
+# Pre-computed Strassen 2x2x2 decomposition (rank 7)
+# Each term: (u_dict, v_dict, w_dict) with keys (row, col)
+_S2 = [
+    ({(0,0): 1, (1,1): 1}, {(0,0): 1, (1,1): 1}, {(0,0): 1, (1,1): 1}),
+    ({(1,0): 1, (1,1): 1}, {(0,0): 1}, {(1,0): 1, (1,1): -1}),
+    ({(0,0): 1}, {(0,1): 1, (1,1): -1}, {(0,1): 1, (1,1): 1}),
+    ({(1,1): 1}, {(1,0): 1, (0,0): -1}, {(0,0): 1, (1,0): 1}),
+    ({(0,0): 1, (0,1): 1}, {(1,1): 1}, {(0,0): -1, (0,1): 1}),
+    ({(1,0): 1, (0,0): -1}, {(0,0): 1, (0,1): 1}, {(1,1): 1}),
+    ({(0,1): 1, (1,1): -1}, {(1,0): 1, (1,1): 1}, {(0,0): 1}),
+]
+
+# 2x2*2x1 schoolbook terms (rank 4)
+_S2x1 = [
+    ({(0,0): 1}, {(0,0): 1}, {(0,0): 1}),
+    ({(1,0): 1}, {(0,0): 1}, {(1,0): 1}),
+    ({(0,1): 1}, {(1,0): 1}, {(0,0): 1}),
+    ({(1,1): 1}, {(1,0): 1}, {(1,0): 1}),
+]
+
+# Combined 2x2x3 terms: rank 7 + 4 = 11
+_S2x3 = _S2 + _S2x1
+
+# Block offsets for 2x2 blocks within 4x4
+_BLOCK_OFFSETS = [(0, 0), (0, 2), (2, 0), (2, 2)]
+
+# The 7 super-Strassen terms for 4x4*4x4
+_SUPER_TERMS = [
+    ({0: 1, 3: 1}, {0: 1, 3: 1}, {0: 1, 3: 1}),
+    ({2: 1, 3: 1}, {0: 1}, {2: 1, 3: -1}),
+    ({0: 1}, {1: 1, 3: -1}, {1: 1, 3: 1}),
+    ({3: 1}, {2: 1, 0: -1}, {0: 1, 2: 1}),
+    ({0: 1, 1: 1}, {3: 1}, {0: -1, 1: 1}),
+    ({2: 1, 0: -1}, {0: 1, 1: 1}, {3: 1}),
+    ({1: 1, 3: -1}, {2: 1, 3: 1}, {0: 1}),
+]
+
+
+def _build_decomposition():
+    """Build the rank-77 decomposition for 4x4 * 4x6."""
+    n, m, p = 4, 4, 6
+    U_cols = []
+    V_cols = []
+    W_cols = []
+
+    def _add_2x2(oi, oj, ok):
+        """Add Strassen decomposition for 2x2 * 2x2 block at offset (oi,oj,ok)."""
+        for u_pat, v_pat, w_pat in _S2:
+            u_col = [0] * (n * m)
+            v_col = [0] * (m * p)
+            w_col = [0] * (p * n)
+            for (r, c), coeff in u_pat.items():
+                i, j = oi + r, oj + c
+                if 0 <= i < n and 0 <= j < m:
+                    u_col[i * m + j] += coeff
+            for (r, c), coeff in v_pat.items():
+                j, k = oj + r, ok + c
+                if 0 <= j < m and 0 <= k < p:
+                    v_col[j * p + k] += coeff
+            for (r, c), coeff in w_pat.items():
+                i, k = oi + r, ok + c
+                if 0 <= i < n and 0 <= k < p:
+                    w_col[k * n + i] += coeff
+            U_cols.append(u_col)
+            V_cols.append(v_col)
+            W_cols.append(w_col)
+
+    def _add_4x4_strassen(oi, oj, ok):
+        """Add recursive Strassen for 4x4 * 4x4 block."""
+        for u_blocks, v_blocks, w_blocks in _SUPER_TERMS:
+            for u_pat, v_pat, w_pat in _S2:
+                u_col = [0] * (n * m)
+                v_col = [0] * (m * p)
+                w_col = [0] * (p * n)
+                for block_idx, block_coeff in u_blocks.items():
+                    br, bc = _BLOCK_OFFSETS[block_idx]
+                    for (r, c), coeff in u_pat.items():
+                        i, j = oi + br + r, oj + bc + c
+                        if 0 <= i < n and 0 <= j < m:
+                            u_col[i * m + j] += block_coeff * coeff
+                for block_idx, block_coeff in v_blocks.items():
+                    br, bc = _BLOCK_OFFSETS[block_idx]
+                    for (r, c), coeff in v_pat.items():
+                        j, k = oj + br + r, ok + bc + c
+                        if 0 <= j < m and 0 <= k < p:
+                            v_col[j * p + k] += block_coeff * coeff
+                for block_idx, block_coeff in w_blocks.items():
+                    br, bc = _BLOCK_OFFSETS[block_idx]
+                    for (r, c), coeff in w_pat.items():
+                        i, k = oi + br + r, ok + bc + c
+                        if 0 <= i < n and 0 <= k < p:
+                            w_col[k * n + i] += block_coeff * coeff
+                U_cols.append(u_col)
+                V_cols.append(v_col)
+                W_cols.append(w_col)
+
+    # PART 1: 4x4 * 4x4 (columns 0-3) using recursive Strassen: rank 49
+    _add_4x4_strassen(0, 0, 0)
+
+    # PART 2: 4x4 * 4x2 (columns 4-5) using 4 independent 2x2*2x2 Strassen: rank 28
+    for rb in range(2):
+        _add_2x2(rb * 2, 0, 4)
+        _add_2x2(rb * 2, 2, 4)
+
+    rank = len(U_cols)
+    U_final = [[U_cols[r][i] for r in range(rank)] for i in range(n * m)]
+    V_final = [[V_cols[r][i] for r in range(rank)] for i in range(m * p)]
+    W_final = [[W_cols[r][i] for r in range(rank)] for i in range(p * n)]
+    return U_final, V_final, W_final
+
+
+def _verify(U, V, W, n, m, p):
+    """Verify the tensor decomposition is correct."""
+    rank = len(U[0])
+    U_arr = np.array(U, dtype=np.int32)
+    V_arr = np.array(V, dtype=np.int32)
+    W_arr = np.array(W, dtype=np.int32)
+    
+    i_vals, j_vals, k_vals = np.meshgrid(
+        np.arange(n), np.arange(m), np.arange(p), indexing='ij'
+    )
+    u_idx = (i_vals * m + j_vals).ravel()
+    v_idx = (j_vals * p + k_vals).ravel()
+    w_idx = (k_vals * n + i_vals).ravel()
+    
+    totals = np.sum(U_arr[u_idx, :] * V_arr[v_idx, :] * W_arr[w_idx, :], axis=1)
+    return bool(np.all(totals == 1))
+
+
+def construct():
+    """
+    Construct a rank-77 tensor decomposition for 4x4 * 4x6 matrix multiplication.
+    
+    Returns a dict with keys 'U', 'V', 'W' where:
+      U: shape (n*m, rank) = (16, rank)
+      V: shape (m*p, rank) = (24, rank)
+      W: shape (p*n, rank) = (24, rank)
+    """
+    n, m, p = 4, 4, 6
+    U_final, V_final, W_final = _build_decomposition()
+    
+    if _verify(U_final, V_final, W_final, n, m, p):
+        return {"U": U_final, "V": V_final, "W": W_final}
+    
+    # Fallback: schoolbook rank-96
+    rank_fb = n * m * p
+    U_fb = [[0] * rank_fb for _ in range(n * m)]
+    V_fb = [[0] * rank_fb for _ in range(m * p)]
+    W_fb = [[0] * rank_fb for _ in range(p * n)]
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U_fb[i * m + j][col] = 1
+                V_fb[j * p + k][col] = 1
+                W_fb[k * n + i][col] = 1
+                col += 1
+    return {"U": U_fb, "V": V_fb, "W": W_fb}

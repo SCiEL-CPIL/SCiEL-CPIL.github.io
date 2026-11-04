@@ -1,0 +1,6 @@
+# ... imports ...
+
+def construct():
+    # Build Rank 112 factors
+    # ... logic ...
+    return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}

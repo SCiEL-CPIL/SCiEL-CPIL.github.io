@@ -1,0 +1,286 @@
+import numpy as np
+from fractions import Fraction
+import itertools
+import time
+import random
+
+DIMENSIONS = [2, 3, 5]
+TIME_LIMIT = 140  # Leave 10s safety margin before 150s kill
+
+def _verify_decomposition(U, V, W, n, m, p):
+    """
+    Verify that sum_r U[:,r] * V[:,r] * W[:,r] == tensor T where T[i,j,k] = 1 for all i,j,k
+    """
+    rank = len(U[0]) if len(U) > 0 else 0
+    U_arr = np.array(U, dtype=float)
+    V_arr = np.array(V, dtype=float)
+    W_arr = np.array(W, dtype=float)
+    
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                idx_u = i * m + j
+                idx_v = j * p + k
+                idx_w = k * n + i
+                s = 0.0
+                for r in range(rank):
+                    s += U_arr[idx_u, r] * V_arr[idx_v, r] * W_arr[idx_w, r]
+                if abs(s - 1.0) > 1e-9:
+                    return False
+    return True
+
+def _build_rank28():
+    """Build the known rank-28 decomposition."""
+    n, m, p = DIMENSIONS
+    rank = 28
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    
+    r = 0
+    
+    # Part 1: A2 B2 (j=2, k=0..4)
+    for i in range(n):
+        for k in range(p):
+            U[i * m + 2][r] = 1
+            V[2 * p + k][r] = 1
+            W[k * n + i][r] = 1
+            r += 1
+            
+    # Part 2: A1 B13 (j=0,1, k=4)
+    for i in range(n):
+        for j in range(2):
+            U[i * m + j][r] = 1
+            V[j * p + 4][r] = 1
+            W[4 * n + i][r] = 1
+            r += 1
+            
+    # Part 3: A1 B11 (j=0,1, k=0,1) using Strassen
+    # M1
+    U[0 * m + 0][r] = 1
+    U[1 * m + 1][r] = 1
+    V[0 * p + 0][r] = 1
+    V[1 * p + 1][r] = 1
+    W[0 * n + 0][r] = 1
+    W[1 * n + 1][r] = 1
+    r += 1
+    
+    # M2
+    U[1 * m + 0][r] = 1
+    U[1 * m + 1][r] = 1
+    V[0 * p + 0][r] = 1
+    W[0 * n + 1][r] = 1
+    W[1 * n + 1][r] = -1
+    r += 1
+    
+    # M3
+    U[0 * m + 0][r] = 1
+    V[0 * p + 1][r] = 1
+    V[1 * p + 1][r] = -1
+    W[1 * n + 0][r] = 1
+    W[1 * n + 1][r] = 1
+    r += 1
+    
+    # M4
+    U[1 * m + 1][r] = 1
+    V[1 * p + 0][r] = 1
+    V[0 * p + 0][r] = -1
+    W[0 * n + 0][r] = 1
+    W[0 * n + 1][r] = 1
+    r += 1
+    
+    # M5
+    U[0 * m + 0][r] = 1
+    U[0 * m + 1][r] = 1
+    V[1 * p + 1][r] = 1
+    W[0 * n + 0][r] = -1
+    W[1 * n + 0][r] = 1
+    r += 1
+    
+    # M6
+    U[1 * m + 0][r] = 1
+    U[0 * m + 0][r] = -1
+    V[0 * p + 0][r] = 1
+    V[0 * p + 1][r] = 1
+    W[1 * n + 1][r] = 1
+    r += 1
+    
+    # M7
+    U[0 * m + 1][r] = 1
+    U[1 * m + 1][r] = -1
+    V[1 * p + 0][r] = 1
+    V[1 * p + 1][r] = 1
+    W[0 * n + 0][r] = 1
+    r += 1
+    
+    # Part 4: A1 B12 (j=0,1, k=2,3) using Strassen
+    # M1
+    U[0 * m + 0][r] = 1
+    U[1 * m + 1][r] = 1
+    V[0 * p + 2][r] = 1
+    V[1 * p + 3][r] = 1
+    W[2 * n + 0][r] = 1
+    W[3 * n + 1][r] = 1
+    r += 1
+    
+    # M2
+    U[1 * m + 0][r] = 1
+    U[1 * m + 1][r] = 1
+    V[0 * p + 2][r] = 1
+    W[2 * n + 1][r] = 1
+    W[3 * n + 1][r] = -1
+    r += 1
+    
+    # M3
+    U[0 * m + 0][r] = 1
+    V[0 * p + 3][r] = 1
+    V[1 * p + 3][r] = -1
+    W[3 * n + 0][r] = 1
+    W[3 * n + 1][r] = 1
+    r += 1
+    
+    # M4
+    U[1 * m + 1][r] = 1
+    V[1 * p + 2][r] = 1
+    V[0 * p + 2][r] = -1
+    W[2 * n + 0][r] = 1
+    W[2 * n + 1][r] = 1
+    r += 1
+    
+    # M5
+    U[0 * m + 0][r] = 1
+    U[0 * m + 1][r] = 1
+    V[1 * p + 3][r] = 1
+    W[2 * n + 0][r] = -1
+    W[3 * n + 0][r] = 1
+    r += 1
+    
+    # M6
+    U[1 * m + 0][r] = 1
+    U[0 * m + 0][r] = -1
+    V[0 * p + 2][r] = 1
+    V[0 * p + 3][r] = 1
+    W[3 * n + 1][r] = 1
+    r += 1
+    
+    # M7
+    U[0 * m + 1][r] = 1
+    U[1 * m + 1][r] = -1
+    V[1 * p + 2][r] = 1
+    V[1 * p + 3][r] = 1
+    W[2 * n + 0][r] = 1
+    r += 1
+    
+    return U, V, W, rank
+
+def _try_rank_reduction(U, V, W, target_rank, n, m, p, time_budget):
+    """
+    Try to reduce the rank by attempting to merge terms.
+    We look for pairs of terms that can be combined.
+    """
+    start_time = time.time()
+    current_rank = len(U[0])
+    
+    if current_rank <= target_rank:
+        return U, V, W, current_rank
+    
+    # Try to find a lower rank by solving a system of equations
+    # For each pair of terms, check if they can be merged
+    # This is a heuristic approach
+    
+    # Convert to numpy for faster computation
+    U_arr = np.array(U, dtype=float)
+    V_arr = np.array(V, dtype=float)
+    W_arr = np.array(W, dtype=float)
+    
+    # Try removing one term at a time and see if the remaining terms can still work
+    # by adjusting coefficients
+    for r_remove in range(current_rank):
+        if time.time() - start_time > time_budget:
+            break
+        
+        # Create masks for all terms except r_remove
+        mask = [i for i in range(current_rank) if i != r_remove]
+        
+        # Check if the remaining terms can span the same space
+        # This is a simplified check - we need to verify the tensor decomposition
+        U_new = U_arr[:, mask]
+        V_new = V_arr[:, mask]
+        W_new = W_arr[:, mask]
+        
+        # Verify
+        valid = True
+        for i in range(n):
+            if not valid:
+                break
+            for j in range(m):
+                if not valid:
+                    break
+                for k in range(p):
+                    idx_u = i * m + j
+                    idx_v = j * p + k
+                    idx_w = k * n + i
+                    s = 0.0
+                    for r in range(len(mask)):
+                        s += U_new[idx_u, r] * V_new[idx_v, r] * W_new[idx_w, r]
+                    if abs(s - 1.0) > 1e-9:
+                        valid = False
+                        break
+        
+        if valid:
+            # Found a valid lower rank decomposition
+            U_list = [[float(x) for x in row] for row in U_new]
+            V_list = [[float(x) for x in row] for row in V_new]
+            W_list = [[float(x) for x in row] for row in W_new]
+            return U_list, V_list, W_list, len(mask)
+    
+    return U, V, W, current_rank
+
+def _search_lower_rank(U, V, W, n, m, p, time_budget):
+    """
+    Search for a lower rank decomposition by trying various transformations.
+    """
+    start_time = time.time()
+    current_rank = len(U[0])
+    best_U, best_V, best_W, best_rank = U, V, W, current_rank
+    
+    # Try Winograd-style transformations
+    # The idea is to use the structure of the problem to find a more efficient decomposition
+    
+    # For 2x3 times 3x5, we can try to exploit the rectangular structure
+    # One approach: group the middle dimension differently
+    
+    # Try various random perturbations and see if we can find a lower rank
+    # This is a heuristic search
+    
+    for attempt in range(100):
+        if time.time() - start_time > time_budget:
+            break
+        
+        # Try a random linear combination of the existing terms
+        # and see if it leads to a lower effective rank
+        pass
+    
+    return best_U, best_V, best_W, best_rank
+
+def construct():
+    n, m, p = DIMENSIONS
+    start_time = time.time()
+    
+    # First, build the known rank-28 decomposition
+    U, V, W, rank = _build_rank28()
+    
+    # Verify it's correct
+    if not _verify_decomposition(U, V, W, n, m, p):
+        raise ValueError("Initial decomposition verification failed")
+    
+    # Try to reduce the rank
+    time_remaining = TIME_LIMIT - (time.time() - start_time)
+    if time_remaining > 5:
+        U, V, W, rank = _try_rank_reduction(U, V, W, rank - 1, n, m, p, time_remaining - 5)
+    
+    # Final verification
+    if not _verify_decomposition(U, V, W, n, m, p):
+        raise ValueError("Final decomposition verification failed")
+    
+    return {"U": U, "V": V, "W": W}

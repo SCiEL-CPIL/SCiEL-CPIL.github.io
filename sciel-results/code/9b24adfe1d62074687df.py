@@ -1,0 +1,452 @@
+"""Circle packing in perimeter-4 rectangle: pack 21 circles, maximize sum of radii."""
+import numpy as np
+import time
+from scipy.optimize import minimize
+
+N = 21
+
+def _validate(circles, w, h, tol=1e-7):
+    """Check if circles are valid: inside rectangle and non-overlapping."""
+    n = len(circles)
+    for i in range(n):
+        cx, cy, r = circles[i]
+        if r <= 0:
+            return False
+        if cx - r < -tol or cx + r > w + tol or cy - r < -tol or cy + r > h + tol:
+            return False
+    cx = circles[:, 0]
+    cy = circles[:, 1]
+    r = circles[:, 2]
+    for i in range(n):
+        dx = cx[i] - cx[i+1:]
+        dy = cy[i] - cy[i+1:]
+        dist = np.sqrt(dx*dx + dy*dy)
+        if np.any(dist < r[i] + r[i+1:] - tol):
+            return False
+    return True
+
+def _total_radius(circles):
+    return float(np.sum(circles[:, 2]))
+
+def _relax_circles(circles, w, h, iterations=500, tol=1e-8):
+    """
+    Relaxation algorithm to resolve overlaps and boundary violations.
+    """
+    n = len(circles)
+    pos = np.array(circles[:, :2], dtype=float)
+    rad = np.array(circles[:, 2], dtype=float)
+
+    for _ in range(iterations):
+        moved = False
+
+        for i in range(n):
+            if pos[i, 0] - rad[i] < 0:
+                pos[i, 0] = rad[i]
+                moved = True
+            if pos[i, 0] + rad[i] > w:
+                pos[i, 0] = w - rad[i]
+                moved = True
+            if pos[i, 1] - rad[i] < 0:
+                pos[i, 1] = rad[i]
+                moved = True
+            if pos[i, 1] + rad[i] > h:
+                pos[i, 1] = h - rad[i]
+                moved = True
+
+        for i in range(n):
+            dx = pos[i+1:, 0] - pos[i, 0]
+            dy = pos[i+1:, 1] - pos[i, 1]
+            dist = np.sqrt(dx*dx + dy*dy)
+            min_dist = rad[i] + rad[i+1:]
+            overlap = min_dist - dist
+            
+            for k in range(len(overlap)):
+                if overlap[k] > 0:
+                    if dist[k] < 1e-9:
+                        angle = np.random.uniform(0, 2 * np.pi)
+                        push = overlap[k] / 2.0
+                        pos[i, 0] -= np.cos(angle) * push
+                        pos[i, 1] -= np.sin(angle) * push
+                        pos[i+1+k, 0] += np.cos(angle) * push
+                        pos[i+1+k, 1] += np.sin(angle) * push
+                    else:
+                        push = overlap[k] / 2.0
+                        ux = dx[k] / dist[k]
+                        uy = dy[k] / dist[k]
+                        pos[i, 0] -= ux * push
+                        pos[i, 1] -= uy * push
+                        pos[i+1+k, 0] += ux * push
+                        pos[i+1+k, 1] += uy * push
+                    moved = True
+
+        if not moved:
+            break
+
+    for i in range(n):
+        pos[i, 0] = np.clip(pos[i, 0], rad[i], w - rad[i])
+        pos[i, 1] = np.clip(pos[i, 1], rad[i], h - rad[i])
+
+    new_circles = np.column_stack((pos, rad))
+
+    if _validate(new_circles, w, h, tol=1e-6):
+        return new_circles
+
+    return circles
+
+def _make_hexagonal_grid(n, w, h):
+    """Create initial hexagonal-like arrangement for 21 circles."""
+    rows = [5, 4, 5, 4, 3]
+    circles = []
+    total_rows = len(rows)
+    
+    for row_i, count in enumerate(rows):
+        y = (row_i + 0.5) * h / total_rows
+        for col_j in range(count):
+            offset = 0.5 * (w / 5) if row_i % 2 == 1 else 0
+            x = (col_j + 0.5) * w / 5 + offset
+            r = 0.35 * min(w/5, h/total_rows)
+            circles.append([x, y, r])
+    
+    return np.array(circles[:n])
+
+def _make_grid(n, w, h):
+    """Fallback grid initialization."""
+    side = int(np.ceil(np.sqrt(n)))
+    cells = []
+    for i in range(side):
+        for j in range(side):
+            cx = (i + 0.5) * w / side
+            cy = (j + 0.5) * h / side
+            r = 0.5 * min(w, h) / side * 0.9
+            cells.append([cx, cy, r])
+    return np.array(cells[:n])
+
+def _smooth_max(x, c):
+    """Smooth maximum of x and 0 using log-sum-exp."""
+    return c * np.logaddexp(0, x / c)
+
+def _smooth_max_grad(x, c):
+    """Gradient of smooth maximum of x and 0."""
+    return 1.0 / (1.0 + np.exp(-x / c))
+
+def _objective_and_grad(x, w, h, beta, c):
+    """
+    Compute objective and gradient for the penalty-based optimization.
+    x = [x1..xn, y1..yn, r1..rn]
+    """
+    n = N
+    cx = x[:n]
+    cy = x[n:2*n]
+    r = x[2*n:]
+    
+    obj = -np.sum(r)
+    grad = np.zeros_like(x)
+    grad[2*n:] = -1.0
+    
+    # Boundary penalties
+    for i in range(n):
+        # Left boundary: cx[i] - r[i] >= 0
+        val = cx[i] - r[i]
+        if val < c:
+            s = _smooth_max(-val, c)
+            ds = _smooth_max_grad(-val, c)
+            obj += beta * s
+            grad[i] += beta * ds
+            grad[2*n+i] -= beta * ds
+        
+        # Right boundary: w - cx[i] - r[i] >= 0
+        val = w - cx[i] - r[i]
+        if val < c:
+            s = _smooth_max(-val, c)
+            ds = _smooth_max_grad(-val, c)
+            obj += beta * s
+            grad[i] -= beta * ds
+            grad[2*n+i] -= beta * ds
+        
+        # Bottom boundary: cy[i] - r[i] >= 0
+        val = cy[i] - r[i]
+        if val < c:
+            s = _smooth_max(-val, c)
+            ds = _smooth_max_grad(-val, c)
+            obj += beta * s
+            grad[n+i] += beta * ds
+            grad[2*n+i] -= beta * ds
+        
+        # Top boundary: h - cy[i] - r[i] >= 0
+        val = h - cy[i] - r[i]
+        if val < c:
+            s = _smooth_max(-val, c)
+            ds = _smooth_max_grad(-val, c)
+            obj += beta * s
+            grad[n+i] -= beta * ds
+            grad[2*n+i] -= beta * ds
+    
+    # Overlap penalties
+    for i in range(n):
+        for j in range(i+1, n):
+            dx = cx[i] - cx[j]
+            dy = cy[i] - cy[j]
+            dist_sq = dx*dx + dy*dy
+            min_dist = r[i] + r[j]
+            
+            if dist_sq < (min_dist + c)**2:
+                dist = np.sqrt(dist_sq + 1e-12)
+                gap = dist - min_dist
+                if gap < c:
+                    s = _smooth_max(-gap, c)
+                    ds = _smooth_max_grad(-gap, c)
+                    obj += beta * s
+                    
+                    # d(dist)/dx_i = -dx/dist, d(dist)/dx_j = dx/dist
+                    # d(gap)/dx_i = -dx/dist, d(gap)/dx_j = dx/dist
+                    # d(gap)/dr_i = -1, d(gap)/dr_j = -1
+                    ux = dx / dist
+                    uy = dy / dist
+                    
+                    grad[i] += beta * ds * (-ux)
+                    grad[j] += beta * ds * ux
+                    grad[n+i] += beta * ds * (-uy)
+                    grad[n+j] += beta * ds * uy
+                    grad[2*n+i] += beta * ds * (-1)
+                    grad[2*n+j] += beta * ds * (-1)
+    
+    return obj, grad
+
+def _penalty_optimize(circles, w, h, deadline):
+    """
+    Penalty-based optimization using L-BFGS-B with progressive parameters.
+    """
+    if time.time() > deadline - 5.0:
+        return None
+
+    n = N
+    x0 = np.concatenate([circles[:, 0], circles[:, 1], circles[:, 2]])
+    
+    # Bounds
+    bounds = []
+    for i in range(n):
+        bounds.append((1e-6, w))
+        bounds.append((1e-6, h))
+    for i in range(n):
+        bounds.append((1e-6, min(w, h)/2))
+
+    # Progressive schedule
+    betas = [10.0, 50.0, 100.0, 500.0, 1000.0]
+    cs = [0.01, 0.005, 0.001, 0.0005, 0.0001]
+    x = x0.copy()
+    
+    for beta, c in zip(betas, cs):
+        if time.time() > deadline - 3.0:
+            break
+        
+        try:
+            res = minimize(
+                lambda x: _objective_and_grad(x, w, h, beta, c)[0],
+                x,
+                jac=lambda x: _objective_and_grad(x, w, h, beta, c)[1],
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={'maxiter': 100, 'ftol': 1e-12, 'gtol': 1e-10}
+            )
+            if res.success or res.fun < 0:
+                x = res.x
+        except Exception:
+            pass
+    
+    new_circles = np.column_stack((x[:n], x[n:2*n], x[2*n:]))
+    new_circles = _relax_circles(new_circles, w, h, iterations=200)
+    
+    if _validate(new_circles, w, h, tol=1e-5):
+        return new_circles
+    
+    return None
+
+def _high_precision_polish(circles, w, h, deadline):
+    """
+    Final high-precision polish with very tight tolerances.
+    """
+    if time.time() > deadline - 8.0:
+        return None
+
+    n = N
+    x0 = np.concatenate([circles[:, 0], circles[:, 1], circles[:, 2]])
+    
+    bounds = []
+    for i in range(n):
+        bounds.append((circles[i, 2] - 1e-8, w - circles[i, 2] + 1e-8))
+        bounds.append((circles[i, 2] - 1e-8, h - circles[i, 2] + 1e-8))
+    for i in range(n):
+        bounds.append((circles[i, 2] * 0.99, min(w, h) / 2))
+
+    betas = [500.0, 1000.0, 5000.0]
+    cs = [0.0001, 0.00001, 0.000001]
+    x = x0.copy()
+    
+    for beta, c in zip(betas, cs):
+        if time.time() > deadline - 3.0:
+            break
+        
+        try:
+            res = minimize(
+                lambda x: _objective_and_grad(x, w, h, beta, c)[0],
+                x,
+                jac=lambda x: _objective_and_grad(x, w, h, beta, c)[1],
+                method='L-BFGS-B',
+                bounds=bounds,
+                options={'maxiter': 150, 'ftol': 1e-14, 'gtol': 1e-12}
+            )
+            if res.success or res.fun < 0:
+                x = res.x
+        except Exception:
+            pass
+    
+    new_circles = np.column_stack((x[:n], x[n:2*n], x[2*n:]))
+    new_circles = _relax_circles(new_circles, w, h, iterations=300)
+    
+    if _validate(new_circles, w, h, tol=1e-6):
+        return new_circles
+    
+    return None
+
+def _slsqp_polish(circles, w, h, deadline):
+    """
+    Final polish using SLSQP with hard constraints.
+    """
+    if time.time() > deadline - 8.0:
+        return None
+
+    n = N
+    x0 = np.concatenate([circles[:, 0], circles[:, 1], circles[:, 2]])
+
+    def objective(x):
+        return -np.sum(x[2*n:])
+
+    constraints = []
+    for i in range(n):
+        constraints.append({'type': 'ineq', 'fun': lambda x, i=i: x[i] - x[2*n+i]})
+        constraints.append({'type': 'ineq', 'fun': lambda x, i=i: w - x[i] - x[2*n+i]})
+        constraints.append({'type': 'ineq', 'fun': lambda x, i=i: x[n+i] - x[2*n+i]})
+        constraints.append({'type': 'ineq', 'fun': lambda x, i=i: h - x[n+i] - x[2*n+i]})
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            constraints.append({
+                'type': 'ineq',
+                'fun': lambda x, i=i, j=j: np.sqrt((x[i]-x[j])**2 + (x[n+i]-x[n+j])**2) - x[2*n+i] - x[2*n+j]
+            })
+
+    bounds = []
+    for i in range(n):
+        bounds.append((1e-6, w))
+        bounds.append((1e-6, h))
+    for i in range(n):
+        bounds.append((1e-6, min(w, h)/2))
+
+    try:
+        res = minimize(
+            objective,
+            x0,
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints,
+            options={'maxiter': 50, 'ftol': 1e-10}
+        )
+
+        if res.success:
+            new_circles = np.column_stack((res.x[:n], res.x[n:2*n], res.x[2*n:]))
+            if _validate(new_circles, w, h, tol=1e-5):
+                return new_circles
+    except Exception:
+        pass
+
+    return None
+
+def _optimize_for_aspect(ar, deadline):
+    """Optimize for a given aspect ratio."""
+    w = ar / (1 + ar) * 2
+    h = 1 / (1 + ar) * 2
+    
+    best_value = 0.0
+    best_result = None
+    
+    for (ww, hh) in [(w, h), (h, w)]:
+        if time.time() > deadline - 10.0:
+            break
+        
+        try:
+            # Initialize with hexagonal grid
+            circles = _make_hexagonal_grid(N, ww, hh)
+            circles = _relax_circles(circles, ww, hh, iterations=300)
+            
+            if not _validate(circles, ww, hh):
+                continue
+            
+            current_value = _total_radius(circles)
+            
+            # Penalty-based optimization
+            if time.time() < deadline - 15.0:
+                optimized = _penalty_optimize(circles, ww, hh, deadline)
+                if optimized is not None:
+                    circles = optimized
+                    current_value = _total_radius(circles)
+            
+            # High-precision polish
+            if time.time() < deadline - 10.0:
+                polished = _high_precision_polish(circles, ww, hh, deadline)
+                if polished is not None:
+                    circles = polished
+                    current_value = _total_radius(circles)
+            
+            # SLSQP polish
+            if time.time() < deadline - 8.0:
+                polished = _slsqp_polish(circles, ww, hh, deadline)
+                if polished is not None:
+                    circles = polished
+                    current_value = _total_radius(circles)
+            
+            if current_value > best_value:
+                best_value = current_value
+                best_result = circles.copy()
+                
+        except Exception:
+            continue
+    
+    return best_value, best_result
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140.0  # safety margin before 150s kill
+
+    best_value = 0.0
+    best_result = None
+
+    # Try a range of aspect ratios
+    ratios = [1.0, 0.85, 1.18, 0.75, 1.35, 0.65, 1.55, 0.55, 1.8, 0.48, 2.0, 0.42, 2.2]
+    
+    for ar in ratios:
+        if time.time() > deadline - 12.0:
+            break
+        
+        try:
+            value, result = _optimize_for_aspect(ar, deadline)
+            if result is not None and value > best_value:
+                best_value = value
+                best_result = result
+        except Exception:
+            continue
+
+    # Fallback
+    if best_result is None:
+        side = int(np.ceil(np.sqrt(N)))
+        cells = []
+        for i in range(side):
+            for j in range(side):
+                if len(cells) >= N:
+                    break
+                x = (i + 0.5) * 1.0 / side
+                y = (j + 0.5) * 1.0 / side
+                r = 0.5 / side - 1e-3
+                cells.append([x, y, r])
+        return np.array(cells[:N])
+    
+    return best_result

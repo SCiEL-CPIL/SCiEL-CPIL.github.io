@@ -1,9 +1,11 @@
-"""Rewritten program: Subgradient/Smooth optimization for low off-diagonal autocorrelation."""
+"""Combined: Zadoff-Chu chirp parameterization + L-BFGS-B smooth off-diagonal optimization."""
 import numpy as np
 import time
 from scipy.optimize import minimize
 
 N = 400
+# Safety margin before the 150s kill
+SAFETY = 10.0
 
 def _autoconv(x):
     """Linear autoconvolution via FFT."""
@@ -22,7 +24,6 @@ def _metric_offdiag(x):
     if abs(s) < 1e-12:
         return float('inf')
     c = _autoconv(x)
-    # Exclude k=0
     if len(c) > 1:
         max_val = np.max(np.abs(c[1:]))
     else:
@@ -39,12 +40,22 @@ def _objective_smooth(x, temp=1.0):
         abs_c = np.abs(c[1:])
     else:
         return 0.0
-    # Soft max: temp * log(sum(exp(c/temp)))
     max_c = np.max(abs_c)
+    if max_c < 1e-15:
+        return 0.0
     soft_max = max_c + temp * np.log(np.sum(np.exp((abs_c - max_c) / temp)))
     return soft_max / (s * s)
 
-def _gradient_descent_polish(x0, max_iter=500, initial_lr=0.01, deadline=None):
+def _chirp_sequence(alpha, beta, gamma, phi0):
+    """
+    Generate a real-valued sequence from a quadratic chirp phase.
+    """
+    n = np.arange(N)
+    phase = alpha * n**2 + beta * n + gamma + phi0
+    x = np.cos(phase)
+    return x
+
+def _gradient_descent_polish(x0, max_iter=2000, initial_lr=0.005, deadline=None):
     """Projected gradient descent with annealed temperature for final polish."""
     x = x0.copy().astype(float)
     s = np.sum(x)
@@ -59,6 +70,9 @@ def _gradient_descent_polish(x0, max_iter=500, initial_lr=0.01, deadline=None):
     
     lr = initial_lr
     temp = 0.5
+    prev_val = best_val
+    stall_count = 0
+    max_stall = 50
     
     for i in range(max_iter):
         if deadline is not None and time.time() > deadline:
@@ -86,23 +100,14 @@ def _gradient_descent_polish(x0, max_iter=500, initial_lr=0.01, deadline=None):
         # Gradient w.r.t. c (chain rule: d|c|/dc = sign(c))
         c_off = c[1:]
         sign_c = np.sign(c_off)
+        # Handle zeros: use subgradient 0
+        sign_c[abs_c < 1e-15] = 0.0
         grad_c = grad_abs_c * sign_c
         
         # Gradient of autoconvolution w.r.t. x
-        # c_k = sum_i x_i * x_{i+k}, so dc_k/dx_j = x_{j-k} + x_{j+k} (with bounds)
-        # This is expensive to compute directly; use FFT-based approach
-        # For simplicity, use numerical gradient or approximate
-        
-        # Instead, use the fact that the gradient of sum_k w_k * c_k w.r.t. x
-        # can be computed via cross-correlation
-        # grad_x[j] = sum_k w_k * (x[j-k] + x[j+k]) where w_k = grad_c[k-1]
-        
-        # Build the weight vector for cross-correlation
         w = np.zeros(2 * N - 1)
         w[1:] = grad_c
         
-        # Cross-correlation: grad_x[j] = sum_k w[k] * x[j-k] (with proper indexing)
-        # Using FFT: if W = fft(w), then grad_x = ifft(W * conj(X))
         fsize = 1
         while fsize < 2 * N:
             fsize *= 2
@@ -110,63 +115,102 @@ def _gradient_descent_polish(x0, max_iter=500, initial_lr=0.01, deadline=None):
         W = np.fft.rfft(w, fsize)
         grad_x = np.fft.irfft(W * np.conj(X), fsize)[:N]
         
-        # Also need to account for the (sum x)^2 denominator
+        # Account for the (sum x)^2 denominator
         s = np.sum(x)
         metric = soft_max / (s * s)
         
-        # Gradient of metric = (grad_soft_max * s^2 - soft_max * 2*s * ones) / s^4
-        # = (grad_soft_max / s^2) - 2 * soft_max * ones / s^3
+        # Gradient of metric
         grad_metric = grad_x / (s * s) - 2.0 * soft_max * np.ones(N) / (s ** 3)
         
-        # Update
-        x_new = x - lr * grad_metric
-        
-        # Project: keep sum non-zero (scale to sum=1 if needed)
-        s_new = np.sum(x_new)
-        if abs(s_new) < 1e-12:
-            x_new = x + 1e-6 * np.random.randn(N)
+        # Adaptive step: backtracking line search
+        best_x_new = x
+        best_val_new = prev_val
+        for trial in range(10):
+            x_new = x - lr * grad_metric
             s_new = np.sum(x_new)
-        x_new = x_new / s_new
+            if abs(s_new) < 1e-12:
+                break
+            x_new = x_new / s_new
+            val_new = _metric_offdiag(x_new)
+            if val_new < prev_val * (1.0 - 1e-4):
+                best_x_new = x_new
+                best_val_new = val_new
+                break
+            lr *= 0.5
+            if lr < 1e-10:
+                break
         
-        # Evaluate
-        val = _metric_offdiag(x_new)
-        if val < best_val:
-            best_val = val
-            best_x = x_new.copy()
+        x = best_x_new
+        prev_val = best_val_new
+        
+        if val_new < best_val:
+            best_val = val_new
+            best_x = x.copy()
+            stall_count = 0
+        else:
+            stall_count += 1
         
         # Decay learning rate and temperature
-        x = x_new
-        lr *= 0.995
-        temp *= 0.999
+        lr *= 0.998
+        temp *= 0.9995
+        
+        if stall_count > max_stall:
+            break
         
     return best_x
 
 def construct():
     t0 = time.time()
-    deadline = t0 + 115.0
+    deadline = t0 + 150.0 - SAFETY
     
     best_x = np.ones(N)
     best_val = _metric_offdiag(best_x)
     
     rng = np.random.default_rng(42)
     
-    # Generate diverse initial candidates
+    # Strategy 1: Quick chirp starts (much faster than grid search)
+    chirp_candidates = []
+    alpha_vals = [0.05, 0.1, 0.15, 0.2, 0.3, 0.5]
+    beta_vals = [0.0, 0.1, 0.2, 0.3]
+    
+    for alpha in alpha_vals:
+        if time.time() > deadline - 60:
+            break
+        for beta in beta_vals:
+            if time.time() > deadline - 60:
+                break
+            # Quick optimization of gamma, phi0
+            try:
+                res = minimize(
+                    lambda p, a=alpha, b=beta: _objective_smooth(_chirp_sequence(a, b, p[0], p[1]), temp=0.5),
+                    [0.0, 0.0],
+                    method='L-BFGS-B',
+                    options={'maxiter': 30, 'ftol': 1e-8, 'gtol': 1e-6}
+                )
+                x_chirp = _chirp_sequence(alpha, beta, res.x[0], res.x[1])
+                chirp_candidates.append(x_chirp)
+                val = _metric_offdiag(x_chirp)
+                if val < best_val:
+                    best_val = val
+                    best_x = x_chirp.copy()
+            except Exception:
+                pass
+    
+    # Strategy 2: Generate diverse initial candidates
     candidates = []
     
     # 1. All ones
     candidates.append(np.ones(N))
     
     # 2. Random sequences with non-zero mean
-    for _ in range(15):
+    for _ in range(20):
         r = rng.random(N)
-        # Bias towards positive to ensure non-zero sum
         x = np.where(r > 0.35, 1.0, -1.0)
         if abs(np.sum(x)) > 5:
             candidates.append(x)
             
-    # 3. M-sequences (if available, otherwise approximate)
-    # Simple pseudo-random binary sequence
-    for _ in range(10):
+    # 3. Pseudo-random binary
+    for _ in range(15):
         x = rng.choice([-1, 1], N)
         if abs(np.sum(x)) > 5:
             candidates.append(x)
@@ -179,51 +223,53 @@ def construct():
                 pattern[i] = 1.0
             else:
                 pattern[i] = -1.0
-        # Add small bias to ensure sum != 0
         pattern[0] += 0.5
         candidates.append(pattern)
     
-    # 5. Sine wave patterns with random phase
+    # 5. Sine wave patterns
     for freq in [1, 2, 5, 10]:
         for phase in [0, np.pi/2, np.pi]:
             t = np.arange(N)
             pattern = np.sin(2 * np.pi * freq * t / N + phase)
-            # Convert to signed step function
             pattern = np.sign(pattern)
-            # Ensure non-zero sum
             if abs(np.sum(pattern)) < 1:
                 pattern[0] = 1.0
             candidates.append(pattern)
-
-    # Optimize candidates
+    
+    # 6. Add chirp candidates
+    for xc in chirp_candidates:
+        candidates.append(xc.copy())
+    
+    # Add the best so far
+    candidates.append(best_x.copy())
+    
+    # Optimize candidates with L-BFGS-B
     for x0 in candidates:
         if time.time() > deadline - 30:
             break
             
         x0 = x0.copy()
-        # Normalize sum to 1 to handle scale invariance
         s0 = np.sum(x0)
         if abs(s0) < 1e-6:
             continue
         x0 = x0 / s0
         
-        # Use L-BFGS-B with smooth objective, annealing temperature
         try:
             # First pass with higher temperature
             res1 = minimize(
-                lambda x: _objective_smooth(x, temp=1.0),
+                lambda x, t=1.0: _objective_smooth(x, temp=t),
                 x0,
                 method='L-BFGS-B',
-                options={'maxiter': 100, 'ftol': 1e-10, 'gtol': 1e-8}
+                options={'maxiter': 150, 'ftol': 1e-10, 'gtol': 1e-8}
             )
             x_mid = res1.x
             
             # Second pass with lower temperature
             res2 = minimize(
-                lambda x: _objective_smooth(x, temp=0.1),
+                lambda x, t=0.1: _objective_smooth(x, temp=t),
                 x_mid,
                 method='L-BFGS-B',
-                options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-10}
+                options={'maxiter': 300, 'ftol': 1e-12, 'gtol': 1e-10}
             )
             x_opt = res2.x
             
@@ -239,7 +285,7 @@ def construct():
         try:
             polished = _gradient_descent_polish(
                 best_x, 
-                max_iter=1000, 
+                max_iter=3000, 
                 initial_lr=0.005,
                 deadline=deadline - 5
             )

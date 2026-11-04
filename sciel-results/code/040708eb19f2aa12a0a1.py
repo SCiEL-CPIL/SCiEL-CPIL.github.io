@@ -1,0 +1,23 @@
+import numpy as np
+
+def construct():
+    n, m, p = 3, 4, 6
+    rank = 48
+    U = np.zeros((n * m, rank))
+    V = np.zeros((m * p, rank))
+    W = np.zeros((p * n, rank))
+    
+    col = 0
+    # Iterate over all i, j, k
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                # U row i*m + j
+                # V row j*p + k
+                # W row k*n + i
+                U[i * m + j, col] = 1
+                V[j * p + k, col] = 1
+                W[k * n + i, col] = 1
+                col += 1
+                
+    return {"U": U, "V": V, "W": W}

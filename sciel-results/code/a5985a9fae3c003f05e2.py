@@ -1,0 +1,6 @@
+def _construct_rank14():
+    ...
+    deadline = time.time() + 140
+    found = _try_find_rank14()
+    ...
+    rank_school = n * m * p

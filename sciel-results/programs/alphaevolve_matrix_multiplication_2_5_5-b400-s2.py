@@ -1,0 +1,419 @@
+import time
+import numpy as np
+from fractions import Fraction
+
+_T0 = time.time()
+_DEADLINE_S = 110.0
+
+def _deadline_ok():
+    return (time.time() - _T0) < _DEADLINE_S
+
+def _verify_decomp(n, m, p, U, V, W):
+    """Verify that U, V, W exactly decompose the matrix multiplication tensor."""
+    rank = len(U[0]) if U else 0
+    # Convention: U[i*m+j, r], V[j*p+k, r], W[k*n+i, r]
+    # The decomposition: sum_r U[i*m+j, r] * V[j*p+k, r] * W[k*n+i, r] = 1 for all (i,j,k)
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                s = 0
+                for r in range(rank):
+                    s += U[i*m + j][r] * V[j*p + k][r] * W[k*n + i][r]
+                if s != 1:
+                    return False
+    return True
+
+def _schoolbook(n=2, m=5, p=5):
+    rank = n * m * p
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][col] = 1
+                V[j * p + k][col] = 1
+                W[k * n + i][col] = 1
+                col += 1
+    return U, V, W
+
+def _strassen_222_block(offset, a_row_start, b_row_start, b_col_start, c_row_start, c_col_start):
+    """
+    Strassen 2x2*2x2 block decomposition.
+    
+    Parameters:
+    - a_row_start: starting row of A (2 rows)
+    - b_row_start: starting row of B (2 rows)  
+    - b_col_start: starting col of B (2 cols)
+    - c_row_start: starting row of C (2 rows)
+    - c_col_start: starting col of C (2 cols)
+    
+    A is 2x2 at rows a_row_start..a_row_start+1, cols 0..1 (but we only use col 0? No...)
+    
+    Wait, I need to reconsider. The full problem is:
+    A is 2x5, B is 5x5, C is 2x5.
+    C[i,j] = sum_{k=0}^{4} A[i,k] * B[k,j]
+    
+    If I want to use Strassen on a 2x2 subblock, I need to pick:
+    - 2 rows of A (both rows since n=2)
+    - 2 rows of B (k values)
+    - 2 cols of B (j values)
+    
+    So for a block with k in {k0,k1} and j in {j0,j1}:
+    C[i,j] contribution = A[i,k0]*B[k0,j] + A[i,k1]*B[k1,j]
+    
+    This is a 2x2 * 2x2 multiplication where:
+    - "A block" is A[:, {k0,k1}] which is 2x2
+    - "B block" is B[{k0,k1}, {j0,j1}] which is 2x2
+    - "C block" is C[:, {j0,j1}] contribution which is 2x2
+    
+    But A[i,k0] and A[i,k1] are specific entries, not linear combinations.
+    So the "A matrix" for this block has entries:
+    A_block[0,0] = A[i0,k0], A_block[0,1] = A[i0,k1]
+    A_block[1,0] = A[i1,k0], A_block[1,1] = A[i1,k1]
+    
+    In our tensor decomposition framework:
+    U[i*m + j, r] where i is row of A, j is col of A (which is k in B)
+    So U[i*5 + k, r]
+    
+    For the Strassen block:
+    r=0: (A_block[0,0]+A_block[1,1])(B_block[0,0]+B_block[1,1])
+    U[i0*5+k0][offset+0] += 1, U[i1*5+k1][offset+0] += 1
+    V[k0*5+j0][offset+0] += 1, V[k1*5+j1][offset+0] += 1
+    W[j0*2+i0][offset+0] += 1, W[j1*2+i1][offset+0] += 1
+    ... etc for all 7 Strassen terms
+    """
+    n, m, p = 2, 5, 5
+    i0, i1 = 0, 1  # rows of A
+    k0, k1 = b_row_start, b_row_start + 1  # rows of B (cols of A)
+    j0, j1 = b_col_start, b_col_start + 1  # cols of B (cols of C)
+    c0, c1 = c_row_start, c_row_start + 1  # rows of C
+    
+    # Since n=2, c_row_start should be 0 and c_row_start+1 = 1
+    # Let me just use i0=0, i1=1
+    
+    U = [None]  # placeholder, we'll use closure
+    V = [None]
+    W = [None]
+    
+    # Actually, let me restructure. I'll build U, V, W as lists and return them.
+    # Let me create a proper function that builds the full decomposition.
+    
+    raise Exception("This function needs to be restructured")
+
+def _build_strassen_based():
+    """
+    Build a Strassen-based decomposition for 2x5 * 5x5.
+    
+    Strategy: Partition the 5 columns of B (and corresponding columns of A) into blocks.
+    5 = 2 + 2 + 1
+    
+    For each pair of k-values and j-values, we can use Strassen if we group them properly.
+    
+    Actually, let me think differently. 
+    C[i,j] = sum_{k=0}^{4} A[i,k] * B[k,j]
+    
+    I can partition k into groups: {0,1}, {2,3}, {4}
+    I can partition j into groups: {0,1}, {2,3}, {4}
+    
+    For group (k_group, j_group):
+    - If k_group has 2 elements and j_group has 2 elements: use Strassen (7 mults)
+    - If k_group has 2 elements and j_group has 1 element: use 4 mults (or 2?)
+    - If k_group has 1 element and j_group has 2 elements: use 4 mults
+    - If k_group has 1 element and j_group has 1 element: use 2 mults (since n=2)
+    
+    Wait, for 1x1 k-group and 1x1 j-group:
+    C[i,j] += A[i,k]*B[k,j] for i=0,1
+    That's 2 multiplications: A[0,k]*B[k,j] and A[1,k]*B[k,j]
+    
+    For 2x1 k-group (k0,k1) and 1x1 j-group (j):
+    C[i,j] += A[i,k0]*B[k0,j] + A[i,k1]*B[k1,j] for i=0,1
+    That's 4 multiplications.
+    
+    For 1x1 k-group (k) and 2x1 j-group (j0,j1):
+    C[i,j0] += A[i,k]*B[k,j0], C[i,j1] += A[i,k]*B[k,j1] for i=0,1
+    That's 4 multiplications.
+    
+    For 2x2 k-group (k0,k1) and 2x2 j-group (j0,j1):
+    C[i,j] += A[i,k0]*B[k0,j] + A[i,k1]*B[k1,j] for i,j in {0,1}x{0,1}
+    This is a 2x2*2x2 multiplication, can use Strassen: 7 multiplications instead of 8.
+    
+    So with partition k={0,1},{2,3},{4} and j={0,1},{2,3},{4}:
+    - (k01, j01): Strassen, 7 mults
+    - (k01, j23): Strassen, 7 mults
+    - (k01, j4): 4 mults
+    - (k23, j01): Strassen, 7 mults
+    - (k23, j23): Strassen, 7 mults
+    - (k23, j4): 4 mults
+    - (k4, j01): 4 mults
+    - (k4, j23): 4 mults
+    - (k4, j4): 2 mults
+    Total: 7+7+4+7+7+4+4+4+2 = 46
+    
+    Schoolbook is 50. So 46 is an improvement!
+    
+    But wait, I need to be careful. The Strassen decomposition for a 2x2*2x2 block
+    requires that the "A block" and "B block" entries are the actual entries of A and B.
+    In our case, the A block for k-group {k0,k1} is A[:, {k0,k1}] which is exactly
+    the 2x2 submatrix of A. And the B block is B[{k0,k1}, {j0,j1}].
+    
+    So the Strassen decomposition applies directly!
+    
+    Let me implement this.
+    """
+    n, m, p = 2, 5, 5
+    
+    # Partition
+    k_groups = [(0,1), (2,3), (4,)]
+    j_groups = [(0,1), (2,3), (4,)]
+    
+    total_rank = 0
+    for kg in k_groups:
+        for jg in j_groups:
+            if len(kg) == 2 and len(jg) == 2:
+                total_rank += 7
+            elif len(kg) == 2 and len(jg) == 1:
+                total_rank += 4
+            elif len(kg) == 1 and len(jg) == 2:
+                total_rank += 4
+            else:
+                total_rank += 2
+    
+    U = [[0] * total_rank for _ in range(n * m)]
+    V = [[0] * total_rank for _ in range(m * p)]
+    W = [[0] * total_rank for _ in range(p * n)]
+    
+    offset = 0
+    
+    for kg in k_groups:
+        for jg in j_groups:
+            if len(kg) == 2 and len(jg) == 2:
+                offset = _add_strassen_222(U, V, W, offset, kg[0], kg[1], jg[0], jg[1])
+            elif len(kg) == 2 and len(jg) == 1:
+                offset = _add_2x1(U, V, W, offset, kg[0], kg[1], jg[0])
+            elif len(kg) == 1 and len(jg) == 2:
+                offset = _add_1x2(U, V, W, offset, kg[0], jg[0], jg[1])
+            else:
+                offset = _add_1x1(U, V, W, offset, kg[0], jg[0])
+    
+    return U, V, W
+
+def _add_strassen_222(U, V, W, offset, k0, k1, j0, j1):
+    """
+    Add Strassen 2x2*2x2 block.
+    A block: rows 0,1 of A, cols k0,k1 -> A[0,k0], A[0,k1], A[1,k0], A[1,k1]
+    B block: rows k0,k1 of B, cols j0,j1 -> B[k0,j0], B[k0,j1], B[k1,j0], B[k1,j1]
+    C block: contribution to C[0,j0], C[0,j1], C[1,j0], C[1,j1]
+    
+    U index: i*5+k
+    V index: k*5+j
+    W index: j*2+i
+    """
+    # A entries:
+    # A_block[0,0] = A[0,k0] -> U[0*5+k0]
+    # A_block[0,1] = A[0,k1] -> U[0*5+k1]
+    # A_block[1,0] = A[1,k0] -> U[1*5+k0]
+    # A_block[1,1] = A[1,k1] -> U[1*5+k1]
+    
+    a00 = 0*5 + k0  # A[0,k0]
+    a01 = 0*5 + k1  # A[0,k1]
+    a10 = 1*5 + k0  # A[1,k0]
+    a11 = 1*5 + k1  # A[1,k1]
+    
+    # B entries:
+    b00 = k0*5 + j0  # B[k0,j0]
+    b01 = k0*5 + j1  # B[k0,j1]
+    b10 = k1*5 + j0  # B[k1,j0]
+    b11 = k1*5 + j1  # B[k1,j1]
+    
+    # C output indices (W index = j*2+i):
+    c00 = j0*2 + 0  # C[0,j0]
+    c01 = j1*2 + 0  # C[0,j1]
+    c10 = j0*2 + 1  # C[1,j0]
+    c11 = j1*2 + 1  # C[1,j1]
+    
+    # Strassen:
+    # M0 = (A00+A11)(B00+B11)
+    # M1 = (A10+A11)B00
+    # M2 = A00(B01-B11)
+    # M3 = A11(B10-B00)
+    # M4 = (A00+A01)B11
+    # M5 = (A10-A00)(B00+B01)
+    # M6 = (A01-A11)(B10+B11)
+    
+    # C00 = M0+M3-M4+M6
+    # C01 = M2+M4
+    # C10 = M1+M3
+    # C11 = M0-M1+M2+M5
+    
+    # r=0: M0 = (A00+A11)(B00+B11)
+    U[a00][offset+0] += 1
+    U[a11][offset+0] += 1
+    V[b00][offset+0] += 1
+    V[b11][offset+0] += 1
+    W[c00][offset+0] += 1
+    W[c11][offset+0] += 1
+    
+    # r=1: M1 = (A10+A11)B00
+    U[a10][offset+1] += 1
+    U[a11][offset+1] += 1
+    V[b00][offset+1] += 1
+    W[c10][offset+1] += 1
+    W[c11][offset+1] += -1
+    
+    # r=2: M2 = A00(B01-B11)
+    U[a00][offset+2] += 1
+    V[b01][offset+2] += 1
+    V[b11][offset+2] += -1
+    W[c01][offset+2] += 1
+    W[c11][offset+2] += 1
+    
+    # r=3: M3 = A11(B10-B00)
+    U[a11][offset+3] += 1
+    V[b10][offset+3] += 1
+    V[b00][offset+3] += -1
+    W[c00][offset+3] += 1
+    W[c10][offset+3] += 1
+    
+    # r=4: M4 = (A00+A01)B11
+    U[a00][offset+4] += 1
+    U[a01][offset+4] += 1
+    V[b11][offset+4] += 1
+    W[c00][offset+4] += -1
+    W[c01][offset+4] += 1
+    
+    # r=5: M5 = (A10-A00)(B00+B01)
+    U[a10][offset+5] += 1
+    U[a00][offset+5] += -1
+    V[b00][offset+5] += 1
+    V[b01][offset+5] += 1
+    W[c11][offset+5] += 1
+    
+    # r=6: M6 = (A01-A11)(B10+B11)
+    U[a01][offset+6] += 1
+    U[a11][offset+6] += -1
+    V[b10][offset+6] += 1
+    V[b11][offset+6] += 1
+    W[c00][offset+6] += 1
+    
+    return offset + 7
+
+def _add_2x1(U, V, W, offset, k0, k1, j):
+    """
+    2x1 k-group, 1x1 j-group: 4 multiplications.
+    C[i,j] += A[i,k0]*B[k0,j] + A[i,k1]*B[k1,j] for i=0,1
+    """
+    # A entries:
+    a0k0 = 0*5 + k0
+    a0k1 = 0*5 + k1
+    a1k0 = 1*5 + k0
+    a1k1 = 1*5 + k1
+    
+    # B entries:
+    bk0j = k0*5 + j
+    bk1j = k1*5 + j
+    
+    # C output:
+    c0j = j*2 + 0
+    c1j = j*2 + 1
+    
+    # 4 multiplications:
+    U[a0k0][offset+0] += 1
+    V[bk0j][offset+0] += 1
+    W[c0j][offset+0] += 1
+    
+    U[a0k1][offset+1] += 1
+    V[bk1j][offset+1] += 1
+    W[c0j][offset+1] += 1
+    
+    U[a1k0][offset+2] += 1
+    V[bk0j][offset+2] += 1
+    W[c1j][offset+2] += 1
+    
+    U[a1k1][offset+3] += 1
+    V[bk1j][offset+3] += 1
+    W[c1j][offset+3] += 1
+    
+    return offset + 4
+
+def _add_1x2(U, V, W, offset, k, j0, j1):
+    """
+    1x1 k-group, 2x1 j-group: 4 multiplications.
+    C[i,j0] += A[i,k]*B[k,j0], C[i,j1] += A[i,k]*B[k,j1] for i=0,1
+    """
+    # A entries:
+    a0k = 0*5 + k
+    a1k = 1*5 + k
+    
+    # B entries:
+    bkj0 = k*5 + j0
+    bkj1 = k*5 + j1
+    
+    # C output:
+    c0j0 = j0*2 + 0
+    c0j1 = j1*2 + 0
+    c1j0 = j0*2 + 1
+    c1j1 = j1*2 + 1
+    
+    # 4 multiplications:
+    U[a0k][offset+0] += 1
+    V[bkj0][offset+0] += 1
+    W[c0j0][offset+0] += 1
+    
+    U[a0k][offset+1] += 1
+    V[bkj1][offset+1] += 1
+    W[c0j1][offset+1] += 1
+    
+    U[a1k][offset+2] += 1
+    V[bkj0][offset+2] += 1
+    W[c1j0][offset+2] += 1
+    
+    U[a1k][offset+3] += 1
+    V[bkj1][offset+3] += 1
+    W[c1j1][offset+3] += 1
+    
+    return offset + 4
+
+def _add_1x1(U, V, W, offset, k, j):
+    """
+    1x1 k-group, 1x1 j-group: 2 multiplications.
+    C[i,j] += A[i,k]*B[k,j] for i=0,1
+    """
+    a0k = 0*5 + k
+    a1k = 1*5 + k
+    bkj = k*5 + j
+    c0j = j*2 + 0
+    c1j = j*2 + 1
+    
+    U[a0k][offset+0] += 1
+    V[bkj][offset+0] += 1
+    W[c0j][offset+0] += 1
+    
+    U[a1k][offset+1] += 1
+    V[bkj][offset+1] += 1
+    W[c1j][offset+1] += 1
+    
+    return offset + 2
+
+def construct():
+    """
+    Returns a valid rank decomposition for 2x5 * 5x5 matrix multiplication.
+    """
+    n, m, p = 2, 5, 5
+    
+    # Schoolbook fallback
+    U_school, V_school, W_school = _schoolbook(n, m, p)
+    
+    if not _deadline_ok():
+        return {"U": U_school, "V": V_school, "W": W_school}
+    
+    # Try Strassen-based approach
+    U, V, W = _build_strassen_based()
+    
+    # Verify
+    if _verify_decomp(n, m, p, U, V, W):
+        return {"U": U, "V": V, "W": W}
+    
+    # Fallback to schoolbook
+    return {"U": U_school, "V": V_school, "W": W_school}

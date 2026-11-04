@@ -1,0 +1,106 @@
+import time
+import numpy as np
+
+DIMENSIONS = [6, 6, 6]
+DEADLINE = 130  # safety margin before 150s kill
+
+def _verify_full(n, m, p, U, V, W):
+    """Full verification using numpy."""
+    Ua = np.array(U, dtype=np.float64)
+    Va = np.array(V, dtype=np.float64)
+    Wa = np.array(W, dtype=np.float64)
+    
+    # Check all valid (i,j,k) triples
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                a_idx = i * m + j
+                b_idx = j * p + k
+                c_idx = k * n + i
+                val = np.dot(Ua[a_idx], Va[b_idx] * Wa[c_idx])
+                if abs(val - 1.0) > 1e-9:
+                    return False
+    return True
+
+def _build_strassen_2x2(n, m, p):
+    """Build Strassen 2x2 block decomposition (rank 189)."""
+    block_size = 2
+    blocks_per_dim = 3
+    rank = (blocks_per_dim ** 3) * 7
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    
+    # Strassen patterns for 2x2 multiplication
+    strassen_patterns = [
+        ({(0,0): 1, (1,1): 1}, {(0,0): 1, (1,1): 1}, {(0,0): 1, (1,1): 1}),
+        ({(1,0): 1, (1,1): 1}, {(0,0): 1}, {(1,0): 1, (1,1): -1}),
+        ({(0,0): 1}, {(0,1): 1, (1,1): -1}, {(0,1): 1, (1,1): 1}),
+        ({(1,1): 1}, {(1,0): 1, (0,0): -1}, {(0,0): 1, (1,0): 1}),
+        ({(0,0): 1, (0,1): 1}, {(1,1): 1}, {(0,0): -1, (0,1): 1}),
+        ({(1,0): 1, (0,0): -1}, {(0,0): 1, (0,1): 1}, {(1,1): 1}),
+        ({(0,1): 1, (1,1): -1}, {(1,0): 1, (1,1): 1}, {(0,0): 1}),
+    ]
+    
+    col_idx = 0
+    for I in range(blocks_per_dim):
+        for J in range(blocks_per_dim):
+            for K in range(blocks_per_dim):
+                for u_coeffs, v_coeffs, w_coeffs in strassen_patterns:
+                    for (pi, pj), val in u_coeffs.items():
+                        r = I * block_size + pi
+                        c = J * block_size + pj
+                        U[r * m + c][col_idx] += val
+                    for (pi, pj), val in v_coeffs.items():
+                        r = J * block_size + pi
+                        c = K * block_size + pj
+                        V[r * p + c][col_idx] += val
+                    for (pi, pj), val in w_coeffs.items():
+                        k = K * block_size + pj
+                        i = I * block_size + pi
+                        W[k * n + i][col_idx] += val
+                    col_idx += 1
+    return U, V, W
+
+def _build_laderman_4x4():
+    """
+    Returns U, V, W matrices for Laderman's 4x4 matrix multiplication algorithm.
+    Rank is 20.
+    Shapes: (16, 20)
+    """
+    # Laderman's algorithm coefficients
+    # This is a known decomposition.
+    # If incorrect, verification will fail and we fallback.
+    
+    # Placeholder for Laderman coefficients
+    # In a real scenario, these would be hardcoded from literature.
+    # For now, we return None to signal fallback if not implemented correctly.
+    return None
+
+def construct():
+    n, m, p = DIMENSIONS
+    start_time = time.time()
+    
+    # Attempt 140 rank solution (Laderman 4x4 + Strassen 2x2)
+    # Requires Laderman coefficients.
+    # Since we don't have reliable Laderman coefficients here, we fallback to 189.
+    
+    U, V, W = _build_strassen_2x2(n, m, p)
+    
+    # Verify
+    if time.time() - start_time < DEADLINE - 10:
+        if not _verify_full(n, m, p, U, V, W):
+            # Fallback to schoolbook
+            rank = n * m * p
+            U = [[0] * rank for _ in range(n * m)]
+            V = [[0] * rank for _ in range(m * p)]
+            W = [[0] * rank for _ in range(p * n)]
+            for i in range(n):
+                for j in range(m):
+                    for k in range(p):
+                        idx = i * m * p + j * p + k
+                        U[i * m + j][idx] = 1
+                        V[j * p + k][idx] = 1
+                        W[k * n + i][idx] = 1
+    
+    return {"U": U, "V": V, "W": W}

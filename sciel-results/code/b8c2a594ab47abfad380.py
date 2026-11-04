@@ -1,0 +1,175 @@
+import numpy as np
+import time
+
+DIMENSIONS = [2, 3, 4]
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 110.0
+    
+    n, m, p = DIMENSIONS
+    trivial_rank = n * m * p
+    
+    # Trivial decomposition
+    U_trivial = np.zeros((n * m, trivial_rank), dtype=np.float64)
+    V_trivial = np.zeros((m * p, trivial_rank), dtype=np.float64)
+    W_trivial = np.zeros((p * n, trivial_rank), dtype=np.float64)
+    
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U_trivial[i * m + j, col] = 1.0
+                V_trivial[j * p + k, col] = 1.0
+                W_trivial[k * n + i, col] = 1.0
+                col += 1
+                
+    T = np.ones((n, m, p), dtype=np.float64)
+    
+    best_result = {
+        "U": U_trivial.tolist(),
+        "V": V_trivial.tolist(),
+        "W": W_trivial.tolist()
+    }
+    best_rank = trivial_rank
+
+    def verify_decomposition(U, V, W, tol=1e-10):
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    val = 0.0
+                    for r in range(U.shape[1]):
+                        val += U[i * m + j, r] * V[j * p + k, r] * W[k * n + i, r]
+                    if abs(val - T[i, j, k]) > tol:
+                        return False
+        return True
+
+    def fast_search(rank, num_trials=50):
+        if time.time() > deadline - 5.0:
+            return None
+            
+        np.random.seed(42 + rank)
+        
+        for trial in range(num_trials):
+            if time.time() > deadline - 5.0:
+                return None
+                
+            # Initialize with small random values
+            U = np.random.randn(n * m, rank) * 0.1
+            V = np.random.randn(m * p, rank) * 0.1
+            W = np.random.randn(p * n, rank) * 0.1
+            
+            # Local search: Coordinate descent with step size 0.5
+            # We only check half-integer constraints at the end or during?
+            # The problem requires integer/half-integer entries.
+            # So we should search in the space of half-integers.
+            
+            # Start from a random half-integer configuration?
+            # Or start from trivial and modify?
+            
+            # Let's try a different initialization: 
+            # Copy trivial solution and truncate to 'rank' columns?
+            # This won't work because the truncated solution won't sum to 1.
+            
+            # Better: Random half-integers in {-1, -0.5, 0, 0.5, 1}
+            vals = [-1.0, -0.5, 0.0, 0.5, 1.0]
+            U = np.array([[np.random.choice(vals) for _ in range(rank)] for _ in range(n*m)])
+            V = np.array([[np.random.choice(vals) for _ in range(rank)] for _ in range(m*p)])
+            W = np.array([[np.random.choice(vals) for _ in range(rank)] for _ in range(p*n)])
+            
+            # Calculate error
+            def get_error():
+                err = 0.0
+                for i in range(n):
+                    for j in range(m):
+                        for k in range(p):
+                            val = 0.0
+                            for r in range(rank):
+                                val += U[i*m+j, r] * V[j*p+k, r] * W[k*n+i, r]
+                            err += (val - 1.0)**2
+                return err
+            
+            best_err = get_error()
+            
+            # Local search
+            for step in range(20):
+                if time.time() > deadline - 5.0:
+                    return None
+                
+                improved = False
+                # Try changing one element in U, V, or W
+                # To be fast, we pre-compute contributions?
+                # For now, simple loop.
+                
+                # Change U
+                for r in range(rank):
+                    for idx in range(n*m):
+                        old = U[idx, r]
+                        for new_val in vals:
+                            if new_val == old: continue
+                            U[idx, r] = new_val
+                            err = get_error()
+                            if err < best_err:
+                                best_err = err
+                                improved = True
+                            else:
+                                U[idx, r] = old
+                # Change V
+                for r in range(rank):
+                    for idx in range(m*p):
+                        old = V[idx, r]
+                        for new_val in vals:
+                            if new_val == old: continue
+                            V[idx, r] = new_val
+                            err = get_error()
+                            if err < best_err:
+                                best_err = err
+                                improved = True
+                            else:
+                                V[idx, r] = old
+                # Change W
+                for r in range(rank):
+                    for idx in range(p*n):
+                        old = W[idx, r]
+                        for new_val in vals:
+                            if new_val == old: continue
+                            W[idx, r] = new_val
+                            err = get_error()
+                            if err < best_err:
+                                best_err = err
+                                improved = True
+                            else:
+                                W[idx, r] = old
+                                
+                if not improved:
+                    break
+                    
+            if best_err < 1e-10:
+                if verify_decomposition(U, V, W):
+                    return (U, V, W)
+                    
+        return None
+
+    # Try ranks 23, 22, 21
+    for rank in [23, 22, 21]:
+        if time.time() > deadline - 10.0:
+            break
+        result = fast_search(rank)
+        if result:
+            U, V, W = result
+            best_result = {
+                "U": U.tolist(),
+                "V": V.tolist(),
+                "W": W.tolist()
+            }
+            best_rank = rank
+            break
+
+    if best_rank == trivial_rank:
+        return {
+            "U": U_trivial.tolist(),
+            "V": V_trivial.tolist(),
+            "W": W_trivial.tolist()
+        }
+        
+    return best_result

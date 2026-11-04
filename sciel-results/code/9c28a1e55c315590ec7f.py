@@ -1,0 +1,36 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+import numpy as np
+import time
+
+DIMENSIONS = [3, 3, 8]
+
+# EVOLVE-BLOCK-START
+def construct():
+    n, m, p = DIMENSIONS
+    start_time = time.time()
+    deadline = start_time + 140  # 10s safety margin
+    
+    # Schoolbook decomposition
+    def schoolbook():
+        rank = n * m * p
+        U = [[0] * rank for _ in range(n * m)]
+        V = [[0] * rank for _ in range(m * p)]
+        W = [[0] * rank for _ in range(p * n)]
+        col = 0
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    U[i * m + j][col] = 1
+                    V[j * p + k][col] = 1
+                    W[k * n + i][col] = 1
+                    col += 1
+        return {"U": U, "V": V, "W": W}
+    
+    # Return the schoolbook decomposition
+    # Finding a lower rank for 3x3x8 requires specific knowledge of
+    # fast matrix multiplication algorithms (e.g., rank 19 for 3x3x3 blocks).
+    # Without hardcoded coefficients for such algorithms, the schoolbook
+    # rank of 72 is the safest valid solution.
+    
+    return schoolbook()
+# EVOLVE-BLOCK-END
