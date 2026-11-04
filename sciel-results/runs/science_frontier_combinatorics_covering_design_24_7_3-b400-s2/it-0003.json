@@ -1,0 +1,1 @@
+[{"v":151,"e":104,"t":"2026-11-04T17:34:49.549959+00:00","ok":false,"val":null,"sc":null,"op":"full_rewrite","req":"idea","sel":"idea_island","fb":null,"mode":"exploit","isl":2,"par":"p11","id":null,"model":"qwen3.8-27b","opp":1.0,"bet":null,"q":null,"notes":null,"patch":null,"code":"86f7285bf1dc2cacea9a","err":"candidate exceeded 120 s","reach":null,"conf":null,"sec":120.3}]
