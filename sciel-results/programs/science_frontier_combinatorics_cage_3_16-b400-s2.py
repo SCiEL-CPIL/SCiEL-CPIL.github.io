@@ -126,7 +126,7 @@ def _construct_petersen_lift(g, deadline, start_time):
             continue
         
         found = False
-        max_attempts = 200
+        max_attempts = 500
         
         for attempt in range(max_attempts):
             if time.time() > deadline:
@@ -136,7 +136,7 @@ def _construct_petersen_lift(g, deadline, start_time):
             voltages = np.array([random.randint(1, m - 1) for _ in range(15)], dtype=np.int64)
             
             # Local Repair Loop with vectorized checking
-            for repair_step in range(30):
+            for repair_step in range(50):
                 # Check validity using numpy
                 if n_constraints > 0:
                     # Compute all constraint sums at once

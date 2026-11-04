@@ -15,6 +15,7 @@ def construct(q, n, radius):
     # Precompute neighbors for radius 1
     # neighbors[i] is a list of indices j such that dist(words[i], words[j]) <= 1
     neighbors = []
+    neighbor_sets = []  # Sets for fast membership testing
     for i, w in enumerate(words):
         neigh = [i]
         w_list = list(w)
@@ -26,52 +27,50 @@ def construct(q, n, radius):
                 w_list[pos] = val
                 idx = word_to_idx[tuple(w_list)]
                 neigh.append(idx)
-                w_list[pos] = orig_val # Restore
+                w_list[pos] = orig_val  # Restore
         neighbors.append(neigh)
-        
-    # 2. Greedy Set Cover
+        neighbor_sets.append(set(neigh))
+    
+    # 2. Greedy Set Cover with vectorized gain computation
     uncovered = np.ones(N, dtype=bool)
     code = []
     code_set = set()
     
+    # Build neighbor matrix as a list of arrays for vectorized operations
+    neighbor_arrays = [np.array(neigh, dtype=np.int32) for neigh in neighbors]
+    
     while np.any(uncovered):
-        if time.time() > deadline - 20:
+        if time.time() > deadline - 25:
             break
-            
-        best_idx = -1
-        max_gain = 0
         
-        # Calculate gain for each candidate
-        # Optimization: We can skip candidates that are already in code? 
-        # Greedy set cover usually allows re-picking, but since we want distinct codewords, 
-        # and picking the same one again doesn't help, we can restrict to unselected?
-        # Actually, if we pick a word, it covers itself. If it's already in code, 
-        # its gain is 0 for *newly* uncovered points? No, the points it covers are already covered.
-        # So gain for existing code words is 0. We can just iterate all N.
+        # Vectorized gain computation: for each candidate, sum uncovered in its neighbors
+        # We can do this by summing uncovered[neighbor_arrays[i]] for all i
+        # But that's still a loop. Let's use a different approach.
         
-        for i in range(N):
-            # Sum of uncovered in neighbors[i]
-            # Using numpy sum on a slice is fast
-            gain = np.sum(uncovered[neighbors[i]])
-            if gain > max_gain:
-                max_gain = gain
-                best_idx = i
-                
+        # Alternative: For each uncovered point, add 1 to all candidates that cover it
+        # This is the transpose of the incidence matrix
+        gains = np.zeros(N, dtype=np.int32)
+        uncovered_indices = np.where(uncovered)[0]
+        for idx in uncovered_indices:
+            # All codewords within distance 1 of idx cover idx
+            # That's neighbors[idx]
+            gains[neighbors[idx]] += 1
+        
+        best_idx = int(np.argmax(gains))
+        max_gain = gains[best_idx]
+        
         if max_gain == 0:
             break
-            
+        
         code.append(best_idx)
         code_set.add(best_idx)
         uncovered[neighbors[best_idx]] = False
         
-    # 3. Local Search
+    # 3. Local Search with enhanced 1-exchange moves
     # Initialize counts
     counts = np.zeros(N, dtype=np.int32)
     for idx in code:
         counts[neighbors[idx]] += 1
-        
-    # Helper to check validity (counts >= 1 everywhere)
-    # We maintain this invariant.
     
     improved = True
     while improved and time.time() < deadline - 5:
@@ -80,8 +79,6 @@ def construct(q, n, radius):
         # --- Deletion Pass ---
         to_remove = []
         for c in code:
-            # Check if all neighbors have count > 1
-            # If min count in neighbors[c] is > 1, we can remove c
             if np.min(counts[neighbors[c]]) > 1:
                 to_remove.append(c)
                 
@@ -92,12 +89,7 @@ def construct(q, n, radius):
                 code_set.remove(c)
                 counts[neighbors[c]] -= 1
             
-        # --- Swap Pass ---
-        # Try to replace codewords to enable more deletions
-        # We iterate through code, and for each one, if it's not removable, 
-        # we try to find a replacement.
-        
-        # To avoid bias, we can shuffle the code list order for the swap pass
+        # --- Enhanced Swap Pass with multiple strategies ---
         random.shuffle(code)
         
         for c in code:
@@ -106,74 +98,48 @@ def construct(q, n, radius):
                 
             # Check if c is currently removable
             if np.min(counts[neighbors[c]]) > 1:
-                # It's removable, but deletion pass should have caught it.
-                # Maybe counts changed? No, we didn't change counts in this loop yet.
-                # So this case shouldn't happen if deletion was thorough.
                 continue
                 
             # Get critical points for c: points i in neighbors[c] with counts[i] == 1
-            crit_points = []
-            for i in neighbors[c]:
-                if counts[i] == 1:
-                    crit_points.append(i)
+            crit_points = [i for i in neighbors[c] if counts[i] == 1]
             
             if not crit_points:
                 continue
                 
-            # We need a replacement w such that all crit_points are in neighbors[w]
-            # and w is not in code_set.
-            
-            # Strategy: Pick a random critical point p. 
-            # Candidates for w must be in neighbors[p].
-            # We sample a few candidates from neighbors[p] that are not in code.
-            
+            # Strategy 1: Find replacement covering all critical points
             found_swap = False
             random.shuffle(crit_points)
+            
             for p in crit_points:
                 if found_swap:
                     break
                     
-                # Get neighbors of p
                 cands = [x for x in neighbors[p] if x not in code_set]
-                
-                # If too many, sample?
-                # neighbors[p] size is 1 + n*(q-1) = 1 + 7*2 = 15.
-                # So cands is small. We can check all of them.
                 
                 best_w = -1
                 best_score = -1
                 
                 for w in cands:
-                    # Check if w covers ALL crit_points
-                    # i.e., for all k in crit_points, k is in neighbors[w]
-                    # Since neighbors are lists, checking membership is O(len(neighbors[w])) ~ 15.
-                    # crit_points size is small (usually 1 or 2).
-                    
                     valid = True
                     for k in crit_points:
-                        if k not in neighbors[w]:
+                        if k not in neighbor_sets[w]:
                             valid = False
                             break
                     
                     if not valid:
                         continue
                     
-                    # Valid replacement. Score it.
-                    # We want to maximize the "redundancy" created.
-                    # Score: Sum of counts in neighbors[w] that are >= 2?
-                    # Or simpler: Just accept the first one?
-                    # Let's try to pick the one that covers the most points with count==2.
-                    score = 0
-                    for i in neighbors[w]:
-                        if counts[i] == 2:
-                            score += 1
-                            
+                    # Score: maximize redundancy creation (points with count==2)
+                    score = sum(1 for i in neighbors[w] if counts[i] == 2)
+                    # Also consider: minimize additional coverage loss
+                    # Points that would go from count 1 to 0 if we remove c
+                    # But we're adding w, so points covered by both c and w stay covered
+                    
                     if score > best_score:
                         best_score = score
                         best_w = w
                         
                 if best_w != -1:
-                    # Perform swap
                     code.remove(c)
                     code_set.remove(c)
                     counts[neighbors[c]] -= 1
@@ -184,10 +150,70 @@ def construct(q, n, radius):
                     
                     improved = True
                     found_swap = True
-                    break # Move to next c
+                    break
+            
+            # Strategy 2: If no swap found, try a "relocation" - move c to a better position
+            # even if it doesn't cover all critical points, as long as we can cover them
+            # with existing codewords
+            if not found_swap:
+                # Check if removing c leaves some points uncovered
+                # Those must be covered by other codewords
+                temp_counts = counts.copy()
+                temp_counts[neighbors[c]] -= 1
+                
+                if np.min(temp_counts) >= 1:
+                    # c is redundant after all (shouldn't happen if deletion pass worked)
+                    continue
+                
+                # Points that would become uncovered
+                would_be_uncovered = [i for i in neighbors[c] if temp_counts[i] == 0]
+                
+                if not would_be_uncovered:
+                    continue
+                
+                # For each such point, find a codeword that covers it and isn't c
+                # We need to add a codeword that covers ALL would_be_uncovered points
+                # OR we can try to replace c with a codeword that covers the critical points
+                # while some other codeword covers the rest
+                
+                # Try to find a single replacement that covers all would_be_uncovered
+                # and all crit_points
+                all_needed = set(crit_points) | set(would_be_uncovered)
+                
+                best_w = -1
+                best_score = -1
+                
+                # Candidates must cover all points in all_needed
+                # Start with candidates from the first needed point
+                first_point = list(all_needed)[0]
+                cands = [x for x in neighbors[first_point] if x not in code_set]
+                
+                for w in cands:
+                    valid = True
+                    for k in all_needed:
+                        if k not in neighbor_sets[w]:
+                            valid = False
+                            break
+                    if not valid:
+                        continue
                     
+                    score = sum(1 for i in neighbors[w] if counts[i] == 2)
+                    if score > best_score:
+                        best_score = score
+                        best_w = w
+                
+                if best_w != -1:
+                    code.remove(c)
+                    code_set.remove(c)
+                    counts[neighbors[c]] -= 1
+                    
+                    code.append(best_w)
+                    code_set.add(best_w)
+                    counts[neighbors[best_w]] += 1
+                    
+                    improved = True
+
     # Final cleanup: Remove any remaining redundant words
-    # Re-initialize counts to be safe
     counts = np.zeros(N, dtype=np.int32)
     for idx in code:
         counts[neighbors[idx]] += 1
