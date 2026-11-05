@@ -1,213 +1,301 @@
-import numpy as np
-from scipy.optimize import minimize
-import time
-
+"""Rewritten program for third autocorrelation inequality optimization."""
 N = 400
-_DEADLINE = 150.0
-_START_TIME = None
 
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from scipy.fft import fft, ifft
+from scipy.optimize import minimize
 
-def _objective_hard(x):
-    """Compute the actual evaluation value."""
-    h = x
+def _eval_value(h):
+    """Compute the objective value."""
+    s = np.sum(h)
+    if abs(s) < 1e-12:
+        return np.inf
+    conv = np.convolve(h, h)
+    return abs(2.0 * N * np.max(conv) / (s * s))
+
+def _convolve_fft(h):
+    """Compute full autoconvolution using FFT (faster than np.convolve for large N)."""
+    n_conv = 2 * len(h) - 1
+    n_fft = 1
+    while n_fft < n_conv:
+        n_fft *= 2
+    H = fft(h, n=n_fft)
+    conv = ifft(H * H, n=n_fft).real[:n_conv]
+    return conv
+
+def _soft_max(x, beta):
+    """Numerically stable soft maximum."""
+    m = np.max(x)
+    if not np.isfinite(m):
+        return m
+    exp_vals = np.exp(beta * (x - m))
+    sm = m + np.log(np.sum(exp_vals)) / beta
+    return sm
+
+def _objective_soft(h, beta):
+    """
+    Soft-max surrogate objective for autoconvolution peak.
+    h is normalized internally so sum(h) = N.
+    """
+    if not np.all(np.isfinite(h)):
+        return 1e10
+    s = np.sum(h)
+    if abs(s) < 1e-10:
+        return 1e10
+    h_norm = h * (N / s)
+    conv = _convolve_fft(h_norm)
+    sm = _soft_max(conv, beta)
+    return abs(2.0 * N * sm / (N * N))
+
+def _objective_exact(h):
+    """Exact objective using FFT-based convolution."""
     s = np.sum(h)
     if abs(s) < 1e-12:
         return 1e10
-    conv = np.convolve(h, h, mode='full')
-    m = np.max(conv)
-    return abs(2 * N * m / (s * s))
-
-
-def _soft_max_obj(x, temp=0.05):
-    """Differentiable soft-max objective."""
-    h = x
-    s = np.sum(h)
-    if abs(s) < 1e-12:
-        return 1e10
-    conv = np.convolve(h, h, mode='full')
-    m = np.max(conv)
-    # Numerically stable log-sum-exp
-    exp_terms = np.exp((conv - m) / temp)
-    logsumexp = m / temp + np.log(np.sum(exp_terms))
-    smax = temp * logsumexp
-    return smax / (s * s)
-
-
-def _soft_max_grad(x, temp=0.05):
-    """Gradient of soft-max objective using efficient vectorized computation."""
-    h = x
-    s = np.sum(h)
-    if abs(s) < 1e-12:
-        return np.zeros_like(x)
-    
-    conv = np.convolve(h, h, mode='full')
-    m = np.max(conv)
-    exp_terms = np.exp((conv - m) / temp)
-    softmax_weights = exp_terms / np.sum(exp_terms)
-    sw = softmax_weights  # length 2N-1
-    
-    # Compute gradient efficiently using the structure of autoconvolution
-    # d(conv[k])/d(h[i]) = h[k-i] (if 0<=k-i<N) + h[i-k] (if 0<=i-k<N)
-    # 
-    # For each i: g[i] = sum_k sw[k] * (h[k-i] if valid + h[i-k] if valid)
-    #
-    # First term: sum_{k=i}^{min(i+N-1, 2N-2)} sw[k] * h[k-i]
-    # Let j = k-i: sum_{j=0}^{min(N-1, 2N-2-i)} sw[i+j] * h[j]
-    #
-    # Second term: sum_{k=max(0,i-N+1)}^{i} sw[k] * h[i-k]
-    # Let j = i-k: sum_{j=0}^{min(i, N-1)} sw[i-j] * h[j]
-    
-    # Vectorized computation using slicing
-    grad = np.zeros(N)
-    
-    # First term for all i simultaneously
-    # For i in range(N): sum_{j=0}^{min(N-1, 2N-2-i)} sw[i+j] * h[j]
-    # This is like a cross-correlation
-    
-    # Use the fact that for each i, we need sw[i:i+min(N, 2N-1-i)] dotted with h[:min(N, 2N-1-i)]
-    # Let's compute this efficiently
-    
-    # For the first sum: for each i, we want dot(sw[i : i+min(N, 2N-1-i)], h[:min(N, 2N-1-i)])
-    # For i=0: dot(sw[0:N], h[0:N])
-    # For i=1: dot(sw[1:N+1], h[0:N]) but only if N+1 <= 2N-1, i.e., N>=2
-    # Actually for i, the valid range is j from 0 to min(N-1, 2N-2-i)
-    # So length = min(N, 2N-1-i)
-    
-    # Let me just do it with a loop but using np.dot for each i
-    for i in range(N):
-        # First sum
-        max_j = min(N, 2 * N - 1 - i)
-        if max_j > 0:
-            grad[i] += np.dot(sw[i:i + max_j], h[:max_j])
-        
-        # Second sum: sum_{j=0}^{min(i, N-1)} sw[i-j] * h[j]
-        max_j2 = min(i + 1, N)
-        if max_j2 > 0:
-            # sw indices: i, i-1, ..., i-(max_j2-1) = i-max_j2+1
-            sw_slice = sw[i - max_j2 + 1 : i + 1][::-1]  # reversed
-            grad[i] += np.dot(sw_slice, h[:max_j2])
-    
-    smax = temp * (m / temp + np.log(np.sum(exp_terms)))
-    d_obj = grad / (s * s) - 2 * smax / (s * s * s)
-    
-    return d_obj
-
-
-def _anneal_temperature(current_time, deadline, total_phases=3):
-    """Linearly decrease temperature over time."""
-    elapsed = current_time - _START_TIME
-    total_time = deadline - _START_TIME
-    frac = min(1.0, elapsed / total_time)
-    # Temperature from 0.1 to 0.001
-    log_temp = np.log(0.1) + frac * (np.log(0.001) - np.log(0.1))
-    return np.exp(log_temp)
-
+    conv = _convolve_fft(h)
+    return abs(2.0 * N * np.max(conv) / (s * s))
 
 def construct():
-    global _START_TIME
-    if _START_TIME is None:
-        _START_TIME = time.time()
-    
-    best_val = 2.0
+    """
+    Returns a sequence of 400 signed step heights.
+    Uses a random walk with negative drift to enforce zero-sum constraint,
+    then optimizes the drift parameter and noise realization to minimize
+    the peak of the zero-mean autocorrelation.
+    """
+    deadline = time.time() + 145.0  # Safety margin before 150s limit
+
+    # Start with all-ones (value 2.0)
     best_h = np.ones(N)
-    
-    deadline = _START_TIME + _DEADLINE - 5.0
-    
-    # Generate diverse initializations
-    inits = []
-    
-    # Random with different scales
-    for i in range(12):
-        r = np.random.RandomState(1000 + i * 137)
-        inits.append(r.randn(N) * (0.3 + 0.1 * i))
-    
-    # Linear ramps
-    inits.append(np.linspace(-1, 1, N))
-    inits.append(np.linspace(1, -1, N))
-    
-    # Step functions with various splits
-    for frac in [0.25, 0.35, 0.45, 0.5, 0.55, 0.65, 0.75]:
-        h = np.zeros(N)
-        h[:int(frac * N)] = 1.0
-        h[int(frac * N):] = -0.3
-        inits.append(h - np.mean(h))
-    
-    # Waves with various frequencies
-    t = np.linspace(0, 2 * np.pi, N)
-    for freq in [1, 2, 3, 5, 8]:
-        inits.append(np.cos(freq * t) - np.mean(np.cos(freq * t)))
-        inits.append(np.sin(freq * t) - np.mean(np.sin(freq * t)))
-    
-    # Polynomials
-    x = np.linspace(-1, 1, N)
-    inits.append(x**2 - np.mean(x**2))
-    inits.append(x**3 - np.mean(x**3))
-    inits.append(x**4 - np.mean(x**4))
-    
-    # Comb-like patterns
-    for period in [7, 11, 13, 17]:
-        h = np.zeros(N)
-        h[::period] = 1.0
-        h[1::period] = -0.5
-        inits.append(h - np.mean(h))
-    
-    # Optimized initializations with multi-temperature annealing
-    for init_idx, init_h in enumerate(inits):
-        if time.time() > deadline - 3:
+    best_val = 2.0
+
+    # Phase 1: Quick parametric families to get a good starting point
+    # Family 1: h[i] = 1 + a*cos(2*pi*m*i/N)
+    for m in range(1, 21):
+        if time.time() > deadline - 80:
             break
-        
-        h = init_h.astype(float).copy()
+        for a in np.linspace(-0.8, 0.8, 17):
+            h = 1.0 + a * np.cos(2.0 * np.pi * m * np.arange(N) / N)
+            v = _eval_value(h)
+            if v < best_val:
+                best_val = v
+                best_h = h.copy()
+
+    # Family 2: Smoothed block
+    for beta in [0.5, 1.0, 2.0, 3.0, 5.0]:
+        if time.time() > deadline - 80:
+            break
+        h = np.tanh(beta * (np.arange(N) - N / 2.0))
         s = np.sum(h)
-        if abs(s) < 1e-12:
-            # Add small perturbation
-            h += 0.01 * np.random.RandomState(init_idx).randn(N)
-            s = np.sum(h)
-            if abs(s) < 1e-12:
-                continue
+        if abs(s) < 1e-6:
+            continue
+        v = _eval_value(h)
+        if v < best_val:
+            best_val = v
+            best_h = h.copy()
+
+    # Phase 2: Random walk with negative drift
+    # h[i] = 1 + cumsum(noise) - drift * i
+    # The drift is chosen so that sum(h) = N (zero-mean perturbation)
+    # We optimize over noise realizations and drift to minimize the peak autocorrelation
+    
+    if time.time() < deadline - 60:
+        rng = np.random.RandomState(42)
         
-        # Multi-temperature annealing for this initialization
-        temps = [0.1, 0.05, 0.02, 0.01, 0.005]
-        current_h = h.copy()
-        
-        for temp in temps:
-            if time.time() > deadline - 3:
+        # Try different noise scales and drift values
+        for noise_scale in [0.1, 0.2, 0.3, 0.5, 0.7, 1.0]:
+            if time.time() > deadline - 60:
                 break
             
+            for trial in range(20):
+                if time.time() > deadline - 60:
+                    break
+                
+                # Generate random noise
+                noise = rng.randn(N) * noise_scale
+                
+                # Compute cumulative sum (random walk)
+                walk = np.cumsum(noise)
+                
+                # Subtract linear trend to make it zero-sum
+                # We want sum(h) = N, so sum(walk - drift * i) = 0
+                # sum(walk) - drift * sum(i) = 0
+                # drift = sum(walk) / sum(i)
+                sum_i = np.sum(np.arange(N))
+                drift = np.sum(walk) / sum_i
+                
+                # Construct h
+                h = 1.0 + walk - drift * np.arange(N)
+                
+                # Check validity
+                if not np.all(np.isfinite(h)) or abs(np.sum(h) - N) > 1e-6:
+                    continue
+                
+                v = _eval_value(h)
+                if v < best_val:
+                    best_val = v
+                    best_h = h.copy()
+    
+    # Phase 3: DCT-domain optimization with soft-max surrogate
+    # Convert best_h to DCT coefficients
+    from scipy.fft import dct, idct
+    
+    def _h_to_dct(h):
+        """Convert time-domain signal to DCT-II coefficients."""
+        return dct(h, type=2, norm='ortho')
+    
+    def _dct_to_h(coeffs):
+        """Convert DCT-II coefficients to time-domain signal."""
+        return idct(coeffs, type=2, norm='ortho')
+    
+    c_best = _h_to_dct(best_h)
+
+    # Fix DC component to maintain mean
+    c_dc = c_best[0].copy()
+
+    # Two-stage soft-max: low beta first, then high beta
+    for beta in [1.0, 5.0, 20.0, 50.0, 100.0]:
+        if time.time() > deadline - 25:
+            break
+
+        # Objective in DCT domain using soft-max
+        def obj_dct(c_ac, beta=beta):
+            c_full = np.concatenate([[c_dc], c_ac])
+            h_recon = _dct_to_h(c_full)
+
+            if not np.all(np.isfinite(h_recon)):
+                return 1e10
+
+            s = np.sum(h_recon)
+            if abs(s) < 1e-10:
+                return 1e10
+
+            h_norm = h_recon * (N / s)
+            conv = _convolve_fft(h_norm)
+            sm = _soft_max(conv, beta)
+            return abs(2.0 * N * sm / (N * N))
+
+        # Try random restarts around best DCT coefficients
+        rng = np.random.RandomState(42 + int(beta))
+        c_ac_init = c_best[1:].copy()
+
+        for trial in range(4):
+            if time.time() > deadline - 25:
+                break
+
+            if trial == 0:
+                c_ac_trial = c_ac_init.copy()
+            else:
+                c_ac_trial = c_ac_init + 0.1 * rng.randn(N-1)
+
             try:
-                res = minimize(
-                    lambda x, t=temp: _soft_max_obj(x, t),
-                    current_h,
-                    jac=lambda x, t=temp: _soft_max_grad(x, t),
+                result = minimize(
+                    obj_dct,
+                    c_ac_trial,
                     method='L-BFGS-B',
-                    options={'maxiter': 200, 'ftol': 1e-10, 'gtol': 1e-7, 'maxfun': 500}
+                    options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-10}
                 )
-                
-                new_val = _objective_hard(res.x)
-                if new_val < best_val:
-                    best_val = new_val
-                    best_h = res.x.copy()
-                
-                # Use the result as starting point for next temperature
-                if res.fun < _soft_max_obj(current_h, temp):
-                    current_h = res.x.copy()
+
+                c_ac_opt = result.x
+                c_full_opt = np.concatenate([[c_dc], c_ac_opt])
+                h_opt = _dct_to_h(c_full_opt)
+
+                if np.all(np.isfinite(h_opt)) and abs(np.sum(h_opt)) > 1e-10:
+                    v_opt = _objective_exact(h_opt)
+                    if v_opt < best_val:
+                        best_val = v_opt
+                        best_h = h_opt.copy()
+                        c_best = _h_to_dct(best_h)
+                        c_dc = c_best[0].copy()
+                        c_ac_init = c_best[1:].copy()
+            except Exception:
+                continue
+
+    # Phase 4: High-precision polish with very high beta in DCT domain
+    if time.time() < deadline - 20:
+        for beta in [200.0, 500.0, 1000.0]:
+            if time.time() > deadline - 15:
+                break
+
+            def obj_polish(c_ac, beta=beta):
+                c_full = np.concatenate([[c_dc], c_ac])
+                h_recon = _dct_to_h(c_full)
+
+                if not np.all(np.isfinite(h_recon)):
+                    return 1e10
+
+                s = np.sum(h_recon)
+                if abs(s) < 1e-10:
+                    return 1e10
+
+                h_norm = h_recon * (N / s)
+                conv = _convolve_fft(h_norm)
+                sm = _soft_max(conv, beta)
+                return abs(2.0 * N * sm / (N * N))
+
+            try:
+                result = minimize(
+                    obj_polish,
+                    c_best[1:].copy(),
+                    method='L-BFGS-B',
+                    options={'maxiter': 300, 'ftol': 1e-14, 'gtol': 1e-12}
+                )
+
+                c_ac_opt = result.x
+                c_full_opt = np.concatenate([[c_dc], c_ac_opt])
+                h_opt = _dct_to_h(c_full_opt)
+
+                if np.all(np.isfinite(h_opt)) and abs(np.sum(h_opt)) > 1e-10:
+                    v_opt = _objective_exact(h_opt)
+                    if v_opt < best_val:
+                        best_val = v_opt
+                        best_h = h_opt.copy()
+                        c_best = _h_to_dct(best_h)
+                        c_dc = c_best[0].copy()
+            except Exception:
+                continue
+
+    # Phase 5: Final high-precision polish
+    if time.time() < deadline - 5:
+        # Try a few more DCT optimizations with very tight tolerances
+        for beta in [2000.0]:
+            if time.time() > deadline - 3:
+                break
+            def obj_final(c_ac, beta=beta):
+                c_full = np.concatenate([[c_dc], c_ac])
+                h_recon = _dct_to_h(c_full)
+                if not np.all(np.isfinite(h_recon)):
+                    return 1e10
+                s = np.sum(h_recon)
+                if abs(s) < 1e-10:
+                    return 1e10
+                h_norm = h_recon * (N / s)
+                conv = _convolve_fft(h_norm)
+                sm = _soft_max(conv, beta)
+                return abs(2.0 * N * sm / (N * N))
+            
+            try:
+                result = minimize(
+                    obj_final,
+                    c_best[1:].copy(),
+                    method='L-BFGS-B',
+                    options={'maxiter': 500, 'ftol': 1e-15, 'gtol': 1e-13}
+                )
+                c_ac_opt = result.x
+                c_full_opt = np.concatenate([[c_dc], c_ac_opt])
+                h_opt = _dct_to_h(c_full_opt)
+                if np.all(np.isfinite(h_opt)) and abs(np.sum(h_opt)) > 1e-10:
+                    v_opt = _objective_exact(h_opt)
+                    if v_opt < best_val:
+                        best_val = v_opt
+                        best_h = h_opt.copy()
             except Exception:
                 pass
-    
-    # Final high-precision polish on the best found
-    if time.time() < deadline - 2:
-        try:
-            res = minimize(
-                lambda x: _soft_max_obj(x, 0.001),
-                best_h,
-                jac=lambda x: _soft_max_grad(x, 0.001),
-                method='L-BFGS-B',
-                options={'maxiter': 1000, 'ftol': 1e-14, 'gtol': 1e-10, 'maxfun': 2000}
-            )
-            val = _objective_hard(res.x)
-            if val < best_val:
-                best_val = val
-                best_h = res.x.copy()
-        except Exception:
-            pass
-    
+
+    # Ensure finite and sum != 0
+    if not np.all(np.isfinite(best_h)) or abs(np.sum(best_h)) < 1e-12:
+        return np.ones(N)
+
     return best_h
+# EVOLVE-BLOCK-END

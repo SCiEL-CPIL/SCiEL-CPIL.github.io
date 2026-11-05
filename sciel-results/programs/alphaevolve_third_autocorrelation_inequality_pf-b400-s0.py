@@ -1,308 +1,346 @@
-"""Rewritten program for the third autocorrelation inequality task using model-and-optimize."""
-N = 400
-
-# EVOLVE-BLOCK-START
-import numpy as np
 import time
-from scipy.optimize import minimize, differential_evolution
+import numpy as np
+from scipy.optimize import differential_evolution, minimize
 
-_DEADLINE = 145.0  # wall-clock limit with safety margin
+N = 400
+_t0 = time.time()
+_DEADLINE = 125.0  # safety margin under 150s wall-clock
 
-
-def _evaluate(h):
-    """Compute the task value: abs(2 * N * max(convolve(h,h)) / sum(h)^2)."""
-    s = np.sum(h)
-    if s == 0 or not np.isfinite(s):
+def _value(h):
+    """Compute the task value (lower is better)."""
+    h = np.asarray(h, dtype=float)
+    s = float(np.sum(h))
+    if s == 0.0 or not np.all(np.isfinite(h)):
         return np.inf
-    conv = np.convolve(h, h)
-    return abs(2.0 * N * np.max(conv) / (s * s))
+    n_fft = 2 * N
+    H = np.fft.rfft(h, n=n_fft)
+    conv = np.fft.irfft(H * H, n=n_fft)[:2 * N - 1]
+    m = float(np.max(conv))
+    return abs(2.0 * N * m / (s * s))
 
+def _fft_convolve(h):
+    """Fast autoconvolution via FFT."""
+    n = len(h)
+    size = 2 * n
+    H = np.fft.rfft(h, size)
+    conv = np.fft.irfft(H * H, size)[:2 * n - 1]
+    return conv
 
-def _build_h(params):
+def _smooth_max_value(h, beta=80.0):
+    """Smooth approximation of max of autoconvolution using log-sum-exp."""
+    h = np.asarray(h, dtype=float)
+    s = float(np.sum(h))
+    if s == 0.0 or not np.all(np.isfinite(h)):
+        return np.inf
+    conv = _fft_convolve(h)
+    m = np.max(conv)
+    # log-sum-exp trick
+    scaled = beta * (conv - m)
+    # clip to avoid overflow
+    scaled = np.clip(scaled, -100, 100)
+    log_sum_exp = m + np.log(np.sum(np.exp(scaled))) / beta
+    return abs(2.0 * N * log_sum_exp / (s * s))
+
+# DCT basis for spectral shaping
+_K_DCT = 40
+_n_idx = np.arange(N)
+_k_idx = np.arange(_K_DCT)
+_angles = np.pi * (2 * _n_idx[:, None] + 1) * _k_idx[None, :] / (2 * N)
+_DCT_BASIS = np.cos(_angles)
+_norms = np.sqrt(np.sum(_DCT_BASIS ** 2, axis=0))
+_norms[_norms == 0] = 1.0
+_DCT_BASIS = _DCT_BASIS / _norms
+
+def _dct_h(coeffs):
+    """Generate h from DCT coefficients."""
+    return _DCT_BASIS @ coeffs
+
+def _dct_smooth_obj(coeffs, beta=80.0):
+    """Smooth objective for DCT coefficients."""
+    h = _dct_h(coeffs)
+    return _smooth_max_value(h, beta)
+
+def _dct_obj(coeffs):
+    """Exact objective for DCT coefficients."""
+    h = _dct_h(coeffs)
+    return _value(h)
+
+# DFT basis for refinement
+_K_DFT = 20
+_basis = np.zeros((2 * _K_DFT, N))
+for k in range(1, _K_DFT + 1):
+    angle = 2.0 * np.pi * k * _n_idx / N
+    _basis[2 * (k - 1), :] = np.cos(angle)
+    _basis[2 * (k - 1) + 1, :] = np.sin(angle)
+
+def _dft_h(coeffs, base_val):
+    """Generate h from DFT coefficients and a base value."""
+    return base_val + _basis.T @ coeffs
+
+def _dft_obj(coeffs_base):
+    """Objective for DFT parameters: [coeffs..., base]."""
+    coeffs = coeffs_base[:-1]
+    base_val = coeffs_base[-1]
+    h = _dft_h(coeffs, base_val)
+    return _value(h)
+
+def _dft_smooth_obj(coeffs_base, beta=80.0):
+    """Smooth objective for DFT parameters."""
+    coeffs = coeffs_base[:-1]
+    base_val = coeffs_base[-1]
+    h = _dft_h(coeffs, base_val)
+    return _smooth_max_value(h, beta)
+
+def _golay_h(params):
     """
-    Build h from parameters: h[n] = offset + sum_k amp[k] * cos(2*pi*freq[k]*n/N + phase[k])
-    params layout: [offset, freq1, phase1, amp1, freq2, phase2, amp2, ...]
+    Golay complementary pair: h = base + a1*cos(q1) + a2*cos(q2)
+    where q1, q2 are quadratic phases (chirps).
+    The complementary property can cancel sidelobes.
     """
-    offset = params[0]
-    n = np.arange(N)
-    h = np.full(N, offset)
-    for k in range(1, len(params) - 2, 3):
-        freq = params[k]
-        phase = params[k + 1]
-        amp = params[k + 2]
-        h += amp * np.cos(2 * np.pi * freq * n / N + phase)
+    p1, r1, a1, p2, r2, a2, base = params
+    i = np.arange(N, dtype=float)
+    ang1 = 2.0 * np.pi * r1 * i * (i + 1) / N + p1
+    ang2 = 2.0 * np.pi * r2 * i * (i + 1) / N + p2
+    return base + a1 * np.cos(ang1) + a2 * np.cos(ang2)
+
+def _golay_obj(params):
+    h = _golay_h(params)
+    return _value(h)
+
+def _golay_smooth_obj(params, beta=80.0):
+    h = _golay_h(params)
+    return _smooth_max_value(h, beta)
+
+def _windowed_zc_h(params):
+    """Windowed Zadoff-Chu sequence."""
+    phase, rate, amp, base, win_width, win_center = params
+    i = np.arange(N, dtype=float)
+    ang = 2.0 * np.pi * rate * i * (i + 1) / N + phase
+    rel_pos = i / N
+    x = (rel_pos - win_center) / (0.5 * win_width)
+    window = np.where(np.abs(x) <= 1.0, 0.5 * (1.0 + np.cos(np.pi * x)), 0.0)
+    return base + amp * window * np.cos(ang)
+
+def _windowed_zc_obj(params):
+    h = _windowed_zc_h(params)
+    return _value(h)
+
+def _chirp_h(params):
+    """Single chirp: h = base + amp * cos(phase + rate * (i/N)^2)"""
+    phase, rate, amp, base = params
+    i = np.arange(N, dtype=float)
+    ang = phase + rate * (i / N) ** 2
+    return base + amp * np.cos(ang)
+
+def _chirp_obj(params):
+    h = _chirp_h(params)
+    return _value(h)
+
+def _barker_like_h(params):
+    """
+    Barker-like sequence from Golay complementary pair.
+    h = base + sum_k a_k * cos(2*pi*k*i/N + phi_k) for k in active set
+    with optimized amplitudes and phases to minimize peak autocorrelation.
+    """
+    base = params[0]
+    n_harmonics = 8
+    amplitudes = params[1:1+n_harmonics]
+    phases = params[1+n_harmonics:1+2*n_harmonics]
+    i = np.arange(N, dtype=float)
+    h = np.full(N, base)
+    for k in range(1, n_harmonics + 1):
+        h += amplitudes[k-1] * np.cos(2.0 * np.pi * k * i / N + phases[k-1])
     return h
 
+def _barker_like_obj(params):
+    h = _barker_like_h(params)
+    return _value(h)
 
-def _build_chirp(params):
-    """
-    Build h from chirp parameters: h[n] = offset + amp * cos(2*pi*(f0*n + chirp*n^2/N) + phase)
-    params layout: [offset, amp, f0, chirp, phase]
-    """
-    offset, amp, f0, chirp, phase = params
-    n = np.arange(N)
-    phase_arg = 2 * np.pi * (f0 * n / N + chirp * n**2 / N**2) + phase
-    h = offset + amp * np.cos(phase_arg)
-    return h
-
-
-def _chirp_objective(params):
-    """Objective for chirp parameters."""
-    h = _build_chirp(params)
-    s = np.sum(h)
-    if s == 0 or not np.isfinite(s):
-        return 1e10
-    conv = np.convolve(h, h)
-    val = abs(2.0 * N * np.max(conv) / (s * s))
-    if not np.isfinite(val):
-        return 1e10
-    return val
-
-
-def _objective(params, n_modes):
-    """
-    Objective function: minimize the task value given sinusoid parameters.
-    params: [offset, freq1, phase1, amp1, freq2, phase2, amp2, ...]
-    """
-    h = _build_h(params)
-    s = np.sum(h)
-    if s == 0 or not np.isfinite(s):
-        return 1e10
-    conv = np.convolve(h, h)
-    max_conv = np.max(conv)
-    val = abs(2.0 * N * max_conv / (s * s))
-    if not np.isfinite(val):
-        return 1e10
-    return val
-
-
-def _optimize_one(n_modes, init_params, deadline):
-    """
-    Optimize sinusoid parameters for a given number of modes.
-    Returns (best_params, best_value).
-    """
-    try:
-        res = minimize(
-            _objective,
-            init_params,
-            args=(n_modes,),
-            method='L-BFGS-B',
-            options={'maxiter': 300, 'ftol': 1e-12, 'gtol': 1e-8, 'maxfun': 1000}
-        )
-        best_params = res.x
-        best_val = _objective(best_params, n_modes)
-        return best_params, best_val
-    except Exception:
-        return init_params, _objective(init_params, n_modes)
-
-
-def _local_refine(h, deadline, max_iter=20000):
-    """
-    Local refinement: try small random perturbations and keep improvements.
-    """
-    best_val = _evaluate(h)
-    best_h = h.copy()
-    rng = np.random.default_rng(42)
-    
-    step_size = 0.1
-    for step in range(max_iter):
-        if time.time() > deadline:
-            break
-        
-        # Try perturbing 1-5 random indices
-        n_perturb = rng.integers(1, 6)
-        idx = rng.choice(N, size=n_perturb, replace=False)
-        h_new = best_h.copy()
-        h_new[idx] += rng.normal(0, step_size, n_perturb)
-        
-        v_new = _evaluate(h_new)
-        if np.isfinite(v_new) and v_new < best_val - 1e-10:
-            best_val = v_new
-            best_h = h_new
-            # Reduce step size on success
-            step_size *= 0.98
-        elif step % 1000 == 0:
-            # Gradually reduce step size if no recent improvement
-            step_size *= 0.999
-    
-    return best_h, best_val
-
+def _barker_like_smooth_obj(params, beta=80.0):
+    h = _barker_like_h(params)
+    return _smooth_max_value(h, beta)
 
 def construct():
-    """
-    Construct step heights to minimize the autocorrelation inequality value.
-    Uses a model-and-optimize approach: parameterize h as sinusoids and fit parameters.
-    """
-    t0 = time.time()
-    deadline = t0 + _DEADLINE
+    global _t0
+    _t0 = time.time()
     
-    rng = np.random.default_rng(123)
-    
-    # Track best solution
-    best_val = 2.0  # seed value
     best_h = np.ones(N)
+    best_v = _value(best_h)
     
-    # Phase 1: Optimize sinusoid models with varying numbers of modes
-    # Try different numbers of sinusoidal modes (1 to 8)
-    for n_modes in range(1, 9):
-        if time.time() > deadline - 15:
-            break
-        
-        # Generate multiple initial parameter sets
-        n_inits = max(3, 12 - n_modes)  # More inits for fewer modes
-        for init_idx in range(n_inits):
-            if time.time() > deadline - 10:
-                break
-            
-            # Build initial parameters
-            offset = rng.uniform(0.5, 2.0)
-            params = [offset]
-            for k in range(n_modes):
-                freq = rng.uniform(1, 10)
-                phase = rng.uniform(0, 2 * np.pi)
-                amp = rng.uniform(0.1, 1.5)
-                params.extend([freq, phase, amp])
-            
-            # Optimize
-            opt_params, opt_val = _optimize_one(n_modes, params, deadline - 5)
-            
-            if np.isfinite(opt_val) and opt_val < best_val:
-                best_val = opt_val
-                best_h = _build_h(opt_params)
+    def deadline_ok():
+        return (time.time() - _t0) < _DEADLINE
     
-    # Phase 2: Chirp optimization using differential evolution + Nelder-Mead
-    if time.time() < deadline - 20:
-        # Define bounds for chirp parameters: [offset, amp, f0, chirp, phase]
-        bounds = [
-            (0.1, 3.0),      # offset
-            (0.1, 2.0),      # amp
-            (0.5, 10.0),     # f0
-            (0.01, 5.0),     # chirp
-            (0.0, 2 * np.pi) # phase
-        ]
-        
-        # Use differential evolution for global search
+    def update_best(h):
+        nonlocal best_h, best_v
+        v = _value(h)
+        if v < best_v:
+            best_v = v
+            best_h = h.copy()
+        return v
+    
+    # Phase 1: DCT spectral shaping with multiple restarts
+    if deadline_ok():
         try:
-            de_result = differential_evolution(
-                _chirp_objective,
-                bounds,
-                seed=42,
-                maxiter=100,
-                tol=1e-8,
-                popsize=15,
-                polish=True
-            )
-            if de_result.success and de_result.fun < best_val:
-                best_val = de_result.fun
-                best_h = _build_chirp(de_result.x)
+            rng = np.random.default_rng(42)
+            for restart in range(8):
+                if not deadline_ok():
+                    break
+                coeffs = np.zeros(_K_DCT)
+                n_active = rng.integers(4, min(12, _K_DCT))
+                active_idx = rng.choice(_K_DCT, size=n_active, replace=False)
+                coeffs[active_idx] = rng.normal(0, 1.0, size=n_active)
+                
+                res = minimize(_dct_smooth_obj, coeffs, method='L-BFGS-B',
+                              options={'maxiter': 300, 'ftol': 1e-14, 'gtol': 1e-12})
+                if res.x is not None:
+                    h = _dct_h(res.x)
+                    update_best(h)
         except Exception:
             pass
-        
-        # If DE didn't find improvement, try Nelder-Mead from a few random starts
-        if time.time() < deadline - 15:
-            for _ in range(5):
-                if time.time() > deadline - 10:
-                    break
-                init_params = np.array([
-                    rng.uniform(0.5, 2.0),
-                    rng.uniform(0.1, 1.5),
-                    rng.uniform(1.0, 5.0),
-                    rng.uniform(0.1, 2.0),
-                    rng.uniform(0, 2 * np.pi)
-                ])
-                try:
-                    nm_result = minimize(
-                        _chirp_objective,
-                        init_params,
-                        method='Nelder-Mead',
-                        options={'maxiter': 500, 'xatol': 1e-10, 'fatol': 1e-10}
-                    )
-                    if nm_result.fun < best_val:
-                        best_val = nm_result.fun
-                        best_h = _build_chirp(nm_result.x)
-                except Exception:
-                    pass
     
-    # Phase 3: Local refinement of the best candidate
-    if time.time() < deadline - 10:
-        best_h, best_val = _local_refine(best_h, deadline - 5)
+    # Phase 2: Golay complementary pair global search
+    if deadline_ok():
+        try:
+            bounds_golay = [
+                (-np.pi, np.pi),
+                (-50.0, 50.0),
+                (-3.0, 3.0),
+                (-np.pi, np.pi),
+                (-50.0, 50.0),
+                (-3.0, 3.0),
+                (-3.0, 3.0),
+            ]
+            res = differential_evolution(
+                _golay_obj, bounds_golay, seed=7, maxiter=50, tol=1e-8,
+                popsize=12, init='sobol', polish=False, update_interval=1
+            )
+            if res.x is not None:
+                h = _golay_h(res.x)
+                update_best(h)
+        except Exception:
+            pass
     
-    # Phase 4: Try structured patterns that might have low autocorrelation
-    if time.time() < deadline - 15:
-        # Pattern 1: Alternating signs with varying magnitudes
-        # h[n] = (-1)^n * (a + b*sin(2*pi*c*n/N))
-        for trial in range(20):
-            if time.time() > deadline - 10:
-                break
-            
-            a = rng.uniform(0.5, 2.0)
-            b = rng.uniform(0.1, 1.0)
-            c = rng.uniform(1, 5)
-            phase = rng.uniform(0, 2 * np.pi)
-            n = np.arange(N)
-            h_test = (-1)**n * (a + b * np.sin(2 * np.pi * c * n / N + phase))
-            
-            if np.sum(h_test) == 0:
-                continue
-            
-            # Optimize this as a starting point
-            h_opt, v_opt = _local_refine(h_test, deadline - 5, max_iter=5000)
-            if np.isfinite(v_opt) and v_opt < best_val:
-                best_val = v_opt
-                best_h = h_opt
-        
-        # Pattern 2: Block patterns with alternating signs
-        for trial in range(15):
-            if time.time() > deadline - 10:
-                break
-            
-            n_blocks = rng.integers(4, 20)
-            block_size = N // n_blocks
-            h_test = np.zeros(N)
-            sign = 1
-            for i in range(0, N, block_size):
-                val = rng.uniform(0.5, 1.5)
-                h_test[i:min(i + block_size, N)] = sign * val
-                sign *= -1
-            
-            if np.sum(h_test) == 0:
-                continue
-            
-            h_opt, v_opt = _local_refine(h_test, deadline - 5, max_iter=5000)
-            if np.isfinite(v_opt) and v_opt < best_val:
-                best_val = v_opt
-                best_h = h_opt
-        
-        # Pattern 3: Low-frequency dominant patterns
-        for trial in range(15):
-            if time.time() > deadline - 10:
-                break
-            
-            # Very low frequency to make autocorrelation flatter
-            freq = rng.uniform(0.5, 2.0)
-            phase = rng.uniform(0, 2 * np.pi)
-            amp = rng.uniform(0.5, 1.5)
-            offset = rng.uniform(0.3, 1.0)
-            n = np.arange(N)
-            h_test = offset + amp * np.cos(2 * np.pi * freq * n / N + phase)
-            
-            if np.sum(h_test) == 0:
-                continue
-            
-            h_opt, v_opt = _local_refine(h_test, deadline - 5, max_iter=5000)
-            if np.isfinite(v_opt) and v_opt < best_val:
-                best_val = v_opt
-                best_h = h_opt
+    # Phase 3: Windowed Zadoff-Chu global search
+    if deadline_ok():
+        try:
+            bounds_wzc = [
+                (-np.pi, np.pi),
+                (-50.0, 50.0),
+                (-3.0, 3.0),
+                (-3.0, 3.0),
+                (0.3, 1.5),
+                (0.2, 0.8),
+            ]
+            res = differential_evolution(
+                _windowed_zc_obj, bounds_wzc, seed=13, maxiter=45, tol=1e-8,
+                popsize=12, init='sobol', polish=False, update_interval=1
+            )
+            if res.x is not None:
+                h = _windowed_zc_h(res.x)
+                update_best(h)
+        except Exception:
+            pass
     
-    # Phase 5: Final local refinement
-    if time.time() < deadline - 5:
-        best_h, best_val = _local_refine(best_h, deadline - 2, max_iter=10000)
+    # Phase 4: Barker-like multi-harmonic search
+    if deadline_ok():
+        try:
+            n_harm = 8
+            bounds_barker = [(-2.0, 2.0)]  # base
+            for _ in range(n_harm):
+                bounds_barker.append((-2.0, 2.0))  # amplitude
+            for _ in range(n_harm):
+                bounds_barker.append((-np.pi, np.pi))  # phase
+            
+            res = differential_evolution(
+                _barker_like_obj, bounds_barker, seed=23, maxiter=40, tol=1e-8,
+                popsize=10, init='sobol', polish=False, update_interval=1
+            )
+            if res.x is not None:
+                h = _barker_like_h(res.x)
+                update_best(h)
+        except Exception:
+            pass
     
-    # Final check
-    final_val = _evaluate(best_h)
-    if not np.isfinite(final_val) or final_val >= 2.0:
-        # Fall back to seed if optimization failed
-        best_h = np.ones(N)
+    # Phase 5: Chirp global search
+    if deadline_ok():
+        try:
+            bounds_chirp = [
+                (-np.pi, np.pi),
+                (-200.0, 200.0),
+                (-3.0, 3.0),
+                (-3.0, 3.0),
+            ]
+            res = differential_evolution(
+                _chirp_obj, bounds_chirp, seed=31, maxiter=40, tol=1e-8,
+                popsize=10, init='sobol', polish=False, update_interval=1
+            )
+            if res.x is not None:
+                h = _chirp_h(res.x)
+                update_best(h)
+        except Exception:
+            pass
     
+    # Phase 6: DFT refinement with smooth max
+    if deadline_ok():
+        try:
+            h_best = best_h
+            mean_h = np.mean(h_best)
+            coeffs_init = np.zeros(2 * _K_DFT)
+            for k in range(1, _K_DFT + 1):
+                angle = 2.0 * np.pi * k * _n_idx / N
+                A_k = np.column_stack([np.cos(angle), np.sin(angle)])
+                target = h_best - mean_h
+                sol = np.linalg.lstsq(A_k, target, rcond=None)[0]
+                coeffs_init[2 * (k - 1)] = sol[0]
+                coeffs_init[2 * (k - 1) + 1] = sol[1]
+            x0 = np.concatenate([coeffs_init, [mean_h]])
+            
+            res = minimize(_dft_smooth_obj, x0, method='L-BFGS-B',
+                          options={'maxiter': 500, 'ftol': 1e-14, 'gtol': 1e-12})
+            if res.x is not None:
+                h = _dft_h(res.x[:-1], res.x[-1])
+                update_best(h)
+        except Exception:
+            pass
+    
+    # Phase 7: Nelder-Mead polish on DFT
+    if deadline_ok():
+        try:
+            h_best = best_h
+            mean_h = np.mean(h_best)
+            coeffs_init = np.zeros(2 * _K_DFT)
+            for k in range(1, _K_DFT + 1):
+                angle = 2.0 * np.pi * k * _n_idx / N
+                A_k = np.column_stack([np.cos(angle), np.sin(angle)])
+                target = h_best - mean_h
+                sol = np.linalg.lstsq(A_k, target, rcond=None)[0]
+                coeffs_init[2 * (k - 1)] = sol[0]
+                coeffs_init[2 * (k - 1) + 1] = sol[1]
+            x0 = np.concatenate([coeffs_init, [mean_h]])
+            
+            res = minimize(_dft_obj, x0, method='Nelder-Mead',
+                          options={'xatol': 1e-12, 'fatol': 1e-14, 'maxiter': 500, 'maxfev': 800})
+            if res.x is not None:
+                h = _dft_h(res.x[:-1], res.x[-1])
+                update_best(h)
+        except Exception:
+            pass
+    
+    # Phase 8: Final DCT polish with tighter tolerance
+    if deadline_ok():
+        try:
+            h_best = best_h
+            # Project onto DCT basis
+            coeffs_init = _DCT_BASIS.T @ h_best
+            res = minimize(_dct_obj, coeffs_init, method='L-BFGS-B',
+                          options={'maxiter': 400, 'ftol': 1e-14, 'gtol': 1e-12})
+            if res.x is not None:
+                h = _dct_h(res.x)
+                update_best(h)
+        except Exception:
+            pass
+    
+    s = np.sum(best_h)
+    if s == 0 or not np.all(np.isfinite(best_h)):
+        return np.ones(N)
     return best_h
-# EVOLVE-BLOCK-END

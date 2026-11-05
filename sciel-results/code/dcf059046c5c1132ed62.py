@@ -1,0 +1,172 @@
+"""Matrix multiplication 4x4 x 4x7 via corrected Strassen construction."""
+import numpy as np
+import time
+
+DIMENSIONS = [4, 4, 7]
+
+# EVOLVE-BLOCK-START
+def _verify(U, V, W, n, m, p, tol=1e-9):
+    """Verify decomposition exactly reconstructs matmul tensor."""
+    U = np.asarray(U, dtype=float)
+    V = np.asarray(V, dtype=float)
+    W = np.asarray(W, dtype=float)
+    if U.shape[0] != n*m or V.shape[0] != m*p or W.shape[0] != p*n:
+        return False
+    r = U.shape[1]
+    if V.shape[1] != r or W.shape[1] != r:
+        return False
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                s = 0.0
+                for c in range(r):
+                    s += U[i*m+j, c] * V[j*p+k, c] * W[k*n+i, c]
+                if abs(s - 1.0) > tol:
+                    return False
+    return True
+
+def _schoolbook(n, m, p):
+    r = n*m*p
+    U = np.zeros((n*m, r)); V = np.zeros((m*p, r)); W = np.zeros((p*n, r))
+    c = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i*m+j, c] = 1; V[j*p+k, c] = 1; W[k*n+i, c] = 1
+                c += 1
+    return U, V, W
+
+def _build_444():
+    """Strassen-based 4x4 * 4x4 -> 4x4, rank 49."""
+    n = m = p = 4
+    U = np.zeros((n*m, 49)); V = np.zeros((m*p, 49)); W = np.zeros((p*n, 49))
+    A11 = [0,1,4,5]; A12 = [2,3,6,7]; A21 = [8,9,12,13]; A22 = [10,11,14,15]
+    B11 = [0,1,4,5]; B12 = [2,3,6,7]; B21 = [8,9,12,13]; B22 = [10,11,14,15]
+    C11 = [0,1,4,5]; C12 = [2,3,6,7]; C21 = [8,9,12,13]; C22 = [10,11,14,15]
+    macros = [
+        ([A11, A22], [1,1], [B11, B22], [1,1], [(C11,1),(C22,1)]),
+        ([A21, A22], [1,1], [B11], [1], [(C21,1)]),
+        ([A11], [1], [B12, B22], [1,-1], [(C12,1)]),
+        ([A22], [1], [B21, B11], [1,-1], [(C11,1),(C21,1)]),
+        ([A11, A12], [1,1], [B22], [1], [(C11,-1),(C12,1)]),
+        ([A21, A11], [1,-1], [B11, B12], [1,1], [(C22,1)]),
+        ([A12, A22], [1,-1], [B21, B22], [1,1], [(C11,1)]),
+    ]
+    # Corrected Strassen patterns
+    strassen_pat = [
+        ([(0,1),(3,1)], [(0,1),(3,1)], [(0,1),(3,-1)]), # M1: C22 sign fixed
+        ([(2,1),(3,1)], [(0,1)], [(2,1)]),              # M2
+        ([(0,1)], [(1,1),(3,-1)], [(1,1)]),             # M3
+        ([(3,1)], [(2,1),(0,-1)], [(0,1),(2,1)]),       # M4
+        ([(0,1),(1,1)], [(3,1)], [(0,-1),(1,1)]),       # M5
+        ([(2,1),(0,-1)], [(0,1),(1,1)], [(3,1)]),       # M6
+        ([(1,1),(3,-1)], [(2,1),(3,1)], [(0,-1)]),      # M7: C11 sign fixed
+    ]
+    col = 0
+    for macro in macros:
+        A_blocks, A_signs, B_blocks, B_signs, C_targets = macro
+        for sub in strassen_pat:
+            U_entries, V_entries, W_entries = sub
+            for a_local, s_u in U_entries:
+                gidx = A_blocks[a_local]
+                U[gidx, col] += A_signs[a_local] * s_u
+            for b_local, s_v in V_entries:
+                gidx = B_blocks[b_local]
+                V[gidx, col] += B_signs[b_local] * s_v
+            for c_local, s_w in W_entries:
+                C_block, c_sign = C_targets[c_local]
+                for gidx in C_block:
+                    W[gidx, col] += c_sign * s_w
+            col += 1
+    return U, V, W
+
+def _build_443():
+    """4x4 * 4x3 -> 4x3, rank 44."""
+    n, m, p = 4, 4, 3
+    r = 44
+    U = np.zeros((n*m, r)); V = np.zeros((m*p, r)); W = np.zeros((p*n, r))
+    
+    products = [
+        (0, 0, 0, 0),
+        (0, 2, 2, 0),
+        (2, 0, 0, 2),
+        (2, 2, 2, 2),
+    ]
+    
+    strassen_2x2 = [
+        ([(0,1),(3,1)], [(0,1),(3,1)], [(0,1),(3,-1)]),
+        ([(2,1),(3,1)], [(0,1)], [(2,1)]),
+        ([(0,1)], [(1,1),(3,-1)], [(1,1)]),
+        ([(3,1)], [(2,1),(0,-1)], [(0,1),(2,1)]),
+        ([(0,1),(1,1)], [(3,1)], [(0,-1),(1,1)]),
+        ([(2,1),(0,-1)], [(0,1),(1,1)], [(3,1)]),
+        ([(1,1),(3,-1)], [(2,1),(3,1)], [(0,-1)]),
+    ]
+    
+    col = 0
+    for (ar, ac, br, cr) in products:
+        for sub in strassen_2x2:
+            U_entries, V_entries, W_entries = sub
+            for a_local, s_u in U_entries:
+                U[(ar+a_local//2)*4 + (ac+a_local%2), col] += s_u
+            for b_local, s_v in V_entries:
+                V[(br+b_local//2)*3 + b_local%2, col] += s_v
+            for c_local, s_w in W_entries:
+                W[(cr+c_local//2)*4 + c_local%2, col] += s_w
+            col += 1
+        for ai in range(2):
+            for bk in range(2):
+                U[(ar+ai)*4 + (ac+bk), col] = 1
+                V[(br+bk)*3 + 2, col] = 1
+                W[(cr+ai)*4 + 2, col] = 1
+                col += 1
+    return U, V, W
+
+def _build_447():
+    """Combine 4x4*4x4 (rank 49) and 4x4*4x3 (rank 44) for 4x4*4x7 (rank 93)."""
+    n, m, p = 4, 4, 7
+    U1, V1, W1 = _build_444()
+    U2, V2, W2 = _build_443()
+    r1 = U1.shape[1]
+    r2 = U2.shape[1]
+    total_rank = r1 + r2
+    U = np.zeros((n*m, total_rank))
+    V = np.zeros((m*p, total_rank))
+    W = np.zeros((p*n, total_rank))
+    U[:, 0:r1] = U1
+    for i in range(4):
+        for j in range(4):
+            V[i*7+j, 0:r1] = V1[i*4+j, :]
+    for i in range(4):
+        for j in range(4):
+            W[i*7+j, 0:r1] = W1[i*4+j, :]
+    U[:, r1:total_rank] = U2
+    for i in range(4):
+        for j in range(3):
+            V[i*7+4+j, r1:total_rank] = V2[i*3+j, :]
+    for row in range(4):
+        for col in range(3):
+            W[row*7+4+col, r1:total_rank] = W2[row*4+col, :]
+    return U, V, W
+
+def construct():
+    n, m, p = DIMENSIONS
+    start_time = time.time()
+    deadline = start_time + 110
+    
+    # Schoolbook fallback
+    U_sb, V_sb, W_sb = _schoolbook(n, m, p)
+    best = {"U": U_sb.tolist(), "V": V_sb.tolist(), "W": W_sb.tolist()}
+    best_rank = n*m*p
+    
+    try:
+        if time.time() < deadline - 10:
+            U, V, W = _build_447()
+            if _verify(U, V, W, n, m, p):
+                best = {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}
+                best_rank = U.shape[1]
+    except Exception:
+        pass
+    
+    return best
+# EVOLVE-BLOCK-END

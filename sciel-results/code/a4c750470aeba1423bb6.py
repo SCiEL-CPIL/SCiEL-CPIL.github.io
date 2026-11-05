@@ -1,0 +1,414 @@
+import time
+import random
+import heapq
+
+def construct(n_rows, k):
+    start_time = time.time()
+    deadline = time.time() + 140  # 10s margin from 150s limit
+    
+    def _row_diffs(row):
+        diffs = set()
+        n = len(row)
+        for i in range(n):
+            for j in range(i + 1, n):
+                diffs.add(row[j] - row[i])
+        return diffs
+    
+    def _all_diffs(rows):
+        used = set()
+        for row in rows:
+            used |= _row_diffs(row)
+        return used
+    
+    def _valid(rows):
+        all_d = set()
+        for row in rows:
+            if not row or row[0] != 0:
+                return False
+            for i in range(len(row) - 1):
+                if row[i + 1] <= row[i]:
+                    return False
+            rd = _row_diffs(row)
+            if rd & all_d:
+                return False
+            all_d |= rd
+        return True
+    
+    def _scope(rows):
+        return max(max(r) for r in rows)
+    
+    def _fragmentation_score(x, row, used):
+        """Score a candidate x by how much it fragments the difference space.
+        Lower score = less fragmentation = better fit."""
+        new_diffs = {x - a for a in row}
+        # Count how many new differences are "isolated" (neighbors already used)
+        # vs "contiguous" (neighbors available)
+        fragmentation = 0
+        for d in new_diffs:
+            # Check if d-1 and d+1 are in used (already fragmented area)
+            # or not (would create new fragmentation)
+            if (d - 1) not in used and (d + 1) not in used:
+                fragmentation += 1  # creates new isolated difference
+            elif (d - 1) in used or (d + 1) in used:
+                fragmentation += 0  # extends existing cluster
+            else:
+                fragmentation += 0.5
+        return fragmentation
+    
+    def greedy_construct_bestfit(seed_offset=0, max_candidates=50):
+        """Priority-queue based best-fit heuristic: select candidates that minimize
+        fragmentation of the difference space."""
+        rng = random.Random(42 + seed_offset)
+        used = set()
+        rows = []
+        
+        for _ in range(n_rows):
+            row = [0]
+            while len(row) < k + 1:
+                last = row[-1]
+                # Generate candidates: next values that don't immediately conflict
+                candidates = []
+                x = last + 1
+                checked = 0
+                while checked < max_candidates:
+                    new_diffs = {x - a for a in row}
+                    if not (new_diffs & used):
+                        # Score by fragmentation
+                        frag = _fragmentation_score(x, row, used)
+                        # Also prefer smaller x (compactness)
+                        score = frag + x * 0.01
+                        candidates.append((score, frag, x))
+                    x += 1
+                    checked += 1
+                
+                if not candidates:
+                    # Fallback: keep going until we find one
+                    x = last + 1
+                    while True:
+                        new_diffs = {x - a for a in row}
+                        if not (new_diffs & used):
+                            candidates.append((0, 0, x))
+                            break
+                        x += 1
+                
+                # Pick the best candidate (lowest score)
+                candidates.sort(key=lambda t: t[0])
+                best_score, best_frag, best_x = candidates[0]
+                
+                # With some probability, pick from top-3 for diversity
+                if len(candidates) > 1 and rng.random() < 0.3:
+                    idx = rng.randint(0, min(2, len(candidates) - 1))
+                    best_x = candidates[idx][2]
+                
+                row.append(best_x)
+                new_diffs = {best_x - a for a in row[:-1]}
+                used |= new_diffs
+            rows.append(row)
+        
+        return rows
+    
+    def greedy_construct(seed_offset=0):
+        rng = random.Random(42 + seed_offset)
+        used = set()
+        rows = []
+        
+        for _ in range(n_rows):
+            row = [0]
+            x = 0
+            while len(row) < k + 1:
+                x += 1
+                new_diffs = {x - a for a in row}
+                if not (new_diffs & used):
+                    row.append(x)
+                    used |= new_diffs
+            rows.append(row)
+        
+        return rows
+    
+    def greedy_construct_randomized(seed_offset=0):
+        rng = random.Random(42 + seed_offset)
+        used = set()
+        rows = []
+        
+        for _ in range(n_rows):
+            row = [0]
+            x = 0
+            while len(row) < k + 1:
+                max_step = max(1, int((k + 1) * 2.5))
+                found = False
+                for _attempt in range(30):
+                    step = rng.randint(1, max_step)
+                    x = row[-1] + step
+                    new_diffs = {x - a for a in row}
+                    if not new_diffs & used:
+                        found = True
+                        break
+                if not found:
+                    x = row[-1] + 1
+                    while True:
+                        new_diffs = {x - a for a in row}
+                        if not new_diffs & used:
+                            break
+                        x += 1
+                row.append(x)
+                used |= new_diffs
+            rows.append(row)
+        
+        return rows
+    
+    def backtrack_row(used, max_val, row, depth, rng, deadline):
+        """Build one row via backtracking within max_val."""
+        if time.time() > deadline:
+            return None
+        if depth == k + 1:
+            return row[:]
+        
+        last = row[-1] if row else 0
+        start = last + 1
+        
+        candidates = list(range(start, max_val + 1))
+        rng.shuffle(candidates)
+        
+        for x in candidates:
+            new_diffs = {x - a for a in row}
+            if new_diffs & used:
+                continue
+            
+            row.append(x)
+            used_copy = used | new_diffs
+            
+            result = backtrack_row(used_copy, max_val, row, depth + 1, rng, deadline)
+            if result is not None:
+                return result
+            
+            row.pop()
+        
+        return None
+    
+    def backtrack_construct(max_val, num_rows, rng, deadline):
+        """Try to construct all rows within max_val using backtracking."""
+        used = set()
+        rows = []
+        
+        for i in range(num_rows):
+            if time.time() > deadline:
+                return None
+            
+            row = [0]
+            result = backtrack_row(used, max_val, row, 1, rng, deadline)
+            if result is None:
+                return None
+            
+            rows.append(result)
+            used |= _row_diffs(result)
+        
+        return rows
+    
+    def local_search_shrink(rows, deadline, rng):
+        """Local search: try to reduce the maximum entry by modifying individual elements.
+        Works at the difference level: for each element position, try alternative values."""
+        rows = [list(r) for r in rows]
+        best_scope = _scope(rows)
+        used = _all_diffs(rows)
+        
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            current_scope = _scope(rows)
+            
+            # Try to reduce each element that is at the current maximum
+            for ri in range(len(rows)):
+                if time.time() > deadline:
+                    break
+                row = rows[ri]
+                for pos in range(len(row) - 1, 0, -1):
+                    if time.time() > deadline:
+                        break
+                    old_val = row[pos]
+                    if old_val < current_scope:
+                        continue
+                    
+                    low = row[pos - 1] + 1
+                    high = old_val - 1
+                    if pos + 1 < len(row):
+                        high = min(high, row[pos + 1] - 1)
+                    
+                    if low > high:
+                        continue
+                    
+                    candidates = list(range(high, low - 1, -1))
+                    rng.shuffle(candidates)
+                    
+                    for new_val in candidates:
+                        if time.time() > deadline:
+                            break
+                        if new_val >= old_val:
+                            continue
+                        
+                        old_diffs = set()
+                        for i in range(pos):
+                            old_diffs.add(old_val - row[i])
+                        for i in range(pos + 1, len(row)):
+                            old_diffs.add(row[i] - old_val)
+                        
+                        new_diffs = set()
+                        for i in range(pos):
+                            new_diffs.add(new_val - row[i])
+                        for i in range(pos + 1, len(row)):
+                            new_diffs.add(row[i] - new_val)
+                        
+                        conflict = new_diffs & (used - old_diffs)
+                        if conflict:
+                            continue
+                        
+                        row[pos] = new_val
+                        used -= old_diffs
+                        used |= new_diffs
+                        improved = True
+                        break
+        
+        return rows
+    
+    def local_search_swap(rows, deadline, rng, iterations=5000):
+        """Local search: try to improve rows by swapping elements."""
+        best = [r[:] for r in rows]
+        best_scope = _scope(best)
+        
+        for _ in range(iterations):
+            if time.time() > deadline:
+                break
+                
+            ri = rng.randint(0, len(best) - 1)
+            pi = rng.randint(1, k)
+            
+            old_val = best[ri][pi]
+            
+            if pi < k:
+                new_val = rng.randint(best[ri][pi - 1] + 1, min(best_scope, best[ri][pi + 1] - 1))
+            else:
+                new_val = rng.randint(best[ri][pi - 1] + 1, best_scope)
+            
+            if new_val == old_val:
+                continue
+            
+            test_row = best[ri][:]
+            test_row[pi] = new_val
+            
+            if len(set(test_row)) != len(test_row):
+                continue
+            
+            all_diffs = set()
+            valid = True
+            for r in best:
+                for i in range(len(r)):
+                    for j in range(i + 1, len(r)):
+                        d = r[j] - r[i]
+                        if d in all_diffs:
+                            valid = False
+                            break
+                        all_diffs.add(d)
+                if not valid:
+                    break
+            
+            if not valid:
+                continue
+            
+            for i in range(len(test_row)):
+                for j in range(i + 1, len(test_row)):
+                    d = test_row[j] - test_row[i]
+                    if d in all_diffs:
+                        valid = False
+                        break
+                if not valid:
+                    break
+            
+            if not valid:
+                continue
+            
+            new_scope = max(max(r) for r in best if r is not test_row)
+            new_scope = max(new_scope, max(test_row))
+            
+            if new_scope <= best_scope:
+                best[ri] = test_row
+                best_scope = new_scope
+        
+        return best, best_scope
+    
+    # Start with best-fit greedy constructions (priority-queue based)
+    best_rows = greedy_construct_bestfit(seed_offset=0)
+    best_scope = _scope(best_rows)
+    
+    # Try more best-fit variants with different seeds and parameters
+    for seed in range(15):
+        if time.time() > deadline - 20:
+            break
+        rows = greedy_construct_bestfit(seed_offset=seed)
+        scope = _scope(rows)
+        if scope < best_scope:
+            best_rows = rows
+            best_scope = scope
+    
+    # Try randomized greedy as fallback
+    for seed in range(5):
+        if time.time() > deadline - 20:
+            break
+        rows = greedy_construct_randomized(seed)
+        scope = _scope(rows)
+        if scope < best_scope:
+            best_rows = rows
+            best_scope = scope
+    
+    # Apply local search shrink
+    rng = random.Random(123)
+    if time.time() < deadline - 10:
+        polished = local_search_shrink(best_rows, deadline - 5, rng)
+        polished_scope = _scope(polished)
+        if polished_scope < best_scope:
+            best_rows = polished
+            best_scope = polished_scope
+    
+    # Apply swap-based local search
+    if time.time() < deadline - 10:
+        polished, polished_scope = local_search_swap(best_rows, deadline - 5, rng, iterations=3000)
+        if polished_scope < best_scope:
+            best_rows = polished
+            best_scope = polished_scope
+    
+    # Try backtracking at progressively lower scopes
+    current_max = best_scope
+    lower_bound = max(n_rows * k * (k + 1) // 2, 50)
+    
+    while time.time() < deadline - 5:
+        target_scope = current_max - 1
+        
+        if target_scope < lower_bound:
+            break
+        
+        rng = random.Random(int(time.time() * 1000) % 10000)
+        result = backtrack_construct(target_scope, n_rows, rng, deadline - 5)
+        if result is not None:
+            best_rows = result
+            best_scope = target_scope
+            current_max = target_scope
+            
+            # Polish the new solution
+            if time.time() < deadline - 5:
+                polished = local_search_shrink(best_rows, deadline - 5, rng)
+                polished_scope = _scope(polished)
+                if polished_scope < best_scope:
+                    best_rows = polished
+                    best_scope = polished_scope
+                    current_max = polished_scope
+        else:
+            current_max = target_scope
+    
+    # Final polish
+    if time.time() < deadline - 2:
+        rng = random.Random(999)
+        polished = local_search_shrink(best_rows, deadline - 2, rng)
+        polished_scope = _scope(polished)
+        if polished_scope < best_scope:
+            best_rows = polished
+            best_scope = polished_scope
+    
+    return best_rows

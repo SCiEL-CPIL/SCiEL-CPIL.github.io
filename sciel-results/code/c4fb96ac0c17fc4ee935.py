@@ -1,0 +1,686 @@
+import math
+import time
+import numpy as np
+from scipy.optimize import minimize, minimize_scalar, differential_evolution
+
+N = 11
+D = math.sqrt(3)
+
+# Precompute base hexagon vertex angles
+_BASE_ANGLES = np.deg2rad(np.array([0.0, 60.0, 120.0, 180.0, 240.0, 300.0]))
+_BASE_COS = np.cos(_BASE_ANGLES)
+_BASE_SIN = np.sin(_BASE_ANGLES)
+
+def _hex_vertices(cx, cy, angle_deg, s=1.0):
+    """Vertices of a regular hexagon with side s, centered at (cx,cy), rotated angle_deg."""
+    angles = _BASE_ANGLES + np.deg2rad(angle_deg)
+    vs = np.column_stack([s * np.cos(angles), s * np.sin(angles)])
+    return vs + np.array([cx, cy])
+
+def _point_in_polygon(pt, poly):
+    """Check if point is inside convex polygon using cross products."""
+    n = len(poly)
+    sign = 0
+    for i in range(n):
+        a = poly[i]
+        b = poly[(i+1) % n]
+        cross = (b[0] - a[0]) * (pt[1] - a[1]) - (b[1] - a[1]) * (pt[0] - a[0])
+        if cross > 1e-12:
+            if sign < 0:
+                return False
+            sign = 1
+        elif cross < -1e-12:
+            if sign > 0:
+                return False
+            sign = -1
+    return True
+
+def _seg_seg_dist(p1, p2, p3, p4):
+    """Minimum distance between two line segments p1-p2 and p3-p4."""
+    d1 = p2 - p1
+    d2 = p4 - p3
+    r = p1 - p3
+    a = np.dot(d1, d1)
+    e = np.dot(d2, d2)
+    f = np.dot(d2, r)
+    if a < 1e-12 and e < 1e-12:
+        return np.linalg.norm(p1 - p3)
+    if a < 1e-12:
+        t = np.clip(f / e, 0.0, 1.0)
+        return np.linalg.norm(p1 - (p3 + t * d2))
+    c = np.dot(d1, r)
+    if e < 1e-12:
+        s = np.clip(c / a, 0.0, 1.0)
+        return np.linalg.norm((p1 + s * d1) - p3)
+    b = np.dot(d1, d2)
+    denom = a * e - b * b
+    if denom > 1e-12:
+        s = (b * f - c * e) / denom
+        s = np.clip(s, 0.0, 1.0)
+        t = (b * s + f) / e
+        if t < 0:
+            t = 0.0
+            s = np.clip(c / a, 0.0, 1.0)
+        elif t > 1:
+            t = 1.0
+            s = np.clip((b + f) / a, 0.0, 1.0)
+        return np.linalg.norm((p1 + s * d1) - (p3 + t * d2))
+    t = np.clip(f / e, 0.0, 1.0)
+    return np.linalg.norm(p1 - (p3 + t * d2))
+
+def _poly_separation(p1, p2):
+    """Minimum distance between two convex polygons; 0 if overlapping."""
+    for v in p1:
+        if _point_in_polygon(v, p2):
+            return 0.0
+    for v in p2:
+        if _point_in_polygon(v, p1):
+            return 0.0
+    min_dist = float('inf')
+    n1, n2 = len(p1), len(p2)
+    for i in range(n1):
+        a1 = p1[i]
+        a2 = p1[(i+1) % n1]
+        for j in range(n2):
+            b1 = p2[j]
+            b2 = p2[(j+1) % n2]
+            d = _seg_seg_dist(a1, a2, b1, b2)
+            if d < min_dist:
+                min_dist = d
+    return min_dist
+
+def _outer_hex_vertices(cx, cy, side, angle_deg):
+    """Vertices of outer regular hexagon."""
+    angles = _BASE_ANGLES + np.deg2rad(angle_deg)
+    vs = np.column_stack([side * np.cos(angles), side * np.sin(angles)])
+    return vs + np.array([cx, cy])
+
+def _fast_side(inner_params, outer_angle_deg):
+    """
+    Vectorized support-function computation of minimum outer hexagon side.
+    inner_params: (n, 3) array [x, y, angle_deg]
+    Returns the minimum side length S such that all inner hexagons fit inside
+    the outer hexagon of rotation outer_angle_deg centered at origin.
+    """
+    n = inner_params.shape[0]
+    xs = inner_params[:, 0]
+    ys = inner_params[:, 1]
+    angles_rad = np.deg2rad(inner_params[:, 2])
+    cos_a = np.cos(angles_rad)[:, np.newaxis]
+    sin_a = np.sin(angles_rad)[:, np.newaxis]
+    # (n, 6) vertex coordinates
+    vx = _BASE_COS * cos_a - _BASE_SIN * sin_a + xs[:, np.newaxis]
+    vy = _BASE_SIN * cos_a + _BASE_COS * sin_a + ys[:, np.newaxis]
+    # Edge normals of outer hexagon: at 30 + outer_angle + k*60
+    normal_angles = np.deg2rad(30.0 + outer_angle_deg + np.arange(6) * 60.0)
+    nx = np.cos(normal_angles)
+    ny = np.sin(normal_angles)
+    # (n, 6, 6): projection of each vertex of each hex onto each normal
+    proj = vx[:, :, np.newaxis] * nx[np.newaxis, np.newaxis, :] + \
+           vy[:, :, np.newaxis] * ny[np.newaxis, np.newaxis, :]
+    # For centered hexagon: need |proj| <= apothem for all
+    abs_proj = np.abs(proj)
+    max_per_hex = abs_proj.max(axis=1)   # (n, 6)
+    max_over_all = max_per_hex.max(axis=0)  # (6,)
+    # Apothem of outer hex = S * sqrt(3)/2, so S = 2 * max_proj / sqrt(3)
+    return 2.0 * float(np.max(max_over_all)) / math.sqrt(3.0)
+
+def _overlap_penalty(inner_params, penalty_weight=50.0, threshold=0.005):
+    """Penalty for overlapping inner hexagons, with center-distance prefilter."""
+    n = inner_params.shape[0]
+    centers = inner_params[:, :2]
+    dists = np.linalg.norm(centers[:, np.newaxis] - centers[np.newaxis, :], axis=2)
+    penalty = 0.0
+    for i in range(n):
+        for j in range(i + 1, n):
+            if dists[i, j] < 2.5:
+                v1 = _hex_vertices(inner_params[i, 0], inner_params[i, 1], inner_params[i, 2])
+                v2 = _hex_vertices(inner_params[j, 0], inner_params[j, 1], inner_params[j, 2])
+                sep = _poly_separation(v1, v2)
+                if sep < threshold:
+                    penalty += penalty_weight * (threshold - sep) ** 2
+    return penalty
+
+def _objective(params, outer_angle_deg, n):
+    inner_params = params.reshape(n, 3)
+    side = _fast_side(inner_params, outer_angle_deg)
+    return side + _overlap_penalty(inner_params)
+
+def _is_valid(inner_params, side, outer_angle_deg, min_sep=1e-8):
+    n = inner_params.shape[0]
+    # Re-check side strictly
+    side_check = _fast_side(inner_params, outer_angle_deg)
+    if side_check > side + 1e-9:
+        return False
+    outer_v = _outer_hex_vertices(0.0, 0.0, side, outer_angle_deg)
+    for i in range(n):
+        hex_v = _hex_vertices(inner_params[i, 0], inner_params[i, 1], inner_params[i, 2])
+        for v in hex_v:
+            if not _point_in_polygon(v, outer_v):
+                return False
+    centers = inner_params[:, :2]
+    dists = np.linalg.norm(centers[:, np.newaxis] - centers[np.newaxis, :], axis=2)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if dists[i, j] < 2.5:
+                v1 = _hex_vertices(inner_params[i, 0], inner_params[i, 1], inner_params[i, 2])
+                v2 = _hex_vertices(inner_params[j, 0], inner_params[j, 1], inner_params[j, 2])
+                sep = _poly_separation(v1, v2)
+                if sep < min_sep:
+                    return False
+    return True
+
+def _seed_solution():
+    """Concentric ring seed solution with exact minimal side calculation."""
+    eps = 1e-9
+    centers = [(0.0, 0.0)]
+    for k in range(6):
+        angle = np.deg2rad(k * 60)
+        centers.append(((D + eps) * np.cos(angle), (D + eps) * np.sin(angle)))
+    for k in range(4):
+        angle = np.deg2rad(30 + k * 60)
+        centers.append(((3.0 + 2 * eps) * np.cos(angle), (3.0 + 2 * eps) * np.sin(angle)))
+    inner = [[x, y, 30.0] for x, y in centers]
+    arr = np.array(inner)
+    
+    # Find the exact minimal side length for this configuration by sweeping angle
+    best_side = float('inf')
+    best_angle = 0.0
+    for angle_deg in np.arange(0, 60, 0.5):
+        s = _fast_side(arr, angle_deg)
+        if s < best_side:
+            best_side, best_angle = s, angle_deg
+            
+    # Refine angle
+    for angle_deg in np.arange(best_angle - 0.5, best_angle + 0.5, 0.02):
+        s = _fast_side(arr, angle_deg)
+        if s < best_side:
+            best_side, best_angle = s, angle_deg
+            
+    return inner, (0.0, 0.0), best_side, best_angle
+
+def _lattice_packing():
+    """Hexagonal lattice packing of 11 unit hexagons."""
+    v1 = np.array([D, 0.0])
+    v2 = np.array([D / 2, 1.5])
+    selected = [(0,0), (1,0), (-1,0), (0,1), (0,-1), (1,-1), (-1,1), (1,1), (-1,-1), (2,0), (0,-2)]
+    inner = []
+    for (i, j) in selected:
+        pos = i * v1 + j * v2
+        inner.append([float(pos[0]), float(pos[1]), 30.0])
+    arr = np.array(inner)
+    best_side, best_angle = float('inf'), 0.0
+    for angle_deg in np.arange(0, 60, 0.5):
+        s = _fast_side(arr, angle_deg)
+        if s < best_side:
+            best_side, best_angle = s, angle_deg
+    for angle_deg in np.arange(best_angle - 0.5, best_angle + 0.5, 0.02):
+        s = _fast_side(arr, angle_deg)
+        if s < best_side:
+            best_side, best_angle = s, angle_deg
+    return inner, (0.0, 0.0), best_side, best_angle
+
+def _rigid_rotation_optimize(base_params, time_limit):
+    """
+    Treat the 11-hex cluster as a rigid body: rotate all hexagons by a common
+    angle and translate by a common vector, then minimize the outer side.
+    """
+    base = base_params.copy()
+    base_angles = base[:, 2].copy()
+
+    def obj(p):
+        if time.time() > time_limit:
+            return 1e9
+        ga = p[0]
+        tx, ty = p[1], p[2]
+        new_params = base.copy()
+        new_params[:, 0] = base[:, 0] + tx
+        new_params[:, 1] = base[:, 1] + ty
+        new_params[:, 2] = base_angles + ga
+        return _fast_side(new_params, 0.0)
+
+    best_val = obj(np.array([0.0, 0.0, 0.0]))
+    best_p = np.array([0.0, 0.0, 0.0])
+
+    # Dense sweep of global rotation (60-degree periodicity)
+    for ga in np.arange(0, 60, 0.5):
+        val = obj(np.array([ga, 0.0, 0.0]))
+        if val < best_val:
+            best_val, best_p = val, np.array([ga, 0.0, 0.0])
+        if time.time() > time_limit - 5:
+            break
+
+    # Refine rotation
+    if time.time() < time_limit - 5:
+        res = minimize_scalar(
+            lambda ga: obj(np.array([ga, best_p[1], best_p[2]])),
+            bounds=(best_p[0] - 0.5, best_p[0] + 0.5),
+            method='bounded', options={'xatol': 1e-8}
+        )
+        if res.success and res.fun < best_val:
+            best_val = res.fun
+            best_p[0] = res.x
+
+    # Optimize translation
+    if time.time() < time_limit - 5:
+        res = minimize(
+            lambda t: obj(np.array([best_p[0], t[0], t[1]])),
+            best_p[1:3], method='Nelder-Mead',
+            options={'maxiter': 500, 'xatol': 1e-7, 'fatol': 1e-7, 'adaptive': True}
+        )
+        if res.fun < best_val:
+            best_val = res.fun
+            best_p[1:3] = res.x
+
+    # Joint polish
+    if time.time() < time_limit - 3:
+        res = minimize(obj, best_p, method='Nelder-Mead',
+                       options={'maxiter': 800, 'xatol': 1e-8, 'fatol': 1e-8, 'adaptive': True})
+        if res.fun < best_val:
+            best_val = res.fun
+            best_p = res.x
+
+    # Final high-precision rotation polish
+    if time.time() < time_limit - 1:
+        res = minimize_scalar(
+            lambda ga: obj(np.array([ga, best_p[1], best_p[2]])),
+            bounds=(best_p[0] - 0.05, best_p[0] + 0.05),
+            method='bounded', options={'xatol': 1e-10}
+        )
+        if res.success and res.fun < best_val:
+            best_val = res.fun
+            best_p[0] = res.x
+
+    ga, tx, ty = best_p
+    new_params = base.copy()
+    new_params[:, 0] = base[:, 0] + tx
+    new_params[:, 1] = base[:, 1] + ty
+    new_params[:, 2] = base_angles + ga
+    return new_params, best_val
+
+def _polish_angle(inner_arr, initial_angle, time_limit):
+    """High-precision polish of the outer hexagon angle with coordinate descent."""
+    best_side = _fast_side(inner_arr, initial_angle)
+    best_angle = initial_angle
+    
+    # Multi-scale coordinate descent: coarse to fine
+    scales = [
+        (1.0, 10.0),
+        (0.1, 1.0),
+        (0.01, 0.1),
+        (0.001, 0.01),
+    ]
+    
+    for step, span in scales:
+        if time.time() > time_limit:
+            break
+        angles = np.arange(best_angle - span, best_angle + span + step/2, step)
+        for angle_deg in angles:
+            if time.time() > time_limit:
+                break
+            side = _fast_side(inner_arr, angle_deg)
+            if side < best_side - 1e-15:
+                best_side, best_angle = side, angle_deg
+    
+    # Final high-precision polish with bounded minimization
+    if time.time() < time_limit:
+        try:
+            res = minimize_scalar(
+                lambda a: _fast_side(inner_arr, a),
+                bounds=(best_angle - 0.001, best_angle + 0.001),
+                method='bounded', options={'xatol': 1e-14}
+            )
+            if res.success and res.fun < best_side - 1e-15:
+                best_side, best_angle = res.fun, res.x
+        except Exception:
+            pass
+    
+    return best_side, best_angle
+
+def _gradient_optimize(inner_params, outer_angle_deg, time_limit):
+    """
+    Optimize inner hexagon positions and angles using L-BFGS-B with numerical gradients.
+    Uses a soft penalty for overlaps to maintain differentiability.
+    Multi-start with diverse initial conditions.
+    """
+    n = inner_params.shape[0]
+    
+    def obj(params):
+        if time.time() > time_limit:
+            return 1e9
+        p = params.reshape(n, 3)
+        side = _fast_side(p, outer_angle_deg)
+        penalty = 0.0
+        centers = p[:, :2]
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.linalg.norm(centers[i] - centers[j])
+                if dist < 2.0:
+                    penalty += 100.0 * (2.0 - dist) ** 2
+        return side + penalty
+
+    initial_conditions = [inner_params.flatten()]
+    
+    rng = np.random.RandomState(42)
+    for _ in range(3):
+        perturbation = rng.randn(n * 3) * 0.1
+        initial_conditions.append(inner_params.flatten() + perturbation)
+    
+    best_result = None
+    best_score = float('inf')
+    
+    for x0 in initial_conditions:
+        if time.time() > time_limit - 5:
+            break
+        try:
+            res = minimize(obj, x0, method='L-BFGS-B', 
+                           options={'maxiter': 150, 'ftol': 1e-12, 'gtol': 1e-12, 'maxfun': 5000})
+            if res.fun < best_score:
+                new_params = res.x.reshape(n, 3)
+                side = _fast_side(new_params, outer_angle_deg)
+                if _is_valid(new_params, side, outer_angle_deg, min_sep=1e-8):
+                    best_result = new_params
+                    best_score = side
+        except Exception:
+            continue
+    
+    if best_result is not None and best_score < _fast_side(inner_params, outer_angle_deg):
+        return best_result, best_score
+    return inner_params, _fast_side(inner_params, outer_angle_deg)
+
+def _smooth_surrogate_optimize(inner_params, outer_angle_deg, time_limit):
+    """
+    Smooth surrogate optimization using log-sum-exp for the max operation
+    and smooth min for the side length. This avoids the nonsmoothness of
+    the support function and allows gradient-based methods to work better.
+    """
+    n = inner_params.shape[0]
+    beta = 50.0  # Temperature for log-sum-exp (higher = smoother)
+    
+    def smooth_side(params):
+        p = params.reshape(n, 3)
+        xs = p[:, 0]
+        ys = p[:, 1]
+        angles_rad = np.deg2rad(p[:, 2])
+        cos_a = np.cos(angles_rad)[:, np.newaxis]
+        sin_a = np.sin(angles_rad)[:, np.newaxis]
+        vx = _BASE_COS * cos_a - _BASE_SIN * sin_a + xs[:, np.newaxis]
+        vy = _BASE_SIN * cos_a + _BASE_COS * sin_a + ys[:, np.newaxis]
+        
+        normal_angles = np.deg2rad(30.0 + outer_angle_deg + np.arange(6) * 60.0)
+        nx = np.cos(normal_angles)
+        ny = np.sin(normal_angles)
+        
+        proj = vx[:, :, np.newaxis] * nx[np.newaxis, np.newaxis, :] + \
+               vy[:, :, np.newaxis] * ny[np.newaxis, np.newaxis, :]
+        
+        # Smooth max using log-sum-exp
+        abs_proj = np.abs(proj)  # (n, 6, 6)
+        
+        # For each normal direction, smooth max over all vertices
+        flat_abs = abs_proj.reshape(n * 6, 6)  # (n*6, 6)
+        max_flat = flat_abs.max(axis=0)  # (6,)
+        exp_shifted = np.exp(flat_abs - max_flat[np.newaxis, :])
+        log_sum_exp = max_flat + np.log(exp_shifted.sum(axis=0) / beta)
+        
+        # S = 2 * max(log_sum_exp) / sqrt(3)
+        return 2.0 * float(np.max(log_sum_exp)) / math.sqrt(3.0)
+    
+    def obj(params):
+        if time.time() > time_limit:
+            return 1e9
+        p = params.reshape(n, 3)
+        side = smooth_side(params)
+        # Smooth overlap penalty
+        penalty = 0.0
+        centers = p[:, :2]
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.linalg.norm(centers[i] - centers[j])
+                if dist < 2.0:
+                    # Smooth step function
+                    t = np.clip((2.0 - dist) / 0.1, 0, 1)
+                    penalty += 50.0 * t * t
+        return side + penalty
+    
+    # Multi-start
+    rng = np.random.RandomState(123)
+    starts = [inner_params.flatten()]
+    for _ in range(5):
+        starts.append(inner_params.flatten() + rng.randn(n * 3) * 0.05)
+    
+    best_result = None
+    best_score = float('inf')
+    
+    for x0 in starts:
+        if time.time() > time_limit - 3:
+            break
+        try:
+            res = minimize(obj, x0, method='L-BFGS-B',
+                           options={'maxiter': 200, 'ftol': 1e-14, 'gtol': 1e-14, 'maxfun': 8000})
+            if res.fun < best_score:
+                new_params = res.x.reshape(n, 3)
+                # Validate with exact (non-smooth) computation
+                exact_side = _fast_side(new_params, outer_angle_deg)
+                if _is_valid(new_params, exact_side, outer_angle_deg, min_sep=1e-8):
+                    best_result = new_params
+                    best_score = exact_side
+        except Exception:
+            continue
+    
+    if best_result is not None and best_score < _fast_side(inner_params, outer_angle_deg):
+        return best_result, best_score
+    return inner_params, _fast_side(inner_params, outer_angle_deg)
+
+def _epigraph_optimize(inner_params, outer_angle_deg, time_limit):
+    """
+    Epigraph formulation: minimize t subject to smooth constraints.
+    Uses auxiliary variable t for the side length.
+    """
+    n = inner_params.shape[0]
+    
+    def obj(params):
+        if time.time() > time_limit:
+            return 1e9
+        # Last variable is t (side length)
+        p = params[:n*3].reshape(n, 3)
+        t = params[n*3]
+        
+        # Smooth constraint: t >= side_length (smoothed)
+        side = _fast_side(p, outer_angle_deg)
+        constraint_violation = max(0, side - t)
+        
+        # Overlap penalty
+        penalty = 0.0
+        centers = p[:, :2]
+        for i in range(n):
+            for j in range(i + 1, n):
+                dist = np.linalg.norm(centers[i] - centers[j])
+                if dist < 2.0:
+                    penalty += 100.0 * (2.0 - dist) ** 2
+        
+        return t + 1000.0 * constraint_violation + penalty
+    
+    # Initial t
+    init_side = _fast_side(inner_params, outer_angle_deg)
+    x0 = np.concatenate([inner_params.flatten(), [init_side]])
+    
+    best_result = None
+    best_score = float('inf')
+    
+    try:
+        res = minimize(obj, x0, method='Nelder-Mead',
+                       options={'maxiter': 1000, 'xatol': 1e-8, 'fatol': 1e-10, 'adaptive': True})
+        new_params = res.x[:n*3].reshape(n, 3)
+        exact_side = _fast_side(new_params, outer_angle_deg)
+        if _is_valid(new_params, exact_side, outer_angle_deg, min_sep=1e-8):
+            if exact_side < _fast_side(inner_params, outer_angle_deg):
+                return new_params, exact_side
+    except Exception:
+        pass
+    
+    return inner_params, _fast_side(inner_params, outer_angle_deg)
+
+def _differential_evolution_search(inner_params, outer_angle_deg, time_limit):
+    """
+    Global search using differential evolution to explore the configuration space.
+    """
+    n = inner_params.shape[0]
+    bounds = [(-5, 5)] * n + [(-5, 5)] * n + [(-180, 180)] * n
+    
+    def obj(params):
+        if time.time() > time_limit:
+            return 1e9
+        p = params.reshape(n, 3)
+        side = _fast_side(p, outer_angle_deg)
+        penalty = _overlap_penalty(p, penalty_weight=20.0, threshold=0.001)
+        return side + penalty
+    
+    try:
+        res = differential_evolution(
+            obj, bounds, 
+            maxiter=50, popsize=10, 
+            tol=1e-10, mutation=(0.5, 1.5), 
+            recombination=0.7, seed=42,
+            polish=True
+        )
+        new_params = res.x.reshape(n, 3)
+        exact_side = _fast_side(new_params, outer_angle_deg)
+        if _is_valid(new_params, exact_side, outer_angle_deg, min_sep=1e-8):
+            if exact_side < _fast_side(inner_params, outer_angle_deg):
+                return new_params, exact_side
+    except Exception:
+        pass
+    
+    return inner_params, _fast_side(inner_params, outer_angle_deg)
+
+def _local_polish(inner_params, outer_angle_deg, time_limit):
+    """
+    Intensive local polish using multiple Nelder-Mead restarts from slightly perturbed starts.
+    """
+    n = inner_params.shape[0]
+    best_params = inner_params.copy()
+    best_side = _fast_side(inner_params, outer_angle_deg)
+    
+    rng = np.random.RandomState(99)
+    for _ in range(5):
+        if time.time() > time_limit - 2:
+            break
+        perturbation = rng.randn(n * 3) * 0.01
+        x0 = inner_params.flatten() + perturbation
+        try:
+            res = minimize(_objective, x0, args=(outer_angle_deg, n), method='Nelder-Mead',
+                           options={'maxiter': 1000, 'xatol': 1e-10, 'fatol': 1e-10, 'adaptive': True})
+            cand = res.x.reshape(n, 3)
+            cand_side = _fast_side(cand, outer_angle_deg)
+            if _is_valid(cand, cand_side, outer_angle_deg, min_sep=1e-8) and cand_side < best_side - 1e-12:
+                best_params = cand
+                best_side = cand_side
+        except Exception:
+            continue
+    
+    return best_params, best_side
+
+def construct():
+    start_time = time.time()
+    DEADLINE = 145.0
+    safety_margin = 5.0
+    n = 11
+
+    # Generate seed candidates
+    seed1_inner, _, seed1_side, seed1_angle = _seed_solution()
+    seed2_inner, _, seed2_side, seed2_angle = _lattice_packing()
+    seed_candidates = [(seed1_inner, seed1_side, seed1_angle),
+                       (seed2_inner, seed2_side, seed2_angle)]
+    best_seed = min(seed_candidates, key=lambda x: x[1])
+    best_inner = np.array(best_seed[0], dtype=float)
+    best_side = best_seed[1]
+    best_angle = best_seed[2]
+
+    # Phase 1: Rigid-body rotation optimization
+    if time.time() < DEADLINE - safety_margin - 25:
+        try:
+            rotated, side_val = _rigid_rotation_optimize(best_inner, DEADLINE - safety_margin - 15)
+            if _is_valid(rotated, side_val, 0.0, min_sep=1e-8):
+                best_inner, best_side, best_angle = rotated, side_val, 0.0
+        except Exception:
+            pass
+
+    # Phase 2: Smooth surrogate optimization (log-sum-exp)
+    if time.time() < DEADLINE - safety_margin - 20:
+        try:
+            opt_inner, opt_side = _smooth_surrogate_optimize(best_inner, best_angle, DEADLINE - safety_margin - 10)
+            if opt_side < best_side - 1e-15:
+                best_inner, best_side = opt_inner, opt_side
+        except Exception:
+            pass
+
+    # Phase 3: Epigraph optimization
+    if time.time() < DEADLINE - safety_margin - 15:
+        try:
+            opt_inner, opt_side = _epigraph_optimize(best_inner, best_angle, DEADLINE - safety_margin - 5)
+            if opt_side < best_side - 1e-15:
+                best_inner, best_side = opt_inner, opt_side
+        except Exception:
+            pass
+
+    # Phase 4: Gradient-based optimization with multi-start (L-BFGS-B)
+    if time.time() < DEADLINE - safety_margin - 15:
+        try:
+            opt_inner, opt_side = _gradient_optimize(best_inner, best_angle, DEADLINE - safety_margin - 5)
+            if opt_side < best_side - 1e-15:
+                best_inner, best_side = opt_inner, opt_side
+        except Exception:
+            pass
+
+    # Phase 5: Differential evolution global search
+    if time.time() < DEADLINE - safety_margin - 20:
+        try:
+            opt_inner, opt_side = _differential_evolution_search(best_inner, best_angle, DEADLINE - safety_margin - 5)
+            if opt_side < best_side - 1e-15:
+                best_inner, best_side = opt_inner, opt_side
+        except Exception:
+            pass
+
+    # Phase 6: High-precision angle polish with coordinate descent
+    if time.time() < DEADLINE - safety_margin:
+        best_side, best_angle = _polish_angle(best_inner, best_angle, DEADLINE - safety_margin)
+
+    # Phase 7: Final local refinement with fixed angle (Nelder-Mead)
+    if time.time() < DEADLINE - safety_margin - 5:
+        init_params2 = best_inner.flatten()
+        try:
+            res2 = minimize(_objective, init_params2, args=(best_angle, n), method='Nelder-Mead',
+                            options={'maxiter': 600, 'xatol': 1e-8, 'fatol': 1e-8, 'adaptive': True})
+            if time.time() < DEADLINE - safety_margin:
+                cand2 = res2.x.reshape(n, 3)
+                cand_side2 = _fast_side(cand2, best_angle)
+                if _is_valid(cand2, cand_side2, best_angle, min_sep=1e-8) and cand_side2 < best_side - 1e-15:
+                    best_inner, best_side = cand2, cand_side2
+        except Exception:
+            pass
+
+    # Phase 8: Intensive local polish with multiple restarts
+    if time.time() < DEADLINE - safety_margin - 5:
+        try:
+            polished_inner, polished_side = _local_polish(best_inner, best_angle, DEADLINE - safety_margin)
+            if polished_side < best_side - 1e-15:
+                best_inner, best_side = polished_inner, polished_side
+        except Exception:
+            pass
+
+    # Phase 9: Final angle polish with coordinate descent
+    if time.time() < DEADLINE - safety_margin:
+        best_side, best_angle = _polish_angle(best_inner, best_angle, DEADLINE - safety_margin)
+
+    # Final validation
+    final_side = _fast_side(best_inner, best_angle)
+    if not _is_valid(best_inner, final_side, best_angle, min_sep=1e-8):
+        best_inner = np.array(best_seed[0], dtype=float)
+        best_side, best_angle = best_seed[1], best_seed[2]
+    else:
+        best_side = final_side
+
+    inner_rows = [[float(best_inner[i, 0]), float(best_inner[i, 1]), float(best_inner[i, 2])]
+                  for i in range(n)]
+    return inner_rows, (0.0, 0.0), float(best_side), float(best_angle)

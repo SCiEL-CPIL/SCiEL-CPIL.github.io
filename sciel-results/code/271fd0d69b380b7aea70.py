@@ -1,0 +1,3 @@
+    def smooth_objective(v, beta=50.0):
+        # ... unflatten ...
+        return get_continuous_score(cfg, tuple(center), angle, beta, beta, 10.0)

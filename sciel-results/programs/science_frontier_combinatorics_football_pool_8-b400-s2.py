@@ -5,9 +5,7 @@ import time
 
 def construct(q, n, radius):
     if q != 3 or n != 8 or radius != 1:
-        # Fallback for non-target parameters (keep existing logic or simple greedy)
-        # The existing fallback is okay, but let's make it slightly faster if possible.
-        # For now, keep the existing fallback logic as it's not the target.
+        # Fallback for non-target parameters
         all_words = list(itertools.product(range(q), repeat=n))
         word_to_idx = {w: i for i, w in enumerate(all_words)}
         neighbors = []
@@ -65,7 +63,7 @@ def construct(q, n, radius):
     all_words = list(itertools.product(range(3), repeat=8))
     word_to_idx = {w: i for i, w in enumerate(all_words)}
     
-    # Precompute neighbors
+    # Precompute neighbors as numpy arrays for fast operations
     neighbors = []
     for i, w in enumerate(all_words):
         neigh_set = set()
@@ -86,10 +84,11 @@ def construct(q, n, radius):
     start_time = time.time()
     time_limit = 115.0
     
+    # Optimize greedy: pick word covering most uncovered
+    # To speed up, we can use a heap or just scan. Scanning 6561 * ~500 iterations is ~3M ops, fast enough.
     while np.any(uncovered):
         best_idx = -1
         best_count = -1
-        # Iterate through all words to find max coverage of uncovered
         for i in range(N):
             cnt = np.sum(uncovered[neighbors[i]])
             if cnt > best_count:
@@ -103,8 +102,6 @@ def construct(q, n, radius):
             break
             
     # 2. Local Search
-    # State: C (list of indices), counts (array of coverage counts)
-    
     def get_counts(code):
         counts = np.zeros(N, dtype=int)
         for c in code:
@@ -142,9 +139,21 @@ def construct(q, n, radius):
     best_counts = counts.copy()
     
     # Local Search Loop
+    # Strategy:
+    # 1. Reduce.
+    # 2. If not reduced, try to find a swap that enables a reduction.
+    #    - Pick a codeword c.
+    #    - Find unique points U_c.
+    #    - If |U_c| <= 3, find a word w not in C that covers U_c.
+    #    - Swap c -> w.
+    #    - Reduce.
+    # 3. If no swap found, try a random swap or accept a neutral swap to escape local minimum.
+    
     while time.time() - start_time < time_limit:
         # 1. Reduction Pass
+        old_size = len(C)
         C, counts = reduce_code(C, counts)
+        
         if len(C) < best_size:
             best_size = len(C)
             best_C = C.copy()
@@ -154,114 +163,147 @@ def construct(q, n, radius):
             break
             
         # 2. Swap Pass
-        # Try to find a swap that enables further reduction or is neutral but changes state
-        improved = False
-        # We iterate through C. If we make a swap, we break and restart the reduction/swap loop.
-        for c in C:
-            if time.time() - start_time > time_limit:
-                break
-                
-            u_indices = neighbors[c]
-            unique_mask = counts[u_indices] == 1
-            unique_points = u_indices[unique_mask]
+        if len(C) == old_size:
+            # No reduction happened. Try to find a move.
+            improved = False
+            # Randomize the order of C to avoid bias
+            indices = list(range(len(C)))
+            random.shuffle(indices)
             
-            if len(unique_points) == 0:
-                continue # Should have been removed
+            for idx in indices:
+                if time.time() - start_time > time_limit:
+                    break
+                c = C[idx]
+                u_indices = neighbors[c]
+                unique_mask = counts[u_indices] == 1
+                unique_points = u_indices[unique_mask]
                 
-            # If too many unique points, unlikely to find a single replacement
-            if len(unique_points) > 3:
-                continue
+                if len(unique_points) == 0:
+                    # Should have been removed, but maybe logic missed it?
+                    # Force removal
+                    C.remove(c)
+                    counts[neighbors[c]] -= 1
+                    improved = True
+                    break
                 
-            # Find candidates c' that cover all unique_points
-            # Intersection of neighbors[u] for u in unique_points
-            # Start with neighbors of first unique point
-            if len(unique_points) == 1:
-                candidates_set = set(neighbors[unique_points[0]].tolist())
-            else:
-                candidates_set = set(neighbors[unique_points[0]].tolist())
-                for u in unique_points[1:]:
-                    candidates_set &= set(neighbors[u].tolist())
-                    if not candidates_set:
+                # If too many unique points, unlikely to find a single replacement
+                # unless we allow larger swaps, but we stick to 1-for-1.
+                if len(unique_points) > 3:
+                    continue
+                
+                # Find candidates c' that cover all unique_points
+                # Intersection of neighbors[u] for u in unique_points
+                if len(unique_points) == 1:
+                    candidates_set = set(neighbors[unique_points[0]].tolist())
+                else:
+                    candidates_set = set(neighbors[unique_points[0]].tolist())
+                    for u in unique_points[1:]:
+                        candidates_set &= set(neighbors[u].tolist())
+                        if not candidates_set:
+                            break
+                
+                if not candidates_set:
+                    continue
+                
+                # Filter candidates: must not be in C
+                candidates_set.difference_update(C)
+                
+                if not candidates_set:
+                    continue
+                    
+                # Pick a candidate
+                # Heuristic: Pick one that maximizes overlap with other codewords?
+                # Or just pick one arbitrarily.
+                # Let's pick one randomly to explore.
+                c_prime = random.choice(list(candidates_set))
+                
+                # Apply swap
+                old_C = C.copy()
+                old_counts = counts.copy()
+                
+                C.remove(c)
+                C.append(c_prime)
+                
+                counts[neighbors[c]] -= 1
+                counts[neighbors[c_prime]] += 1
+                
+                # Check validity (should be valid by construction of U_c)
+                # But let's be safe
+                if np.any(counts < 1):
+                    C = old_C
+                    counts = old_counts
+                    continue
+                
+                # Try to reduce
+                new_C, new_counts = reduce_code(C, counts)
+                
+                if len(new_C) < len(old_C):
+                    # Improvement!
+                    C = new_C
+                    counts = new_counts
+                    if len(C) < best_size:
+                        best_size = len(C)
+                        best_C = C.copy()
+                        best_counts = counts.copy()
+                    improved = True
+                    break # Restart loop
+                    
+                else:
+                    # No reduction.
+                    # Keep the swap?
+                    # If we keep it, we might escape a local minimum.
+                    # If we revert, we might cycle.
+                    # Let's keep it if it's a "neutral" move that changes the structure.
+                    # But to avoid infinite loops of neutral swaps, we can limit them.
+                    # For now, let's keep it.
+                    # C and counts are already updated.
+                    improved = True
+                    break # Restart loop to see if this new state allows reduction
+            
+            if not improved:
+                # No move found in this pass.
+                # To escape local minima, we can try a "kick":
+                # Randomly swap a word with a random neighbor, even if it doesn't enable reduction immediately.
+                # Or just break and return best.
+                # Let's try a few random kicks.
+                for _ in range(10):
+                    if time.time() - start_time > time_limit: break
+                    if not C: break
+                    c_idx = random.randint(0, len(C)-1)
+                    c = C[c_idx]
+                    # Pick a random neighbor of c
+                    cand = neighbors[c]
+                    c_prime = cand[random.randint(0, len(cand)-1)]
+                    if c_prime in C: continue
+                    
+                    old_C = C.copy()
+                    old_counts = counts.copy()
+                    
+                    C.remove(c)
+                    C.append(c_prime)
+                    counts[neighbors[c]] -= 1
+                    counts[neighbors[c_prime]] += 1
+                    
+                    if np.any(counts < 1):
+                        C = old_C
+                        counts = old_counts
+                        continue
+                        
+                    # Try reduce
+                    new_C, new_counts = reduce_code(C, counts)
+                    if len(new_C) < len(old_C):
+                        C = new_C
+                        counts = new_counts
+                        if len(C) < best_size:
+                            best_size = len(C)
+                            best_C = C.copy()
+                            best_counts = counts.copy()
                         break
-            
-            if not candidates_set:
-                continue
-            
-            # Filter candidates: must not be in C
-            # We want to replace c with c'
-            # c' must cover unique_points.
-            # If c' is in C, it's already there. If we remove c, c' stays.
-            # But if c' is in C and c' != c, then c' was covering its own points.
-            # The condition for removing c is that its unique points are covered by others.
-            # If c' is in C, and c' covers unique_points, then c can be removed without adding anything.
-            # This is a pure removal, which reduce_code should have caught?
-            # No, reduce_code checks if min(counts) >= 2.
-            # If c' is in C, then counts[unique_points] >= 2 (one from c, one from c').
-            # So reduce_code would have removed c.
-            # Therefore, if we are in the swap phase, unique_points are covered ONLY by c.
-            # So c' MUST be NOT in C.
-            
-            candidates_set.difference_update(C)
-            
-            if not candidates_set:
-                continue
-                
-            # Pick a candidate
-            # Heuristic: Pick one that maximizes overlap with other codewords?
-            # Or just pick one arbitrarily.
-            # Let's pick one that has the highest number of neighbors in C?
-            # This might create more redundancy.
-            best_c_prime = None
-            max_overlap = -1
-            # To speed up, just pick the first one?
-            # Let's try picking one that is "dense" in C.
-            # But computing overlap for all candidates is expensive.
-            # Let's just pick one randomly or the first one.
-            # Randomness might help escape cycles.
-            c_prime = next(iter(candidates_set))
-            
-            # Apply swap
-            old_C = C.copy()
-            old_counts = counts.copy()
-            
-            C.remove(c)
-            C.append(c_prime)
-            
-            counts[neighbors[c]] -= 1
-            counts[neighbors[c_prime]] += 1
-            
-            # Check validity (should be valid)
-            if np.any(counts < 1):
-                C = old_C
-                counts = old_counts
-                continue
-                
-            # Try to reduce
-            new_C, new_counts = reduce_code(C, counts)
-            
-            if len(new_C) < len(old_C):
-                # Improvement!
-                C = new_C
-                counts = new_counts
-                if len(C) < best_size:
-                    best_size = len(C)
-                    best_C = C.copy()
-                    best_counts = counts.copy()
-                improved = True
-                break # Restart loop
-                
-            else:
-                # No reduction.
-                # Keep the swap?
-                # If we keep it, we might escape a local minimum.
-                # If we revert, we might cycle.
-                # Let's keep it if it's a "neutral" move that changes the structure.
-                # But to avoid infinite loops of neutral swaps, we can limit them.
-                # For now, let's keep it.
-                # C and counts are already updated.
-                improved = True
-                break # Restart loop to see if this new state allows reduction
-                
+                    else:
+                        # Accept the kick to change state
+                        C = new_C
+                        counts = new_counts
+
     # Final Reduction
     best_C, _ = reduce_code(best_C, get_counts(best_C))
     

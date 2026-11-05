@@ -1,0 +1,278 @@
+import itertools
+import random
+import time
+import math
+
+def construct(v, k, t):
+    start_time = time.time()
+    deadline = start_time + 115  # Safety margin
+    
+    # Pre-compute all t-subsets (triples)
+    all_triples = list(itertools.combinations(range(v), t))
+    num_triples = len(all_triples)
+    triple_to_idx = {tri: i for i, tri in enumerate(all_triples)}
+    
+    # Pre-compute all k-subsets (blocks)
+    all_blocks = list(itertools.combinations(range(v), k))
+    num_blocks = len(all_blocks)
+    
+    # Pre-compute bitmask for each block
+    block_masks = [0] * num_blocks
+    for bi, b in enumerate(all_blocks):
+        mask = 0
+        for tri in itertools.combinations(b, t):
+            idx = triple_to_idx[tri]
+            mask |= (1 << idx)
+        block_masks[bi] = mask
+        
+    # Pre-compute for each triple, the list of blocks that cover it
+    triple_to_blocks = [[] for _ in range(num_triples)]
+    for bi in range(num_blocks):
+        mask = block_masks[bi]
+        m = mask
+        while m:
+            lb = m & -m
+            idx = lb.bit_length() - 1
+            triple_to_blocks[idx].append(bi)
+            m ^= lb
+            
+    def popcount(x):
+        return x.bit_count()
+        
+    def find_uncovered(uncovered_mask):
+        if uncovered_mask == 0:
+            return -1
+        lb = uncovered_mask & -uncovered_mask
+        return lb.bit_length() - 1
+
+    # 1. Initial Construction: Greedy Set Cover
+    def greedy_construct(seed):
+        random.seed(seed)
+        uncovered_mask = (1 << num_triples) - 1
+        current_blocks = []
+        
+        while uncovered_mask != 0:
+            target_idx = find_uncovered(uncovered_mask)
+            if target_idx == -1:
+                break
+                
+            candidates = triple_to_blocks[target_idx]
+            best_gain = -1
+            best_block_idx = -1
+            best_block_mask = 0
+            
+            for bi in candidates:
+                bm = block_masks[bi]
+                gain = popcount(uncovered_mask & bm)
+                if gain > best_gain:
+                    best_gain = gain
+                    best_block_idx = bi
+                    best_block_mask = bm
+                elif gain == best_gain and random.random() < 0.5:
+                    best_block_idx = bi
+                    best_block_mask = bm
+                    
+            if best_block_idx != -1:
+                current_blocks.append(best_block_idx)
+                uncovered_mask &= ~best_block_mask
+                
+        return current_blocks
+
+    # 2. Local Optimization: Remove Redundant Blocks
+    def remove_redundant(state, counts):
+        """
+        state: list of block indices
+        counts: list of coverage counts for each triple
+        Returns: (new_state, new_counts)
+        """
+        if not state:
+            return state, counts
+        
+        # We iterate and try to remove any block that doesn't uniquely cover any triple
+        # To be efficient, we check if all triples in the block have count > 1
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(state) - 1, -1, -1):
+                bi = state[i]
+                mask = block_masks[bi]
+                m = mask
+                redundant = True
+                while m:
+                    lb = m & -m
+                    idx = lb.bit_length() - 1
+                    if counts[idx] <= 1:
+                        redundant = False
+                        break
+                    m ^= lb
+                
+                if redundant:
+                    # Remove block i
+                    m = mask
+                    while m:
+                        lb = m & -m
+                        idx = lb.bit_length() - 1
+                        counts[idx] -= 1
+                        m ^= lb
+                    state.pop(i)
+                    changed = True
+                    break # Restart scan as indices changed
+        return state, counts
+
+    # Helper to compute counts from a state
+    def compute_counts(state):
+        counts = [0] * num_triples
+        for bi in state:
+            mask = block_masks[bi]
+            m = mask
+            while m:
+                lb = m & -m
+                idx = lb.bit_length() - 1
+                counts[idx] += 1
+                m ^= lb
+        return counts
+
+    # 3. Iterated Local Search (ILS)
+    # Strategy:
+    # - Start with a good greedy solution.
+    # - Loop:
+    #   a. Apply "Kick": Randomly replace a few blocks with random alternatives to escape local minima.
+    #   b. Repair: Greedily add blocks to cover any uncovered triples (if kick broke coverage).
+    #   c. Optimize: Remove all redundant blocks.
+    #   d. If better, accept. Else, reject (or accept with probability based on temperature? 
+    #      For simplicity and speed, we'll use deterministic acceptance if better, 
+    #      and random kicks to explore).
+    #      Actually, standard ILS accepts worse solutions with some probability to escape basins.
+    #      Given time constraints, let's try a simpler "Random Restart Local Search" 
+    #      but with a smarter kick: Swap a block with one that covers many currently covered triples.
+
+    best_blocks = None
+    best_len = float('inf')
+    
+    # Run several initial greedy restarts to find a good starting point
+    for restart in range(10):
+        if time.time() > deadline - 30:
+            break
+        state = greedy_construct(42 + restart)
+        counts = compute_counts(state)
+        state, counts = remove_redundant(state, counts)
+        
+        if len(state) < best_len:
+            best_len = len(state)
+            best_blocks = state[:]
+
+    # Main ILS Loop
+    current_state = best_blocks[:]
+    current_counts = compute_counts(current_state)
+    current_state, current_counts = remove_redundant(current_state, current_counts)
+    
+    no_improve = 0
+    max_no_improve = 500
+    
+    while time.time() < deadline - 5 and no_improve < max_no_improve:
+        
+        # 1. Kick: Perturb the current solution
+        # Strategy: Pick 1-3 random blocks and replace them with random blocks 
+        # that cover the same "core" or just random blocks, then repair.
+        # A better kick: Identify blocks with low "unique contribution" and swap them 
+        # with blocks that have high "overlap" with the current set (to create redundancy).
+        
+        # Let's try a specific kick: 
+        # Find a block B in current_state.
+        # Find a block B' that is NOT in current_state.
+        # If we remove B and add B', we might create uncovered triples.
+        # We want B' to cover as many of B's triples as possible to minimize damage,
+        # OR we want to create a state where many blocks become redundant.
+        
+        # Simple Kick: Random Swap
+        if len(current_state) > 1:
+            idx = random.randint(0, len(current_state) - 1)
+            bi_old = current_state[idx]
+            
+            # Choose a new block bi_new
+            # To make the kick effective, let's pick a block that shares many elements with bi_old
+            # or is completely random.
+            # Let's try: Pick a random triple from bi_old, and pick a random block covering that triple.
+            # This ensures some continuity.
+            
+            old_mask = block_masks[bi_old]
+            # Pick a random triple from the old block
+            m = old_mask
+            # Get list of set bits
+            bits = []
+            while m:
+                lb = m & -m
+                bits.append(lb.bit_length() - 1)
+                m ^= lb
+            
+            if bits:
+                target_tri = random.choice(bits)
+                candidates = triple_to_blocks[target_tri]
+                # Pick a random candidate different from bi_old
+                valid_cands = [c for c in candidates if c != bi_old]
+                if valid_cands:
+                    bi_new = random.choice(valid_cands)
+                    
+                    # Perform Swap
+                    current_state[idx] = bi_new
+                    current_counts = compute_counts(current_state)
+                    
+                    # 2. Repair: If we broke coverage, add blocks to fix it
+                    # Check for uncovered triples
+                    uncovered_mask = 0
+                    for i in range(num_triples):
+                        if current_counts[i] == 0:
+                            uncovered_mask |= (1 << i)
+                            
+                    while uncovered_mask != 0:
+                        if time.time() > deadline - 5:
+                            break
+                        target_idx = find_uncovered(uncovered_mask)
+                        if target_idx == -1:
+                            break
+                        candidates = triple_to_blocks[target_idx]
+                        best_gain = -1
+                        best_block_idx = -1
+                        best_block_mask = 0
+                        for bi in candidates:
+                            bm = block_masks[bi]
+                            gain = popcount(uncovered_mask & bm)
+                            if gain > best_gain:
+                                best_gain = gain
+                                best_block_idx = bi
+                                best_block_mask = bm
+                        if best_block_idx != -1:
+                            current_state.append(best_block_idx)
+                            # Update counts
+                            m = best_block_mask
+                            while m:
+                                lb = m & -m
+                                idx_tri = lb.bit_length() - 1
+                                current_counts[idx_tri] += 1
+                                m ^= lb
+                            uncovered_mask &= ~best_block_mask
+                        else:
+                            break # Should not happen if problem is solvable
+
+                    # 3. Optimize: Remove redundancies
+                    current_state, current_counts = remove_redundant(current_state, current_counts)
+                    
+                    if len(current_state) < best_len:
+                        best_len = len(current_state)
+                        best_blocks = current_state[:]
+                        no_improve = 0
+                    else:
+                        no_improve += 1
+                        # If no improvement, revert to previous best? 
+                        # In ILS, we usually keep the current state even if worse, to continue exploring.
+                        # But if we just made it worse, we might get stuck.
+                        # Let's stick with the current state (the kicked one) for the next iteration.
+        else:
+            no_improve += 1
+
+    # Final cleanup of best_blocks
+    final_counts = compute_counts(best_blocks)
+    final_blocks, _ = remove_redundant(best_blocks[:], final_counts)
+    
+    # Convert indices to actual blocks
+    return [list(all_blocks[bi]) for bi in final_blocks]

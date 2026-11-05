@@ -1,0 +1,137 @@
+"""Program for rank-minimal exact tensor decomposition of 4x5*5x6 matrix multiplication."""
+import numpy as np
+import time
+
+DIMENSIONS = [4, 5, 6]
+
+def construct():
+    """
+    Construct a rank-minimal exact tensor decomposition for 4x5 * 5x6 matrix multiplication.
+    
+    Uses a block decomposition with Strassen's algorithm for 2x2x2 blocks 
+    and schoolbook for 2x1x2 blocks.
+    Expected rank: 108 (vs 120 schoolbook).
+    """
+    start_time = time.time()
+    deadline = start_time + 140.0 # Safety margin for 150s limit
+    
+    n, m, p = DIMENSIONS
+    
+    # Define block offsets and sizes
+    # n=4 split into 2, 2
+    # m=5 split into 2, 2, 1
+    # p=6 split into 2, 2, 2
+    
+    i_offsets = [0, 2]
+    i_sizes = [2, 2]
+    
+    j_offsets = [0, 2, 4]
+    j_sizes = [2, 2, 1]
+    
+    k_offsets = [0, 2, 4]
+    k_sizes = [2, 2, 2]
+    
+    # Estimate max rank to allocate memory
+    # 12 Strassen blocks * 7 + 6 Schoolbook blocks * 4 = 84 + 24 = 108
+    max_rank = 120 # Safe upper bound
+    
+    U = np.zeros((n * m, max_rank), dtype=int)
+    V = np.zeros((m * p, max_rank), dtype=int)
+    W = np.zeros((p * n, max_rank), dtype=int)
+    
+    col = 0
+    
+    for i_idx, i_0 in enumerate(i_offsets):
+        n_b = i_sizes[i_idx]
+        if time.time() > deadline:
+            break
+        for j_idx, j_0 in enumerate(j_offsets):
+            m_b = j_sizes[j_idx]
+            if time.time() > deadline:
+                break
+            for k_idx, k_0 in enumerate(k_offsets):
+                p_b = k_sizes[k_idx]
+                
+                # Handle 2x2x2 block with Strassen
+                if n_b == 2 and m_b == 2 and p_b == 2:
+                    # Term 1
+                    U[(i_0+0)*m + (j_0+0), col] = 1
+                    U[(i_0+1)*m + (j_0+1), col] = 1
+                    V[(j_0+0)*p + (k_0+0), col] = 1
+                    V[(j_0+1)*p + (k_0+1), col] = 1
+                    W[(k_0+0)*n + (i_0+0), col] = 1
+                    W[(k_0+1)*n + (i_0+1), col] = 1
+                    col += 1
+                    
+                    # Term 2
+                    U[(i_0+1)*m + (j_0+0), col] = 1
+                    U[(i_0+1)*m + (j_0+1), col] = 1
+                    V[(j_0+0)*p + (k_0+0), col] = 1
+                    W[(k_0+0)*n + (i_0+1), col] = 1
+                    W[(k_0+1)*n + (i_0+1), col] = -1
+                    col += 1
+                    
+                    # Term 3
+                    U[(i_0+0)*m + (j_0+0), col] = 1
+                    V[(j_0+0)*p + (k_0+1), col] = 1
+                    V[(j_0+1)*p + (k_0+1), col] = -1
+                    W[(k_0+1)*n + (i_0+0), col] = 1
+                    W[(k_0+1)*n + (i_0+1), col] = 1
+                    col += 1
+                    
+                    # Term 4
+                    U[(i_0+1)*m + (j_0+1), col] = 1
+                    V[(j_0+1)*p + (k_0+0), col] = 1
+                    V[(j_0+0)*p + (k_0+0), col] = -1
+                    W[(k_0+0)*n + (i_0+0), col] = 1
+                    W[(k_0+0)*n + (i_0+1), col] = 1
+                    col += 1
+                    
+                    # Term 5
+                    U[(i_0+0)*m + (j_0+0), col] = 1
+                    U[(i_0+0)*m + (j_0+1), col] = 1
+                    V[(j_0+1)*p + (k_0+1), col] = 1
+                    W[(k_0+1)*n + (i_0+0), col] = 1
+                    W[(k_0+0)*n + (i_0+0), col] = -1
+                    col += 1
+                    
+                    # Term 6
+                    U[(i_0+1)*m + (j_0+0), col] = 1
+                    U[(i_0+0)*m + (j_0+0), col] = -1
+                    V[(j_0+0)*p + (k_0+0), col] = 1
+                    V[(j_0+0)*p + (k_0+1), col] = 1
+                    W[(k_0+1)*n + (i_0+1), col] = 1
+                    col += 1
+                    
+                    # Term 7
+                    U[(i_0+0)*m + (j_0+1), col] = 1
+                    U[(i_0+1)*m + (j_0+1), col] = -1
+                    V[(j_0+1)*p + (k_0+0), col] = 1
+                    V[(j_0+1)*p + (k_0+1), col] = 1
+                    W[(k_0+0)*n + (i_0+0), col] = 1
+                    col += 1
+                    
+                elif n_b == 2 and m_b == 1 and p_b == 2:
+                    # Schoolbook for 2x1x2
+                    for u in range(2):
+                        for w in range(2):
+                            U[(i_0+u)*m + (j_0+0), col] = 1
+                            V[(j_0+0)*p + (k_0+w), col] = 1
+                            W[(k_0+w)*n + (i_0+u), col] = 1
+                            col += 1
+                else:
+                    # Fallback: Schoolbook for any other size
+                    for u in range(n_b):
+                        for v in range(m_b):
+                            for w in range(p_b):
+                                U[(i_0+u)*m + (j_0+v), col] = 1
+                                V[(j_0+v)*p + (k_0+w), col] = 1
+                                W[(k_0+w)*n + (i_0+u), col] = 1
+                                col += 1
+
+    # Trim arrays to actual rank
+    U = U[:, :col]
+    V = V[:, :col]
+    W = W[:, :col]
+    
+    return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}

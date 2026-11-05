@@ -32,30 +32,43 @@ for block in itertools.combinations(range(V), K):
 
 N_BLOCKS = len(all_blocks)
 
-# Precompute weights for weighted greedy
-max_freq = max(subset_frequencies)
-weights = [1.0 / f for f in subset_frequencies]
-
-# Precompute block masks as numpy arrays for faster operations
-# Each block has C(7,4)=35 subsets
-# We'll store masks as lists of bit indices for faster iteration
+# Precompute per-block list of covered subset indices (35 each) for fast iteration
 block_bit_indices = []
 for mask in all_masks:
     bits = []
     mm = mask
     while mm:
         lsb = mm & -mm
-        bit_idx = lsb.bit_length() - 1
-        bits.append(bit_idx)
+        bits.append(lsb.bit_length() - 1)
         mm ^= lsb
     block_bit_indices.append(bits)
 
-# Precompute for each subset, the list of blocks containing it (sorted by frequency)
-subset_to_blocks = [sorted(blocks_containing_subset[i], key=lambda b: subset_frequencies[i]) for i in range(N_SUBSETS)]
+# Weighted greedy weights: rare subsets get higher priority
+weights = [1.0 / f for f in subset_frequencies]
+
+# Precompute coverage matrix as numpy array for fast vectorized greedy
+# coverage_matrix[i, j] = 1 if block i covers subset j
+coverage_matrix = np.zeros((N_BLOCKS, N_SUBSETS), dtype=np.int8)
+for i, bits in enumerate(block_bit_indices):
+    for b in bits:
+        coverage_matrix[i, b] = 1
+
+# weights as numpy array
+weights_np = np.array(weights, dtype=np.float64)
+
+# Precompute alternative weightings for diverse greedy runs
+weights_uniform = np.ones(N_SUBSETS, dtype=np.float64)
+weights_sqrt_inv = np.array([1.0 / math.sqrt(f) for f in subset_frequencies], dtype=np.float64)
+weights_inv_sqrt = np.array([1.0 / math.sqrt(f) for f in subset_frequencies], dtype=np.float64)
+
+# Precompute block coverage counts for faster redundancy checks
+block_covered_count = np.zeros(N_BLOCKS, dtype=np.int32)
+for i, bits in enumerate(block_bit_indices):
+    block_covered_count[i] = len(bits)
+
 
 def construct(v, k, t):
     if v != 19 or k != 7 or t != 4:
-        # Fallback for other parameters (not expected in this task)
         uncovered = set(itertools.combinations(range(v), t))
         blocks = []
         all_k_subsets = list(itertools.combinations(range(v), k))
@@ -70,331 +83,301 @@ def construct(v, k, t):
         return blocks
 
     start_time = time.time()
-    deadline = start_time + 115  # Safety margin
-    
-    def fast_greedy():
-        """Fast weighted greedy using numpy for gain computation"""
-        counts = np.zeros(N_SUBSETS, dtype=np.int32)
-        current_blocks = []
-        uncovered_mask = (1 << N_SUBSETS) - 1
+    deadline = start_time + 112  # Safety margin below 120s kill
+
+    def fast_greedy(weight_vector=None):
+        """Vectorized weighted greedy using numpy for speed."""
+        if weight_vector is None:
+            weight_vector = weights_np
+        uncovered = np.ones(N_SUBSETS, dtype=np.int8)
+        chosen = []
+        remaining = N_SUBSETS
         
-        # Convert weights to numpy
-        weights_np = np.array(weights, dtype=np.float64)
-        
-        while uncovered_mask:
+        while remaining > 0:
             # Compute gain for each block: sum of weights of uncovered subsets it covers
-            # For each block, gain = sum(weights[b] for b in block_bits if b is uncovered)
+            gains = coverage_matrix @ (weight_vector * uncovered)
+            best_idx = int(np.argmax(gains))
+            best_gain = gains[best_idx]
             
-            # Efficient approach: for each uncovered bit, add its weight to all blocks containing it
-            # But this is O(N_SUBSETS * avg_blocks_per_subset) per iteration
-            
-            # Alternative: iterate through blocks and compute gain
-            best_idx = -1
-            best_gain = 0.0
-            
-            # Only consider blocks that have at least one uncovered subset
-            # Precompute: for each block, which subsets it covers
-            # We need: gain[block] = sum(weights[subset] for subset in block_subsets if subset is uncovered)
-            
-            # Faster: maintain a running gain array
-            # When we add a block, subtract its contribution from all other blocks' potential gain
-            # This is complex, so let's use a simpler approach with early termination
-            
-            # Use numpy: for each block, compute dot product of its indicator vector with weights * uncovered_indicator
-            # But creating indicator vectors is expensive
-            
-            # Practical approach: iterate blocks, compute gain by iterating its 35 subsets
-            for i in range(N_BLOCKS):
-                bits = block_bit_indices[i]
-                gain = 0.0
-                for bit in bits:
-                    if (uncovered_mask >> bit) & 1:
-                        gain += weights[bit]
-                        if gain > best_gain:
-                            # Early exit if we already beat the best
-                            pass
-                if gain > best_gain:
-                    best_gain = gain
-                    best_idx = i
-            
-            if best_gain == 0:
+            if best_gain <= 0:
                 break
             
-            current_blocks.append(best_idx)
-            # Update uncovered_mask
-            uncovered_mask &= ~all_masks[best_idx]
+            chosen.append(best_idx)
             
-        return current_blocks
+            # Update uncovered
+            newly_covered = coverage_matrix[best_idx]
+            still_uncovered = uncovered & (1 - newly_covered)
+            remaining = int(np.sum(still_uncovered))
+            uncovered = still_uncovered
+        
+        return chosen
+
+    # 1. Try multiple greedy initializations with different weightings
+    greedy_results = []
+    for w_vec in [weights_np, weights_uniform, weights_sqrt_inv]:
+        if time.time() > deadline - 5:
+            break
+        result = fast_greedy(w_vec)
+        if result:
+            greedy_results.append(result)
     
-    # 1. Initial greedy
-    current_blocks = fast_greedy()
+    # Pick the best greedy result
+    if greedy_results:
+        best_greedy = min(greedy_results, key=len)
+    else:
+        best_greedy = fast_greedy(weights_np)
+    
+    current_blocks = best_greedy
     best_len = len(current_blocks)
     best_blocks = current_blocks.copy()
-    
-    # Build counts for current solution
-    counts = np.zeros(N_SUBSETS, dtype=np.int32)
+
+    # Build counts (list of ints, fast)
+    counts = [0] * N_SUBSETS
     for idx in current_blocks:
         for bit in block_bit_indices[idx]:
             counts[bit] += 1
-    
-    def is_redundant(idx, counts):
-        """Check if block idx is redundant given current counts"""
+
+    def add_block(idx):
+        current_blocks.append(idx)
+        for bit in block_bit_indices[idx]:
+            counts[bit] += 1
+
+    def remove_block(pos):
+        idx = current_blocks[pos]
+        for bit in block_bit_indices[idx]:
+            counts[bit] -= 1
+        current_blocks.pop(pos)
+
+    def is_redundant(pos):
+        idx = current_blocks[pos]
         for bit in block_bit_indices[idx]:
             if counts[bit] == 1:
                 return False
         return True
-    
-    def try_remove_blocks(block_indices, counts):
-        """Try to remove a set of blocks. Returns True if successful."""
-        # Check if all blocks are redundant
-        for idx in block_indices:
-            if not is_redundant(idx, counts):
-                return False
-        # Remove them
-        for idx in block_indices:
-            for bit in block_bit_indices[idx]:
-                counts[bit] -= 1
-            current_blocks.remove(idx)
-        return True
-    
-    def try_swap_remove_add(remove_indices, add_indices, counts):
-        """Remove some blocks and add others to maintain coverage"""
-        # Check coverage after removal
-        temp_counts = counts.copy()
-        for idx in remove_indices:
-            for bit in block_bit_indices[idx]:
-                temp_counts[bit] -= 1
-        
-        # Check if any subset would become uncovered
-        uncovered_bits = []
-        for bit in set().union(*[set(block_bit_indices[idx]) for idx in remove_indices]):
-            if temp_counts[bit] == 0:
-                uncovered_bits.append(bit)
-        
-        if not uncovered_bits:
-            # No uncovered bits, just remove
-            for idx in remove_indices:
-                for bit in block_bit_indices[idx]:
-                    counts[bit] -= 1
-                current_blocks.remove(idx)
-            return True
-        
-        # Need to cover uncovered_bits with add_indices
-        # Check if add_indices cover all uncovered_bits
-        add_mask = 0
-        for idx in add_indices:
-            add_mask |= all_masks[idx]
-        
-        for bit in uncovered_bits:
-            if not (add_mask >> bit) & 1:
-                return False
-        
-        # Also check that add_indices don't create duplicates
+
+    def find_redundant():
+        for pos in range(len(current_blocks)):
+            if is_redundant(pos):
+                return pos
+        return -1
+
+    # 2. Local search: repeatedly remove redundant blocks, then do swaps
+    no_improve = 0
+    max_no_improve = 40
+    current_set = set(current_blocks)
+
+    def rebuild_set():
+        nonlocal current_set
         current_set = set(current_blocks)
-        for idx in add_indices:
-            if idx in current_set:
-                return False
+
+    def do_local_search(blocks, counts, deadline):
+        """Perform local search on the given blocks and counts."""
+        nonlocal best_len, best_blocks
+        current = blocks.copy()
+        cnt = counts.copy()
+        cset = set(current)
+        n_imp = 0
         
-        # Apply the swap
-        for idx in remove_indices:
-            for bit in block_bit_indices[idx]:
-                counts[bit] -= 1
-            current_blocks.remove(idx)
-        
-        for idx in add_indices:
-            for bit in block_bit_indices[idx]:
-                counts[bit] += 1
-            current_blocks.append(idx)
-        
-        return True
-    
-    # 2. Local Search with multiple strategies
-    no_improve_count = 0
-    max_no_improve = 200
-    restart_count = 0
-    max_restarts = 10
-    
-    while time.time() < deadline:
-        # Strategy 1: Try to remove single redundant blocks
-        removed_any = False
-        indices = list(range(len(current_blocks)))
-        random.shuffle(indices)
-        
-        for i in indices:
-            if time.time() > deadline: break
-            if is_redundant(current_blocks[i], counts):
-                idx = current_blocks[i]
-                for bit in block_bit_indices[idx]:
-                    counts[bit] -= 1
-                current_blocks.remove(idx)
-                removed_any = True
-                if len(current_blocks) < best_len:
-                    best_len = len(current_blocks)
-                    best_blocks = current_blocks.copy()
-                break
-        
-        if removed_any:
-            no_improve_count = 0
-            continue
-        
-        # Strategy 2: Try 1-exchange (remove 1, add 1)
-        if len(current_blocks) > 0:
-            i = random.randint(0, len(current_blocks) - 1)
-            idx_to_remove = current_blocks[i]
-            
-            # Find uncovered bits if we remove this block
-            temp_counts = counts.copy()
-            for bit in block_bit_indices[idx_to_remove]:
-                temp_counts[bit] -= 1
-            
-            uncovered_bits = [bit for bit in block_bit_indices[idx_to_remove] if temp_counts[bit] == 0]
-            
-            if not uncovered_bits:
-                # Block is redundant, remove it
-                for bit in block_bit_indices[idx_to_remove]:
-                    counts[bit] -= 1
-                current_blocks.remove(idx_to_remove)
-                if len(current_blocks) < best_len:
-                    best_len = len(current_blocks)
-                    best_blocks = current_blocks.copy()
-                no_improve_count = 0
-                continue
-            
-            # Find candidate blocks that cover all uncovered_bits
-            if len(uncovered_bits) <= 5:
-                # Use intersection of blocks containing each uncovered bit
-                candidates = None
-                for bit in uncovered_bits:
-                    blocks_with_bit = set(subset_to_blocks[bit])
-                    if candidates is None:
-                        candidates = blocks_with_bit
-                    else:
-                        candidates &= blocks_with_bit
-                
-                if candidates:
-                    candidates.discard(idx_to_remove)
-                    if candidates:
-                        # Try a random candidate
-                        j = random.choice(list(candidates))
-                        if try_swap_remove_add([idx_to_remove], [j], counts):
-                            no_improve_count = 0
-                            continue
-        
-        # Strategy 3: Try 2-exchange (remove 2, add 1-2)
-        if len(current_blocks) > 1 and no_improve_count > 50:
-            i1 = random.randint(0, len(current_blocks) - 1)
-            i2 = random.randint(0, len(current_blocks) - 1)
-            if i1 != i2:
-                idx1 = current_blocks[i1]
-                idx2 = current_blocks[i2]
-                
-                # Find uncovered bits if we remove both
-                temp_counts = counts.copy()
-                for bit in block_bit_indices[idx1]:
-                    temp_counts[bit] -= 1
-                for bit in block_bit_indices[idx2]:
-                    temp_counts[bit] -= 1
-                
-                uncovered_bits = set()
-                for bit in set(block_bit_indices[idx1]) | set(block_bit_indices[idx2]):
-                    if temp_counts[bit] == 0:
-                        uncovered_bits.add(bit)
-                
-                if uncovered_bits and len(uncovered_bits) <= 8:
-                    # Try to find 1-2 blocks that cover all uncovered_bits
-                    # First try 1 block
-                    candidates = None
-                    for bit in list(uncovered_bits)[:3]:  # Limit for speed
-                        blocks_with_bit = set(subset_to_blocks[bit])
-                        if candidates is None:
-                            candidates = blocks_with_bit
-                        else:
-                            candidates &= blocks_with_bit
-                    
-                    if candidates:
-                        candidates.discard(idx1)
-                        candidates.discard(idx2)
-                        if candidates:
-                            j = random.choice(list(candidates))
-                            if try_swap_remove_add([idx1, idx2], [j], counts):
-                                no_improve_count = 0
-                                continue
-                    
-                    # Try 2 blocks
-                    if not candidates or len(candidates) < 3:
-                        for _ in range(5):
-                            j1 = random.randint(0, N_BLOCKS - 1)
-                            j2 = random.randint(0, N_BLOCKS - 1)
-                            if j1 == j2 or j1 in (idx1, idx2) or j2 in (idx1, idx2):
-                                continue
-                            if j1 in current_blocks or j2 in current_blocks:
-                                continue
-                            
-                            combined_mask = all_masks[j1] | all_masks[j2]
-                            covers_all = all((combined_mask >> bit) & 1 for bit in uncovered_bits)
-                            if covers_all:
-                                if try_swap_remove_add([idx1, idx2], [j1, j2], counts):
-                                    no_improve_count = 0
-                                    break
-        
-        # Strategy 4: Perturbation if stuck
-        if not removed_any and no_improve_count > max_no_improve:
-            # Perturb: add a random block, then try to prune
-            c = random.randint(0, N_BLOCKS - 1)
-            if c not in current_blocks:
-                for bit in block_bit_indices[c]:
-                    counts[bit] += 1
-                current_blocks.append(c)
-            
-            # Try to prune
-            prune_attempts = 0
-            while prune_attempts < 20 and time.time() < deadline:
-                prune_attempts += 1
-                indices = list(range(len(current_blocks)))
-                random.shuffle(indices)
-                pruned = False
-                for i in indices:
-                    if is_redundant(current_blocks[i], counts):
-                        idx = current_blocks[i]
-                        for bit in block_bit_indices[idx]:
-                            counts[bit] -= 1
-                        current_blocks.remove(idx)
-                        pruned = True
-                        if len(current_blocks) < best_len:
-                            best_len = len(current_blocks)
-                            best_blocks = current_blocks.copy()
-                        break
-                if not pruned:
-                    break
-            
-            no_improve_count = 0
-            
-            # If we've done many restarts, consider restarting from best
-            restart_count += 1
-            if restart_count > max_restarts:
-                # Restart from best solution
-                current_blocks = best_blocks.copy()
-                counts = np.zeros(N_SUBSETS, dtype=np.int32)
-                for idx in current_blocks:
+        while time.time() < deadline:
+            # Phase A: prune all redundant blocks
+            progress = True
+            while progress:
+                progress = False
+                for pos in range(len(current)):
+                    idx = current[pos]
+                    redundant = True
                     for bit in block_bit_indices[idx]:
-                        counts[bit] += 1
-                restart_count = 0
-                no_improve_count = 0
-        else:
-            no_improve_count += 1
+                        if cnt[bit] == 1:
+                            redundant = False
+                            break
+                    if redundant:
+                        for bit in block_bit_indices[idx]:
+                            cnt[bit] -= 1
+                        current.pop(pos)
+                        cset.discard(idx)
+                        progress = True
+                        if len(current) < best_len:
+                            best_len = len(current)
+                            best_blocks = current.copy()
+                        n_imp = 0
+                        break
+
+            if len(current) == 0:
+                break
+
+            # Phase B: try a 1-for-1 swap
+            best_swap_candidate = -1
+            min_unique = float('inf')
+            
+            n_sample = min(len(current), 30)
+            sampled_indices = random.sample(range(len(current)), n_sample)
+            
+            for i in sampled_indices:
+                idx_i = current[i]
+                n_unique = 0
+                for bit in block_bit_indices[idx_i]:
+                    if cnt[bit] == 1:
+                        n_unique += 1
+                if 0 < n_unique < min_unique:
+                    min_unique = n_unique
+                    best_swap_candidate = i
+            
+            if best_swap_candidate < 0:
+                i = random.randint(0, len(current) - 1)
+                idx_i = current[i]
+                uncovered_bits = [bit for bit in block_bit_indices[idx_i] if cnt[bit] == 1]
+                if not uncovered_bits:
+                    for bit in block_bit_indices[idx_i]:
+                        cnt[bit] -= 1
+                    current.pop(i)
+                    cset.discard(idx_i)
+                    if len(current) < best_len:
+                        best_len = len(current)
+                        best_blocks = current.copy()
+                    n_imp = 0
+                    continue
+                best_swap_candidate = i
+                idx_i = current[i]
+                uncovered_bits = [bit for bit in block_bit_indices[idx_i] if cnt[bit] == 1]
+            else:
+                i = best_swap_candidate
+                idx_i = current[i]
+                uncovered_bits = [bit for bit in block_bit_indices[idx_i] if cnt[bit] == 1]
+
+            if not uncovered_bits:
+                for bit in block_bit_indices[idx_i]:
+                    cnt[bit] -= 1
+                current.pop(i)
+                cset.discard(idx_i)
+                if len(current) < best_len:
+                    best_len = len(current)
+                    best_blocks = current.copy()
+                n_imp = 0
+                continue
+
+            if len(uncovered_bits) > 5:
+                n_imp += 1
+                if n_imp > max_no_improve:
+                    under_covered = [b for b in range(N_SUBSETS) if cnt[b] == 1]
+                    if under_covered:
+                        target = random.choice(under_covered)
+                        cands_for_target = blocks_containing_subset[target]
+                        c = random.choice(cands_for_target)
+                        if c not in cset:
+                            for bit in block_bit_indices[c]:
+                                cnt[bit] += 1
+                            current.append(c)
+                            cset.add(c)
+                    n_imp = 0
+                continue
+
+            uncovered_bits_sorted = sorted(uncovered_bits, key=lambda b: len(blocks_containing_subset[b]))
+            cands = set(blocks_containing_subset[uncovered_bits_sorted[0]])
+            for b in uncovered_bits_sorted[1:]:
+                cands.intersection_update(blocks_containing_subset[b])
+                if not cands:
+                    break
+
+            if cands:
+                cands.discard(idx_i)
+                if cands:
+                    cands_list = list(cands)
+                    if len(cands_list) <= 10:
+                        best_j = cands_list[0]
+                        best_extra = -1
+                        for j in cands_list:
+                            extra = 0
+                            for bit in block_bit_indices[j]:
+                                if cnt[bit] == 0:
+                                    extra += 1
+                            if extra > best_extra:
+                                best_extra = extra
+                                best_j = j
+                        j = best_j
+                    else:
+                        j = random.choice(cands_list)
+                    
+                    # Remove i, add j
+                    for bit in block_bit_indices[idx_i]:
+                        cnt[bit] -= 1
+                    current.pop(i)
+                    cset.discard(idx_i)
+                    
+                    for bit in block_bit_indices[j]:
+                        cnt[bit] += 1
+                    current.append(j)
+                    cset.add(j)
+                    
+                    n_imp = 0
+                    continue
+
+            n_imp += 1
+            if n_imp > max_no_improve:
+                under_covered = [b for b in range(N_SUBSETS) if cnt[b] == 1]
+                if under_covered:
+                    for _ in range(random.randint(2, 3)):
+                        target = random.choice(under_covered)
+                        cands_for_target = blocks_containing_subset[target]
+                        c = random.choice(cands_for_target)
+                        if c not in cset:
+                            for bit in block_bit_indices[c]:
+                                cnt[bit] += 1
+                            current.append(c)
+                            cset.add(c)
+                else:
+                    for _ in range(random.randint(1, 2)):
+                        c = random.randint(0, N_BLOCKS - 1)
+                        if c not in cset:
+                            for bit in block_bit_indices[c]:
+                                cnt[bit] += 1
+                            current.append(c)
+                            cset.add(c)
+                n_imp = 0
+
+        return current, cnt
+
+    # Run local search
+    current_blocks, counts = do_local_search(current_blocks, counts, deadline)
+
+    # 3. If time remains, try more greedy restarts with different weightings
+    if time.time() < deadline - 10:
+        for w_vec in [weights_uniform, weights_sqrt_inv]:
+            if time.time() > deadline - 5:
+                break
+            alt = fast_greedy(w_vec)
+            if len(alt) < best_len:
+                best_len = len(alt)
+                best_blocks = alt.copy()
+                # Quick prune pass
+                counts2 = [0] * N_SUBSETS
+                for idx in best_blocks:
+                    for bit in block_bit_indices[idx]:
+                        counts2[bit] += 1
+                changed = True
+                while changed and time.time() < deadline - 3:
+                    changed = False
+                    for pos in range(len(best_blocks)):
+                        idx = best_blocks[pos]
+                        redundant = True
+                        for bit in block_bit_indices[idx]:
+                            if counts2[bit] == 1:
+                                redundant = False
+                                break
+                        if redundant:
+                            for bit in block_bit_indices[idx]:
+                                counts2[bit] -= 1
+                            best_blocks.pop(pos)
+                            changed = True
+                            if len(best_blocks) < best_len:
+                                best_len = len(best_blocks)
+                            break
+
+    # Final validation: ensure all blocks are distinct and valid
+    seen = set()
+    final_blocks = []
+    for idx in best_blocks:
+        if idx not in seen:
+            seen.add(idx)
+            final_blocks.append(list(all_blocks[idx]))
     
-    # Final cleanup
-    for i in range(len(current_blocks)):
-        if time.time() > deadline - 5:
-            break
-        idx = current_blocks[i]
-        if is_redundant(idx, counts):
-            for bit in block_bit_indices[idx]:
-                counts[bit] -= 1
-            current_blocks.remove(idx)
-            i -= 1
-            if len(current_blocks) < best_len:
-                best_len = len(current_blocks)
-                best_blocks = current_blocks.copy()
-    
-    return [list(all_blocks[i]) for i in best_blocks]
+    return final_blocks

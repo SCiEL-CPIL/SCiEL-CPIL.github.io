@@ -1,0 +1,1 @@
+BET: {mechanism: "Replacing schoolbook rank-9 3x3 decomposition with BCLR rank-21 in Strassen block structure reduces total rank from 7*27=189 to 7*21=147, a 22% improvement in rank efficiency", q: 0.85, delta: [0.15, 0.25]}
