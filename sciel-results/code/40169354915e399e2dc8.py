@@ -1,0 +1,201 @@
+import random
+import time
+import numpy as np
+
+def construct():
+    n = 20
+    start_time = time.time()
+    max_time = 115.0  # Safety margin
+    
+    best_edges = []
+    best_count = 0
+    
+    # Precompute all pairs
+    all_pairs = [(u, v) for u in range(n) for v in range(u + 1, n)]
+    
+    def is_valid_add(u, v, adj_mask, common, common_mask):
+        """Check if edge (u,v) can be added without violating K2,3-free constraint."""
+        if (adj_mask[u] >> v) & 1:
+            return False
+        if common[u][v] > 2:
+            return False
+        
+        # Adding (u,v) makes u and v share each other's other neighbors.
+        # For each w in N(v)\{u}: common[u][w] increases by 1.
+        #   Valid iff common[u][w] < 2 for all such w, i.e., no bit w set in common_mask[u].
+        mask_v = adj_mask[v] & ~(1 << u)
+        if mask_v & common_mask[u]:
+            return False
+        
+        # Similarly for v's side
+        mask_u = adj_mask[u] & ~(1 << v)
+        if mask_u & common_mask[v]:
+            return False
+        
+        return True
+
+    def add_edge(u, v, adj_mask, common, common_mask, edges):
+        """Add edge (u,v) to the graph state."""
+        adj_mask[u] |= (1 << v)
+        adj_mask[v] |= (1 << u)
+        edges.append((u, v))
+        
+        # Update common neighbor counts and masks
+        mask_v = adj_mask[v] & ~(1 << u)
+        m = mask_v
+        while m:
+            lsb = m & -m
+            w = lsb.bit_length() - 1
+            common[u][w] += 1
+            common[w][u] += 1
+            if common[u][w] >= 2:
+                common_mask[u] |= (1 << w)
+                common_mask[w] |= (1 << u)
+            m -= lsb
+        
+        mask_u = adj_mask[u] & ~(1 << v)
+        m = mask_u
+        while m:
+            lsb = m & -m
+            w = lsb.bit_length() - 1
+            common[v][w] += 1
+            common[w][v] += 1
+            if common[v][w] >= 2:
+                common_mask[v] |= (1 << w)
+                common_mask[w] |= (1 << v)
+            m -= lsb
+
+    def remove_edge(u, v, adj_mask, common, common_mask, edges):
+        """Remove edge (u,v) from the graph state."""
+        mask_v = adj_mask[v] & ~(1 << u)
+        mask_u = adj_mask[u] & ~(1 << v)
+        
+        adj_mask[u] &= ~(1 << v)
+        adj_mask[v] &= ~(1 << u)
+        edges.remove((u, v))
+        
+        m = mask_v
+        while m:
+            lsb = m & -m
+            w = lsb.bit_length() - 1
+            common[u][w] -= 1
+            common[w][u] -= 1
+            if common[u][w] < 2:
+                common_mask[u] &= ~(1 << w)
+                common_mask[w] &= ~(1 << u)
+            m -= lsb
+        
+        m = mask_u
+        while m:
+            lsb = m & -m
+            w = lsb.bit_length() - 1
+            common[v][w] -= 1
+            common[w][v] -= 1
+            if common[v][w] < 2:
+                common_mask[v] &= ~(1 << w)
+                common_mask[w] &= ~(1 << v)
+            m -= lsb
+
+    def greedy_fill(adj_mask, common, common_mask, edges):
+        """Greedy fill: add edges in random order if valid."""
+        pairs = all_pairs[:]
+        random.shuffle(pairs)
+        for u, v in pairs:
+            if is_valid_add(u, v, adj_mask, common, common_mask):
+                add_edge(u, v, adj_mask, common, common_mask, edges)
+
+    def local_search(initial_edges, max_iters=500, deadline=None):
+        """Local search with kicks to escape local optima."""
+        adj_mask = [0] * n
+        common = [[0] * n for _ in range(n)]
+        common_mask = [0] * n
+        edges = []
+        
+        for u, v in initial_edges:
+            add_edge(u, v, adj_mask, common, common_mask, edges)
+            
+        best_local_edges = list(edges)
+        best_local_count = len(edges)
+        
+        for it in range(max_iters):
+            if deadline is not None and time.time() > deadline - 5:
+                break
+            
+            # Sweep: Add all valid edges possible in one pass
+            added_any = False
+            pairs = all_pairs[:]
+            random.shuffle(pairs)
+            for u, v in pairs:
+                if is_valid_add(u, v, adj_mask, common, common_mask):
+                    add_edge(u, v, adj_mask, common, common_mask, edges)
+                    added_any = True
+            
+            if len(edges) > best_local_count:
+                best_local_count = len(edges)
+                best_local_edges = list(edges)
+            
+            if not added_any:
+                # Local optimum - apply a kick
+                if len(edges) == 0:
+                    break
+                
+                # Remove 1-5 random edges to escape local optimum
+                kick_size = random.choice([1, 2, 2, 3, 3, 4, 5])
+                to_remove = random.sample(edges, min(kick_size, len(edges)))
+                for u, v in to_remove:
+                    remove_edge(u, v, adj_mask, common, common_mask, edges)
+        
+        return best_local_edges
+
+    def verify_edges(edge_list):
+        """Verify that the edge list forms a K2,3-free graph."""
+        adj = [0] * n
+        for u, v in edge_list:
+            if u == v:
+                return False
+            adj[u] |= (1 << v)
+            adj[v] |= (1 << u)
+        
+        for u in range(n):
+            for v in range(u + 1, n):
+                common = adj[u] & adj[v]
+                if bin(common).count('1') > 2:
+                    return False
+        return True
+
+    # Main search loop
+    deadline = start_time + max_time
+    while time.time() < deadline:
+        # Greedy initialization with random ordering
+        adj_mask = [0] * n
+        common = [[0] * n for _ in range(n)]
+        common_mask = [0] * n
+        edges = []
+        greedy_fill(adj_mask, common, common_mask, edges)
+        
+        # Local search with kicks
+        result_edges = local_search(edges, deadline=deadline)
+        
+        # Verify and update best
+        if verify_edges(result_edges) and len(result_edges) > best_count:
+            best_count = len(result_edges)
+            best_edges = [[u, v] for u, v in result_edges]
+        
+        # Check time
+        if time.time() > deadline - 5:
+            break
+
+    # Fallback if no edges found
+    if not best_edges:
+        best_edges = []
+        for i in range(5):
+            base = i * 4
+            for u in range(4):
+                for v in range(u + 1, 4):
+                    best_edges.append([base + u, base + v])
+    
+    return best_edges
+
+if __name__ == "__main__":
+    edges = construct()
+    print(f"Found {len(edges)} edges")

@@ -1,0 +1,251 @@
+import time
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+P = {'n': 100, 'edges': [[0, 10], [0, 27], [0, 80], [1, 59], [2, 50], [2, 74], [3, 12], [3, 18], [3, 62], [3, 87], [4, 48], [4, 72], [4, 89], [5, 11], [6, 36], [8, 13], [8, 45], [8, 52], [8, 94], [9, 26], [9, 47], [9, 78], [10, 81], [11, 18], [11, 21], [11, 84], [12, 22], [12, 65], [12, 83], [13, 30], [13, 76], [15, 82], [17, 35], [19, 38], [19, 49], [19, 61], [19, 96], [20, 52], [21, 23], [21, 58], [22, 33], [22, 48], [24, 29], [24, 31], [24, 55], [24, 58], [24, 89], [25, 82], [26, 44], [26, 69], [30, 45], [30, 70], [32, 96], [33, 55], [34, 66], [35, 38], [35, 93], [36, 81], [37, 42], [37, 70], [39, 59], [40, 69], [40, 97], [41, 80], [42, 44], [42, 48], [42, 68], [43, 53], [44, 50], [46, 50], [46, 73], [46, 97], [47, 78], [48, 77], [49, 59], [50, 59], [50, 62], [51, 57], [53, 68], [53, 80], [56, 58], [58, 95], [60, 65], [60, 90], [61, 88], [62, 90], [68, 81], [69, 90], [70, 92], [74, 85], [75, 82]], 'edge_probability': [9, 500]}
+
+def construct():
+    n = P['n']
+    adj = [0] * n
+    for u, v in P['edges']:
+        adj[u] |= 1 << v
+        adj[v] |= 1 << u
+    ALL = (1 << n) - 1
+
+    def popcount(x):
+        return bin(x).count('1')
+
+    # --- connected components ---
+    comp_of = [-1] * n
+    comps = []
+    for s in range(n):
+        if comp_of[s] != -1:
+            continue
+        cid = len(comps)
+        mask = 0
+        stack = [s]
+        comp_of[s] = cid
+        mask |= 1 << s
+        while stack:
+            x = stack.pop()
+            nb = adj[x]
+            while nb:
+                lsb = nb & (-nb)
+                nb ^= lsb
+                y = lsb.bit_length() - 1
+                if comp_of[y] == -1:
+                    comp_of[y] = cid
+                    mask |= lsb
+                    stack.append(y)
+        comps.append(mask)
+    comps.sort(key=popcount, reverse=True)
+
+    deadline = time.time() + 80.0
+    best = 0
+    best_path = []
+
+    # --- greedy warm start (Warnsdorff) from every vertex ---
+    def greedy(start):
+        path = [start]
+        seen = 1 << start
+        while True:
+            cand = adj[path[-1]] & ~seen
+            if not cand:
+                break
+            bu = -1
+            bon = None
+            m = cand
+            while m:
+                lsb = m & (-m)
+                m ^= lsb
+                u = lsb.bit_length() - 1
+                on = popcount(adj[u] & ~seen & ~(1 << u))
+                if bon is None or on < bon:
+                    bon = on
+                    bu = u
+            path.append(bu)
+            seen |= 1 << bu
+        return path
+
+    for s in range(n):
+        p = greedy(s)
+        if len(p) > best:
+            best = len(p)
+            best_path = p
+
+    # --- MWPM-based path extraction ---
+    def extract_path_from_matching(comp_mask):
+        """Extract a path from the matching solution for a component."""
+        verts = []
+        m = comp_mask
+        while m:
+            lsb = m & (-m)
+            m ^= lsb
+            verts.append(lsb.bit_length() - 1)
+        
+        if len(verts) <= 1:
+            return verts
+        
+        # Build cost matrix for Hungarian algorithm
+        # Each vertex v has two copies: left (v) and right (v)
+        # Edge between left(u) and right(v) has cost -1 if (u,v) is an edge
+        # Self-loop (v,v) has large negative cost to encourage path inclusion
+        # We want to maximize the number of edges in the path
+        
+        size = len(verts)
+        idx = {v: i for i, v in enumerate(verts)}
+        
+        # Cost matrix: minimize sum of costs
+        # For path edges: cost = -1 (we want to maximize these)
+        # For self-loops (vertex inclusion): cost = -1000 (strongly prefer including vertices)
+        # For non-edges: cost = +10000 (penalize non-edges)
+        
+        cost = np.full((size, size), 10000.0)
+        
+        for u in verts:
+            for v in verts:
+                if u == v:
+                    # Self-loop: strongly prefer including this vertex
+                    cost[idx[u]][idx[v]] = -1000.0
+                elif (adj[u] >> v) & 1:
+                    # Edge: prefer using this edge in the path
+                    cost[idx[u]][idx[v]] = -1.0
+        
+        # Solve assignment problem
+        row_ind, col_ind = linear_sum_assignment(cost)
+        
+        # Extract the path from the matching
+        # The matching gives us pairs (u, v) where left(u) is matched to right(v)
+        # This forms a set of directed edges
+        matched = {}
+        for r, c in zip(row_ind, col_ind):
+            u = verts[r]
+            v = verts[c]
+            matched[u] = v
+        
+        # Find the path by following the chain
+        # Start from a vertex with no incoming edge
+        in_deg = {v: 0 for v in verts}
+        for u, v in matched.items():
+            if v != u:  # Not a self-loop
+                in_deg[v] += 1
+        
+        # Find start vertex (in-degree 0)
+        start = None
+        for v in verts:
+            if in_deg[v] == 0:
+                start = v
+                break
+        
+        if start is None:
+            # All vertices have in-degree > 0, pick any
+            start = verts[0]
+        
+        # Follow the path
+        path = [start]
+        visited = {start}
+        current = start
+        
+        while True:
+            if current not in matched:
+                break
+            next_v = matched[current]
+            if next_v == current:
+                break
+            if next_v in visited:
+                break
+            path.append(next_v)
+            visited.add(next_v)
+            current = next_v
+        
+        return path
+
+    # Try MWPM on the largest component
+    for comp in comps:
+        csz = popcount(comp)
+        if best >= csz:
+            break
+        if time.time() > deadline:
+            break
+        
+        path = extract_path_from_matching(comp)
+        if len(path) > best:
+            best = len(path)
+            best_path = path
+        
+        if time.time() > deadline:
+            break
+
+    # --- exact DFS with connectivity (reachability) pruning ---
+    nodes = 0
+    NODE_CAP = 40_000_000
+
+    def dfs(v, visited_mask, path):
+        nonlocal best, best_path, nodes
+        nodes += 1
+        if time.time() > deadline or nodes > NODE_CAP:
+            return False
+        if len(path) > best:
+            best = len(path)
+            best_path = list(path)
+        unvis = ALL & ~visited_mask
+        if unvis == 0:
+            return True
+        # reachable unvisited vertices from v through unvisited vertices
+        seen = adj[v] & unvis
+        frontier = seen
+        while frontier:
+            lsb = frontier & (-frontier)
+            frontier ^= lsb
+            x = lsb.bit_length() - 1
+            new = adj[x] & unvis & ~seen
+            seen |= new
+            frontier |= new
+        # upper bound: can only add vertices still reachable from the open end
+        if len(path) + popcount(seen) <= best:
+            return True
+        cand = adj[v] & unvis
+        if cand == 0:
+            return True
+        # Warnsdorff ordering: fewest onward options first
+        lst = []
+        m = cand
+        while m:
+            lsb = m & (-m)
+            m ^= lsb
+            u = lsb.bit_length() - 1
+            on = popcount(adj[u] & unvis & ~(1 << u))
+            lst.append((on, u))
+        lst.sort()
+        for on, u in lst:
+            path.append(u)
+            if not dfs(u, visited_mask | (1 << u), path):
+                path.pop()
+                return False
+            path.pop()
+        return True
+
+    for comp in comps:
+        csz = popcount(comp)
+        if best >= csz:
+            break
+        if time.time() > deadline:
+            break
+        m = comp
+        verts = []
+        while m:
+            lsb = m & (-m)
+            m ^= lsb
+            verts.append(lsb.bit_length() - 1)
+        # low-degree vertices first (likely endpoints of long paths)
+        verts.sort(key=lambda w: popcount(adj[w]))
+        for s in verts:
+            if time.time() > deadline:
+                break
+            dfs(s, 1 << s, [s])
+            if time.time() > deadline:
+                break
+
+    if not best_path:
+        best_path = [0]
+    return best_path

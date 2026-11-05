@@ -1,0 +1,3 @@
+ALL_MASK = (1 << N) - 1
+# ...
+rem_mask = ALL_MASK & ~used_mask_local

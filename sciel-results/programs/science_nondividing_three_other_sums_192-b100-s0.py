@@ -1,335 +1,277 @@
 import random
 import time
-from itertools import combinations
-
-def is_valid_fast(s):
-    """
-    Fast validity check: for each element a, check if any 3 distinct others sum to multiple of a.
-    Uses sorted list and early termination.
-    """
-    lst = sorted(s)
-    n = len(lst)
-    if n < 4:
-        return True
-    
-    for idx_a, a in enumerate(lst):
-        others = lst[:idx_a] + lst[idx_a+1:]
-        m = len(others)
-        if m < 3:
-            continue
-        
-        # If a is larger than the max possible sum of 3 others, no violation
-        max_sum3 = others[-1] + others[-2] + others[-3]
-        if a > max_sum3:
-            continue
-        
-        # Min sum of 3 others
-        min_sum3 = others[0] + others[1] + others[2]
-        
-        others_set = set(others)
-        
-        start_mult = (min_sum3 + a - 1) // a
-        end_mult = max_sum3 // a
-        
-        if start_mult > end_mult:
-            continue
-            
-        for k in range(start_mult, end_mult + 1):
-            target = k * a
-            found = False
-            for i in range(m - 2):
-                xi = others[i]
-                if xi + others[i+1] + others[i+2] > target:
-                    break
-                for j in range(i + 1, m - 1):
-                    xj = others[j]
-                    if xi + xj + others[j+1] > target:
-                        break
-                    rem = target - xi - xj
-                    if rem > xj and rem in others_set:
-                        found = True
-                        break
-                if found:
-                    break
-            if found:
-                return False
-    return True
-
-def is_valid_incremental(existing_set, new_elem):
-    """
-    Check if adding new_elem to existing_set maintains validity.
-    Only need to check:
-    1. new_elem doesn't divide sum of any 3 existing elements
-    2. No existing element divides sum of new_elem + 2 existing elements
-    """
-    if not existing_set:
-        return True
-    
-    existing_sorted = sorted(existing_set)
-    n = len(existing_sorted)
-    
-    # Check 1: new_elem vs triples from existing_set
-    a = new_elem
-    if n >= 3:
-        max_sum3 = existing_sorted[-1] + existing_sorted[-2] + existing_sorted[-3]
-        if a <= max_sum3:
-            min_sum3 = existing_sorted[0] + existing_sorted[1] + existing_sorted[2]
-            start_mult = (min_sum3 + a - 1) // a
-            end_mult = max_sum3 // a
-            if start_mult <= end_mult:
-                existing_set_s = set(existing_sorted)
-                for k in range(start_mult, end_mult + 1):
-                    target = k * a
-                    found = False
-                    for i in range(n - 2):
-                        xi = existing_sorted[i]
-                        if xi + existing_sorted[i+1] + existing_sorted[i+2] > target:
-                            break
-                        for j in range(i + 1, n - 1):
-                            xj = existing_sorted[j]
-                            if xi + xj + existing_sorted[j+1] > target:
-                                break
-                            rem = target - xi - xj
-                            if rem > xj and rem in existing_set_s:
-                                found = True
-                                break
-                        if found:
-                            break
-                    if found:
-                        return False
-    
-    # Check 2: Each existing element vs triples including new_elem
-    for idx_a, a in enumerate(existing_sorted):
-        # Triples that include new_elem: new_elem + 2 from existing_set (excluding a)
-        # Need to check if a divides new_elem + x + y for some x, y in existing_set, x != y, x != a, y != a
-        others_excluding_a = [x for x in existing_sorted if x != a]
-        m = len(others_excluding_a)
-        if m < 2:
-            continue
-        
-        # We need: a | (new_elem + x + y) for some distinct x, y in others_excluding_a
-        # Equivalently: (new_elem + x + y) % a == 0
-        # i.e., x + y ≡ -new_elem (mod a)
-        
-        # If a is large, few multiples. If a is small, more to check.
-        # Max possible sum: new_elem + others_excluding_a[-1] + others_excluding_a[-2]
-        max_sum = new_elem + others_excluding_a[-1] + others_excluding_a[-2]
-        if a > max_sum:
-            continue
-        
-        min_sum = new_elem + others_excluding_a[0] + others_excluding_a[1]
-        
-        start_mult = (min_sum + a - 1) // a
-        end_mult = max_sum // a
-        
-        if start_mult > end_mult:
-            continue
-        
-        # For each multiple target = k*a, check if x + y = target - new_elem for distinct x,y in others_excluding_a
-        others_set_s = set(others_excluding_a)
-        for k in range(start_mult, end_mult + 1):
-            target = k * a
-            need = target - new_elem
-            if need < 0:
-                continue
-            # Check if any pair in others_excluding_a sums to need
-            found = False
-            for i in range(m - 1):
-                xi = others_excluding_a[i]
-                if xi + others_excluding_a[i+1] > need:
-                    break
-                rem = need - xi
-                if rem > xi and rem in others_set_s:
-                    found = True
-                    break
-            if found:
-                return False
-    
-    return True
-
-def greedy_construct(seed_rng=None):
-    """
-    Greedy construction with priority on larger numbers (they're easier to satisfy).
-    Also tries multiple orderings.
-    """
-    best_result = []
-    
-    # Strategy 1: Descending order
-    selected = []
-    for x in range(192, 0, -1):
-        if is_valid_incremental(set(selected), x):
-            selected.append(x)
-    if len(selected) > len(best_result):
-        best_result = selected
-    
-    # Strategy 2: Descending but skip some small numbers
-    selected = []
-    for x in range(192, 0, -1):
-        if x <= 10:
-            # Be more selective with small numbers
-            if len(selected) < 40:
-                if is_valid_incremental(set(selected), x):
-                    selected.append(x)
-        else:
-            if is_valid_incremental(set(selected), x):
-                selected.append(x)
-    if len(selected) > len(best_result):
-        best_result = selected
-    
-    # Strategy 3: Start with large primes (harder to be divisors)
-    def is_prime(n):
-        if n < 2:
-            return False
-        if n < 4:
-            return True
-        if n % 2 == 0 or n % 3 == 0:
-            return False
-        i = 5
-        while i * i <= n:
-            if n % i == 0 or n % (i + 2) == 0:
-                return False
-            i += 6
-        return True
-    
-    selected = []
-    # Add large primes first
-    for x in range(192, 0, -1):
-        if is_prime(x):
-            if is_valid_incremental(set(selected), x):
-                selected.append(x)
-    # Then add composites
-    for x in range(192, 0, -1):
-        if x not in selected:
-            if is_valid_incremental(set(selected), x):
-                selected.append(x)
-    if len(selected) > len(best_result):
-        best_result = selected
-    
-    return best_result
+import sys
 
 def construct():
     start_time = time.time()
     deadline = start_time + 55  # 55s deadline to be safe
-    rng = random.Random(42)
     
-    # Start with multiple greedy strategies
-    best = greedy_construct()
-    best_set = frozenset(best)
-    best_size = len(best)
+    N = 192
+    all_numbers = set(range(1, N + 1))
     
-    all_numbers = set(range(1, 193))
-    
-    def local_search(s, rng, max_iters=500):
-        """
-        Improved hill-climb with better swap strategies.
-        """
-        s = set(s)
-        cur_size = len(s)
-        stall_count = 0
-        
-        for _ in range(max_iters):
-            if time.time() > deadline:
-                break
+    # Fast validity check for adding x to set S
+    # S is a set of ints
+    # Returns True if x can be added to S
+    def can_add(x, S):
+        # Check 1: For each a in S, does x + y + z == 0 mod a for some y, z in S\{a}?
+        # y, z must be distinct and not a.
+        # If len(S) < 2, no pairs y, z exist, so no violation for existing a.
+        if len(S) >= 2:
+            S_list = list(S)
+            for a in S_list:
+                # We need y, z in S, y != z, y != a, z != a
+                # such that (x + y + z) % a == 0
+                # => y + z == (-x) % a
+                # Let target = (-x) % a
+                # We need to find distinct y, z in S\{a} summing to target?
+                # Wait, y+z can be target + k*a.
+                # Max y+z is (N-1) + (N-2) ~ 380.
+                # a is at most 192.
+                # So k can be 0 or 1 (maybe 2 if a is small).
+                
+                # More efficient:
+                # Iterate y in S\{a}.
+                # For each y, check if (target - y) is in S\{a, y}?
+                # No, y+z = target + k*a.
+                # So z = target + k*a - y.
+                # We can just iterate y in S\{a} and check if any z in S\{a, y} satisfies (x+y+z) % a == 0.
+                # This is O(|S|^2) per a.
+                
+                # Optimization:
+                # Create a set of S without a for fast lookup.
+                # S_minus_a = S - {a}
+                # If len(S_minus_a) < 2, continue.
+                
+                # Let's just do the double loop, it's fast enough.
+                found = False
+                # To avoid creating sets repeatedly, we can use a list and check membership
+                # But S is small.
+                for y in S_list:
+                    if y == a:
+                        continue
+                    for z in S_list:
+                        if z == a or z == y:
+                            continue
+                        if (x + y + z) % a == 0:
+                            return False
+        else:
+            # If S has < 2 elements, we can't form a pair y,z for existing a.
+            # But we still need to check if x itself is safe?
+            # Check 2 handles x.
+            pass
             
+        # Check 2: Does x divide sum of any 3 distinct elements in S?
+        # Need y, z, w in S distinct such that (y+z+w) % x == 0.
+        if len(S) >= 3:
+            S_list = list(S)
+            # Triple loop O(|S|^3)
+            # 48^3 is ~110k. 
+            # We can optimize with pair sums.
+            # Precompute pair sums? No, S changes.
+            # Just do triple loop with early break?
+            # Or: for each y, z, check if w exists.
+            # w = (k*x - y - z).
+            # Iterate y, z in S.
+            # Check if w in S and w != y and w != z.
+            S_set = S # already a set
+            found = False
+            # To speed up, iterate y, z
+            # We can break early if we find one.
+            for i in range(len(S_list)):
+                y = S_list[i]
+                for j in range(len(S_list)):
+                    if j == i:
+                        continue
+                    z = S_list[j]
+                    # We need w such that y+z+w is multiple of x.
+                    # y+z+w = k*x => w = k*x - y - z
+                    # w must be in S, w != y, w != z.
+                    # Max sum is 3*192 = 576.
+                    # Min sum is 1+2+3 = 6.
+                    # k*x is in [6, 576].
+                    # So k is in [ceil(6/x), floor(576/x)].
+                    min_k = (6 + x - 1) // x
+                    max_k = 576 // x
+                    # Actually, we can just check specific w values.
+                    # But iterating k and checking w in S is O(range(k)).
+                    # range(k) is small (576/x).
+                    # So inner loop is O(576/x).
+                    # Total O(|S|^2 * 576/x).
+                    # For x=1, 576. For x=192, 3.
+                    # This is much faster than O(|S|^3) if x is large.
+                    # If x is small, 576/x is large, but |S|^2 is small.
+                    
+                    for k in range(min_k, max_k + 1):
+                        w = k * x - y - z
+                        if w in S_set and w != y and w != z:
+                            return False
+                            
+        return True
+
+    # Initial Greedy Construction
+    def greedy_construct(order):
+        S = set()
+        for x in order:
+            if can_add(x, S):
+                S.add(x)
+        return S
+
+    # Generate different orders
+    # 1. Descending
+    order1 = list(range(N, 0, -1))
+    # 2. Ascending
+    order2 = list(range(1, N + 1))
+    # 3. Random
+    rng = random.Random(42)
+    order3 = list(range(1, N + 1))
+    rng.shuffle(order3)
+    
+    best_S = set()
+    best_size = 0
+    
+    for order in [order1, order2, order3]:
+        S = greedy_construct(order)
+        if len(S) > best_size:
+            best_size = len(S)
+            best_S = S.copy()
+            
+    # Local Search (Hill Climbing)
+    # Try to swap elements to increase size or maintain size with better properties?
+    # Objective: Maximize |S|.
+    # Move: Remove one, add one. If size increases, accept.
+    # If size stays same, maybe accept with some probability (Simulated Annealing)?
+    # Or just try to add elements to a slightly smaller set?
+    
+    # Let's try a "repair" strategy.
+    # Start with a random valid set of size K.
+    # Try to add elements.
+    # If stuck, remove an element, try to add two?
+    
+    # Simpler: 
+    # While time remains:
+    #   1. Try to add any valid element to best_S.
+    #   2. If no element can be added, try a swap: remove a, add b, if valid and |S| same, keep it?
+    #      Actually, if we remove a and add b, size is same. We want to increase size.
+    #      So we should look for a state where we can add.
+    #      Maybe remove 2, add 2?
+    
+    # Let's use a random restart local search.
+    
+    def local_search(start_S, rng):
+        S = start_S.copy()
+        current_size = len(S)
+        stall = 0
+        
+        while time.time() < deadline:
             improved = False
             
-            # Try adding elements (prioritize larger numbers)
-            candidates = sorted(all_numbers - s, reverse=True)
+            # Try to add an element
+            # Prioritize larger numbers? Or random?
+            # Larger numbers are less likely to be divisors of sums, but more likely to be sums?
+            # Actually, if x is large, it's hard for x to divide sum of 3 others (sum < 3x usually).
+            # So large x is "safe" as a divisor.
+            # But small x is "dangerous" as a divisor.
+            # So we should add large numbers first.
+            
+            candidates = sorted(all_numbers - S, reverse=True)
             rng.shuffle(candidates)
-            for x in candidates[:15]:
-                if is_valid_incremental(s, x):
-                    s.add(x)
-                    cur_size += 1
+            
+            for x in candidates:
+                if can_add(x, S):
+                    S.add(x)
+                    current_size += 1
                     improved = True
-                    stall_count = 0
+                    stall = 0
                     break
             
             if improved:
                 continue
             
-            # Try 1-swap: remove one, add another
-            elems = list(s)
+            # If no single add works, try a swap: remove one, add one.
+            # This keeps size constant, but might allow future adds.
+            # Or try remove 1, add 2 (size +1).
+            
+            # Try Remove 1, Add 2
+            elems = list(S)
             rng.shuffle(elems)
-            # Prioritize removing smaller numbers (they cause more constraints)
-            elems.sort(key=lambda x: x)
             
-            for rem in elems[:8]:
-                candidates = sorted(all_numbers - s, reverse=True)
-                rng.shuffle(candidates)
-                for add in candidates[:12]:
-                    if add == rem:
-                        continue
-                    new_s = (s - {rem}) | {add}
-                    if is_valid_fast(new_s):
-                        s = new_s
-                        improved = True
-                        stall_count = 0
-                        break
-                if improved:
-                    break
-            
-            if improved:
-                continue
-            
-            # Try 2-swap: remove 2, add 2
-            if rng.random() < 0.4:
-                elems = list(s)
-                rng.shuffle(elems)
-                # Try removing two smaller elements
-                elems.sort(key=lambda x: x)
-                rem_pairs = list(combinations(elems[:10], 2))
-                rng.shuffle(rem_pairs)
+            found_move = False
+            for rem in elems:
+                # Try to add 2 elements from candidates
+                # This is O(|S| * |candidates|^2 * check_cost).
+                # Too slow?
+                # Let's try Remove 1, Add 1 first to escape local minima.
+                # If we remove a "bad" element, we might be able to add 2 "good" ones.
                 
-                for rem1, rem2 in rem_pairs[:6]:
-                    candidates = sorted(all_numbers - s, reverse=True)
-                    rng.shuffle(candidates)
-                    add_pairs = list(combinations(candidates[:10], 2))
-                    for add1, add2 in add_pairs[:8]:
-                        new_s = (s - {rem1, rem2}) | {add1, add2}
-                        if is_valid_fast(new_s):
-                            s = new_s
-                            improved = True
-                            stall_count = 0
-                            break
-                    if improved:
+                # Let's just do a random swap to explore.
+                add_candidates = [x for x in all_numbers if x not in S]
+                if not add_candidates:
+                    break
+                rng.shuffle(add_candidates)
+                
+                for add in add_candidates[:10]: # Limit tries
+                    new_S = (S - {rem}) | {add}
+                    # Check if new_S is valid
+                    # We can check incrementally?
+                    # Removing rem: 
+                    # 1. rem was not dividing sums of others (was valid).
+                    # 2. Others were not dividing sums involving rem.
+                    #    Now rem is gone. Those constraints are gone.
+                    #    So removing rem cannot create a violation.
+                    # Adding add:
+                    # 1. add might divide sum of 3 others in new_S\{add}.
+                    # 2. Others might divide sum involving add.
+                    # So we only need to check if `add` can be added to `S - {rem}`.
+                    if can_add(add, S - {rem}):
+                        S = new_S
+                        improved = True
+                        stall = 0
+                        found_move = True
                         break
+                if found_move:
+                    break
             
             if not improved:
-                stall_count += 1
-                if stall_count > 30:
+                stall += 1
+                if stall > 50:
                     break
-        return s
-    
-    # Run multiple local search rounds with diverse starting points
-    for round_num in range(200):
+                    
+        return S
+
+    # Run multiple local searches
+    for i in range(50):
         if time.time() > deadline:
             break
         
-        # Generate diverse starting points
-        if round_num == 0:
-            start_s = set(best)
-        elif round_num == 1:
-            start_s = set(greedy_construct())
+        # Generate diverse starts
+        if i == 0:
+            start_S = best_S
         else:
-            # Random start: take a random subset biased toward larger numbers
-            k = rng.randint(35, 45)
-            # Weight toward larger numbers
-            weights = [x for x in range(1, 193)]
-            start_s = set(rng.choices(range(1, 193), weights=weights, k=k))
+            # Random subset
+            k = rng.randint(20, 40)
+            start_S = set(rng.sample(list(all_numbers), k))
+            # Filter to valid
+            valid_start = set()
+            for x in sorted(start_S, reverse=True):
+                if can_add(x, valid_start):
+                    valid_start.add(x)
+            start_S = valid_start
             
-            # Filter to valid set by greedily adding (larger first)
-            valid_s = set()
-            for x in sorted(start_s, reverse=True):
-                if is_valid_incremental(valid_s, x):
-                    valid_s.add(x)
-            start_s = valid_s
+        S = local_search(start_S, rng)
         
-        # Local search
-        result = local_search(start_s, rng, max_iters=200)
-        
-        if len(result) > best_size:
-            best_size = len(result)
-            best_set = frozenset(result)
-            best = list(result)
+        if len(S) > best_size:
+            best_size = len(S)
+            best_S = S.copy()
             
-    return list(best_set)
+    # Final polish
+    # Try to add any remaining
+    for x in sorted(all_numbers - best_S, reverse=True):
+        if can_add(x, best_S):
+            best_S.add(x)
+            
+    return list(best_S)
+
+if __name__ == "__main__":
+    # Test
+    res = construct()
+    print(len(res))

@@ -1,0 +1,1 @@
+BET: {mechanism: "Replaces slow coordinate descent with analytic gradient-based optimization using chain-rule gradients through the circuit; this should converge much faster to lower distances for the 3 generic targets, reducing their contribution to the mean distance", q: 0.6, delta: [50, 120]}

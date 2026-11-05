@@ -1,0 +1,104 @@
+"""Construct 32 unit pennies on the triangular lattice maximizing unit-distance pairs."""
+import time
+import itertools
+
+def construct():
+    # Deadline guard: 150s wall-clock limit, keep 10s margin
+    deadline = time.time() + 140
+    
+    def dist_sq(p, q):
+        da = p[0] - q[0]
+        db = p[1] - q[1]
+        return da*da + db*db + da*db
+    
+    def count_edges(points):
+        count = 0
+        n = len(points)
+        for i in range(n):
+            for j in range(i+1, n):
+                if dist_sq(points[i], points[j]) == 1:
+                    count += 1
+        return count
+    
+    # Generate Hexagon of radius 2 (19 points)
+    R_core = 2
+    core_points = []
+    for a in range(-R_core, R_core+1):
+        for b in range(-R_core, R_core+1):
+            if abs(a+b) <= R_core:
+                core_points.append((a, b))
+    
+    # Generate Hexagon of radius 3 (37 points)
+    R_full = 3
+    full_points = []
+    for a in range(-R_full, R_full+1):
+        for b in range(-R_full, R_full+1):
+            if abs(a+b) <= R_full:
+                full_points.append((a, b))
+                
+    core_set = set(core_points)
+    boundary_points = [p for p in full_points if p not in core_set]
+    
+    n_boundary = len(boundary_points) # 18
+    target_count = 13 # 19 + 13 = 32
+    
+    core_edges = count_edges(core_points)
+    
+    # Pre-compute boundary-core edges
+    b_core_edges = [0] * n_boundary
+    for i, bp in enumerate(boundary_points):
+        for cp in core_points:
+            if dist_sq(bp, cp) == 1:
+                b_core_edges[i] += 1
+                
+    # Pre-compute boundary-boundary adjacency
+    b_b_adj = [[0]*n_boundary for _ in range(n_boundary)]
+    for i in range(n_boundary):
+        for j in range(i+1, n_boundary):
+            if dist_sq(boundary_points[i], boundary_points[j]) == 1:
+                b_b_adj[i][j] = 1
+                b_b_adj[j][i] = 1
+                
+    best_edges = -1
+    best_combo = None
+    
+    # Exhaustive search over C(18,13) = 8568 combinations
+    # This is fast enough to complete well within the deadline
+    for combo in itertools.combinations(range(n_boundary), target_count):
+        if time.time() > deadline - 5:
+            break
+            
+        edges = core_edges
+        for i in combo:
+            edges += b_core_edges[i]
+            
+        # Count edges within the selected boundary points
+        # combo is a tuple of indices
+        for idx in range(len(combo)):
+            i = combo[idx]
+            for jdx in range(idx+1, len(combo)):
+                j = combo[jdx]
+                edges += b_b_adj[i][j]
+                
+        if edges > best_edges:
+            best_edges = edges
+            best_combo = combo
+            
+    if best_combo is None:
+        # Fallback if no combination found (should not happen)
+        best_combo = tuple(range(target_count))
+        
+    final_points = list(core_points) + [boundary_points[i] for i in best_combo]
+    
+    # Verification
+    if len(final_points) != 32 or len(set(final_points)) != 32:
+        # Fallback to a valid configuration (e.g., a 4x8 rectangle, though edge count will be lower)
+        final_points = [(a, b) for a in range(16) for b in range(2)]
+        
+    # Check bounds
+    for p in final_points:
+        if abs(p[0]) > 64 or abs(p[1]) > 64:
+            final_points = [(a, b) for a in range(16) for b in range(2)]
+            break
+            
+    return [[a, b] for a, b in final_points]

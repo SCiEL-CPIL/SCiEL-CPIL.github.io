@@ -1,165 +1,199 @@
 import time
 import random
+import math
 
 def construct():
-    start_time = time.time()
-    deadline = start_time + 55  # 5s safety margin
+    N = 512
+    # Bit i represents element i+1
     
-    n = 512
+    # Precompute conflict masks
+    conflicts = [[] for _ in range(N)]
     
-    # Precompute all 4-APs
-    # conflict_triples[x] is a list of masks. 
-    # If x is in S, and (mask & S_mask) == mask, then a 4-AP exists.
-    # The mask contains the other 3 elements.
-    conflict_triples = [[] for _ in range(n + 1)]
-    
-    # Generate all 4-APs (a, a+d, a+2d, a+3d)
-    for a in range(1, n + 1):
-        max_d = (n - a) // 3
-        for d in range(1, max_d + 1):
+    # Generate all 4-APs: a, a+d, a+2d, a+3d
+    for d in range(1, (N - 1) // 3 + 1):
+        max_a = N - 3 * d
+        for a in range(1, max_a + 1):
             b = a + d
             c = a + 2 * d
-            term4 = a + 3 * d
+            e = a + 3 * d
             
-            # For each element in the AP, the other 3 form the conflict mask
-            mask_a = (1 << (b - 1)) | (1 << (c - 1)) | (1 << (term4 - 1))
-            conflict_triples[a].append(mask_a)
+            a_bit = 1 << (a - 1)
+            b_bit = 1 << (b - 1)
+            c_bit = 1 << (c - 1)
+            e_bit = 1 << (e - 1)
             
-            mask_b = (1 << (a - 1)) | (1 << (c - 1)) | (1 << (term4 - 1))
-            conflict_triples[b].append(mask_b)
+            mask_bce = b_bit | c_bit | e_bit
+            conflicts[a - 1].append(mask_bce)
             
-            mask_c = (1 << (a - 1)) | (1 << (b - 1)) | (1 << (term4 - 1))
-            conflict_triples[c].append(mask_c)
+            mask_ace = a_bit | c_bit | e_bit
+            conflicts[b - 1].append(mask_ace)
             
-            mask_d = (1 << (a - 1)) | (1 << (b - 1)) | (1 << (c - 1))
-            conflict_triples[term4].append(mask_d)
+            mask_abe = a_bit | b_bit | e_bit
+            conflicts[c - 1].append(mask_abe)
             
-    # Convert to tuples for faster iteration
-    conflict_triples = [tuple(lst) for lst in conflict_triples]
-    
-    bit_positions = {i: 1 << (i - 1) for i in range(1, n + 1)}
-    
-    def can_add(x, S_mask):
-        """Check if x can be added to S without forming a 4-AP."""
-        for mask in conflict_triples[x]:
-            if (mask & S_mask) == mask:
+            mask_abc = a_bit | b_bit | c_bit
+            conflicts[e - 1].append(mask_abc)
+
+    def can_add(x_idx, S):
+        for mask in conflicts[x_idx]:
+            if (S & mask) == mask:
                 return False
         return True
 
-    def greedy_fill(S_mask, S_list, order):
-        """Try to add all possible elements in the given order."""
-        added_any = False
-        for x in order:
-            if not (S_mask & bit_positions[x]):
-                if can_add(x, S_mask):
-                    S_mask |= bit_positions[x]
-                    S_list.append(x)
-                    added_any = True
-        return S_mask, S_list, added_any
+    def greedy_fill(S, order):
+        for x_idx in order:
+            if not (S & (1 << x_idx)):
+                if can_add(x_idx, S):
+                    S |= (1 << x_idx)
+        return S
 
-    best_mask = 0
+    def count_bits(S):
+        return bin(S).count('1')
+
+    start_time = time.time()
+    deadline = start_time + 55.0
+
+    best_S = 0
     best_size = 0
-    all_elements = list(range(1, n + 1))
+    current_S = 0
+    current_size = 0
+
+    # Initial Greedy Constructions
+    base_order = list(range(N))
     
-    # Run multiple restarts to find a good solution
-    # Each restart: Greedy + Local Search
+    S_try = greedy_fill(0, base_order)
+    size_try = count_bits(S_try)
+    if size_try > best_size:
+        best_size = size_try
+        best_S = S_try
+        current_S = S_try
+        current_size = size_try
+
+    for _ in range(30):
+        random.shuffle(base_order)
+        S_try = greedy_fill(0, base_order)
+        size_try = count_bits(S_try)
+        if size_try > best_size:
+            best_size = size_try
+            best_S = S_try
+            current_S = S_try
+            current_size = size_try
+
+    # Local Search
+    # We will use a combination of "Remove and Fill" and "Swap" moves.
+    # Also, we will use a "Periodic Fill" strategy: after every few moves, 
+    # we run a full greedy fill to ensure we are at a local optimum.
+    
+    iterations = 0
+    stagnation = 0
+    
     while time.time() < deadline:
-        # 1. Greedy Construction with random shuffle
-        S_mask = 0
-        S_list = []
-        candidates = all_elements[:]
-        random.shuffle(candidates)
+        iterations += 1
         
-        for x in candidates:
-            if can_add(x, S_mask):
-                S_mask |= bit_positions[x]
-                S_list.append(x)
+        # 1. Periodic Full Fill (to escape shallow local optima)
+        # This is cheap if we just check additions.
+        # But greedy_fill is O(N * K). 
+        # Let's do it every 10 iterations or so.
+        if iterations % 10 == 0:
+            # Try to add any element that can be added, in random order
+            order = list(range(N))
+            random.shuffle(order)
+            S_filled = greedy_fill(current_S, order)
+            size_filled = count_bits(S_filled)
+            if size_filled > best_size:
+                best_size = size_filled
+                best_S = S_filled
+                stagnation = 0
+            else:
+                stagnation += 1
+            current_S = S_filled
+            current_size = size_filled
+            continue
+
+        # 2. Move Type Selection
+        # If stagnation is high, increase perturbation strength
+        perturbation_strength = min(5, 1 + stagnation // 5)
         
-        current_size = len(S_list)
-        if current_size > best_size:
-            best_size = current_size
-            best_mask = S_mask
+        if random.random() < 0.7:
+            # Remove and Fill
+            k = random.randint(1, perturbation_strength)
             
-        # 2. Local Search Phase
-        # We will try to improve the set by swapping elements.
-        # Strategy: 
-        #   1. Try to add any element.
-        #   2. If stuck, perform a random swap (remove y, add x) if valid.
-        #   3. Repeat.
-        
-        # Precompute list of elements NOT in S for faster random selection?
-        # Or just pick random x and check.
-        
-        # To speed up "pick random x not in S", we can maintain a list of candidates
-        # But rebuilding it is expensive. Just picking random 1..n and checking is O(1).
-        
-        no_improvement_count = 0
-        max_no_improvement = 20000 # Tune this
-        
-        while time.time() < deadline:
-            # Try to add an element
-            added = False
-            # Try a few random additions
-            for _ in range(10):
-                x = random.randint(1, n)
-                if not (S_mask & bit_positions[x]):
-                    if can_add(x, S_mask):
-                        S_mask |= bit_positions[x]
-                        S_list.append(x)
-                        current_size += 1
-                        added = True
-                        no_improvement_count = 0
-                        if current_size > best_size:
-                            best_size = current_size
-                            best_mask = S_mask
-                        break # Restart loop if added
+            elements_in_set = [i for i in range(N) if (current_S & (1 << i))]
             
-            if added:
-                continue
+            if len(elements_in_set) < k:
+                k = len(elements_in_set)
+                if k == 0:
+                    continue
+            
+            if k > 0:
+                removed = random.sample(elements_in_set, k)
+                S_temp = current_S
+                for idx in removed:
+                    S_temp &= ~(1 << idx)
                 
-            # If no element could be added, try a swap
-            # Pick random y in S to remove
-            y_idx = random.randint(0, len(S_list) - 1)
-            y = S_list[y_idx]
+                order = list(range(N))
+                random.shuffle(order)
+                
+                S_filled = greedy_fill(S_temp, order)
+                size_filled = count_bits(S_filled)
+                
+                if size_filled > best_size:
+                    best_size = size_filled
+                    best_S = S_filled
+                    stagnation = 0
+                else:
+                    stagnation += 1
+                
+                current_S = S_filled
+                current_size = size_filled
+        else:
+            # Swap Move
+            elements_in_set = [i for i in range(N) if (current_S & (1 << i))]
+            if not elements_in_set:
+                continue
             
-            # Pick random x not in S to add
-            # We need to ensure x is not in S
-            # Try a few times to find a valid x
-            swap_made = False
-            for _ in range(5):
-                x = random.randint(1, n)
-                if S_mask & bit_positions[x]:
+            u = random.choice(elements_in_set)
+            S_temp = current_S & ~(1 << u)
+            
+            # Try to find a v that can be added
+            # We can bias towards elements that were recently removed or just random
+            # Let's just try random v's
+            found_swap = False
+            for _ in range(20):
+                v = random.randint(0, N - 1)
+                if current_S & (1 << v):
                     continue
                 
-                # Check if x can be added to S \ {y}
-                S_mask_without_y = S_mask & ~bit_positions[y]
-                if can_add(x, S_mask_without_y):
-                    # Perform swap
-                    S_mask = S_mask_without_y | bit_positions[x]
-                    S_list[y_idx] = x
-                    swap_made = True
-                    no_improvement_count = 0
+                if can_add(v, S_temp):
+                    S_new = S_temp | (1 << v)
+                    current_S = S_new
+                    # Size is same, but structure changed
+                    # Check if we can now fill more
+                    order = list(range(N))
+                    random.shuffle(order)
+                    S_filled = greedy_fill(current_S, order)
+                    size_filled = count_bits(S_filled)
+                    
+                    if size_filled > best_size:
+                        best_size = size_filled
+                        best_S = S_filled
+                        stagnation = 0
+                    else:
+                        stagnation += 1
+                    
+                    current_S = S_filled
+                    current_size = size_filled
+                    found_swap = True
                     break
-            
-            if not swap_made:
-                no_improvement_count += 1
-                if no_improvement_count > max_no_improvement:
-                    break # Stuck, break inner loop and restart outer loop
-            
-        # Final add pass after local search
-        S_mask, S_list, _ = greedy_fill(S_mask, S_list, all_elements)
-        current_size = len(S_list)
-        if current_size > best_size:
-            best_size = current_size
-            best_mask = S_mask
-
-    # Final polish: try to add any remaining elements to the best solution
-    final_list = []
-    for i in range(n):
-        if best_mask & (1 << i):
-            final_list.append(i + 1)
     
-    if not final_list:
-        return [1, 2]
-        
-    return final_list
+    # Final check
+    if count_bits(current_S) > best_size:
+        best_S = current_S
+        best_size = count_bits(current_S)
+
+    result = []
+    for i in range(N):
+        if best_S & (1 << i):
+            result.append(i + 1)
+            
+    return sorted(result)

@@ -1,310 +1,221 @@
-import itertools
 import numpy as np
+import itertools
 import random
 import time
 
 def construct(q, n, radius):
-    if q != 3 or n != 8 or radius != 1:
-        # Fallback for non-target parameters
-        all_words = list(itertools.product(range(q), repeat=n))
-        word_to_idx = {w: i for i, w in enumerate(all_words)}
-        neighbors = []
-        for i, w in enumerate(all_words):
-            neigh_set = set()
-            neigh_set.add(i)
-            for pos in range(n):
-                for val in range(q):
-                    if val == w[pos]:
-                        continue
-                    new_w_list = list(w)
-                    new_w_list[pos] = val
-                    new_w = tuple(new_w_list)
-                    neigh_set.add(word_to_idx[new_w])
-            neighbors.append(list(neigh_set))
-        
-        N = q ** n
-        uncovered = np.ones(N, dtype=bool)
-        C = []
-        start_time = time.time()
-        time_limit = 100.0
-        
-        while np.any(uncovered):
-            best_idx = -1
-            best_count = -1
-            for i in range(N):
-                cnt = np.sum(uncovered[neighbors[i]])
-                if cnt > best_count:
-                    best_count = cnt
-                    best_idx = i
-            if best_count == 0: break
-            C.append(best_idx)
-            uncovered[neighbors[best_idx]] = False
-            if time.time() - start_time > time_limit: break
-            
-        # Reduction
-        coverage_counts = np.zeros(N, dtype=int)
-        for c in C:
-            coverage_counts[neighbors[c]] += 1
-        changed = True
-        while changed:
-            changed = False
-            new_C = []
-            for c in C:
-                if np.min(coverage_counts[neighbors[c]]) >= 2:
-                    coverage_counts[neighbors[c]] -= 1
-                    changed = True
-                else:
-                    new_C.append(c)
-            C = new_C
-        return [list(all_words[i]) for i in C]
+    # Fallback for non-standard parameters
+    if not (q == 3 and n == 8 and radius == 1):
+        if q == 3 and n == 4 and radius == 1:
+            return [[a, b, (a + b) % 3, (a + 2 * b) % 3] for a in range(3) for b in range(3)]
+        return [list(word) for word in itertools.product(range(q), repeat=n)]
 
-    # Specific optimization for q=3, n=8, radius=1
-    N = 6561
-    all_words = list(itertools.product(range(3), repeat=8))
-    word_to_idx = {w: i for i, w in enumerate(all_words)}
-    
-    # Precompute neighbors as numpy arrays for fast operations
-    neighbors = []
-    for i, w in enumerate(all_words):
-        neigh_set = set()
-        neigh_set.add(i)
-        for pos in range(8):
-            for val in range(3):
-                if val == w[pos]:
-                    continue
-                new_w_list = list(w)
-                new_w_list[pos] = val
-                new_w = tuple(new_w_list)
-                neigh_set.add(word_to_idx[new_w])
-        neighbors.append(np.array(list(neigh_set), dtype=int))
-        
-    # 1. Fast Greedy Initialization
-    uncovered = np.ones(N, dtype=bool)
-    C = []
     start_time = time.time()
-    time_limit = 115.0
+    deadline = start_time + 115.0
     
-    # Optimize greedy: pick word covering most uncovered
-    # To speed up, we can use a heap or just scan. Scanning 6561 * ~500 iterations is ~3M ops, fast enough.
-    while np.any(uncovered):
-        best_idx = -1
-        best_count = -1
-        for i in range(N):
-            cnt = np.sum(uncovered[neighbors[i]])
-            if cnt > best_count:
-                best_count = cnt
-                best_idx = i
-        if best_count == 0:
-            break
-        C.append(best_idx)
-        uncovered[neighbors[best_idx]] = False
-        if time.time() - start_time > time_limit:
-            break
-            
-    # 2. Local Search
-    def get_counts(code):
-        counts = np.zeros(N, dtype=int)
-        for c in code:
-            counts[neighbors[c]] += 1
-        return counts
-
-    def reduce_code(code, counts):
-        """
-        Reduces code by removing redundant words.
-        Returns new_code and new_counts.
-        """
-        if not code:
-            return code, counts
-        current_code = list(code)
-        current_counts = counts.copy()
+    total_words = q ** n  # 6561
+    
+    # Precompute digits for all words for final output
+    digits_of = [None] * total_words
+    for i in range(total_words):
+        d = []
+        x = i
+        for _ in range(n):
+            d.append(x % q)
+            x //= q
+        d.reverse()
+        digits_of[i] = tuple(d)
         
-        while True:
-            removed_any = False
-            next_code = []
-            for c in current_code:
-                if np.min(current_counts[neighbors[c]]) >= 2:
-                    # Remove c
-                    current_counts[neighbors[c]] -= 1
-                    removed_any = True
-                else:
-                    next_code.append(c)
-            current_code = next_code
-            if not removed_any:
+    # Precompute neighbor lists
+    # For q=3, n=8, radius=1: 1 + 8*(3-1) = 17 neighbors
+    neighbors = [None] * total_words
+    for i in range(total_words):
+        d = digits_of[i]
+        neigh = [i]
+        for pos in range(n):
+            orig_val = d[pos]
+            for new_val in range(q):
+                if new_val == orig_val:
+                    continue
+                new_d = list(d)
+                new_d[pos] = new_val
+                idx = 0
+                for j in range(n):
+                    idx = idx * q + new_d[j]
+                neigh.append(idx)
+        neighbors[i] = np.array(neigh, dtype=np.int32)
+        
+    def generate_greedy_code():
+        cov_count = np.zeros(total_words, dtype=np.int32)
+        is_code = np.zeros(total_words, dtype=bool)
+        code_list = []
+        
+        # Potential: number of uncovered neighbors
+        # Initially all 17 are uncovered
+        potential = np.full(total_words, len(neighbors[0]), dtype=np.int32)
+        uncovered_remaining = total_words
+        
+        while uncovered_remaining > 0 and time.time() < deadline - 30.0:
+            # Find word covering most uncovered points
+            # Using argmax on potential is O(N). With N=6561, it's fast.
+            # We could use a heap, but argmax on numpy is very fast (C loop)
+            c = np.argmax(potential)
+            if potential[c] == 0:
                 break
-        return current_code, current_counts
+                
+            code_list.append(c)
+            is_code[c] = True
+            potential[c] = 0 # Prevent re-picking
+            
+            neigh_c = neighbors[c]
+            for x in neigh_c:
+                if cov_count[x] == 0:
+                    cov_count[x] = 1
+                    uncovered_remaining -= 1
+                    # Update potentials of neighbors of x
+                    potential[neighbors[x]] -= 1
+                else:
+                    cov_count[x] += 1
+        return code_list, cov_count, is_code
 
-    C, counts = reduce_code(C, get_counts(C))
-    best_size = len(C)
-    best_C = C.copy()
-    best_counts = counts.copy()
-    
-    # Local Search Loop
-    # Strategy:
-    # 1. Reduce.
-    # 2. If not reduced, try to find a swap that enables a reduction.
-    #    - Pick a codeword c.
-    #    - Find unique points U_c.
-    #    - If |U_c| <= 3, find a word w not in C that covers U_c.
-    #    - Swap c -> w.
-    #    - Reduce.
-    # 3. If no swap found, try a random swap or accept a neutral swap to escape local minimum.
-    
-    while time.time() - start_time < time_limit:
-        # 1. Reduction Pass
-        old_size = len(C)
-        C, counts = reduce_code(C, counts)
+    def perform_local_search(code, cov_count, is_code, max_time):
+        # code: list of ints
+        # cov_count: numpy array
+        # is_code: numpy array bool
+        end_time = time.time() + max_time
+        random.seed(42)
+        stuck_counter = 0
+        best_code = code[:]
+        best_size = len(code)
+        best_cov_count = cov_count.copy()
+        best_is_code = is_code.copy()
         
-        if len(C) < best_size:
-            best_size = len(C)
-            best_C = C.copy()
-            best_counts = counts.copy()
+        while time.time() < end_time:
+            if len(code) == 0:
+                break
+                
+            # 1. Try Deletion
+            idx = random.randint(0, len(code) - 1)
+            c = code[idx]
             
-        if time.time() - start_time > time_limit:
-            break
-            
-        # 2. Swap Pass
-        if len(C) == old_size:
-            # No reduction happened. Try to find a move.
-            improved = False
-            # Randomize the order of C to avoid bias
-            indices = list(range(len(C)))
-            random.shuffle(indices)
-            
-            for idx in indices:
-                if time.time() - start_time > time_limit:
-                    break
-                c = C[idx]
-                u_indices = neighbors[c]
-                unique_mask = counts[u_indices] == 1
-                unique_points = u_indices[unique_mask]
+            # Check if all neighbors are covered > 1 time
+            # If yes, remove c
+            if np.all(cov_count[neighbors[c]] > 1):
+                cov_count[neighbors[c]] -= 1
+                is_code[c] = False
+                code.pop(idx)
+                stuck_counter = 0
                 
-                if len(unique_points) == 0:
-                    # Should have been removed, but maybe logic missed it?
-                    # Force removal
-                    C.remove(c)
-                    counts[neighbors[c]] -= 1
-                    improved = True
-                    break
-                
-                # If too many unique points, unlikely to find a single replacement
-                # unless we allow larger swaps, but we stick to 1-for-1.
-                if len(unique_points) > 3:
-                    continue
-                
-                # Find candidates c' that cover all unique_points
-                # Intersection of neighbors[u] for u in unique_points
-                if len(unique_points) == 1:
-                    candidates_set = set(neighbors[unique_points[0]].tolist())
-                else:
-                    candidates_set = set(neighbors[unique_points[0]].tolist())
-                    for u in unique_points[1:]:
-                        candidates_set &= set(neighbors[u].tolist())
-                        if not candidates_set:
-                            break
-                
-                if not candidates_set:
-                    continue
-                
-                # Filter candidates: must not be in C
-                candidates_set.difference_update(C)
-                
-                if not candidates_set:
-                    continue
-                    
-                # Pick a candidate
-                # Heuristic: Pick one that maximizes overlap with other codewords?
-                # Or just pick one arbitrarily.
-                # Let's pick one randomly to explore.
-                c_prime = random.choice(list(candidates_set))
-                
-                # Apply swap
-                old_C = C.copy()
-                old_counts = counts.copy()
-                
-                C.remove(c)
-                C.append(c_prime)
-                
-                counts[neighbors[c]] -= 1
-                counts[neighbors[c_prime]] += 1
-                
-                # Check validity (should be valid by construction of U_c)
-                # But let's be safe
-                if np.any(counts < 1):
-                    C = old_C
-                    counts = old_counts
-                    continue
-                
-                # Try to reduce
-                new_C, new_counts = reduce_code(C, counts)
-                
-                if len(new_C) < len(old_C):
-                    # Improvement!
-                    C = new_C
-                    counts = new_counts
-                    if len(C) < best_size:
-                        best_size = len(C)
-                        best_C = C.copy()
-                        best_counts = counts.copy()
-                    improved = True
-                    break # Restart loop
-                    
-                else:
-                    # No reduction.
-                    # Keep the swap?
-                    # If we keep it, we might escape a local minimum.
-                    # If we revert, we might cycle.
-                    # Let's keep it if it's a "neutral" move that changes the structure.
-                    # But to avoid infinite loops of neutral swaps, we can limit them.
-                    # For now, let's keep it.
-                    # C and counts are already updated.
-                    improved = True
-                    break # Restart loop to see if this new state allows reduction
-            
-            if not improved:
-                # No move found in this pass.
-                # To escape local minima, we can try a "kick":
-                # Randomly swap a word with a random neighbor, even if it doesn't enable reduction immediately.
-                # Or just break and return best.
-                # Let's try a few random kicks.
-                for _ in range(10):
-                    if time.time() - start_time > time_limit: break
-                    if not C: break
-                    c_idx = random.randint(0, len(C)-1)
-                    c = C[c_idx]
-                    # Pick a random neighbor of c
-                    cand = neighbors[c]
-                    c_prime = cand[random.randint(0, len(cand)-1)]
-                    if c_prime in C: continue
-                    
-                    old_C = C.copy()
-                    old_counts = counts.copy()
-                    
-                    C.remove(c)
-                    C.append(c_prime)
-                    counts[neighbors[c]] -= 1
-                    counts[neighbors[c_prime]] += 1
-                    
-                    if np.any(counts < 1):
-                        C = old_C
-                        counts = old_counts
-                        continue
-                        
-                    # Try reduce
-                    new_C, new_counts = reduce_code(C, counts)
-                    if len(new_C) < len(old_C):
-                        C = new_C
-                        counts = new_counts
-                        if len(C) < best_size:
-                            best_size = len(C)
-                            best_C = C.copy()
-                            best_counts = counts.copy()
-                        break
-                    else:
-                        # Accept the kick to change state
-                        C = new_C
-                        counts = new_counts
+                if len(code) < best_size:
+                    best_size = len(code)
+                    best_code = code[:]
+                    best_cov_count = cov_count.copy()
+                    best_is_code = is_code.copy()
+                continue
 
-    # Final Reduction
-    best_C, _ = reduce_code(best_C, get_counts(best_C))
+            # 2. Deletion failed. Check if c is removable by swapping?
+            # Find risky points: neighbors of c with coverage exactly 1
+            neigh_c = neighbors[c]
+            risky_mask = cov_count[neigh_c] == 1
+            risky_points = neigh_c[risky_mask]
+            
+            # If no risky points, it means we *could* delete, but np.all check above 
+            # would have caught it if ALL were >1. 
+            # Wait, if np.all(cov_count[neighbors[c]] > 1) is False, then at least one is 1.
+            # So risky_points is non-empty if deletion failed.
+            
+            if len(risky_points) == 0:
+                # Should not happen if deletion check failed, but safety
+                cov_count[neighbors[c]] -= 1
+                is_code[c] = False
+                code.pop(idx)
+                stuck_counter = 0
+                if len(code) < best_size:
+                    best_size = len(code)
+                    best_code = code[:]
+                    best_cov_count = cov_count.copy()
+                    best_is_code = is_code.copy()
+                continue
+
+            # Find a candidate c2 such that c2 covers all risky_points
+            # c2 must be in intersection of N(r) for all r in risky_points
+            # And c2 should not be in current code (to maintain size or reduce, 
+            # but if we swap, size stays same. To reduce size we need deletion.
+            # However, sometimes a swap allows a subsequent deletion.
+            # Also, c2 must not be c itself.
+            
+            # Start with neighbors of first risky point
+            # Note: N(r) includes r itself and its neighbors.
+            # c2 must be in N(r) means dist(c2, r) <= 1.
+            
+            candidates = set(neighbors[risky_points[0]].tolist())
+            candidates.discard(c) # c is already removed? No, we are considering swapping c -> c2.
+            # c is in code. c2 must be NOT in code.
+            
+            for r in risky_points[1:]:
+                candidates &= set(neighbors[r].tolist())
+                if not candidates:
+                    break
+            
+            # Filter out current code words
+            code_set = set(code)
+            valid_candidates = [c2 for c2 in candidates if c2 not in code_set]
+            
+            if valid_candidates:
+                # Pick a random candidate
+                c2 = random.choice(valid_candidates)
+                
+                # Perform Swap: remove c, add c2
+                # 1. Remove c
+                cov_count[neighbors[c]] -= 1
+                is_code[c] = False
+                code.pop(idx)
+                code.append(c2) # Keep list, index doesn't matter for logic, just distinctness
+                is_code[c2] = True
+                
+                # 2. Add c2
+                cov_count[neighbors[c2]] += 1
+                
+                # Since c2 covers all risky points, and c was the only cover for them,
+                # coverage of risky points is restored.
+                # Other points in N(c) \ N(c2) lose coverage from c.
+                # But we checked that they had coverage > 1 (or were not risky).
+                # If a point was in N(c) but NOT in N(c2), and had cov_count 1, it would have been in risky_points.
+                # So all points in N(c) that had count 1 are in N(c2).
+                # Points with count > 1 remain covered.
+                # So the swap is always valid in terms of coverage!
+                
+                stuck_counter = 0
+            else:
+                stuck_counter += 1
+                
+                # If stuck a lot, maybe try a random perturbation?
+                # For now, just continue.
+                
+            # Check for improvement (size didn't change, so no improvement in size)
+            # But we might escape local minima for future deletions.
+            # We don't update best_code here because size is same.
+            
+            # Optional: Occasionally try to delete multiple? No, single step.
+            
+        return best_code, best_cov_count, best_is_code
+
+    # 1. Initialize
+    code, cov_count, is_code = generate_greedy_code()
     
-    return [list(all_words[i]) for i in best_C]
+    # 2. Local Search
+    # Use remaining time for search
+    time_left = deadline - time.time()
+    code, cov_count, is_code = perform_local_search(code, cov_count, is_code, time_left)
+    
+    # 3. Final Verification and Cleanup
+    # Recompute counts to be sure
+    final_cov_count = np.zeros(total_words, dtype=np.int32)
+    for c in code:
+        final_cov_count[neighbors[c]] += 1
+        
+    if not np.all(final_cov_count > 0):
+        # Fallback to greedy if search broke something (shouldn't happen)
+        code, _, _ = generate_greedy_code()
+        
+    return [list(digits_of[i]) for i in code]

@@ -1,200 +1,261 @@
 import numpy as np
 import time
+import random
+import math
+
+def _primes_up_to(n):
+    is_prime = [True] * (n + 1)
+    is_prime[0] = is_prime[1] = False
+    for i in range(2, int(math.isqrt(n)) + 1):
+        if is_prime[i]:
+            for j in range(i * i, n + 1, i):
+                is_prime[j] = False
+    return [i for i, prime in enumerate(is_prime) if prime]
 
 def construct():
     start_time = time.time()
     deadline = start_time + 115.0
 
-    def get_primes(limit):
-        sieve = [True] * (limit + 1)
-        sieve[0] = sieve[1] = False
-        for i in range(2, int(limit**0.5) + 1):
-            if sieve[i]:
-                step = i
-                start = i * i
-                sieve[start:limit+1:step] = [False] * len(sieve[start:limit+1:step])
-        return [i for i, is_prime in enumerate(sieve) if is_prime]
-
-    primes = get_primes(1000)
+    primes = _primes_up_to(1000)
     n_primes = len(primes)
     MAX_L = 100000
 
-    def build_counts(residues, primes):
-        counts = np.zeros(MAX_L + 1, dtype=np.int32)
+    residues = np.zeros(n_primes, dtype=np.int32)
+    counts = np.zeros(MAX_L + 1, dtype=np.int8)
+
+    def build_counts():
+        counts[:] = 0
         for i, p in enumerate(primes):
             r = residues[i]
-            start = r if r > 0 else p
-            if start <= MAX_L:
-                counts[start::p] += 1
-        return counts
+            if r == 0:
+                counts[p::p] += 1
+            else:
+                counts[r::p] += 1
+        counts[0] = 100
 
-    def find_L(counts, current_L):
-        # Find the largest L such that counts[1..L] >= 2
+    def find_L(current_L=0):
         if current_L >= MAX_L:
-            # Check if MAX_L is still valid
-            if np.min(counts[1:MAX_L+1]) >= 2:
-                return MAX_L
-        # Check current prefix
+            return MAX_L
         if current_L > 0:
-            prefix = counts[1:current_L+1]
-            if np.min(prefix) < 2:
-                bad = np.where(prefix < 2)[0]
-                return bad[0]
-            # Current prefix is valid, try to extend
-            if current_L < MAX_L:
-                rest = counts[current_L+1:]
-                bad_idx = np.where(rest < 2)[0]
-                if len(bad_idx) == 0:
-                    return MAX_L
-                else:
-                    return current_L + bad_idx[0]
+            min_cov = np.min(counts[1:current_L + 1])
+            if min_cov < 2:
+                bad = np.where(counts[1:current_L + 1] < 2)[0]
+                return int(bad[0])
+        rest = counts[current_L + 1:]
+        bad_idx = np.where(rest < 2)[0]
+        if len(bad_idx) == 0:
+            return MAX_L
+        return int(current_L + bad_idx[0])
+
+    def apply_change(i, new_r):
+        p = primes[i]
+        old_r = residues[i]
+        if old_r == new_r:
+            return
+        if old_r == 0:
+            counts[p::p] -= 1
         else:
-            bad_idx = np.where(counts[1:] < 2)[0]
-            if len(bad_idx) == 0:
-                return MAX_L
-            return bad_idx[0]
+            counts[old_r::p] -= 1
+        residues[i] = new_r
+        if new_r == 0:
+            counts[p::p] += 1
+        else:
+            counts[new_r::p] += 1
 
-    # --- Greedy Initialization ---
-    def greedy_init(primes, n_primes):
-        residues = [0] * n_primes
-        # Start with all zeros, then greedily pick residues to maximize L
-        # But all zeros means x=0 mod p, so x ≡ 0 mod p.
-        # For x in 1..L, x satisfies x≡0 mod p iff p divides x.
-        # Let's just do a simple greedy: for each prime, pick r to maximize
-        # the minimum count in the current covered range, or extend L.
-        
-        # Actually, let's start with a random-ish but deterministic init
-        # and then do a few greedy passes.
-        
-        # Simple init: r_p = p // 2 or something
-        # Let's try r_p = 1 for all (covers all odd numbers with 2, but 2 is prime)
-        # Better: let's just use the seed init as a starting point for greedy
-        residues = [((i + 2) // 2) % p for i, p in enumerate(primes)]
-        
-        counts = build_counts(residues, primes)
-        L = find_L(counts, 0)
-        
-        # Greedy pass: try to improve L by changing one residue at a time
-        # For each prime, try all residues (or a subset) and pick the best
-        for _pass in range(5):
-            improved = False
-            for i in range(n_primes):
-                p = primes[i]
-                old_r = residues[i]
-                best_r = old_r
-                best_L = L
-                
-                # Remove old contribution
-                start_old = old_r if old_r > 0 else p
-                if start_old <= MAX_L:
-                    counts[start_old::p] -= 1
-                    
-                # Try a few candidate residues
-                # Try 0, and a few random ones, and old_r ± small amounts
-                candidates = set([0, old_r])
-                if old_r > 0:
-                    candidates.add(old_r - 1)
-                if old_r < p - 1:
-                    candidates.add(old_r + 1)
-                # Add a few random ones
-                for _ in range(3):
-                    candidates.add(np.random.randint(p))
-                    
-                for r in candidates:
-                    if r == old_r:
-                        continue
-                    start_new = r if r > 0 else p
-                    if start_new <= MAX_L:
-                        counts[start_new::p] += 1
-                    new_L = find_L(counts, L)
-                    if new_L > best_L:
-                        best_L = new_L
-                        best_r = r
-                    if start_new <= MAX_L:
-                        counts[start_new::p] -= 1
-                        
-                # Apply best
-                if best_r != old_r:
-                    start_new = best_r if best_r > 0 else p
-                    if start_new <= MAX_L:
-                        counts[start_new::p] += 1
-                    residues[i] = best_r
-                    L = best_L
-                    improved = True
-                else:
-                    # Restore old
-                    start_old = old_r if old_r > 0 else p
-                    if start_old <= MAX_L:
-                        counts[start_old::p] += 1
-            
-            if not improved:
-                break
-        
-        return residues, counts, L
+    def revert_change(i, old_r):
+        p = primes[i]
+        new_r = residues[i]
+        if old_r == new_r:
+            return
+        if new_r == 0:
+            counts[p::p] -= 1
+        else:
+            counts[new_r::p] -= 1
+        residues[i] = old_r
+        if old_r == 0:
+            counts[p::p] += 1
+        else:
+            counts[old_r::p] += 1
 
-    residues, counts, current_L = greedy_init(primes, n_primes)
+    # --- Phase 1: Greedy Forward Construction ---
+    # Build residues one prime at a time, choosing each to maximize the doubly-covered prefix
+    # Use a temporary smaller range for speed during construction
+    CONSTRUCT_MAX = 20000
+    temp_counts = np.zeros(CONSTRUCT_MAX + 1, dtype=np.int8)
+
+    for idx in range(n_primes):
+        if time.time() > deadline - 60.0:
+            break
+        p = primes[idx]
+        best_r = 0
+        best_score = -1
+
+        for r_candidate in range(p):
+            # Add this residue to temp_counts
+            if r_candidate == 0:
+                temp_counts[p::p] += 1
+            else:
+                temp_counts[r_candidate::p] += 1
+
+            # Find L from temp_counts
+            deficient = np.where(temp_counts[1:CONSTRUCT_MAX + 1] < 2)[0]
+            if len(deficient) == 0:
+                score = CONSTRUCT_MAX
+            else:
+                score = int(deficient[0])
+
+            # Remove
+            if r_candidate == 0:
+                temp_counts[p::p] -= 1
+            else:
+                temp_counts[r_candidate::p] -= 1
+
+            if score > best_score:
+                best_score = score
+                best_r = r_candidate
+
+        residues[idx] = best_r
+
+    # Build full counts
+    build_counts()
+    current_L = find_L(0)
     best_L = current_L
     best_residues = residues.copy()
 
-    # --- Simulated Annealing ---
-    T = 2.0
-    min_T = 0.001
-    cooling = 0.9998
-    
-    # Track time
-    while time.time() < deadline:
-        i = np.random.randint(n_primes)
-        p = primes[i]
-        old_r = residues[i]
-        new_r = np.random.randint(p)
-        
-        if new_r == old_r:
-            continue
-            
-        # Apply change
-        start_old = old_r if old_r > 0 else p
-        if start_old <= MAX_L:
-            counts[start_old::p] -= 1
-            
-        start_new = new_r if new_r > 0 else p
-        if start_new <= MAX_L:
-            counts[start_new::p] += 1
-            
-        # Calculate new L
-        new_L = find_L(counts, current_L)
-        
-        # Acceptance
-        if new_L >= current_L:
-            residues[i] = new_r
-            current_L = new_L
-            if new_L > best_L:
-                best_L = new_L
-                best_residues = residues.copy()
-        else:
-            delta = new_L - current_L
-            if delta > -500:
-                prob = np.exp(delta / T)
-                if np.random.random() < prob:
-                    residues[i] = new_r
-                    current_L = new_L
-                else:
-                    residues[i] = old_r
-                    if start_new <= MAX_L:
-                        counts[start_new::p] -= 1
-                    if start_old <= MAX_L:
-                        counts[start_old::p] += 1
+    # --- Phase 2: Targeted Greedy Extension ---
+    # Try to extend L by finding primes that can safely cover L+1
+    extension_rounds = 0
+    max_extensions = 200
+    while current_L < MAX_L and time.time() < deadline - 40.0 and extension_rounds < max_extensions:
+        extension_rounds += 1
+        x = current_L + 1
+        candidates = []
+        for i, p in enumerate(primes):
+            target_r = x % p
+            if residues[i] == target_r:
+                continue
+            old_r = residues[i]
+            # Check if removing old_r coverage breaks any y in [1, x-1]
+            if old_r == 0:
+                if x <= p:
+                    candidates.append(i)
+                    continue
+                if x > p:
+                    min_cov = np.min(counts[p:x:p])
+                    if min_cov >= 3:
+                        candidates.append(i)
             else:
-                residues[i] = old_r
-                if start_new <= MAX_L:
-                    counts[start_new::p] -= 1
-                if start_old <= MAX_L:
-                    counts[start_old::p] += 1
-            
-        T *= cooling
-        if T < min_T:
-            T = min_T
-            # Restart with higher T to escape local minima
-            if time.time() < deadline - 20:
-                T = 1.0
+                if old_r >= x:
+                    candidates.append(i)
+                    continue
+                if old_r > 0:
+                    min_cov = np.min(counts[old_r:x:p])
+                    if min_cov >= 3:
+                        candidates.append(i)
 
-    return best_residues
+        if candidates:
+            i = random.choice(candidates)
+            apply_change(i, x % primes[i])
+            new_L = find_L(current_L)
+            if new_L > current_L:
+                current_L = new_L
+                if current_L > best_L:
+                    best_L = current_L
+                    best_residues = residues.copy()
+            else:
+                old_r = residues[i]
+                revert_change(i, old_r)
+        else:
+            break
+
+    # --- Phase 3: Simulated Annealing ---
+    if time.time() < deadline - 15.0:
+        T = 5.0
+        cooling_rate = 0.9999
+        min_T = 0.05
+
+        while time.time() < deadline - 10.0:
+            i = np.random.randint(n_primes)
+            p = primes[i]
+            old_r = residues[i]
+            new_r = np.random.randint(p)
+
+            if new_r == old_r:
+                continue
+
+            apply_change(i, new_r)
+            new_L = find_L(current_L)
+
+            delta = new_L - current_L
+
+            if delta > 0:
+                current_L = new_L
+                if new_L > best_L:
+                    best_L = new_L
+                    best_residues = residues.copy()
+            else:
+                if delta > -200:
+                    prob = math.exp(delta / T)
+                    if random.random() < prob:
+                        current_L = new_L
+                    else:
+                        revert_change(i, old_r)
+                else:
+                    revert_change(i, old_r)
+
+            T *= cooling_rate
+            if T < min_T:
+                T = min_T
+
+    # --- Phase 4: Final Polish - targeted local search near frontier ---
+    if time.time() < deadline - 3.0:
+        polish_deadline = deadline - 1.0
+        for _ in range(30):
+            if time.time() > polish_deadline:
+                break
+            progress = False
+            for i in range(n_primes):
+                if time.time() > polish_deadline:
+                    break
+                p = primes[i]
+                old_r = residues[i]
+                for offset in [-3, -2, -1, 1, 2, 3, -7, 7, -13, 13]:
+                    new_r = (old_r + offset) % p
+                    if new_r == old_r:
+                        continue
+                    apply_change(i, new_r)
+                    new_L = find_L(current_L)
+                    if new_L > current_L:
+                        current_L = new_L
+                        if new_L > best_L:
+                            best_L = new_L
+                            best_residues = residues.copy()
+                        progress = True
+                        break
+                    else:
+                        revert_change(i, old_r)
+            if not progress:
+                break
+
+    # Final verification
+    final_counts = np.zeros(MAX_L + 1, dtype=np.int8)
+    for i, p in enumerate(primes):
+        r = best_residues[i]
+        if r == 0:
+            final_counts[p::p] += 1
+        else:
+            final_counts[r::p] += 1
+    final_counts[0] = 100
+
+    if np.min(final_counts[1:best_L + 1]) < 2:
+        bad = np.where(final_counts[1:best_L + 1] < 2)[0]
+        final_L = int(bad[0])
+    else:
+        final_L = best_L
+        if final_L < MAX_L:
+            rest = final_counts[final_L + 1:]
+            bad_idx = np.where(rest < 2)[0]
+            if len(bad_idx) > 0:
+                final_L = int(final_L + bad_idx[0])
+
+    return best_residues.tolist()

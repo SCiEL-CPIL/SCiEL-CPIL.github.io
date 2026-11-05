@@ -1,0 +1,167 @@
+"""
+Quantum information: fixed-depth QAOA parameter design.
+
+Uses exact combinatorial probability aggregation over all 2^n bitmasks to
+compute the expected cut value for given QAOA angles, then optimizes angles
+per graph using multi-start local optimization.
+"""
+import numpy as np
+from scipy.optimize import minimize
+
+
+def _build_edge_list(n, edges):
+    """Return list of (u, v) for each edge, with u < v."""
+    edge_set = set()
+    for e in edges:
+        u, v = int(e[0]), int(e[1])
+        if u > v:
+            u, v = v, u
+        edge_set.add((u, v))
+    return sorted(edge_set)
+
+
+def _precompute_cut_counts(n, edge_list):
+    """Precompute cut count for all 2^n bitmasks as float."""
+    dim = 1 << n
+    cut_counts = np.zeros(dim, dtype=np.float64)
+    num_edges = len(edge_list)
+    if num_edges == 0:
+        return cut_counts
+    for idx in range(dim):
+        count = 0
+        for (u, v) in edge_list:
+            if ((idx >> u) & 1) != ((idx >> v) & 1):
+                count += 1
+        cut_counts[idx] = count
+    return cut_counts
+
+
+def _precompute_mixer_indices(n):
+    """Precompute indices for mixer gate application."""
+    dim = 1 << n
+    indices = []
+    for q in range(n):
+        mask = 1 << q
+        idx0 = np.array([i for i in range(dim) if (i & mask) == 0], dtype=np.int32)
+        idx1 = idx0 | mask
+        indices.append((idx0, idx1))
+    return indices
+
+
+def _expected_cut_fast(n, edge_list, cut_counts, mixer_indices, gammas, betas):
+    """
+    Compute expected cut using precomputed cut counts and vectorized operations.
+    """
+    dim = 1 << n
+    
+    # Start in |+>^n
+    psi = np.ones(dim, dtype=np.complex128) / np.sqrt(dim)
+    
+    for l in range(len(gammas)):
+        gamma = gammas[l]
+        beta = betas[l]
+        
+        # Apply cost gate: phase = exp(-i * gamma * cut_count)
+        phases = np.exp(-1j * gamma * cut_counts)
+        psi *= phases
+        
+        # Apply mixer: product of single-qubit rotations
+        c = np.cos(beta)
+        s = np.sin(beta)
+        for q in range(n):
+            idx0, idx1 = mixer_indices[q]
+            a0 = psi[idx0].copy()
+            a1 = psi[idx1].copy()
+            psi[idx0] = c * a0 - 1j * s * a1
+            psi[idx1] = -1j * s * a0 + c * a1
+    
+    # Compute expected cut
+    probs = np.abs(psi) ** 2
+    total_cut = np.sum(probs * cut_counts)
+    
+    return float(total_cut)
+
+
+def _exact_optimum(n, edge_list, cut_counts):
+    """Compute the exact maximum cut."""
+    if len(edge_list) == 0:
+        return 0.0
+    return float(np.max(cut_counts))
+
+
+def _optimize_angles(n, edges, p, max_iters=300):
+    """Optimize QAOA angles for a given graph."""
+    edge_list = _build_edge_list(n, edges)
+    cut_counts = _precompute_cut_counts(n, edge_list)
+    mixer_indices = _precompute_mixer_indices(n)
+    opt_cut = _exact_optimum(n, edge_list, cut_counts)
+    
+    if opt_cut == 0:
+        return np.zeros((p, 2))
+    
+    def objective(params):
+        gammas = params[:p]
+        betas = params[p:2*p]
+        expected = _expected_cut_fast(n, edge_list, cut_counts, mixer_indices, gammas, betas)
+        return -expected / opt_cut
+    
+    # Try multiple initializations and keep the best
+    best_obj = np.inf
+    best_params = None
+    
+    # Deterministic initializations based on known good QAOA angles
+    inits = [
+        np.array([0.5, 0.3] * p),
+        np.array([0.4, 0.2] * p),
+        np.array([0.3, 0.4] * p),
+        np.array([0.6, 0.1] * p),
+        np.array([0.2, 0.5] * p),
+        np.array([0.7, 0.2] * p),
+        np.array([0.3, 0.3] * p),
+        np.array([0.5, 0.5] * p),
+    ]
+    
+    # Add some random initializations
+    rng = np.random.default_rng(42)
+    for _ in range(10):
+        inits.append(rng.uniform(0.1, 0.9, 2*p))
+    
+    for x0 in inits:
+        try:
+            # Use Powell which is often more robust for this problem
+            res = minimize(objective, x0, method='Powell',
+                          options={'maxiter': max_iters, 'xtol': 1e-5, 'ftol': 1e-7})
+            if res.fun < best_obj:
+                best_obj = res.fun
+                best_params = res.x
+        except Exception:
+            pass
+    
+    if best_params is None:
+        best_params = np.array([0.4, 0.3] * p)
+    
+    gammas = best_params[:p]
+    betas = best_params[p:2*p]
+    
+    return np.column_stack([gammas, betas])
+
+
+def angles(n, edges, p):
+    """
+    Design graph-dependent two-layer QAOA angles maximizing the mean ratio
+    of the independently simulated expected cut to the exact classical optimum.
+    
+    Args:
+        n: number of nodes
+        edges: list of edges (u, v)
+        p: number of layers (fixed to 2 in this task)
+    
+    Returns:
+        np.ndarray of shape (p, 2), rows (gamma, beta) in radians.
+    """
+    if p == 0:
+        return np.zeros((0, 2))
+    
+    result = _optimize_angles(n, edges, p)
+    
+    return result

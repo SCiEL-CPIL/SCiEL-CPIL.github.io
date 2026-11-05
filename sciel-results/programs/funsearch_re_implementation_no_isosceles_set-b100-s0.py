@@ -1,177 +1,344 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+N = 64
+import time
+import random
+import math
+import numpy as np
+
+# EVOLVE-BLOCK-START
 def construct():
-    import time
-    import random
-    import numpy as np
-    
-    deadline = time.time() + 290
-    N = 64
-    num_points = N * N
-    
-    # 1. Precompute all points and distances
+    start_time = time.time()
+    deadline = start_time + 280  # Safety margin
+
+    # Grid points
     points = [(x, y) for y in range(N) for x in range(N)]
-    point_to_idx = {p: i for i, p in enumerate(points)}
-    
-    # Distance matrix: dist_matrix[i, j] = squared distance between points[i] and points[j]
-    # Using numpy for speed
-    xs = np.array([p[0] for p in points])
-    ys = np.array([p[1] for p in points])
-    
-    # dist_matrix[i, j] = (xs[i]-xs[j])^2 + (ys[i]-ys[j])^2
-    # This is a 4096x4096 matrix.
+    num_points = N * N
+
+    # Create coordinate arrays
+    xs = np.array([p[0] for p in points], dtype=np.int32)
+    ys = np.array([p[1] for p in points], dtype=np.int32)
+
+    # Calculate squared distances using int32 to save memory and speed up
     dx = xs[:, None] - xs[None, :]
     dy = ys[:, None] - ys[None, :]
-    dist_matrix = (dx * dx + dy * dy).astype(np.int32)
-    
-    def can_add(idx, S, dist_sets):
-        """
-        Check if point idx can be added to set S.
-        S is a list of indices.
-        dist_sets is a dict: idx -> set of distances to other points in S.
-        """
-        # Distances from idx to all points in S
-        dists_to_S = []
-        for q_idx in S:
-            d = dist_matrix[idx, q_idx]
-            # Check if this distance is already used by q_idx to another point in S
-            if d in dist_sets[q_idx]:
-                return False
-            # Check if this distance is already used by idx to a previous point in S
-            if d in dists_to_S: # O(k) check, k is len(S)
-                return False
-            dists_to_S.append(d)
+    dist2 = (dx*dx + dy*dy).astype(np.int32)
+
+    # State:
+    # S_set: set of indices in S
+    # D_dict: {idx: set of squared distances from idx to other points in S}
+    # For each idx in S, D_dict[idx] = {dist(idx, j) : j in S, j != idx}
+
+    def is_valid_addition(idx_P, S_indices, D_dict):
+        """Check if point idx_P can be added to set S_indices."""
+        if not S_indices:
+            return True
         
+        dists_from_P = set()
+        for idx_Q in S_indices:
+            d_val = int(dist2[idx_P, idx_Q])
+            # Condition A: distances from P to all Q in S must be distinct
+            if d_val in dists_from_P:
+                return False
+            dists_from_P.add(d_val)
+            # Condition B: d_val must not be in D_dict[idx_Q]
+            if d_val in D_dict[idx_Q]:
+                return False
         return True
 
-    def add_point(idx, S, dist_sets):
-        S.append(idx)
-        new_dists = set()
-        for q_idx in S[:-1]:
-            d = dist_matrix[idx, q_idx]
-            new_dists.add(d)
-            dist_sets[q_idx].add(d)
-        dist_sets[idx] = new_dists
-
-    def remove_point(idx, S, dist_sets):
-        # Remove idx from S
-        S.remove(idx)
-        # Remove distances from idx to other points in S from their sets
-        for q_idx in S:
-            d = dist_matrix[idx, q_idx]
-            dist_sets[q_idx].discard(d)
-        # Clean up idx's set
-        if idx in dist_sets:
-            del dist_sets[idx]
-
-    def greedy_build(rng):
-        S = []
-        dist_sets = {}
-        candidates = list(range(num_points))
-        rng.shuffle(candidates)
+    def add_point(idx_P, S_indices, D_dict, S_set, complement):
+        S_indices.append(idx_P)
+        S_set.add(idx_P)
+        complement.remove(idx_P)
         
-        for idx in candidates:
+        dists_from_P = set()
+        for idx_Q in S_indices:
+            if idx_Q == idx_P:
+                continue
+            d = int(dist2[idx_P, idx_Q])
+            dists_from_P.add(d)
+            D_dict[idx_Q].add(d)
+        D_dict[idx_P] = dists_from_P
+
+    def remove_point(idx_P, S_indices, D_dict, S_set, complement):
+        if idx_P in S_indices:
+            S_indices.remove(idx_P)
+        S_set.discard(idx_P)
+        complement.append(idx_P)
+        
+        if idx_P in D_dict:
+            for idx_Q in S_indices:
+                d = int(dist2[idx_P, idx_Q])
+                if d in D_dict[idx_Q]:
+                    D_dict[idx_Q].discard(d)
+            del D_dict[idx_P]
+
+    # Phase 1: Greedy with multiple orderings
+    rng = random.Random(123)
+    best_size = 0
+    best_solution = []
+    best_D = {}
+    best_S_set = set()
+    best_complement = list(range(num_points))
+
+    # Generate several orderings
+    orderings = []
+    
+    # Random orderings
+    for _ in range(8):
+        order = list(range(num_points))
+        rng.shuffle(order)
+        orderings.append(order)
+    
+    # Sorted by x
+    orderings.append(sorted(range(num_points), key=lambda i: (points[i][0], points[i][1])))
+    # Sorted by y
+    orderings.append(sorted(range(num_points), key=lambda i: (points[i][1], points[i][0])))
+    # Sorted by x+y
+    orderings.append(sorted(range(num_points), key=lambda i: points[i][0] + points[i][1]))
+    # Sorted by x-y
+    orderings.append(sorted(range(num_points), key=lambda i: points[i][0] - points[i][1]))
+    # Sorted by distance from center
+    cx, cy = N/2 - 0.5, N/2 - 0.5
+    orderings.append(sorted(range(num_points), key=lambda i: (points[i][0]-cx)**2 + (points[i][1]-cy)**2))
+    # Sorted by distance from corner
+    orderings.append(sorted(range(num_points), key=lambda i: points[i][0]**2 + points[i][1]**2))
+
+    for order in orderings:
+        S_indices = []
+        D_dict = {}
+        S_set = set()
+        complement = list(range(num_points))
+        
+        for idx_P in order:
+            if idx_P in S_set:
+                continue
+            if is_valid_addition(idx_P, S_indices, D_dict):
+                add_point(idx_P, S_indices, D_dict, S_set, complement)
+        
+        if len(S_indices) > best_size:
+            best_size = len(S_indices)
+            best_solution = S_indices[:]
+            best_D = {k: v.copy() for k, v in D_dict.items()}
+            best_S_set = S_set.copy()
+            best_complement = complement[:]
+
+    # Phase 2: Local search with batch swaps and 2-opt improvements
+    S_indices = best_solution[:]
+    D_dict = {k: v.copy() for k, v in best_D.items()}
+    S_set = best_S_set.copy()
+    complement = best_complement[:]
+    
+    current_size = len(S_indices)
+    best_size = current_size
+    
+    def try_add_random(S_indices, D_dict, S_set, complement, max_attempts=5):
+        """Try to add random points from complement."""
+        added = 0
+        for _ in range(max_attempts):
+            if not complement or time.time() > deadline - 15:
+                break
+            idx_P_add = rng.choice(complement)
+            if is_valid_addition(idx_P_add, S_indices, D_dict):
+                add_point(idx_P_add, S_indices, D_dict, S_set, complement)
+                added += 1
+        return added
+
+    def try_batch_swap(S_indices, D_dict, S_set, complement, batch_size=2):
+        """Try to remove batch_size points and add more points."""
+        if len(S_indices) < batch_size or not complement:
+            return False, 0
+        
+        # Select random points to remove
+        to_remove = rng.sample(S_indices, min(batch_size, len(S_indices)))
+        
+        # Save state before modification
+        orig_S_indices = S_indices[:]
+        orig_D_dict = {k: v.copy() for k, v in D_dict.items()}
+        orig_S_set = S_set.copy()
+        orig_complement = complement[:]
+        
+        # Remove the selected points
+        temp_S_indices = S_indices[:]
+        temp_D_dict = {k: v.copy() for k, v in D_dict.items()}
+        temp_S_set = S_set.copy()
+        temp_complement = complement[:]
+        
+        for idx in to_remove:
+            if idx in temp_S_indices:
+                temp_S_indices.remove(idx)
+            temp_S_set.discard(idx)
+            temp_complement.append(idx)
+            
+            if idx in temp_D_dict:
+                for idx_R in temp_S_indices:
+                    d = int(dist2[idx, idx_R])
+                    if d in temp_D_dict[idx_R]:
+                        temp_D_dict[idx_R].discard(d)
+                del temp_D_dict[idx]
+        
+        # Try to add as many points as possible from complement
+        added_count = 0
+        for idx_P in temp_complement[:]:
+            if time.time() > deadline - 15:
+                break
+            if idx_P in temp_S_set:
+                continue
+            if is_valid_addition(idx_P, temp_S_indices, temp_D_dict):
+                add_point(idx_P, temp_S_indices, temp_D_dict, temp_S_set, temp_complement)
+                added_count += 1
+        
+        # If we added more than we removed, accept the change
+        if added_count > len(to_remove):
+            # Apply the changes
+            S_indices.clear()
+            S_indices.extend(temp_S_indices)
+            D_dict.clear()
+            D_dict.update({k: v for k, v in temp_D_dict.items()})
+            S_set.clear()
+            S_set.update(temp_S_set)
+            complement.clear()
+            complement.extend(temp_complement)
+            return True, added_count - len(to_remove)
+        else:
+            # Roll back
+            S_indices.clear()
+            S_indices.extend(orig_S_indices)
+            D_dict.clear()
+            D_dict.update({k: v for k, v in orig_D_dict.items()})
+            S_set.clear()
+            S_set.update(orig_S_set)
+            complement.clear()
+            complement.extend(orig_complement)
+            return False, 0
+
+    no_improve = 0
+    max_no_improve = 50
+    
+    while time.time() < deadline - 20:
+        improved = False
+        
+        # Strategy 1: Try single swaps
+        for _ in range(15):
+            if time.time() > deadline - 20 or not complement or not S_indices:
+                break
+                
+            idx_P = rng.choice(complement)
+            idx_Q = rng.choice(S_indices)
+            
+            # Check if swapping Q for P is valid
+            temp_D = {k: v.copy() for k, v in D_dict.items()}
+            if idx_Q in temp_D:
+                for idx_R in S_indices:
+                    if idx_R != idx_Q:
+                        d = int(dist2[idx_Q, idx_R])
+                        if d in temp_D[idx_R]:
+                            temp_D[idx_R].discard(d)
+                del temp_D[idx_Q]
+            
+            valid = True
+            dists_from_P = set()
+            for idx_R in S_indices:
+                if idx_R == idx_Q:
+                    continue
+                d_val = int(dist2[idx_P, idx_R])
+                if d_val in dists_from_P:
+                    valid = False
+                    break
+                dists_from_P.add(d_val)
+                if d_val in temp_D.get(idx_R, set()):
+                    valid = False
+                    break
+            
+            if valid:
+                # Perform the swap
+                if idx_Q in S_indices:
+                    S_indices.remove(idx_Q)
+                S_set.discard(idx_Q)
+                complement.append(idx_Q)
+                
+                if idx_Q in D_dict:
+                    for idx_R in S_indices:
+                        d = int(dist2[idx_Q, idx_R])
+                        if d in D_dict[idx_R]:
+                            D_dict[idx_R].discard(d)
+                    del D_dict[idx_Q]
+                
+                S_indices.append(idx_P)
+                S_set.add(idx_P)
+                complement.remove(idx_P)
+                
+                dists_from_P_new = set()
+                for idx_R in S_indices:
+                    if idx_R == idx_P:
+                        continue
+                    d = int(dist2[idx_P, idx_R])
+                    dists_from_P_new.add(d)
+                    D_dict[idx_R].add(d)
+                D_dict[idx_P] = dists_from_P_new
+                
+                improved = True
+                break
+        
+        # Strategy 2: Try batch swaps (remove 2-3 points, add more)
+        if not improved and time.time() < deadline - 20:
+            for batch_size in [2, 3]:
+                success, gain = try_batch_swap(S_indices, D_dict, S_set, complement, batch_size)
+                if success:
+                    improved = True
+                    break
+        
+        # Strategy 3: Try to add more points after any improvement
+        if improved:
+            try_add_random(S_indices, D_dict, S_set, complement, max_attempts=8)
+            no_improve = 0
+            
+            if len(S_indices) > best_size:
+                best_size = len(S_indices)
+                best_solution = S_indices[:]
+                best_D = {k: v.copy() for k, v in D_dict.items()}
+                best_S_set = S_set.copy()
+                best_complement = complement[:]
+        else:
+            no_improve += 1
+            
+            if no_improve > max_no_improve:
+                # Restart from best with perturbation
+                S_indices = best_solution[:]
+                D_dict = {k: v.copy() for k, v in best_D.items()}
+                S_set = best_S_set.copy()
+                complement = best_complement[:]
+                no_improve = 0
+                
+                # Perturb: remove some random points to explore new region
+                if S_indices:
+                    num_remove = max(1, len(S_indices) // 8)
+                    to_remove = rng.sample(S_indices, min(num_remove, len(S_indices)))
+                    for idx in to_remove:
+                        remove_point(idx, S_indices, D_dict, S_set, complement)
+                
+                # Try to fill back up
+                try_add_random(S_indices, D_dict, S_set, complement, max_attempts=10)
+
+    # Phase 3: Final polish - systematic scan for addable points
+    S_indices = best_solution[:]
+    D_dict = {k: v.copy() for k, v in best_D.items()}
+    S_set = best_S_set.copy()
+    complement = best_complement[:]
+    
+    # Try to add any remaining valid points in multiple passes
+    for pass_num in range(3):
+        changed = False
+        for idx_P in complement[:]:
             if time.time() > deadline - 5:
                 break
-            if can_add(idx, S, dist_sets):
-                add_point(idx, S, dist_sets)
-        return S, dist_sets
-
-    def local_search(S, dist_sets, rng):
-        """
-        Improve the set using swaps and additions.
-        """
-        current_S = list(S)
-        current_dist_sets = {k: v.copy() for k, v in dist_sets.items()}
-        best_S = list(current_S)
-        best_size = len(current_S)
-        
-        # Track time
-        start_time = time.time()
-        
-        while time.time() < deadline - 2:
-            # 1. Try to add a point
-            # Sample a few random candidates
-            added = False
-            for _ in range(10):
-                if time.time() > deadline - 2:
-                    break
-                cand_idx = rng.randint(0, num_points - 1)
-                if cand_idx in current_dist_sets:
-                    continue
-                if can_add(cand_idx, current_S, current_dist_sets):
-                    add_point(cand_idx, current_S, current_dist_sets)
-                    added = True
-                    if len(current_S) > best_size:
-                        best_S = list(current_S)
-                        best_size = len(current_S)
-                    break
-            
-            if added:
-                continue
-                
-            # 2. If no point added, perform a "kick" (swap) to escape local optimum
-            # Remove a random point
-            if not current_S:
-                break
-            rem_idx = current_S[rng.randint(0, len(current_S) - 1)]
-            remove_point(rem_idx, current_S, current_dist_sets)
-            
-            # Try to add a random point
-            # We want to restore the size, so we try to add a point that fits
-            swap_success = False
-            for _ in range(10):
-                if time.time() > deadline - 2:
-                    break
-                add_idx = rng.randint(0, num_points - 1)
-                if add_idx == rem_idx:
-                    continue
-                if add_idx in current_dist_sets:
-                    continue
-                if can_add(add_idx, current_S, current_dist_sets):
-                    add_point(add_idx, current_S, current_dist_sets)
-                    swap_success = True
-                    break
-            
-            # If swap failed, put rem_idx back
-            if not swap_success:
-                # Re-add rem_idx
-                # We need to check if it can be added back
-                # It should be, since we just removed it from a valid set
-                # But to be safe, we can just re-insert it into the data structures
-                # Actually, remove_point cleaned up the sets.
-                # We can just call add_point(rem_idx)
-                add_point(rem_idx, current_S, current_dist_sets)
-                
-        return best_S
-
-    # Main loop
-    best_S_global = []
-    rng = random.Random(42)
-    
-    # Run multiple greedy restarts
-    for i in range(50):
-        if time.time() > deadline - 10:
+            if is_valid_addition(idx_P, S_indices, D_dict):
+                add_point(idx_P, S_indices, D_dict, S_set, complement)
+                changed = True
+        if not changed:
             break
-        
-        S, dist_sets = greedy_build(rng)
-        
-        if len(S) > len(best_S_global):
-            best_S_global = S
-            # Run local search on the best found so far
-            if time.time() < deadline - 5:
-                best_S_global = local_search(S, dist_sets, rng)
-        
-        # If we are running low on time, do a final local search on the best
-        if time.time() > deadline - 15 and len(best_S_global) > 0:
-             # Reconstruct dist_sets for best_S_global for the final search
-             # This is expensive, so we only do it once
-             # Actually, local_search returns the best_S, but we lost the dist_sets structure.
-             # We should keep the dist_sets of the best_S.
-             pass
+    
+    if len(S_indices) > len(best_solution):
+        best_solution = S_indices[:]
 
-    # To ensure we return a valid set, we should verify or just trust the algorithm.
-    # The algorithm maintains validity.
-    
-    # Convert indices back to points
-    result_points = [points[i] for i in best_S_global]
-    
-    return result_points
+    return [points[i] for i in best_solution]
+# EVOLVE-BLOCK-END

@@ -1,0 +1,336 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+def construct():
+    """
+    Finds the optimal 24 coefficients in {+1, -1} minimizing the score.
+    Uses spectral synthesis initialization, vectorized local search,
+    and simulated annealing with golden-section refinement for accuracy.
+    """
+    N = 24
+    start_time = time.time()
+    deadline = start_time + 145.0  # Safety margin before 150s limit
+    
+    # Precompute DFT matrix for fast evaluation
+    # Increased grid size for better resolution of sup-norm peaks
+    M_grid = 65536
+    theta_grid = 2 * np.pi * np.arange(M_grid) / M_grid
+    E = np.exp(1j * np.outer(theta_grid, np.arange(N)))
+    E_T = E.T # (N, M_grid) for fast column access
+    
+    def get_supnorm_accurate(coeffs):
+        """Accurate sup norm with golden-section refinement."""
+        M = 8192
+        c_padded = np.zeros(M, dtype=complex)
+        c_padded[:N] = coeffs
+        P = M * np.fft.ifft(c_padded)
+        mags = np.abs(P)
+        
+        K = 80
+        idx = np.argsort(mags)[-K:][::-1]
+        theta = 2 * np.pi * np.arange(M) / M
+        
+        max_val = 0.0
+        for i in idx:
+            w = 2 * np.pi / M
+            a = theta[i] - w
+            b = theta[i] + w
+            gr = (5 ** 0.5 - 1) / 2
+            c = b - gr * (b - a)
+            d = a + gr * (b - a)
+            
+            def f(theta_val):
+                z_val = np.exp(1j * theta_val)
+                p_val = 0.0
+                for coeff in reversed(coeffs):
+                    p_val = p_val * z_val + coeff
+                return np.abs(p_val)
+            
+            fc = f(c)
+            fd = f(d)
+            for _ in range(80):
+                if fc < fd:
+                    a = c
+                    c = d
+                    fc = fd
+                    d = a + gr * (b - a)
+                    fd = f(d)
+                else:
+                    b = d
+                    d = c
+                    fd = fc
+                    c = b - gr * (b - a)
+                    fc = f(c)
+            peak_val = max(fc, fd)
+            if peak_val > max_val:
+                max_val = peak_val
+        return max_val
+
+    def local_search_vectorized(current_c, P_curr, time_limit):
+        """
+        Fast local search using vectorized 1-flip evaluation with incremental P_curr update.
+        """
+        current_val = float(np.max(np.abs(P_curr)))
+        best_c = current_c.copy()
+        best_val = current_val
+        
+        max_iters = 5000
+        for iteration in range(max_iters):
+            if time.time() > time_limit:
+                break
+            
+            # Vectorized single flip search
+            # Deltas[i] = 2 * current_c[i] * E_T[i]
+            # P_new[i] = P_curr - Deltas[i]
+            
+            Deltas = 2.0 * current_c[:, None] * E_T
+            P_new_all = P_curr[None, :] - Deltas
+            Mags_new_all = np.abs(P_new_all)
+            Max_vals = np.max(Mags_new_all, axis=1)
+            
+            best_idx = np.argmin(Max_vals)
+            if Max_vals[best_idx] < current_val - 1e-12:
+                # Apply flip
+                c_old = current_c[best_idx]
+                current_c[best_idx] = -c_old
+                P_curr = P_curr - 2.0 * c_old * E_T[best_idx]
+                current_val = Max_vals[best_idx]
+                
+                if current_val < best_val - 1e-12:
+                    best_c = current_c.copy()
+                    best_val = current_val
+            else:
+                # Stuck in local minimum for single flips
+                break
+        
+        return best_c, P_curr, best_val
+    
+    # --- Spectral Synthesis Initialization ---
+    initial_candidates = []
+    
+    # 1. Golay-Rudin-Shapiro and its shifts (proven to provide diverse high-quality starts)
+    p, q = [1], [1]
+    while len(p) < N:
+        p, q = p + q, p + [-c for c in q]
+    g = np.array(p[:N], dtype=float)
+    initial_candidates.append(g.copy())
+    
+    # Add GRS shifts (cyclic rotations) - proven to escape local minima
+    for shift in range(1, N):
+        g_shifted = np.roll(g, shift)
+        initial_candidates.append(g_shifted.copy())
+    
+    # Also add sign-flipped GRS shifts
+    for shift in range(0, N, 2):
+        g_neg_shifted = -np.roll(g, shift)
+        initial_candidates.append(g_neg_shifted.copy())
+    
+    # 2. Spectral synthesis: various spectrum shapes
+    for _ in range(30):
+        if time.time() > deadline - 40:
+            break
+        # Random phase, flat magnitude
+        phases = np.random.uniform(0, 2 * np.pi, size=N)
+        spectrum = np.exp(1j * phases)
+        c_complex = np.fft.ifft(spectrum)
+        c_real = np.real(c_complex)
+        c_bin = np.sign(c_real)
+        c_bin[c_bin == 0] = 1
+        initial_candidates.append(c_bin)
+        
+        # Cosine-tapered magnitude
+        taper = np.cos(np.pi * np.arange(N) / (N - 1)) ** 2
+        spectrum2 = taper * np.exp(1j * phases)
+        c_complex2 = np.fft.ifft(spectrum2)
+        c_real2 = np.real(c_complex2)
+        c_bin2 = np.sign(c_real2)
+        c_bin2[c_bin2 == 0] = 1
+        initial_candidates.append(c_bin2)
+        
+        # Gaussian-tapered magnitude
+        centers = np.random.uniform(0, N, size=2)
+        widths = np.random.uniform(2, 6, size=2)
+        taper3 = np.zeros(N)
+        for c, w in zip(centers, widths):
+            taper3 += np.exp(-((np.arange(N) - c) ** 2) / (2 * w ** 2))
+        spectrum3 = taper3 * np.exp(1j * phases)
+        c_complex3 = np.fft.ifft(spectrum3)
+        c_real3 = np.real(c_complex3)
+        c_bin3 = np.sign(c_real3)
+        c_bin3[c_bin3 == 0] = 1
+        initial_candidates.append(c_bin3)
+    
+    # 3. Random starts
+    for _ in range(15):
+        if time.time() > deadline - 40:
+            break
+        c_rand = np.random.choice([-1, 1], size=N).astype(float)
+        initial_candidates.append(c_rand)
+    
+    # Run local search on all candidates
+    best_overall_c = None
+    best_overall_P = None
+    best_overall_val = float('inf')
+    
+    for c0 in initial_candidates:
+        if time.time() > deadline - 20:
+            break
+        P0 = E @ c0
+        c_best, P_best, v_best = local_search_vectorized(c0.copy(), P0.copy(), time.time() + 1.5)
+        if v_best < best_overall_val:
+            best_overall_val = v_best
+            best_overall_c = c_best
+            best_overall_P = P_best
+    
+    # Simulated annealing with adaptive cooling and diverse moves
+    T = 0.5
+    cooling_rate = 0.995
+    min_T = 1e-6
+    
+    pairs = [(i, j) for i in range(N) for j in range(i + 1, N)]
+    triples = [(i, j, k) for i in range(N-2) for j in range(i+1, N-1) for k in range(j+1, N)]
+    
+    # Track best solution seen
+    sa_best_c = best_overall_c.copy()
+    sa_best_P = best_overall_P.copy()
+    sa_best_val = best_overall_val
+    
+    curr_c = best_overall_c.copy()
+    curr_P = best_overall_P.copy()
+    curr_val = best_overall_val
+    
+    # Use iteration counter for periodic actions instead of wall-clock modulo
+    iter_count = 0
+    
+    while T > min_T and time.time() < deadline - 20:
+        # Pick random move with adaptive probabilities
+        # Increased 2-flip probability (proven to escape 1-bit local minima)
+        r = np.random.rand()
+        if r < 0.55:
+            # 2-flip move
+            i, j = pairs[np.random.randint(len(pairs))]
+            # Calculate delta for P
+            delta_P = -2.0 * curr_c[i] * E_T[i] - 2.0 * curr_c[j] * E_T[j]
+            new_P = curr_P + delta_P
+            new_val = float(np.max(np.abs(new_P)))
+            delta = new_val - curr_val
+            
+            if delta < 0 or np.random.rand() < np.exp(-delta / T):
+                curr_c[i] *= -1
+                curr_c[j] *= -1
+                curr_P = new_P
+                curr_val = new_val
+                if new_val < sa_best_val:
+                    sa_best_val = new_val
+                    sa_best_c = curr_c.copy()
+                    sa_best_P = curr_P.copy()
+            # else: revert (do nothing)
+        elif r < 0.75:
+            # 1-flip move
+            i = np.random.randint(N)
+            delta_P = -2.0 * curr_c[i] * E_T[i]
+            new_P = curr_P + delta_P
+            new_val = float(np.max(np.abs(new_P)))
+            delta = new_val - curr_val
+            
+            if delta < 0 or np.random.rand() < np.exp(-delta / T):
+                curr_c[i] *= -1
+                curr_P = new_P
+                curr_val = new_val
+                if new_val < sa_best_val:
+                    sa_best_val = new_val
+                    sa_best_c = curr_c.copy()
+                    sa_best_P = curr_P.copy()
+        elif r < 0.92:
+            # 3-flip move
+            i, j, k = triples[np.random.randint(len(triples))]
+            delta_P = -2.0 * curr_c[i] * E_T[i] - 2.0 * curr_c[j] * E_T[j] - 2.0 * curr_c[k] * E_T[k]
+            new_P = curr_P + delta_P
+            new_val = float(np.max(np.abs(new_P)))
+            delta = new_val - curr_val
+            
+            if delta < 0 or np.random.rand() < np.exp(-delta / T):
+                curr_c[i] *= -1
+                curr_c[j] *= -1
+                curr_c[k] *= -1
+                curr_P = new_P
+                curr_val = new_val
+                if new_val < sa_best_val:
+                    sa_best_val = new_val
+                    sa_best_c = curr_c.copy()
+                    sa_best_P = curr_P.copy()
+        else:
+            # 4-flip move (rare, for large jumps)
+            idxs = np.random.choice(N, size=4, replace=False)
+            delta_P = np.zeros_like(curr_P)
+            for idx in idxs:
+                delta_P -= 2.0 * curr_c[idx] * E_T[idx]
+            new_P = curr_P + delta_P
+            new_val = float(np.max(np.abs(new_P)))
+            delta = new_val - curr_val
+            
+            if delta < 0 or np.random.rand() < np.exp(-delta / T):
+                for idx in idxs:
+                    curr_c[idx] *= -1
+                curr_P = new_P
+                curr_val = new_val
+                if new_val < sa_best_val:
+                    sa_best_val = new_val
+                    sa_best_c = curr_c.copy()
+                    sa_best_P = curr_P.copy()
+        
+        T *= cooling_rate
+        iter_count += 1
+        
+        # Periodic local search every 200 iterations
+        if iter_count % 200 == 0:
+            curr_c, curr_P, curr_val = local_search_vectorized(
+                curr_c, curr_P, time.time() + 0.5)
+            if curr_val < sa_best_val:
+                sa_best_val = curr_val
+                sa_best_c = curr_c.copy()
+                sa_best_P = curr_P.copy()
+        
+        # Occasionally restart from best seen every 500 iterations
+        if iter_count % 500 == 0:
+            curr_c = sa_best_c.copy()
+            curr_P = sa_best_P.copy()
+            curr_val = sa_best_val
+    
+    # Final local search
+    curr_c, curr_P, curr_val = local_search_vectorized(
+        curr_c, curr_P, deadline - 10)
+    if curr_val < sa_best_val:
+        sa_best_val = curr_val
+        sa_best_c = curr_c.copy()
+        sa_best_P = curr_P.copy()
+    
+    # Try several more local searches from perturbed versions
+    for _ in range(8):
+        if time.time() > deadline - 10:
+            break
+        perturbed = sa_best_c.copy()
+        for _ in range(np.random.randint(2, 5)):
+            idx = np.random.randint(N)
+            perturbed[idx] *= -1
+        P_pert = E @ perturbed
+        c_best, P_best, v_best = local_search_vectorized(perturbed, P_pert, time.time() + 1.5)
+        if v_best < sa_best_val:
+            sa_best_val = v_best
+            sa_best_c = c_best
+            sa_best_P = P_best
+    
+    # Final high-precision polish: run local search again on the best candidate
+    if time.time() < deadline - 5:
+        final_P = E @ sa_best_c
+        sa_best_c, final_P, final_grid_val = local_search_vectorized(
+            sa_best_c.copy(), final_P.copy(), deadline - 3)
+    
+    # Final accurate evaluation
+    final_val = get_supnorm_accurate(sa_best_c)
+    
+    return [int(c) for c in sa_best_c]
+
+# EVOLVE-BLOCK-END

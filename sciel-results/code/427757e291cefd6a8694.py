@@ -1,0 +1,1 @@
+BET: {mechanism: "Greedy with 25 random restarts plus targeted swap local search finds more K(2,2,2)-free triples than the seed's star construction; the swap phase specifically tries to add blocked triples by removing one of the 7 conflicting transversals, enabling net gains", q: 0.7, delta: [0.2, 0.8]}

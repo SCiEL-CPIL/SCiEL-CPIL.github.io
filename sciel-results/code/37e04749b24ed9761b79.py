@@ -1,0 +1,171 @@
+"""Combined: diverse prime-set candidates + vectorized prefix-greedy + local refinement."""
+import time
+from fractions import Fraction
+import numpy as np
+
+# EVOLVE-BLOCK-START
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140  # safety margin before 150s kill
+
+    def _time_ok():
+        return time.time() < deadline
+
+    def sieve(n):
+        is_prime = [True] * (n + 1)
+        is_prime[0] = is_prime[1] = False
+        for i in range(2, int(n ** 0.5) + 1):
+            if is_prime[i]:
+                for j in range(i * i, n + 1, i):
+                    is_prime[j] = False
+        return [i for i in range(2, n + 1) if is_prime[i]]
+
+    primes = sieve(1000)
+    small_primes = [2, 3, 5, 7, 11]
+    large_primes = [p for p in primes if p > 11]
+
+    MAX_L = 100000
+
+    # ---- Build candidate prime sets ----
+    seen_sets = set()
+    candidate_sets = []
+
+    def add_set(P):
+        P = sorted(P)
+        if not P:
+            return
+        key = tuple(P)
+        if key in seen_sets:
+            return
+        # budget check
+        s = sum(Fraction(1, p) for p in P)
+        if s > 1:
+            return
+        seen_sets.add(key)
+        candidate_sets.append(P)
+
+    # Seed: primes >= 13
+    seed_set = [p for p in primes if p >= 13]
+    add_set(seed_set)
+
+    # Subsets of small primes, fill rest with smallest large primes under budget
+    import itertools
+    for r in range(len(small_primes) + 1):
+        if not _time_ok():
+            break
+        for subset in itertools.combinations(small_primes, r):
+            current_sum = sum(Fraction(1, p) for p in subset)
+            if current_sum > 1:
+                continue
+            current_set = list(subset)
+            for p in large_primes:
+                if current_sum + Fraction(1, p) <= 1:
+                    current_set.append(p)
+                    current_sum += Fraction(1, p)
+                else:
+                    break
+            add_set(current_set)
+
+    # Targeted swaps: remove some large primes, add a small prime
+    for small in [11, 7, 5, 3, 2]:
+        if not _time_ok():
+            break
+        for remove_list in [[], [13], [17], [19], [13, 17], [13, 19], [17, 19],
+                            [13, 17, 19], [13, 17, 19, 23], [23, 29], [13, 17, 23]]:
+            s = [p for p in seed_set if p not in remove_list]
+            s_sum = sum(Fraction(1, p) for p in s)
+            if s_sum + Fraction(1, small) <= 1:
+                s.append(small)
+                add_set(s)
+
+    # ---- Vectorized prefix-greedy residue assignment ----
+    def evaluate_set(P, max_check=MAX_L):
+        """Assign residues to cover the longest prefix 1..L using prefix-greedy."""
+        if not P:
+            return 0, {}
+        P_sorted = sorted(P)
+        n_primes = len(P_sorted)
+        if n_primes == 0:
+            return 0, {}
+
+        covered = bytearray(max_check + 1)  # 1-indexed
+        residues = {}
+        used = set()
+
+        for n in range(1, max_check + 1):
+            if not _time_ok():
+                break
+            if covered[n]:
+                continue
+            # Try unused primes; prefer small primes (dense coverage)
+            assigned = False
+            for p in P_sorted:
+                if p in used:
+                    continue
+                r = n % p
+                residues[p] = r
+                used.add(p)
+                # Vectorized mark of arithmetic progression r mod p
+                idx = np.arange(r, max_check + 1, p, dtype=np.int64)
+                if idx.size:
+                    covered[idx] = 1
+                assigned = True
+                break
+            if not assigned:
+                break
+
+        # Compute L (longest covered prefix)
+        L = 0
+        # find first zero in covered[1:]
+        arr = np.frombuffer(covered, dtype=np.uint8)
+        if max_check >= 1:
+            seg = arr[1:max_check + 1]
+            z = np.nonzero(seg == 0)[0]
+            if z.size:
+                L = int(z[0])
+            else:
+                L = max_check
+        return L, residues
+
+    # Prioritize candidate sets: more small primes first, then more total primes
+    def small_prime_count(P):
+        return sum(1 for p in P if p <= 11)
+
+    candidate_sets.sort(key=lambda P: (-small_prime_count(P), -len(P)))
+
+    best_L = 0
+    best_classes = [[p, (i + 1) % p] for i, p in enumerate(seed_set)]
+
+    for P in candidate_sets:
+        if not _time_ok():
+            break
+        L, residues = evaluate_set(P)
+        if L > best_L:
+            best_L = L
+            best_classes = [[p, residues[p]] for p in sorted(P) if p in residues]
+
+    # ---- Local refinement: try to extend the best prefix by re-optimizing residues ----
+    # Take the best set and attempt a second pass with a different prime ordering
+    # (largest-first for the tail) to close remaining gaps.
+    if best_classes and _time_ok():
+        best_P = sorted(p for p, r in best_classes)
+        # Re-run with a hybrid ordering: small primes first (already), but also
+        # try assigning with the smallest *unused* prime that also covers the most
+        # new numbers (heuristic via vectorized count) for a few early steps.
+        # Keep it simple: re-evaluate with same set but stop earlier cap for speed.
+        L2, residues2 = evaluate_set(best_P, max_check=min(MAX_L, best_L + 20000))
+        if L2 > best_L:
+            best_L = L2
+            best_classes = [[p, residues2[p]] for p in sorted(best_P) if p in residues2]
+
+    # Final verification
+    if best_classes:
+        final_sum = sum(Fraction(1, p) for p, r in best_classes)
+        if final_sum > 1:
+            best_classes = [[p, (i + 1) % p] for i, p in enumerate(seed_set)]
+        prime_list = [p for p, r in best_classes]
+        if len(prime_list) != len(set(prime_list)):
+            best_classes = [[p, (i + 1) % p] for i, p in enumerate(seed_set)]
+
+    return best_classes
+# EVOLVE-BLOCK-END

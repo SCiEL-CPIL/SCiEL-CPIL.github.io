@@ -1,0 +1,294 @@
+import time
+import random
+
+def construct(n_rows, k):
+    start_time = time.time()
+    deadline = time.time() + 110  # 10s margin from 120s limit
+    
+    total_diffs = n_rows * k * (k + 1) // 2
+    
+    def get_scope(rows):
+        return max(max(r) for r in rows)
+    
+    def greedy_construct():
+        used = set()
+        rows = []
+        for _ in range(n_rows):
+            row = [0]
+            x = 0
+            while len(row) < k + 1:
+                x += 1
+                new_diffs = {x - a for a in row}
+                if not (new_diffs & used):
+                    row.append(x)
+                    used |= new_diffs
+            rows.append(row)
+        return rows
+    
+    def compute_diffs(rows):
+        diffs = set()
+        for r in rows:
+            for i in range(len(r)):
+                for j in range(i + 1, len(r)):
+                    diffs.add(r[j] - r[i])
+        return diffs
+
+    def simulate_annealing(rows, max_iters=50000, start_temp=100.0, end_temp=1.0):
+        """
+        Simulated Annealing to minimize the scope (max element).
+        Moves: Change one element in one row.
+        """
+        current_rows = [r[:] for r in rows]
+        current_diffs = compute_diffs(current_rows)
+        current_scope = get_scope(current_rows)
+        
+        best_rows = [r[:] for r in current_rows]
+        best_scope = current_scope
+        best_diffs = set(current_diffs)
+        
+        # Pre-compute row sizes for faster access
+        row_len = k + 1
+        
+        for i in range(max_iters):
+            if time.time() > deadline:
+                break
+            
+            # Temperature schedule
+            temp = start_temp * (end_temp / start_temp) ** (i / max_iters)
+            
+            # Pick a random row and index
+            r_idx = random.randint(0, n_rows - 1)
+            # Index 0 is always 0, so pick from 1 to k
+            a_idx = random.randint(1, k)
+            
+            row = current_rows[r_idx]
+            old_val = row[a_idx]
+            
+            # Determine range for new value
+            # Must be strictly between row[a_idx-1] and row[a_idx+1] (if exists)
+            low = row[a_idx - 1] + 1
+            high = row[a_idx + 1] - 1 if a_idx < k else current_scope # Can go up to current scope initially, but we want to shrink
+            
+            # To encourage shrinking, bias towards smaller values if possible
+            # But we must respect the lower bound from previous elements
+            # Let's try a random value in [low, high]
+            if low > high:
+                continue
+                
+            # Bias: 50% chance to try a value close to low (shrink), 50% random
+            if random.random() < 0.5 and low < high:
+                # Try to shrink: pick from low to min(low + 10, high)
+                max_shrink = min(low + 10, high)
+                new_val = random.randint(low, max_shrink)
+            else:
+                new_val = random.randint(low, high)
+                
+            if new_val == old_val:
+                continue
+            
+            # Check if new_val creates any difference conflicts
+            # We need to remove diffs involving old_val and add diffs involving new_val
+            # Diffs involving old_val:
+            # 1. old_val - row[j] for j < a_idx
+            # 2. row[j] - old_val for j > a_idx
+            
+            # Let's collect the diffs to remove
+            diffs_to_remove = set()
+            for j in range(a_idx):
+                diffs_to_remove.add(old_val - row[j])
+            for j in range(a_idx + 1, row_len):
+                diffs_to_remove.add(row[j] - old_val)
+            
+            # Diffs to add
+            diffs_to_add = set()
+            for j in range(a_idx):
+                diffs_to_add.add(new_val - row[j])
+            for j in range(a_idx + 1, row_len):
+                diffs_to_add.add(row[j] - new_val)
+            
+            # Check for conflicts
+            # A conflict exists if any diff in diffs_to_add is in current_diffs 
+            # AND that diff is NOT in diffs_to_remove (because if it's being removed, it's free)
+            
+            # Optimization: 
+            # If a diff is in both to_remove and to_add, it's effectively staying (if same value) or just swapping.
+            # Actually, if d is in to_remove and to_add, it means the difference value is still used.
+            # But we need to check if it's used *elsewhere*.
+            
+            # Simpler check:
+            # New diff set = (current_diffs - diffs_to_remove) | diffs_to_add
+            # This is valid if len(new_diffs) == len(current_diffs) - len(diffs_to_remove) + len(diffs_to_add - (current_diffs - diffs_to_remove))
+            # Or simply: for d in diffs_to_add:
+            #   if d in current_diffs and d not in diffs_to_remove:
+            #      # Conflict? 
+            #      # Wait, if d is in current_diffs, it might be generated by this row (in to_remove) or another row.
+            #      # If d is in to_remove, it's being freed by this row.
+            #      # If d is in to_add and in current_diffs, and d is NOT in to_remove, then another row uses it. Conflict.
+            #      # If d is in to_add and in current_diffs, and d IS in to_remove, then this row was using it, we remove it, then add it back? 
+            #      # Actually, if d is in to_remove, it means the old value created it. If new value also creates it, it's fine.
+            
+            is_valid = True
+            for d in diffs_to_add:
+                if d in current_diffs:
+                    if d not in diffs_to_remove:
+                        is_valid = False
+                        break
+            
+            if not is_valid:
+                continue
+            
+            # Calculate new scope
+            # Only the row r_idx changed
+            new_row_max = max(row[:a_idx] + [new_val] + row[a_idx+1:])
+            other_rows_max = max(max(r) for r in current_rows if r is not row)
+            # Optimization: precompute max of other rows? 
+            # For now, just calculate. n_rows is small (7).
+            new_scope = max(new_row_max, other_rows_max)
+            
+            delta_scope = new_scope - current_scope
+            
+            # Metropolis acceptance
+            if delta_scope < 0:
+                accept = True
+            else:
+                # Accept with probability exp(-delta / T)
+                # Since we minimize scope, delta > 0 is bad.
+                prob = random.random()
+                if prob < (1.0 / (1.0 + delta_scope * 10.0)): # Simple heuristic or exp
+                    accept = True
+                else:
+                    # Use exponential
+                    accept = (random.random() < 2.71828 ** (-delta_scope / (temp + 1e-6)))
+            
+            if accept:
+                # Update state
+                row[a_idx] = new_val
+                current_diffs -= diffs_to_remove
+                current_diffs |= diffs_to_add
+                current_scope = new_scope
+                
+                if current_scope < best_scope:
+                    best_scope = current_scope
+                    best_rows = [r[:] for r in current_rows]
+                    best_diffs = set(current_diffs)
+                    
+        return best_rows, best_scope, best_diffs
+
+    def polish_max(rows, diffs, scope):
+        """
+        Try to reduce the maximum element of the row that contains the global max.
+        """
+        # Find the row with the max
+        max_val = scope
+        target_row_idx = -1
+        for i, r in enumerate(rows):
+            if max(r) == max_val:
+                target_row_idx = i
+                break
+        
+        if target_row_idx == -1:
+            return rows, diffs, scope
+            
+        row = rows[target_row_idx]
+        # Find the index of the max value in this row
+        # It's likely the last one, but check
+        max_idx = row.index(max_val)
+        
+        # Try to reduce max_val by 1, 2, ...
+        # We can only reduce if we don't violate strict increase with previous element
+        # And if we don't create duplicate diffs
+        
+        # Since it's the max, it's likely the last element.
+        # If max_idx < k, reducing it might violate increase with next? No, it's the max, so next is smaller.
+        # But if we reduce it, it might become <= previous?
+        
+        # Let's try values from max_val - 1 down to row[max_idx-1] + 1
+        # Note: If max_idx is not the last index, reducing it might make it smaller than the next element?
+        # No, row is increasing. row[max_idx] > row[max_idx+1] is false. row[max_idx] > row[max_idx-1].
+        # If we reduce row[max_idx], it must remain > row[max_idx-1].
+        # It must remain < row[max_idx+1] if max_idx < k.
+        
+        low_bound = row[max_idx - 1] + 1
+        high_bound = row[max_idx + 1] - 1 if max_idx < k else max_val
+        
+        for new_val in range(max_val - 1, low_bound - 1, -1):
+            if new_val > high_bound:
+                continue
+                
+            # Check diffs
+            old_val = max_val
+            diffs_to_remove = set()
+            for j in range(max_idx):
+                diffs_to_remove.add(old_val - row[j])
+            for j in range(max_idx + 1, k + 1):
+                diffs_to_remove.add(row[j] - old_val)
+                
+            diffs_to_add = set()
+            for j in range(max_idx):
+                diffs_to_add.add(new_val - row[j])
+            for j in range(max_idx + 1, k + 1):
+                diffs_to_add.add(row[j] - new_val)
+                
+            is_valid = True
+            for d in diffs_to_add:
+                if d in diffs:
+                    if d not in diffs_to_remove:
+                        is_valid = False
+                        break
+            
+            if is_valid:
+                # Accept
+                row[max_idx] = new_val
+                diffs -= diffs_to_remove
+                diffs |= diffs_to_add
+                # Update scope
+                # The max of this row might decrease
+                new_row_max = max(row)
+                other_max = max(max(r) for r in rows if r is not row)
+                new_scope = max(new_row_max, other_max)
+                return rows, diffs, new_scope
+        
+        return rows, diffs, scope
+
+    # Start with greedy
+    best_rows = greedy_construct()
+    best_scope = get_scope(best_rows)
+    best_diffs = compute_diffs(best_rows)
+    
+    # Iterative improvement
+    # 1. Run SA
+    # 2. Polish
+    # 3. Repeat
+    
+    while time.time() < deadline - 5:
+        # Run SA for a short duration
+        sa_start = time.time()
+        target_time = min(sa_start + 5, deadline - 5)
+        
+        # Estimate iterations based on time
+        # We can just run until time check
+        # Modify simulate_annealing to accept a deadline
+        # For simplicity, run a fixed number of iterations that fits in ~5s
+        # Let's say 10000 iterations per 5s? 
+        # Each iteration is O(k). k=5. Very fast.
+        # 100,000 iterations should be < 1s.
+        
+        new_rows, new_scope, new_diffs = simulate_annealing(best_rows, max_iters=50000)
+        
+        if new_scope < best_scope:
+            best_rows = new_rows
+            best_scope = new_scope
+            best_diffs = new_diffs
+            
+            # Polish
+            polished_rows, polished_diffs, polished_scope = polish_max(best_rows, best_diffs, best_scope)
+            if polished_scope < best_scope:
+                best_rows = polished_rows
+                best_scope = polished_scope
+                best_diffs = polished_diffs
+        else:
+            # Even if scope didn't improve, maybe the configuration is better for future SA?
+            # Usually we keep the best known.
+            pass
+            
+    return best_rows

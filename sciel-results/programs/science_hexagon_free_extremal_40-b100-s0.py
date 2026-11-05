@@ -1,218 +1,285 @@
-import time
 import random
-
-_START = time.time()
-_DEADLINE = _START + 108
-
-def _can_add_edge(u, v, adj_masks):
-    """
-    Check if adding edge (u, v) creates a C6.
-    This is equivalent to checking if there is a path of length 4 
-    from u to v in the graph G \ {u, v}.
-    Path: u - a - b - c - d - v
-    a, b, c, d must be distinct and not u or v.
-    """
-    # We do a DFS from u.
-    # Depth 0: u
-    # Depth 1: neighbors of u (excluding v)
-    # Depth 2: neighbors of depth 1 (excluding u, v, and visited)
-    # Depth 3: neighbors of depth 2
-    # Depth 4: neighbors of depth 3. If any is v, return True.
-    
-    # Optimization: 
-    # If u and v have no common neighbors, can we still have a path of length 4?
-    # u-a-b-c-d-v. 
-    # a is neighbor of u. d is neighbor of v.
-    # If N(u) and N(v) are disjoint, it's possible.
-    
-    # Let's use a stack: (node, depth, mask)
-    # mask includes u and v to prevent visiting them? 
-    # Actually, we just need to ensure a,b,c,d are distinct and not u,v.
-    
-    stack = []
-    # Start with neighbors of u
-    # We can't start with v
-    neighbors_u = adj_masks[u] & ~(1 << v)
-    
-    # If no neighbors, no path
-    if not neighbors_u:
-        return False
-        
-    # Push neighbors of u as depth 1
-    # mask should contain u and v? 
-    # Let's say mask contains all visited nodes.
-    # Initially visited: {u, v}
-    initial_mask = (1 << u) | (1 << v)
-    
-    while neighbors_u:
-        bit = neighbors_u & -neighbors_u
-        a = bit.bit_length() - 1
-        neighbors_u ^= bit
-        stack.append((a, 1, initial_mask | (1 << a)))
-        
-    while stack:
-        node, depth, mask = stack.pop()
-        
-        if depth == 4:
-            # Check if node is connected to v
-            if adj_masks[node] & (1 << v):
-                return True
-            continue
-            
-        if depth == 5:
-            # Should not happen if we stop at 4 and check v
-            pass
-            
-        # Get neighbors of node
-        # Exclude visited nodes
-        neighbors = adj_masks[node] & ~mask
-        
-        # We don't need to exclude v explicitly if v is in mask? 
-        # Yes, v is in initial_mask.
-        
-        # If depth < 4, we can go deeper
-        # If depth == 3, next is depth 4.
-        
-        # Optimization: if depth is 3, we only care if any neighbor is v.
-        # But v is in mask, so it will be excluded from `neighbors`.
-        # So we must check for v separately or handle depth 4 check.
-        # My logic above: at depth 4, I check if node is neighbor of v.
-        # This works.
-        
-        # Iterate neighbors
-        while neighbors:
-            bit = neighbors & -neighbors
-            nb = bit.bit_length() - 1
-            neighbors ^= bit
-            stack.append((nb, depth + 1, mask | (1 << nb)))
-            
-    return False
-
-def _greedy_with_local_search(n=40, seed=0):
-    rng = random.Random(seed)
-    adj_masks = [0] * n
-    edges = set()
-    
-    all_edges = [(i, j) for i in range(n) for j in range(i+1, n)]
-    rng.shuffle(all_edges)
-    
-    # Greedy Phase
-    for u, v in all_edges:
-        if not _can_add_edge(u, v, adj_masks):
-            adj_masks[u] |= (1 << v)
-            adj_masks[v] |= (1 << u)
-            edges.add((u, v))
-            
-    # Local Search
-    # We maintain a list of non-edges to try
-    # And a list of edges to try swapping
-    
-    # To speed up, we can just iterate through all edges and non-edges
-    # But checking all is O(N^2).
-    
-    # Strategy:
-    # 1. Try to add any non-edge.
-    # 2. If no add, try to swap: remove edge, add non-edge.
-    
-    # To avoid O(N^4) in swap, we limit the search.
-    
-    improved = True
-    # Limit iterations to prevent infinite loops or excessive time
-    max_iter = 1000 
-    
-    while improved and time.time() < _DEADLINE - 5:
-        improved = False
-        
-        # Phase 1: Try to add
-        # Shuffle non-edges to randomize
-        non_edges = [(u, v) for u, v in all_edges if (u, v) not in edges]
-        rng.shuffle(non_edges)
-        
-        added = False
-        for u, v in non_edges:
-            if not _can_add_edge(u, v, adj_masks):
-                adj_masks[u] |= (1 << v)
-                adj_masks[v] |= (1 << u)
-                edges.add((u, v))
-                added = True
-                improved = True
-                break # Restart add/swap loop with new state
-                
-        if added:
-            continue
-            
-        # Phase 2: Try to swap
-        # Remove one edge, try to add one non-edge
-        edge_list = list(edges)
-        rng.shuffle(edge_list)
-        
-        swapped = False
-        for u, v in edge_list:
-            # Remove u, v
-            adj_masks[u] &= ~(1 << v)
-            adj_masks[v] &= ~(1 << u)
-            edges.remove((u, v))
-            
-            # Try to add a non-edge
-            # We can try the same non_edges list or generate new
-            # To be safe, generate new or use a subset
-            # Let's try to add any edge that was previously blocked
-            # We can just iterate through all non-edges again
-            # This is expensive. 
-            # Optimization: Only try non-edges incident to u or v? 
-            # Not necessarily. The swap might open up a path elsewhere.
-            # But usually, local changes help local additions.
-            # Let's try all non-edges but break early.
-            
-            non_edges_curr = [(x, y) for x, y in all_edges if (x, y) not in edges]
-            rng.shuffle(non_edges_curr)
-            
-            added_back = False
-            for x, y in non_edges_curr:
-                if not _can_add_edge(x, y, adj_masks):
-                    adj_masks[x] |= (1 << y)
-                    adj_masks[y] |= (1 << x)
-                    edges.add((x, y))
-                    added_back = True
-                    swapped = True
-                    improved = True
-                    break
-                    
-            if not added_back:
-                # Revert swap
-                adj_masks[u] |= (1 << v)
-                adj_masks[v] |= (1 << u)
-                edges.add((u, v))
-            
-            if swapped:
-                break # Restart loop
-                
-    return list(edges)
+import time
+import math
 
 def construct():
-    global _DEADLINE
-    _DEADLINE = time.time() + 108
-    
-    best_edges = []
-    best_count = 0
-    
-    # Run multiple seeds
-    # Each run takes some time. 
-    # If a run is fast, we can do more.
-    
-    for seed in range(1000):
-        if time.time() > _DEADLINE - 2:
-            break
-        
-        try:
-            edges = _greedy_with_local_search(40, seed)
-            count = len(edges)
-            if count > best_count:
-                best_count = count
-                best_edges = edges
-                if count >= 110:
-                    break
-        except Exception:
-            continue
-            
-    return [[u, v] for u, v in best_edges]
+    deadline = time.time() + 118  # Safety margin (evaluator kills at 150s)
+    n = 40
+    FULL = (1 << n) - 1
+
+    def adj_to_edges(adj):
+        edges = []
+        for i in range(n):
+            bits = adj[i]
+            while bits:
+                lsb = bits & -bits
+                j = lsb.bit_length() - 1
+                if i < j:
+                    edges.append([i, j])
+                bits ^= lsb
+        return edges
+
+    def count_edges(adj):
+        return sum(adj[i].bit_count() for i in range(n)) // 2
+
+    def creates_c6_fast(adj, u, v):
+        """
+        Fast C6 check: is there a path u-a-b-c-d-v of length 5?
+        Uses bitmask operations for speed.
+        """
+        nu = adj[u] & ~(1 << v)
+        nv = adj[v] & ~(1 << u)
+
+        if nu == 0 or nv == 0:
+            return False
+
+        # For each a in N(u), for each d in N(v)\{a},
+        # check if there's a path a-b-c-d of length 3 in G-{u,v}
+        bits_a = nu
+        while bits_a:
+            lsb_a = bits_a & -bits_a
+            a = lsb_a.bit_length() - 1
+            bits_a ^= lsb_a
+
+            # d must be in N(v) but not a, and not u or v
+            bits_d = nv & ~(1 << a)
+            if bits_d == 0:
+                continue
+
+            # Precompute: for each d, we need b in N(a)\{u,v,a,d} and c in N(d)\{u,v,a,d}
+            # such that b~c in G-{u,v}
+            bits_d_cur = bits_d
+            while bits_d_cur:
+                lsb_d = bits_d_cur & -bits_d_cur
+                d = lsb_d.bit_length() - 1
+                bits_d_cur ^= lsb_d
+
+                # b candidates: neighbors of a, excluding u, v, a, d
+                b_mask = adj[a] & ~(1 << u) & ~(1 << v) & ~(1 << a) & ~(1 << d)
+                if b_mask == 0:
+                    continue
+
+                # c candidates: neighbors of d, excluding u, v, a, d
+                c_mask = adj[d] & ~(1 << u) & ~(1 << v) & ~(1 << a) & ~(1 << d)
+                if c_mask == 0:
+                    continue
+
+                # For each b in b_mask, check if adj[b] intersects c_mask (excluding b itself)
+                bits_b = b_mask
+                while bits_b:
+                    lsb_b = bits_b & -bits_b
+                    b = lsb_b.bit_length() - 1
+                    bits_b ^= lsb_b
+
+                    # c must be in N(b) ∩ c_mask, c ≠ b
+                    if adj[b] & c_mask & ~(1 << b):
+                        return True
+
+        return False
+
+    def is_c6_free(adj):
+        """Full validation: check that no C6 exists in the graph."""
+        for u in range(n):
+            for v in range(u + 1, n):
+                if adj[u] & (1 << v):
+                    adj[u] &= ~(1 << v)
+                    adj[v] &= ~(1 << u)
+                    if creates_c6_fast(adj, u, v):
+                        adj[u] |= (1 << v)
+                        adj[v] |= (1 << u)
+                        return False
+                    adj[u] |= (1 << v)
+                    adj[v] |= (1 << u)
+        return True
+
+    def get_missing_edges(adj):
+        missing = []
+        for u in range(n):
+            for v in range(u + 1, n):
+                if not (adj[u] & (1 << v)):
+                    missing.append((u, v))
+        return missing
+
+    def get_existing_edges(adj):
+        existing = []
+        for u in range(n):
+            for v in range(u + 1, n):
+                if adj[u] & (1 << v):
+                    existing.append((u, v))
+        return existing
+
+    def greedy_construct(rng):
+        """Greedy edge addition in random order."""
+        adj = [0] * n
+        all_edges = [(u, v) for u in range(n) for v in range(u + 1, n)]
+        rng.shuffle(all_edges)
+
+        for u, v in all_edges:
+            if not creates_c6_fast(adj, u, v):
+                adj[u] |= (1 << v)
+                adj[v] |= (1 << u)
+        return adj
+
+    def local_search(adj, rng):
+        """
+        Greedily add valid edges until no more can be added.
+        Uses multiple passes with random ordering.
+        """
+        improved = True
+        while improved:
+            improved = False
+            missing = get_missing_edges(adj)
+            if not missing:
+                break
+            rng.shuffle(missing)
+            for u, v in missing:
+                if not creates_c6_fast(adj, u, v):
+                    adj[u] |= (1 << v)
+                    adj[v] |= (1 << u)
+                    improved = True
+        return adj
+
+    def edge_swap_local_search(adj, rng, max_iters=50):
+        """
+        Try to swap one edge for another to increase edge count.
+        Remove edge (u,v), then try to add a different edge (x,y) that was previously blocked.
+        This can help escape local optima.
+        """
+        current_m = count_edges(adj)
+        best_m = current_m
+        best_adj = adj[:]
+
+        for _ in range(max_iters):
+            if time.time() > deadline - 5:
+                break
+
+            existing = get_existing_edges(adj)
+            if not existing:
+                break
+
+            # Pick a random edge to remove
+            u, v = rng.choice(existing)
+            adj[u] &= ~(1 << v)
+            adj[v] &= ~(1 << u)
+
+            # Now try to add as many edges as possible
+            adj = local_search(adj, rng)
+            m = count_edges(adj)
+
+            if m > best_m:
+                best_m = m
+                best_adj = adj[:]
+            else:
+                # Revert: restore the removed edge and re-run local search
+                # Actually, just restore the edge and continue
+                adj[u] |= (1 << v)
+                adj[v] |= (1 << u)
+                adj = local_search(adj, rng)
+
+        return best_adj
+
+    rng = random.Random(42)
+
+    best_adj = None
+    best_m = 0
+
+    # Phase 1: Multiple random greedy constructions
+    phase1_deadline = time.time() + 8
+    while time.time() < phase1_deadline:
+        adj = greedy_construct(rng)
+        adj = local_search(adj, rng)
+        m = count_edges(adj)
+        if m > best_m:
+            best_m = m
+            best_adj = adj[:]
+
+    current_adj = best_adj[:]
+    current_m = best_m
+
+    # Phase 2: Iterated Local Search with varied perturbations
+    while time.time() < deadline - 3:
+        perturbed = current_adj[:]
+
+        # Choose perturbation type
+        pert_type = rng.random()
+
+        if pert_type < 0.4:
+            # Remove 2-6 random edges
+            num_removals = rng.randint(2, 6)
+            existing = get_existing_edges(perturbed)
+            if existing:
+                rng.shuffle(existing)
+                for i in range(min(num_removals, len(existing))):
+                    u, v = existing[i]
+                    perturbed[u] &= ~(1 << v)
+                    perturbed[v] &= ~(1 << u)
+
+        elif pert_type < 0.7:
+            # Remove 1-3 edges and add 1-2 random missing edges
+            num_removals = rng.randint(1, 3)
+            existing = get_existing_edges(perturbed)
+            if existing:
+                rng.shuffle(existing)
+                for i in range(min(num_removals, len(existing))):
+                    u, v = existing[i]
+                    perturbed[u] &= ~(1 << v)
+                    perturbed[v] &= ~(1 << u)
+
+            missing = get_missing_edges(perturbed)
+            if missing:
+                num_adds = rng.randint(1, 2)
+                rng.shuffle(missing)
+                for i in range(min(num_adds, len(missing))):
+                    u, v = missing[i]
+                    if not creates_c6_fast(perturbed, u, v):
+                        perturbed[u] |= (1 << v)
+                        perturbed[v] |= (1 << u)
+
+        else:
+            # Remove 4-12 edges (larger perturbation)
+            num_removals = rng.randint(4, 12)
+            existing = get_existing_edges(perturbed)
+            if existing:
+                rng.shuffle(existing)
+                for i in range(min(num_removals, len(existing))):
+                    u, v = existing[i]
+                    perturbed[u] &= ~(1 << v)
+                    perturbed[v] &= ~(1 << u)
+
+        # Local search on perturbed
+        perturbed = local_search(perturbed, rng)
+        m = count_edges(perturbed)
+
+        # Acceptance criterion
+        if m >= best_m:
+            if m > best_m:
+                best_m = m
+                best_adj = perturbed[:]
+            current_adj = perturbed[:]
+            current_m = m
+        else:
+            # Accept worse solutions with some probability (simulated annealing style)
+            # Probability decreases as the gap increases
+            gap = best_m - m
+            if gap <= 1:
+                accept_prob = 0.3
+            elif gap <= 2:
+                accept_prob = 0.1
+            else:
+                accept_prob = 0.02
+
+            if rng.random() < accept_prob:
+                current_adj = perturbed[:]
+                current_m = m
+            # Else: keep current_adj as is (perturb from it next time)
+
+    # Final validation
+    if not is_c6_free(best_adj):
+        adj = greedy_construct(rng)
+        if is_c6_free(adj):
+            best_adj = adj
+        else:
+            # Fallback: return empty graph
+            return []
+
+    return adj_to_edges(best_adj)
