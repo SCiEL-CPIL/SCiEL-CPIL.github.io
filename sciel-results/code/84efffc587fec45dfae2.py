@@ -1,0 +1,188 @@
+import random
+import time
+
+def construct():
+    start_time = time.time()
+    time_limit = 115.0  # Safety margin before 120s kill
+    
+    d = 7
+    n = 2 ** d  # 128 vertices
+    
+    # Precompute all edges: (u, v, dim) where u < v and dim is the bit that differs
+    all_edges = []
+    for x in range(n):
+        for i in range(d):
+            y = x ^ (1 << i)
+            if x < y:
+                all_edges.append((x, y, i))
+    
+    total_edges = len(all_edges)  # 448
+    
+    # For each edge, precompute the "forbidden pairs" - the other 3 edges that would complete a C4
+    # Edge (u, v) with dimension i: for each j != i, the C4 is u, v, u^bit_j, v^bit_j
+    # The three other edges are: (u, u^bit_j), (v, v^bit_j), (u^bit_j, v^bit_j)
+    edge_to_forbidden = {}
+    for idx, (u, v, i) in enumerate(all_edges):
+        forbidden = []
+        for j in range(d):
+            if j != i:
+                c = u ^ (1 << j)
+                e = v ^ (1 << j)
+                # Three other edges in this C4
+                e1 = (min(u, c), max(u, c))
+                e2 = (min(v, e), max(v, e))
+                e3 = (min(c, e), max(c, e))
+                forbidden.append((e1, e2, e3))
+        edge_to_forbidden[idx] = forbidden
+    
+    # Build a mapping from edge tuple to index
+    edge_to_idx = {}
+    for idx, (u, v, i) in enumerate(all_edges):
+        edge_to_idx[(u, v)] = idx
+    
+    def greedy_randomized(seed=None):
+        if seed is not None:
+            rng = random.Random(seed)
+        else:
+            rng = random.Random()
+        
+        chosen = set()  # set of edge indices chosen
+        # Shuffle edges for random order
+        order = list(range(total_edges))
+        rng.shuffle(order)
+        
+        for idx in order:
+            u, v, i = all_edges[idx]
+            ok = True
+            for (e1, e2, e3) in edge_to_forbidden[idx]:
+                if edge_to_idx.get(e1) is not None and edge_to_idx.get(e2) is not None and edge_to_idx.get(e3) is not None:
+                    if edge_to_idx[e1] in chosen and edge_to_idx[e2] in chosen and edge_to_idx[e3] in chosen:
+                        ok = False
+                        break
+            if ok:
+                chosen.add(idx)
+        
+        return chosen
+    
+    def local_search(chosen, max_iters=2000, seed=None):
+        if seed is not None:
+            rng = random.Random(seed)
+        else:
+            rng = random.Random()
+        
+        chosen = set(chosen)
+        current_size = len(chosen)
+        
+        # Build adjacency: for each chosen edge, which other edges conflict with it (would form C4 if both added)
+        # Actually, let's think about this differently.
+        # An edge is "removable" if removing it allows adding some other edge.
+        # Or: try swapping - remove one edge, add another.
+        
+        # Better approach: try to add unchosen edges by removing minimal set of conflicting edges
+        # Simpler: random restarts with different orderings + local improvement
+        
+        # Let's do: try adding each unchosen edge; if it conflicts, try removing one conflicting edge
+        for iteration in range(max_iters):
+            if time.time() - start_time > time_limit - 5:
+                break
+            
+            # Get list of unchosen edges
+            unchosen = [i for i in range(total_edges) if i not in chosen]
+            if not unchosen:
+                break
+            
+            # Try a random unchosen edge
+            idx = rng.choice(unchosen)
+            u, v, i = all_edges[idx]
+            
+            # Find which chosen edges conflict with idx
+            # An edge conflicts with idx if adding idx would create a C4 with existing edges
+            # That means: for some j != i, the three other edges of the C4 are all in chosen
+            # But actually, idx conflicts with the chosen set if any of the forbidden triples are fully present
+            # To add idx, we need to remove at least one edge from each forbidden triple that is fully present
+            
+            blocking = []
+            for (e1, e2, e3) in edge_to_forbidden[idx]:
+                i1 = edge_to_idx.get(e1)
+                i2 = edge_to_idx.get(e2)
+                i3 = edge_to_idx.get(e3)
+                if i1 is not None and i2 is not None and i3 is not None:
+                    if i1 in chosen and i2 in chosen and i3 in chosen:
+                        blocking.append((i1, i2, i3))
+            
+            if not blocking:
+                # Can add directly
+                chosen.add(idx)
+                current_size += 1
+            else:
+                # Try removing one edge from a blocking triple and see if we can add idx
+                # Pick a random blocking triple
+                triple = rng.choice(blocking)
+                # Try removing each edge in the triple
+                for rem_idx in triple:
+                    # Check if removing rem_idx and adding idx is valid
+                    # After removing rem_idx, check if idx can be added
+                    chosen.discard(rem_idx)
+                    # Check if idx is now addable
+                    can_add = True
+                    for (e1, e2, e3) in edge_to_forbidden[idx]:
+                        i1 = edge_to_idx.get(e1)
+                        i2 = edge_to_idx.get(e2)
+                        i3 = edge_to_idx.get(e3)
+                        if i1 is not None and i2 is not None and i3 is not None:
+                            if i1 in chosen and i2 in chosen and i3 in chosen:
+                                can_add = False
+                                break
+                    if can_add:
+                        chosen.add(idx)
+                        # Net change: 0 (removed 1, added 1) unless the removed edge was the only blocker
+                        # Actually we might have improved if we can now add more
+                        break
+                    else:
+                        # Restore
+                        chosen.add(rem_idx)
+        
+        return chosen
+    
+    best_solution = None
+    best_size = 0
+    
+    # Phase 1: Multiple randomized greedy restarts
+    num_restarts = 0
+    while time.time() - start_time < time_limit - 30:
+        seed = num_restarts
+        solution = greedy_randomized(seed)
+        size = len(solution)
+        if size > best_size:
+            best_size = size
+            best_solution = solution
+        num_restarts += 1
+    
+    # Phase 2: Local search on best solution
+    if best_solution is not None and time.time() - start_time < time_limit - 10:
+        improved = local_search(best_solution, max_iters=5000, seed=42)
+        if len(improved) > best_size:
+            best_size = len(improved)
+            best_solution = improved
+    
+    # Phase 3: More local search iterations if time permits
+    if best_solution is not None and time.time() - start_time < time_limit - 5:
+        for _ in range(3):
+            if time.time() - start_time > time_limit - 5:
+                break
+            improved = local_search(best_solution, max_iters=3000, seed=random.randint(0, 10000))
+            if len(improved) > best_size:
+                best_size = len(improved)
+                best_solution = improved
+    
+    if best_solution is None:
+        # Fallback: deterministic greedy
+        best_solution = greedy_randomized(0)
+    
+    # Convert to output format
+    result = []
+    for idx in sorted(best_solution):
+        u, v, i = all_edges[idx]
+        result.append([u, v])
+    
+    return result

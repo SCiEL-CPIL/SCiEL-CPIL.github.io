@@ -2,7 +2,6 @@ import random
 import time
 import sys
 import math
-from collections import deque
 
 # EVOLVE-BLOCK-START
 
@@ -51,7 +50,7 @@ def _energy_delta_contact(sequence, pos_dict, i, old_pos, new_pos):
             
     return delta
 
-def _greedy_grow(sequence, rng=None):
+def _greedy_grow(sequence, rng=None, temperature=0.0):
     """Fast greedy growth to get an initial conformation."""
     n = len(sequence)
     if n == 0:
@@ -59,6 +58,7 @@ def _greedy_grow(sequence, rng=None):
     start = (0, 0)
     chain = [start]
     occupied = {start: 0}
+    
     for i in range(1, n):
         last = chain[-1]
         candidates = []
@@ -84,11 +84,27 @@ def _greedy_grow(sequence, rng=None):
         if not candidates:
             return None, 0
         
-        # Pick best candidate
-        candidates.sort(key=lambda x: -x[0])
-        best_site = candidates[0][1]
-        chain.append(best_site)
-        occupied[best_site] = i
+        # Pick best candidate with some randomness based on temperature
+        if temperature > 0 and len(candidates) > 1:
+            # Softmax selection
+            scores = [c[0] for c in candidates]
+            max_score = max(scores)
+            exp_scores = [math.exp((s - max_score) / temperature) for s in scores]
+            total = sum(exp_scores)
+            r = rng.random() * total
+            cumsum = 0
+            chosen = candidates[-1][1]
+            for idx, es in enumerate(exp_scores):
+                cumsum += es
+                if r <= cumsum:
+                    chosen = candidates[idx][1]
+                    break
+        else:
+            candidates.sort(key=lambda x: -x[0])
+            chosen = candidates[0][1]
+        
+        chain.append(chosen)
+        occupied[chosen] = i
     
     return chain, _energy(sequence, chain)
 
@@ -107,14 +123,17 @@ def _random_walk(sequence, rng):
             new_pos = (last[0] + dx, last[1] + dy)
             if new_pos not in occupied:
                 candidates.append(new_pos)
+        
         if not candidates:
             return None
-        new_pos = rng.choice(candidates)
-        chain.append(new_pos)
-        occupied.add(new_pos)
+        
+        next_pos = rng.choice(candidates)
+        chain.append(next_pos)
+        occupied.add(next_pos)
+    
     return chain
 
-def _local_search(sequence, chain, deadline, rng):
+def _local_search(sequence, chain, deadline, rng, aggressive=False):
     """
     Local search with single-residue moves and segment moves.
     Returns (best_chain, best_energy).
@@ -129,9 +148,14 @@ def _local_search(sequence, chain, deadline, rng):
     best_chain = list(current_chain)
     best_energy = current_energy
     
-    T = 2.0
-    cooling = 0.9995
-    min_T = 0.05
+    if aggressive:
+        T = 3.0
+        cooling = 0.999
+        min_T = 0.1
+    else:
+        T = 1.5
+        cooling = 0.9995
+        min_T = 0.05
     
     start_time = time.time()
     steps = 0
@@ -142,7 +166,6 @@ def _local_search(sequence, chain, deadline, rng):
         steps += 1
         
         # Choose move type
-        # 50% single residue, 50% segment
         if rng.random() < 0.5 and n > 5:
             # Single residue move
             i = rng.randint(1, n - 2)
@@ -222,7 +245,7 @@ def _local_search(sequence, chain, deadline, rng):
                         no_improve_count += 1
         else:
             # Segment move
-            max_seg = min(n // 2, 10)
+            max_seg = min(n // 2, 12)
             if max_seg < 2:
                 max_seg = 2
             seg_len = rng.randint(2, max_seg)
@@ -297,9 +320,93 @@ def _local_search(sequence, chain, deadline, rng):
                     no_improve_count += 1
         
         # Restart if stuck too long
-        if no_improve_count > 500:
+        if no_improve_count > 300:
             T = max(T * 1.5, 1.0)
             no_improve_count = 0
+    
+    return best_chain, best_energy
+
+def _polish_pass(sequence, chain, deadline, rng):
+    """
+    A high-precision polish pass using only improving moves (hill climbing).
+    This is used after the main local search to squeeze out last contacts.
+    """
+    n = len(sequence)
+    if n < 3:
+        return list(chain), _energy(sequence, chain)
+    
+    current_chain = list(chain)
+    pos_dict = {p: i for i, p in enumerate(current_chain)}
+    current_energy = _energy(sequence, current_chain)
+    best_chain = list(current_chain)
+    best_energy = current_energy
+    
+    start_time = time.time()
+    no_improve = 0
+    max_no_improve = 100
+    
+    while time.time() < deadline and no_improve < max_no_improve:
+        improved = False
+        # Try all single-residue moves that improve energy
+        for i in range(n):
+            if i == 0 or i == n - 1:
+                neighbor_idx = 1 if i == 0 else n - 2
+                neighbor_pos = current_chain[neighbor_idx]
+                old_pos = current_chain[i]
+                
+                candidates = []
+                for nb in _neighbours(neighbor_pos):
+                    if nb == old_pos:
+                        continue
+                    if nb in pos_dict and pos_dict[nb] != i:
+                        continue
+                    candidates.append(nb)
+                
+                for new_pos in candidates:
+                    delta = _energy_delta_contact(sequence, pos_dict, i, old_pos, new_pos)
+                    if delta < 0:
+                        # Accept improving move
+                        del pos_dict[old_pos]
+                        current_chain[i] = new_pos
+                        pos_dict[new_pos] = i
+                        current_energy += delta
+                        improved = True
+                        if current_energy < best_energy:
+                            best_energy = current_energy
+                            best_chain = list(current_chain)
+                        break
+            else:
+                prev_pos = current_chain[i - 1]
+                next_pos = current_chain[i + 1]
+                old_pos = current_chain[i]
+                
+                candidates = []
+                for nb in _neighbours(prev_pos):
+                    if nb == old_pos:
+                        continue
+                    if nb in _neighbours(next_pos):
+                        if nb in pos_dict and pos_dict[nb] != i:
+                            continue
+                        candidates.append(nb)
+                
+                for new_pos in candidates:
+                    delta = _energy_delta_contact(sequence, pos_dict, i, old_pos, new_pos)
+                    if delta < 0:
+                        # Accept improving move
+                        del pos_dict[old_pos]
+                        current_chain[i] = new_pos
+                        pos_dict[new_pos] = i
+                        current_energy += delta
+                        improved = True
+                        if current_energy < best_energy:
+                            best_energy = current_energy
+                            best_chain = list(current_chain)
+                        break
+        
+        if not improved:
+            no_improve += 1
+        else:
+            no_improve = 0
     
     return best_chain, best_energy
 
@@ -321,26 +428,31 @@ def _restart_local_search(sequence, n_restarts, deadline, rng):
             break
         
         # Generate initial conformation
-        if rng.random() < 0.5:
-            init_chain, init_energy = _greedy_grow(sequence, rng)
+        # Alternate between greedy at different temperatures and random walks
+        if r % 3 == 0:
+            init_chain, init_energy = _greedy_grow(sequence, rng, temperature=0.0)
             if init_chain is None:
-                init_chain = _random_walk(sequence, rng)
-                if init_chain is None:
-                    init_chain = [(i, 0) for i in range(n)]
-                    init_energy = _energy(sequence, init_chain)
+                init_chain = [(i, 0) for i in range(n)]
+                init_energy = _energy(sequence, init_chain)
+        elif r % 3 == 1:
+            init_chain, init_energy = _greedy_grow(sequence, rng, temperature=2.0)
+            if init_chain is None:
+                init_chain = [(i, 0) for i in range(n)]
+                init_energy = _energy(sequence, init_chain)
         else:
             init_chain = _random_walk(sequence, rng)
             if init_chain is None:
-                init_chain, init_energy = _greedy_grow(sequence, rng)
+                init_chain, init_energy = _greedy_grow(sequence, rng, temperature=0.0)
                 if init_chain is None:
                     init_chain = [(i, 0) for i in range(n)]
                     init_energy = _energy(sequence, init_chain)
             else:
                 init_energy = _energy(sequence, init_chain)
         
-        # Run local search
+        # Run local search with more aggressive settings for later restarts
+        aggressive = r >= n_restarts // 2
         ls_deadline = restart_deadline - 0.05
-        ls_chain, ls_energy = _local_search(sequence, init_chain, ls_deadline, rng)
+        ls_chain, ls_energy = _local_search(sequence, init_chain, ls_deadline, rng, aggressive=aggressive)
         
         if ls_energy < best_energy:
             best_energy = ls_energy
@@ -357,7 +469,7 @@ def fold(sequence, dimension):
     start_time = time.time()
     n = len(sequence)
     
-    # Total budget: 120s for all sequences. 
+    # Total budget: 120s for all sequences.
     # We have 10 sequences. 120/10 = 12s per sequence.
     # Add a safety margin. Let's use 10s per sequence.
     
@@ -366,15 +478,22 @@ def fold(sequence, dimension):
     if n == 0:
         return []
     
-    # Number of restarts
-    # More restarts for longer sequences?
-    # Shorter sequences converge faster.
-    # Let's keep it simple: 20 restarts.
-    n_restarts = 20
+    # Number of restarts - scale with sequence length
+    if n <= 30:
+        n_restarts = 25
+    elif n <= 50:
+        n_restarts = 20
+    else:
+        n_restarts = 15
     
     rng = random.Random(12345 + n)
     
     best_chain, best_energy = _restart_local_search(sequence, n_restarts, deadline, rng)
+    
+    # Final polish pass
+    polish_deadline = deadline - 0.1
+    if time.time() < polish_deadline:
+        best_chain, best_energy = _polish_pass(sequence, best_chain, polish_deadline, rng)
     
     return [list(p) for p in best_chain]
 

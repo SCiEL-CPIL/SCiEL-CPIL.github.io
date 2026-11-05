@@ -1,0 +1,462 @@
+import time
+import random
+import math
+from collections import deque
+
+# EVOLVE-BLOCK-START
+
+def construct(k, g):
+    start_time = time.time()
+    deadline = start_time + 115.0  # Safety margin before 120s limit
+
+    def remaining():
+        return deadline - time.time()
+
+    # ---------- arithmetic helpers ----------
+    def is_prime(n):
+        if n < 2:
+            return False
+        if n == 2:
+            return True
+        if n % 2 == 0:
+            return False
+        for i in range(3, int(math.isqrt(n)) + 1, 2):
+            if n % i == 0:
+                return False
+        return True
+
+    def is_prime_power(n):
+        if n < 2:
+            return False
+        if is_prime(n):
+            return True
+        for p in range(2, int(math.isqrt(n)) + 1):
+            if n % p == 0:
+                t = n
+                while t % p == 0:
+                    t //= p
+                return t == 1
+        return False
+
+    def is_quadratic_residue(a, q):
+        a = a % q
+        if a == 0:
+            return True
+        if not is_prime_power(q):
+            return True
+        p = None
+        for cand in range(2, int(math.isqrt(q)) + 1):
+            if q % cand == 0:
+                t = q
+                while t % cand == 0:
+                    t //= cand
+                if t == 1:
+                    p = cand
+                    break
+        if p is None:
+            p = q
+        a_p = a % p
+        if a_p == 0:
+            return True
+        return pow(a_p, (p - 1) // 2, p) == 1
+
+    def modinv(a, m):
+        if m <= 1:
+            return None
+        a = a % m
+        if a == 0:
+            return None
+        try:
+            return pow(a, -1, m)
+        except:
+            return None
+
+    def moore_bound(k, g):
+        if k <= 1:
+            return 0
+        if g == 1:
+            return 1
+        r = g // 2
+        if g % 2 == 1:
+            s = 1
+            term = k
+            for _ in range(r - 1):
+                s += term
+                term *= (k - 1)
+            return s
+        else:
+            s = 0
+            term = 1
+            for _ in range(r):
+                s += term
+                term *= (k - 1)
+            return 2 * s
+
+    n_min = moore_bound(k, g)
+
+    # ---------- graph validation ----------
+    def get_girth(adj, n):
+        """Returns the girth of the graph, or 0 if not connected/disconnected."""
+        min_girth = float('inf')
+        for u in range(n):
+            dist = [-1] * n
+            parent = [-1] * n
+            dist[u] = 0
+            queue = deque([u])
+            while queue:
+                x = queue.popleft()
+                for y in adj[x]:
+                    if dist[y] == -1:
+                        dist[y] = dist[x] + 1
+                        parent[y] = x
+                        queue.append(y)
+                    elif y != parent[x] and parent[y] != x:
+                        cycle_len = dist[x] + dist[y] + 1
+                        if cycle_len < min_girth:
+                            min_girth = cycle_len
+        return min_girth if min_girth != float('inf') else 0
+
+    def is_connected(adj, n):
+        visited = [False] * n
+        visited[0] = True
+        queue = deque([0])
+        count = 0
+        while queue:
+            u = queue.popleft()
+            count += 1
+            for v in adj[u]:
+                if not visited[v]:
+                    visited[v] = True
+                    queue.append(v)
+        return count == n
+
+    def validate(adj, n, k, g):
+        for i in range(n):
+            if len(adj[i]) != k:
+                return None
+        if not is_connected(adj, n):
+            return None
+        girth = get_girth(adj, n)
+        if girth < g:
+            return None
+        edges = []
+        for i in range(n):
+            for j in adj[i]:
+                if i < j:
+                    edges.append((i, j))
+        return (n, edges)
+
+    # ---------- Lazebnik-Ustimenko-Woldar baseline ----------
+    def luw_construct(k, g):
+        q = k
+        d = max(3, g - 5 if (g - 5) % 2 else g - 4)
+        if q == 4:
+            table = [[0, 0, 0, 0], [0, 1, 2, 3], [0, 2, 3, 1], [0, 3, 1, 2]]
+            add, sub, mul = (lambda x, y: x ^ y), (lambda x, y: x ^ y), (lambda x, y: table[x][y])
+        else:
+            add, sub, mul = (lambda x, y: (x + y) % q), (lambda x, y: (x - y) % q), (lambda x, y: x * y % q)
+        rule = {2: (1, 1), 3: (2, 1), 4: (1, 2)}
+        for c in range(5, d + 1):
+            r, c0 = (c - 5) % 4, c - (c - 5) % 4
+            rule[c] = [(1, c0 - 2), (c0 - 1, 1), (c0, 1), (1, c0 + 1)][r]
+
+        def neighbours(vertex):
+            side, x = vertex
+            for first in range(q):
+                y = [None, first] + [0] * (d - 1)
+                for c in range(2, d + 1):
+                    a, b = rule[c]
+                    y[c] = add(x[c], mul(y[a], x[b])) if side == 0 else sub(x[c], mul(x[a], y[b]))
+                yield 1 - side, tuple(y)
+
+        start = (0, (None,) + (0,) * d)
+        index, order, edges = {start: 0}, [start], []
+        for vertex in order:
+            for other in neighbours(vertex):
+                if other not in index:
+                    index[other] = len(order)
+                    order.append(other)
+                if vertex[0] == 0:
+                    edges.append((index[vertex], index[other]))
+        return len(order), edges
+
+    # ---------- PGL(2, q) machinery ----------
+    def action_on_point(x, a, b, c, d, q):
+        if x == q:
+            if c == 0:
+                return q
+            inv_c = modinv(c, q)
+            if inv_c is None:
+                return None
+            return (a * inv_c) % q
+        num = (a * x + b) % q
+        den = (c * x + d) % q
+        if den == 0:
+            return q
+        inv_den = modinv(den, q)
+        if inv_den is None:
+            return None
+        return (num * inv_den) % q
+
+    def inv_matrix(a, b, c, d, q):
+        det = (a * d - b * c) % q
+        det_inv = modinv(det, q)
+        if det_inv is None:
+            return None
+        return (d * det_inv % q, -b * det_inv % q, -c * det_inv % q, a * det_inv % q)
+
+    def is_derangement(a, b, c, d, q):
+        a, b, c, d = a % q, b % q, c % q, d % q
+        if c == 0:
+            return False
+        disc = ((d - a) ** 2 + 4 * b * c) % q
+        if disc == 0:
+            return False
+        if is_quadratic_residue(disc, q):
+            return False
+        return True
+
+    def build_from_gens(gens, q, k, g):
+        n = q + 1
+        adj = [set() for _ in range(n)]
+        for i in range(n):
+            x = i if i < q else q
+            for gen in gens:
+                y = action_on_point(x, gen[0], gen[1], gen[2], gen[3], q)
+                if y is None or y == i:
+                    return None
+                j = y if y < q else q
+                adj[i].add(j)
+                adj[j].add(i)
+        return validate(adj, n, k, g)
+
+    def random_search_pgl(q, k, g, budget):
+        n = q + 1
+        if n < n_min:
+            return None
+        if q % 2 == 0 or not is_prime_power(q):
+            return None
+
+        def random_gen():
+            while True:
+                a = random.randrange(q)
+                b = random.randrange(q)
+                c = random.randrange(q)
+                d = random.randrange(q)
+                if (a * d - b * c) % q != 0:
+                    return (a, b, c, d)
+
+        def random_gens():
+            out = []
+            attempts = 0
+            while len(out) < k and attempts < k * 20:
+                attempts += 1
+                m = random_gen()
+                mi = inv_matrix(*m, q)
+                if mi is None:
+                    continue
+                if not is_derangement(*m, q):
+                    continue
+                # Check involution
+                a2 = (m[0]*m[0] + m[1]*m[2]) % q
+                b2 = (m[1]*(m[0]+m[3])) % q
+                c2 = (m[2]*(m[0]+m[3])) % q
+                d2 = (m[3]*m[3] + m[1]*m[2]) % q
+                is_involution = (a2 == 1 and b2 == 0 and c2 == 0 and d2 == 1)
+                
+                if is_involution or random.random() < 0.4:
+                    out.append(m)
+                    if mi != m and len(out) < k:
+                        out.append(mi)
+            while len(out) < k:
+                m = random_gen()
+                if is_derangement(*m, q):
+                    out.append(m)
+            return out[:k]
+
+        seen = set()
+        while time.time() < budget:
+            gens = random_gens()
+            key = tuple(gens)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not all(is_derangement(*gen, q) for gen in gens):
+                continue
+            res = build_from_gens(gens, q, k, g)
+            if res:
+                return res
+        return None
+
+    # ---------- Simulated Annealing for small n ----------
+    def sa_construct(n, k, g, budget):
+        if n < n_min:
+            return None
+        if n > 150: # SA is slow for large n
+            return None
+            
+        # Generate random k-regular graph
+        # Use configuration model
+        def random_k_regular(n, k):
+            if (n * k) % 2 != 0:
+                return None
+            stubs = []
+            for i in range(n):
+                for _ in range(k):
+                    stubs.append(i)
+            random.shuffle(stubs)
+            adj = [set() for _ in range(n)]
+            valid = True
+            for i in range(0, len(stubs), 2):
+                u, v = stubs[i], stubs[i+1]
+                if u == v:
+                    valid = False
+                    break
+                if v in adj[u]:
+                    valid = False
+                    break
+                adj[u].add(v)
+                adj[v].add(u)
+            if not valid:
+                return None
+            # Check connectivity
+            if not is_connected(adj, n):
+                return None
+            return adj
+
+        adj = None
+        attempts = 0
+        while attempts < 100 and time.time() < budget - 5.0:
+            attempts += 1
+            adj = random_k_regular(n, k)
+            if adj:
+                break
+        if not adj:
+            return None
+            
+        current_girth = get_girth(adj, n)
+        if current_girth >= g:
+            return validate(adj, n, k, g)
+            
+        best_girth = current_girth
+        best_adj = [set(s) for s in adj]
+        
+        T = 1.0
+        cooling = 0.995
+        
+        while time.time() < budget:
+            # Pick random edges to swap
+            # (u, v) and (x, y) -> (u, x) and (v, y)
+            # Ensure u!=x, v!=y, u!=y, v!=x to avoid loops
+            # And (u,x) not in adj, (v,y) not in adj
+            
+            u = random.randrange(n)
+            v = random.choice(list(adj[u]))
+            
+            x = random.randrange(n)
+            if x == u or x == v:
+                continue
+            if x not in adj[u]: # Ensure (u,x) is not an edge
+                y = random.choice(list(adj[x]))
+                if y == u or y == v:
+                    continue
+                if y not in adj[v]: # Ensure (v,y) is not an edge
+                    # Check for multi-edges
+                    if x in adj[v] or y in adj[u]:
+                        continue
+                    
+                    # Perform swap
+                    adj[u].remove(v)
+                    adj[v].remove(u)
+                    adj[x].remove(y)
+                    adj[y].remove(x)
+                    
+                    adj[u].add(x)
+                    adj[x].add(u)
+                    adj[v].add(y)
+                    adj[y].add(v)
+                    
+                    new_girth = get_girth(adj, n)
+                    
+                    if new_girth >= g:
+                        return validate(adj, n, k, g)
+                    
+                    if new_girth > best_girth:
+                        best_girth = new_girth
+                        best_adj = [set(s) for s in adj]
+                    else:
+                        # Metropolis
+                        delta = best_girth - new_girth
+                        if delta > 0 and random.random() > math.exp(-delta / T):
+                            # Revert
+                            adj[u].remove(x)
+                            adj[x].remove(u)
+                            adj[v].remove(y)
+                            adj[y].remove(v)
+                            
+                            adj[u].add(v)
+                            adj[v].add(u)
+                            adj[x].add(y)
+                            adj[y].add(x)
+                            
+                    T *= cooling
+            if T < 0.01:
+                T = 0.01
+                
+        return None
+
+    # ---------- main ----------
+    # 1. deterministic baseline
+    n_luw, edges_luw = luw_construct(k, g)
+    best_n = [n_luw]
+    best_result = (n_luw, edges_luw)
+
+    # 2. Search for smaller n
+    # We try n from n_min to best_n - 1
+    # For each n, we try PGL (if n-1 is prime power) and SA
+    
+    # Sort candidate n's: prefer smaller n
+    # But PGL only works for specific n (q+1).
+    # SA works for any n.
+    
+    # Let's interleave:
+    # For n in range(n_min, best_n):
+    #   if n-1 is prime power: try PGL
+    #   try SA (if n < 150)
+    
+    # To save time, we will prioritize n values that are "likely" to be cages.
+    # Usually cages are close to Moore bound.
+    
+    # We will iterate n from n_min to best_n - 1
+    # But we must be careful with time.
+    
+    n_cursor = n_min
+    while n_cursor < best_n[0] and time.time() < deadline - 10.0:
+        
+        # Check if n-1 is a prime power for PGL
+        q = n_cursor - 1
+        if q >= 3 and is_prime_power(q):
+            # Try PGL with short budget
+            pgl_budget = min(5.0, deadline - 10.0 - time.time())
+            res = random_search_pgl(q, k, g, pgl_budget)
+            if res:
+                best_n[0] = res[0]
+                best_result = res
+                n_cursor += 1
+                continue
+        
+        # Try Simulated Annealing
+        if n_cursor <= 150:
+            sa_budget = min(10.0, deadline - 10.0 - time.time())
+            res = sa_construct(n_cursor, k, g, sa_budget)
+            if res:
+                best_n[0] = res[0]
+                best_result = res
+                n_cursor += 1
+                continue
+        
+        n_cursor += 1
+
+    return best_result
+
+# EVOLVE-BLOCK-END

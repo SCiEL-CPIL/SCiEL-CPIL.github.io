@@ -1,0 +1,424 @@
+import time
+import random
+import sys
+from collections import deque
+import numpy as np
+
+def construct(k, g):
+    """
+    Constructs a k-regular graph with girth at least g.
+    Uses voltage lift of Petersen graph for k=3 with greedy forward construction.
+    """
+    start_time = time.time()
+    deadline = start_time + 145.0
+
+    if k == 3:
+        return _construct_petersen_lift(g, deadline, start_time)
+    else:
+        return _construct_luw(k, g, d=7)
+
+def _construct_petersen_lift(g, deadline, start_time):
+    """
+    Constructs a girth-g graph by lifting the Petersen graph with voltages in Z_m.
+    Uses greedy forward construction with backtracking for voltage assignment.
+    """
+    # Petersen graph edges (10 vertices, 15 edges)
+    pet_edges = [
+        (0, 1), (1, 2), (2, 3), (3, 4), (4, 0),
+        (5, 7), (7, 9), (9, 6), (6, 8), (8, 5),
+        (0, 5), (1, 6), (2, 7), (3, 8), (4, 9)
+    ]
+    
+    n_base = 10
+    edge_index = {}
+    for i, (u, v) in enumerate(pet_edges):
+        edge_index[(u, v)] = i
+        edge_index[(v, u)] = i
+    
+    # Precompute all non-backtracking closed walks of length < g in the Petersen graph
+    # We represent each walk as a vector of coefficients for the 15 edges.
+    coeff_vectors = set()
+    max_walk_len = g - 1
+    
+    for start_v in range(n_base):
+        # stack: (current_vertex, prev_vertex, length, coeff_vector_list)
+        stack = [(start_v, -1, 0, [0]*15)]
+        
+        while stack:
+            v, prev_v, l, counts = stack.pop()
+            
+            if l >= max_walk_len:
+                continue
+            
+            for next_v in range(n_base):
+                if next_v == prev_v or next_v == v:
+                    continue
+                
+                e_idx = edge_index.get((v, next_v))
+                if e_idx is None:
+                    continue
+                
+                new_counts = counts.copy()
+                u_edge, v_edge = pet_edges[e_idx]
+                if v == u_edge and next_v == v_edge:
+                    new_counts[e_idx] += 1
+                else:
+                    new_counts[e_idx] -= 1
+                
+                new_l = l + 1
+                if next_v == start_v and new_l > 0:
+                    coeff_vectors.add(tuple(new_counts))
+                
+                stack.append((next_v, v, new_l, new_counts))
+    
+    # Normalize constraints to remove redundancy
+    unique_coeffs = set()
+    for c in coeff_vectors:
+        if all(x == 0 for x in c):
+            continue
+        # Canonical form: first non-zero coefficient is positive
+        for i in range(15):
+            if c[i] != 0:
+                if c[i] < 0:
+                    c = tuple(-x for x in c)
+                unique_coeffs.add(c)
+                break
+    coeff_list = list(unique_coeffs)
+    
+    if not coeff_list:
+        voltages = [1] * 15
+        m = 2
+        n_candidate = 10 * m
+        edges = _build_lifted_graph(pet_edges, voltages, m)
+        return n_candidate, edges
+
+    # Build coefficient matrix
+    coeff_matrix = np.array(coeff_list, dtype=np.int64)
+    n_constraints = len(coeff_matrix)
+    
+    def is_prime(n):
+        if n < 2:
+            return False
+        if n < 4:
+            return True
+        if n % 2 == 0 or n % 3 == 0:
+            return False
+        i = 5
+        while i * i <= n:
+            if n % i == 0 or n % (i + 2) == 0:
+                return False
+            i += 6
+        return True
+
+    primes = []
+    candidate = 2
+    while len(primes) < 100:
+        if is_prime(candidate):
+            primes.append(candidate)
+        candidate += 1
+    
+    best_n = float('inf')
+    best_edges = None
+    
+    # Moore bound for n(3,16) is 512, so m >= 52
+    # But we can try smaller m if constraints are sparse? No, girth 16 requires large m.
+    # Start from m=52 upwards.
+    
+    for m in range(52, 1000):
+        if time.time() > deadline - 5.0:
+            break
+        
+        n_candidate = 10 * m
+        if n_candidate >= best_n:
+            continue
+        
+        found = _solve_voltages(coeff_matrix, m, deadline)
+        
+        if found:
+            voltages_list = found.tolist()
+            edges = _build_lifted_graph(pet_edges, voltages_list, m)
+            return n_candidate, edges
+    
+    # Fallback: use LUW construction
+    return _construct_luw(k=3, g=g, d=11)
+
+def _solve_voltages(coeff_matrix, m, deadline):
+    """
+    Solves for voltages using greedy forward construction with backtracking.
+    Returns numpy array of voltages if found, else None.
+    """
+    n_edges = 15
+    # Order edges: we might want to prioritize edges that appear in many constraints
+    # For now, random order per attempt might help, but fixed order is faster.
+    # Let's use a static order based on edge index, but maybe shuffle if stuck?
+    # Actually, let's just iterate 0..14.
+    
+    # Precompute for each constraint, which edges it involves
+    # To speed up checking, we can maintain a running sum for each constraint.
+    # sum[c] = sum(coeff[c][i] * voltages[i] for assigned i)
+    # When assigning edge j with value v:
+    #   For each constraint c involving j:
+    #     new_sum = sum[c] + coeff[c][j] * v
+    #     If all edges in c are now assigned, check new_sum % m != 0
+    
+    # Let's build a list of (constraint_idx, edge_idx, coeff_val) for quick update
+    # And a list of edges per constraint to know when it's "complete"
+    
+    edges_in_constraint = []
+    for c in range(coeff_matrix.shape[0]):
+        edges_in_constraint.append(np.where(coeff_matrix[c] != 0)[0])
+    
+    # For backtracking, we need to restore sums.
+    # We will use a stack of states.
+    
+    def solve_rec(assigned_count, voltages, sums, assigned_mask):
+        if time.time() > deadline:
+            return None
+            
+        if assigned_count == n_edges:
+            return voltages.copy()
+            
+        # Pick next edge to assign
+        # Heuristic: pick edge with highest degree in remaining constraints?
+        # For simplicity, just pick first unassigned.
+        edge_idx = -1
+        for i in range(n_edges):
+            if not assigned_mask[i]:
+                edge_idx = i
+                break
+                
+        if edge_idx == -1:
+            return voltages.copy()
+            
+        # Try random values for this edge
+        # To avoid bias, we can try a few random values
+        # If m is small, we can iterate all. If large, random sampling.
+        
+        # Determine which constraints are affected by this edge
+        affected_constraints = []
+        for c in range(coeff_matrix.shape[0]):
+            if coeff_matrix[c][edge_idx] != 0:
+                affected_constraints.append(c)
+                
+        # Try values
+        # If m is small (< 20), try all values in random order
+        # Else, try ~50 random values
+        
+        values_to_try = []
+        if m < 20:
+            values_to_try = list(range(1, m))
+            random.shuffle(values_to_try)
+        else:
+            # Try 100 random values
+            values_to_try = [random.randint(1, m-1) for _ in range(min(100, m-1))]
+            # Ensure uniqueness
+            values_to_try = list(set(values_to_try))
+            random.shuffle(values_to_try)
+            
+        for v in values_to_try:
+            if time.time() > deadline:
+                return None
+                
+            # Check if this value is valid
+            valid = True
+            # We need to check constraints that become "complete" or are already complete
+            # Actually, we just need to check if any constraint that is now fully assigned
+            # has sum == 0.
+            
+            # Optimization: Only check constraints that include edge_idx AND are now fully assigned?
+            # No, a constraint might have been fully assigned BEFORE this step.
+            # But if it was fully assigned before, its sum was already checked and non-zero.
+            # Adding this edge doesn't change it.
+            # So we only need to check constraints that include edge_idx AND where
+            # ALL other edges in that constraint were already assigned.
+            
+            for c in affected_constraints:
+                # Check if all edges in constraint c are assigned (including this one)
+                # edges_in_constraint[c] contains the edge indices
+                # We need to check if all of them are in assigned_mask (plus this one)
+                
+                # Quick check: if any edge in this constraint is not assigned (and not this one), skip
+                # But we know this one is being assigned.
+                is_complete = True
+                for e in edges_in_constraint[c]:
+                    if e != edge_idx and not assigned_mask[e]:
+                        is_complete = False
+                        break
+                        
+                if is_complete:
+                    # Calculate new sum
+                    # Current sum is sums[c] (which includes contributions from previously assigned edges)
+                    # We need to add coeff[c][edge_idx] * v
+                    new_sum = (sums[c] + coeff_matrix[c][edge_idx] * v) % m
+                    if new_sum == 0:
+                        valid = False
+                        break
+            
+            if valid:
+                # Commit
+                voltages[edge_idx] = v
+                assigned_mask[edge_idx] = True
+                
+                # Update sums for affected constraints
+                # We need to save old sums to backtrack
+                old_sums = {}
+                for c in affected_constraints:
+                    old_sums[c] = sums[c]
+                    sums[c] = (sums[c] + coeff_matrix[c][edge_idx] * v) % m
+                    
+                # Recurse
+                result = solve_rec(assigned_count + 1, voltages, sums, assigned_mask)
+                if result is not None:
+                    return result
+                    
+                # Backtrack
+                for c in affected_constraints:
+                    sums[c] = old_sums[c]
+                assigned_mask[edge_idx] = False
+                voltages[edge_idx] = 0
+                
+        return None
+
+    # Initialize
+    voltages = np.zeros(n_edges, dtype=np.int64)
+    sums = np.zeros(coeff_matrix.shape[0], dtype=np.int64)
+    assigned_mask = np.zeros(n_edges, dtype=bool)
+    
+    # Run solver
+    # To handle potential deep recursion or getting stuck, we can add a limit on backtracking depth
+    # But 15 edges is small.
+    
+    # Try multiple random restarts if the first greedy path fails?
+    # The greedy path is deterministic if we don't shuffle values.
+    # We shuffled values_to_try.
+    # If it fails, we might need to try a different order of edges.
+    # Let's just try a few times with different random seeds for value selection.
+    
+    for attempt in range(10):
+        if time.time() > deadline:
+            break
+        res = solve_rec(0, np.zeros(n_edges, dtype=np.int64), np.zeros(coeff_matrix.shape[0], dtype=np.int64), np.zeros(n_edges, dtype=bool))
+        if res is not None:
+            return res
+            
+    return None
+
+def _build_lifted_graph(pet_edges, voltages, m):
+    n_base = 10
+    edge_index = {}
+    for i, (u, v) in enumerate(pet_edges):
+        edge_index[(u, v)] = i
+        edge_index[(v, u)] = i
+    
+    edges = []
+    for u in range(n_base):
+        for v in range(n_base):
+            if u == v:
+                continue
+            e_idx = edge_index.get((u, v))
+            if e_idx is None:
+                continue
+            
+            vol = voltages[e_idx]
+            u_edge, v_edge = pet_edges[e_idx]
+            if u == u_edge and v == v_edge:
+                sign = 1
+            else:
+                sign = -1
+            
+            for layer in range(m):
+                u_node = layer * n_base + u
+                target_layer = (layer + sign * vol) % m
+                v_node = target_layer * n_base + v
+                
+                if u_node < v_node:
+                    edges.append((u_node, v_node))
+                else:
+                    edges.append((v_node, u_node))
+                
+    edges = list(set(edges))
+    return edges
+
+def _construct_luw(k, g, d=None, variant=0):
+    """
+    LUW construction with specified depth d and variant for rule selection.
+    For k=3, uses q=3 arithmetic.
+    """
+    if d is None:
+        d = max(3, g - 5 if (g - 5) % 2 else g - 4)
+    
+    q = k
+    if q == 4:
+        table = [[0, 0, 0, 0], [0, 1, 2, 3], [0, 2, 3, 1], [0, 3, 1, 2]]
+        add = lambda x, y: x ^ y
+        sub = lambda x, y: x ^ y
+        mul = lambda x, y: table[x][y]
+    else:
+        add = lambda x, y: (x + y) % q
+        sub = lambda x, y: (x - y) % q
+        mul = lambda x, y: x * y % q
+    
+    rule = {2: (1, 1), 3: (2, 1), 4: (1, 2)}
+    offset = variant % 4
+    for c in range(5, d + 1):
+        r = (c - 5 + offset) % 4
+        c0 = c - (c - 5) % 4
+        rule[c] = [(1, c0 - 2), (c0 - 1, 1), (c0, 1), (1, c0 + 1)][r]
+    
+    def neighbours(vertex):
+        side, x = vertex
+        for first in range(q):
+            y = [None, first] + [0] * (d - 1)
+            for c in range(2, d + 1):
+                a, b = rule[c]
+                if side == 0:
+                    y[c] = add(x[c], mul(y[a], x[b]))
+                else:
+                    y[c] = sub(x[c], mul(x[a], y[b]))
+            yield 1 - side, tuple(y)
+    
+    start = (0, (None,) + (0,) * d)
+    index = {start: 0}
+    order = [start]
+    edges = []
+    
+    for i, vertex in enumerate(order):
+        for other in neighbours(vertex):
+            if other not in index:
+                index[other] = len(order)
+                order.append(other)
+            if vertex[0] == 0:
+                edges.append((index[vertex], index[other]))
+    
+    return len(order), edges
+
+def _has_girth_at_least(n, edges, g):
+    """
+    Check if graph has girth at least g using non-backtracking walks.
+    """
+    adj = [[] for _ in range(n)]
+    for u, v in edges:
+        adj[u].append(v)
+        adj[v].append(u)
+    
+    max_len = g - 1
+    
+    for start in range(n):
+        queue = deque()
+        for nb in adj[start]:
+            queue.append((nb, start, 1))
+        
+        while queue:
+            u, prev, l = queue.popleft()
+            
+            if u == start and l > 0:
+                return False
+            
+            if l >= max_len:
+                continue
+            
+            for v in adj[u]:
+                if v != prev:
+                    queue.append((v, u, l + 1))
+    
+    return True

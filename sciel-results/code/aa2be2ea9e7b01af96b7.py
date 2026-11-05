@@ -1,0 +1,226 @@
+import time
+import random
+import sys
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 115.0
+    n = 18
+
+    # Helper: Check if bitmask represents an independent set
+    def is_independent(mask, adj):
+        m = mask
+        while m:
+            lsb = m & -m
+            v = lsb.bit_length() - 1
+            if adj[v] & (mask ^ lsb):
+                return False
+            m ^= lsb
+        return True
+
+    # Helper: Check if adding edge (u,v) keeps graph K4-free
+    def can_add_edge(adj, u, v):
+        if (adj[u] >> v) & 1:
+            return True
+        common = adj[u] & adj[v]
+        # Common neighbors must form an independent set
+        return is_independent(common, adj)
+
+    # Exact B&B for largest triangle-free induced subgraph
+    # Triangle-free induced subgraph = no triangle within the induced subgraph
+    # A set S is triangle-free iff for every v in S, N(v) ∩ S is an independent set
+    def largest_tf(adj, time_limit=None):
+        best = [0]
+        full_mask = (1 << n) - 1
+        
+        # Greedy Lower Bound - try multiple orderings
+        degrees = [bin(adj[i]).count('1') for i in range(n)]
+        
+        # Ordering 1: degree descending
+        order1 = sorted(range(n), key=lambda x: -degrees[x])
+        greedy_set = 0
+        for v in order1:
+            if is_independent(adj[v] & greedy_set, adj):
+                greedy_set |= (1 << v)
+        best[0] = bin(greedy_set).count('1')
+        
+        # Ordering 2: degree ascending
+        order2 = sorted(range(n), key=lambda x: degrees[x])
+        greedy_set2 = 0
+        for v in order2:
+            if is_independent(adj[v] & greedy_set2, adj):
+                greedy_set2 |= (1 << v)
+        if bin(greedy_set2).count('1') > best[0]:
+            best[0] = bin(greedy_set2).count('1')
+        
+        # Ordering 3: random
+        random_order = list(range(n))
+        random.shuffle(random_order)
+        greedy_set3 = 0
+        for v in random_order:
+            if is_independent(adj[v] & greedy_set3, adj):
+                greedy_set3 |= (1 << v)
+        if bin(greedy_set3).count('1') > best[0]:
+            best[0] = bin(greedy_set3).count('1')
+        
+        # B&B
+        def bnb(S_mask, C_mask):
+            if time_limit and time.time() > time_limit:
+                return
+            sz = bin(S_mask).count('1')
+            # Upper bound
+            if sz + bin(C_mask).count('1') <= best[0]:
+                return
+            
+            if not C_mask:
+                if sz > best[0]:
+                    best[0] = sz
+                return
+
+            # Select vertex with max degree in C
+            max_deg = -1
+            chosen_v = -1
+            c = C_mask
+            while c:
+                lsb = c & -c
+                vid = lsb.bit_length() - 1
+                deg_in_c = bin(adj[vid] & C_mask).count('1')
+                if deg_in_c > max_deg:
+                    max_deg = deg_in_c
+                    chosen_v = vid
+                c ^= lsb
+                
+            v = chosen_v
+            v_bit = 1 << v
+            
+            # Branch 1: Include v (try first if likely to extend)
+            # Check if S ∪ {v} is triangle-free
+            # This requires N(v) ∩ S to be independent
+            if is_independent(adj[v] & S_mask, adj):
+                bnb(S_mask | v_bit, C_mask & ~v_bit)
+            
+            # Branch 2: Exclude v
+            bnb(S_mask, C_mask & ~v_bit)
+                
+        bnb(0, full_mask)
+        return best[0]
+
+    def get_edge_list(adj):
+        edges = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if (adj[i] >> j) & 1:
+                    edges.append([i, j])
+        return edges
+
+    random.seed(42)
+    best_adj = [0] * n
+    best_score = n  # Max possible is n
+
+    all_edges = [(i, j) for i in range(n) for j in range(i + 1, n)]
+
+    # Precompute: for each pair (u,v), which common neighbors exist
+    # We'll use a smarter generation strategy
+
+    # Strategy: Start with Turán graph T(18, 3) as base, then perturb
+    # T(18,3) has 3 parts of 6 vertices, all edges between parts
+    # This is K4-free and has a known structure
+
+    # Actually, let's use a more systematic approach:
+    # Build dense K4-free graphs using random edge ordering with K4 pruning
+
+    iteration = 0
+    while time.time() < deadline - 3.0:
+        iteration += 1
+        adj = [0] * n
+        
+        # Random edge ordering
+        random.shuffle(all_edges)
+        
+        # Greedy fill with K4 constraint
+        for u, v in all_edges:
+            if can_add_edge(adj, u, v):
+                adj[u] |= (1 << v)
+                adj[v] |= (1 << u)
+        
+        # Evaluate
+        t_start = time.time()
+        score = largest_tf(adj, time_limit=deadline - 3.0)
+        t_end = time.time()
+        
+        if score < best_score:
+            best_score = score
+            best_adj = adj[:]
+            print(f"Iter {iteration}: New best: {best_score}, time taken: {t_end-t_start:.2f}s", flush=True)
+            
+        # Local Search: Try to add more edges while maintaining K4-free
+        if time.time() < deadline - 8.0 and score <= best_score:
+            improved = True
+            while improved and time.time() < deadline - 8.0:
+                improved = False
+                random.shuffle(all_edges)
+                for u, v in all_edges:
+                    if not ((adj[u] >> v) & 1):
+                        if can_add_edge(adj, u, v):
+                            # Tentatively add
+                            adj[u] |= (1 << v)
+                            adj[v] |= (1 << u)
+                            
+                            # Periodically check score
+                            if iteration % 3 == 0 or random.random() < 0.3:
+                                new_score = largest_tf(adj, time_limit=deadline - 3.0)
+                                if new_score > best_score:
+                                    # Revert
+                                    adj[u] &= ~(1 << v)
+                                    adj[v] &= ~(1 << u)
+                                else:
+                                    if new_score < best_score:
+                                        best_score = new_score
+                                        best_adj = adj[:]
+                                        improved = True
+                                    # Else keep the edge (same or better)
+                            else:
+                                # Keep edge, assume denser tends to be better
+                                pass
+                            
+                            if time.time() > deadline - 8.0:
+                                break
+                # End local search inner loop
+
+        # Also try: start from current best and do edge swaps
+        if time.time() < deadline - 8.0:
+            adj2 = best_adj[:]
+            # Try removing some edges and adding others
+            for _ in range(min(5, len(all_edges))):
+                if time.time() > deadline - 8.0:
+                    break
+                # Remove a random existing edge
+                existing = []
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        if (adj2[i] >> j) & 1:
+                            existing.append((i, j))
+                if not existing:
+                    break
+                ru, rv = random.choice(existing)
+                adj2[ru] &= ~(1 << rv)
+                adj2[rv] &= ~(1 << ru)
+                
+                # Try to add back some edges
+                random.shuffle(all_edges)
+                for u, v in all_edges:
+                    if not ((adj2[u] >> v) & 1):
+                        if can_add_edge(adj2, u, v):
+                            adj2[u] |= (1 << v)
+                            adj2[v] |= (1 << u)
+                
+                score2 = largest_tf(adj2, time_limit=deadline - 3.0)
+                if score2 < best_score:
+                    best_score = score2
+                    best_adj = adj2[:]
+                    print(f"Swap improvement: {best_score}", flush=True)
+                    break
+
+    edges = get_edge_list(best_adj)
+    print(f"Final: score={best_score}, edges={len(edges)}", flush=True)
+    return edges

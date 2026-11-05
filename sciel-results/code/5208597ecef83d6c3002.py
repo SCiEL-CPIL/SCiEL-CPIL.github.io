@@ -1,0 +1,991 @@
+"""HP lattice protein folding using MIS-inspired contact selection with local refinement."""
+import time
+import random
+import math
+from collections import defaultdict
+
+def _neighbours(point):
+    """Yield the 4 neighbours of a point on the square lattice."""
+    x, y = point
+    yield (x + 1, y)
+    yield (x - 1, y)
+    yield (x, y + 1)
+    yield (x, y - 1)
+
+def _energy(sequence, chain):
+    """Compute the HP contact energy of a chain conformation."""
+    where = {p: i for i, p in enumerate(chain)}
+    contacts = 0
+    for i, p in enumerate(chain):
+        if sequence[i] == 'H':
+            for q in _neighbours(p):
+                j = where.get(q)
+                if j is not None and j > i + 1 and sequence[j] == 'H':
+                    contacts += 1
+    return -contacts
+
+def _delta_energy(sequence, chain, i, new_pos, occupied):
+    """Compute the change in energy if residue i moves from chain[i] to new_pos."""
+    old_pos = chain[i]
+    if new_pos == old_pos:
+        return 0
+    
+    old_contacts = 0
+    if sequence[i] == 'H':
+        for q in _neighbours(old_pos):
+            j = occupied.get(q)
+            if j is not None and j != i - 1 and j != i + 1 and sequence[j] == 'H':
+                old_contacts += 1
+    
+    new_contacts = 0
+    if sequence[i] == 'H':
+        for q in _neighbours(new_pos):
+            j = occupied.get(q)
+            if j is not None and j != i - 1 and j != i + 1 and sequence[j] == 'H':
+                new_contacts += 1
+    
+    return -(new_contacts - old_contacts)
+
+def _spiral_template(n, direction_start=(1, 0)):
+    """Generate a compact spiral-shaped self-avoiding walk of length n."""
+    if n <= 1:
+        return [(0, 0)] if n == 1 else []
+    
+    chain = [(0, 0)]
+    occupied = {(0, 0): 0}
+    direction = direction_start
+    
+    for i in range(1, n):
+        found = False
+        for step in range(4):
+            x, y = chain[-1]
+            dx, dy = direction
+            new_pos = (x + dx, y + dy)
+            
+            if new_pos not in occupied:
+                chain.append(new_pos)
+                occupied[new_pos] = i
+                found = True
+                break
+            
+            # Turn right
+            direction = (dy, -dx)
+        
+        if not found:
+            return None
+    
+    return chain
+
+def _generate_spiral_templates(n, num_templates=50):
+    """Pre-compute multiple compact spiral templates of length n."""
+    templates = []
+    seen = set()
+    
+    start_dirs = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+    
+    for t in range(num_templates):
+        rng = random.Random(1000 + t)
+        
+        # Vary the spiral pattern slightly
+        start_dir = start_dirs[t % 4]
+        
+        # Sometimes use a different turning pattern
+        turn_pattern = t % 3  # 0: standard, 1: alternate, 2: random-ish
+        
+        chain = [(0, 0)]
+        occupied = {(0, 0): 0}
+        direction = start_dir
+        
+        for i in range(1, n):
+            found = False
+            
+            if turn_pattern == 0:
+                # Standard spiral
+                for step in range(4):
+                    x, y = chain[-1]
+                    dx, dy = direction
+                    new_pos = (x + dx, y + dy)
+                    if new_pos not in occupied:
+                        chain.append(new_pos)
+                        occupied[new_pos] = i
+                        found = True
+                        break
+                    direction = (dy, -dx)
+            elif turn_pattern == 1:
+                # Alternate turning
+                for step in range(4):
+                    x, y = chain[-1]
+                    dx, dy = direction
+                    new_pos = (x + dx, y + dy)
+                    if new_pos not in occupied:
+                        chain.append(new_pos)
+                        occupied[new_pos] = i
+                        found = True
+                        break
+                    # Alternate between left and right turns
+                    if step % 2 == 0:
+                        direction = (dy, -dx)  # right
+                    else:
+                        direction = (-dy, dx)  # left
+            else:
+                # Random-ish with preference for compactness
+                candidates = []
+                x, y = chain[-1]
+                for dx, dy in [(1,0), (-1,0), (0,1), (0,-1)]:
+                    new_pos = (x + dx, y + dy)
+                    if new_pos not in occupied:
+                        # Prefer positions that are closer to the centroid
+                        cx = sum(p[0] for p in chain) / len(chain)
+                        cy = sum(p[1] for p in chain) / len(chain)
+                        dist = abs(new_pos[0] - cx) + abs(new_pos[1] - cy)
+                        candidates.append((dist, new_pos))
+                
+                if candidates:
+                    candidates.sort(key=lambda x: x[0])
+                    # Pick from top 2 with some randomness
+                    if len(candidates) > 1 and rng.random() < 0.3:
+                        new_pos = candidates[1][1]
+                    else:
+                        new_pos = candidates[0][1]
+                    chain.append(new_pos)
+                    occupied[new_pos] = i
+                    found = True
+                else:
+                    break
+            
+            if not found:
+                break
+        
+        if len(chain) == n:
+            # Normalize to start at origin
+            min_x = min(p[0] for p in chain)
+            min_y = min(p[1] for p in chain)
+            normalized = tuple((p[0] - min_x, p[1] - min_y) for p in chain)
+            if normalized not in seen:
+                seen.add(normalized)
+                templates.append(list(chain))
+    
+    return templates
+
+def _contact_guided_growth(sequence, rng):
+    """Grow chain by explicitly targeting future H-H contacts.
+    
+    For each H residue being placed, prefer positions adjacent to already-placed H
+    residues. For P residues, prefer compact positions that leave room for future H
+    contacts.
+    """
+    n = len(sequence)
+    if n <= 1:
+        return [(0, 0)] if n == 1 else []
+    
+    # Precompute H positions for reference
+    h_positions = [i for i, c in enumerate(sequence) if c == 'H']
+    
+    chain = [(0, 0)]
+    occupied = {(0, 0): 0}
+    placed_h = set()
+    if sequence[0] == 'H':
+        placed_h.add(0)
+    
+    for i in range(1, n):
+        last = chain[-1]
+        candidates = []
+        
+        for site in _neighbours(last):
+            if site in occupied:
+                continue
+            
+            score = 0.0
+            
+            # Primary: direct H-H contact gain
+            if sequence[i] == 'H':
+                direct_contacts = 0
+                for q in _neighbours(site):
+                    if q in occupied:
+                        j = occupied[q]
+                        if j < i - 1 and sequence[j] == 'H':
+                            direct_contacts += 1
+                score += direct_contacts * 15.0
+            
+            # Secondary: potential future contacts for this H with upcoming H's
+            if sequence[i] == 'H':
+                # Count how many future H residues could potentially contact this site
+                future_h_count = sum(1 for j in range(i + 2, n) if sequence[j] == 'H')
+                if future_h_count > 0:
+                    # Prefer sites with more empty neighbors (more room for future H's)
+                    empty_neighbors = sum(1 for q in _neighbours(site) if q not in occupied)
+                    score += empty_neighbors * 2.0
+            
+            # Tertiary: compactness (keep chain tight)
+            if len(chain) > 3:
+                cx = sum(p[0] for p in chain) / len(chain)
+                cy = sum(p[1] for p in chain) / len(chain)
+                dist_to_center = abs(site[0] - cx) + abs(site[1] - cy)
+                score -= dist_to_center * 0.5
+            
+            # Avoid dead ends
+            free_count = sum(1 for q in _neighbours(site) if q not in occupied)
+            if free_count == 0 and i < n - 1:
+                score -= 100.0
+            elif free_count == 1 and i < n - 3:
+                score -= 10.0
+            
+            # Small random perturbation
+            score += rng.random() * 0.3
+            
+            candidates.append((score, site))
+        
+        if not candidates:
+            return None
+        
+        candidates.sort(key=lambda x: -x[0])
+        
+        # Explore occasionally
+        if rng.random() < 0.1 and len(candidates) > 1:
+            idx = min(rng.randint(1, 2), len(candidates) - 1)
+            best_site = candidates[idx][1]
+        else:
+            best_site = candidates[0][1]
+        
+        chain.append(best_site)
+        occupied[best_site] = i
+        if sequence[i] == 'H':
+            placed_h.add(i)
+    
+    return chain
+
+def _greedy_contact_growth(sequence, rng, max_iter=5000):
+    """Grow a chain using greedy contact maximization with MIS-inspired scoring."""
+    n = len(sequence)
+    if n <= 1:
+        return [(0, 0)] if n == 1 else []
+    
+    chain = [(0, 0)]
+    occupied = {(0, 0): 0}
+    
+    for i in range(1, n):
+        last = chain[-1]
+        candidates = []
+        
+        for site in _neighbours(last):
+            if site in occupied:
+                continue
+            
+            score = 0.0
+            
+            # MIS-inspired: score based on potential H-H contacts
+            if sequence[i] == 'H':
+                for q in _neighbours(site):
+                    if q in occupied:
+                        j = occupied[q]
+                        if j < i - 1 and sequence[j] == 'H':
+                            # Weight by how "valuable" this contact is
+                            # Contacts with H residues that have few other contacts are more valuable
+                            h_neighbors = sum(1 for r in _neighbours(q) if r in occupied and occupied[r] != j and sequence[occupied[r]] == 'H' and abs(occupied[r] - j) > 1)
+                            score += 10.0 / (1 + h_neighbors * 0.5)
+            
+            # Prefer compact positions
+            if len(chain) > 5:
+                cx = sum(p[0] for p in chain) / len(chain)
+                cy = sum(p[1] for p in chain) / len(chain)
+                dist_to_center = abs(site[0] - cx) + abs(site[1] - cy)
+                score -= dist_to_center * 0.3
+            
+            # Avoid dead ends
+            free_count = sum(1 for q in _neighbours(site) if q not in occupied)
+            if free_count == 0 and i < n - 1:
+                score -= 50.0
+            elif free_count == 1 and i < n - 3:
+                score -= 5.0
+            
+            # Add small random perturbation
+            score += rng.random() * 0.5
+            
+            candidates.append((score, site))
+        
+        if not candidates:
+            return None
+        
+        candidates.sort(key=lambda x: -x[0])
+        
+        # Sometimes pick a non-best candidate for diversity
+        if rng.random() < 0.15 and len(candidates) > 1:
+            idx = min(rng.randint(1, 3), len(candidates) - 1)
+            best_site = candidates[idx][1]
+        else:
+            best_site = candidates[0][1]
+        
+        chain.append(best_site)
+        occupied[best_site] = i
+    
+    return chain
+
+def _beam_search(sequence, beam_width=20, max_time=5.0):
+    """
+    Beam search for HP protein folding.
+    """
+    n = len(sequence)
+    if n <= 1:
+        return [(0, 0)] if n == 1 else []
+    
+    # Beam: list of (chain, occupied, energy)
+    beam = [([(0, 0)], {(0, 0): 0}, 0)]
+    
+    start_time = time.time()
+    
+    for i in range(1, n):
+        new_beam = []
+        for chain, occupied, energy in beam:
+            last_pos = chain[-1]
+            for neighbor in _neighbours(last_pos):
+                if neighbor in occupied:
+                    continue
+                
+                new_chain = chain + [neighbor]
+                new_occupied = dict(occupied)
+                new_occupied[neighbor] = i
+                
+                delta_e = 0
+                if sequence[i] == 'H':
+                    for q in _neighbours(neighbor):
+                        if q in new_occupied:
+                            j = new_occupied[q]
+                            if j < i - 1 and sequence[j] == 'H':
+                                delta_e -= 1
+                
+                new_energy = energy + delta_e
+                
+                # Heuristic: distance to centroid
+                cx = sum(p[0] for p in new_chain) / len(new_chain)
+                cy = sum(p[1] for p in new_chain) / len(new_chain)
+                dist = abs(neighbor[0] - cx) + abs(neighbor[1] - cy)
+                
+                score = new_energy - dist * 0.5
+                
+                new_beam.append((score, new_chain, new_occupied, new_energy))
+        
+        if not new_beam:
+            return None
+        
+        new_beam.sort(key=lambda x: x[0])
+        beam = [(nc, no, ne) for _, nc, no, ne in new_beam[:beam_width]]
+        
+        if time.time() - start_time > max_time:
+            break
+            
+    if not beam:
+        return None
+        
+    beam.sort(key=lambda x: x[2])
+    return beam[0][0]
+
+def _try_rigid_body_move(sequence, chain, occupied, i, j, rng):
+    """
+    Try to move the segment chain[i:j+1] to a new position.
+    Returns (new_chain, new_occupied) or None.
+    """
+    n = len(chain)
+    if i == 0 or j == n - 1:
+        return None
+    
+    segment = chain[i:j+1]
+    length = len(segment)
+    
+    anchor_prev = chain[i-1]
+    anchor_next = chain[j+1]
+    
+    candidates = []
+    for pos in _neighbours(anchor_prev):
+        if pos in occupied:
+            continue
+        
+        dx = pos[0] - chain[i][0]
+        dy = pos[1] - chain[i][1]
+        
+        new_tail = (segment[-1][0] + dx, segment[-1][1] + dy)
+        if abs(new_tail[0] - anchor_next[0]) + abs(new_tail[1] - anchor_next[1]) != 1:
+            continue
+            
+        valid = True
+        for k in range(length):
+            orig_pos = segment[k]
+            new_pos = (orig_pos[0] + dx, orig_pos[1] + dy)
+            
+            if new_pos in occupied:
+                occ_idx = occupied[new_pos]
+                if not (i <= occ_idx <= j):
+                    valid = False
+                    break
+            
+        if valid:
+            candidates.append((dx, dy))
+            
+    if not candidates:
+        return None
+        
+    dx, dy = candidates[rng.randint(0, len(candidates) - 1)]
+    
+    new_chain = list(chain)
+    for k in range(length):
+        orig_pos = segment[k]
+        new_pos = (orig_pos[0] + dx, orig_pos[1] + dy)
+        new_chain[i+k] = new_pos
+        
+    new_occupied = dict(occupied)
+    for k in range(length):
+        del new_occupied[segment[k]]
+    for k in range(length):
+        new_occupied[new_chain[i+k]] = i+k
+        
+    return new_chain, new_occupied
+
+def _local_search_with_rigid(sequence, chain, rng, max_iter=500):
+    """Local search with single-residue and rigid body moves."""
+    n = len(sequence)
+    if n < 5:
+        return chain, _energy(sequence, chain)
+    
+    best_chain = list(chain)
+    best_energy = _energy(sequence, chain)
+    occupied = {p: i for i, p in enumerate(best_chain)}
+    
+    for _ in range(max_iter):
+        improved = False
+        
+        # Try single residue move
+        i = rng.randint(1, n - 2)
+        old_pos = best_chain[i]
+        for new_pos in _neighbours(old_pos):
+            if new_pos in occupied:
+                continue
+            prev_pos = best_chain[i - 1]
+            next_pos = best_chain[i + 1]
+            if abs(new_pos[0] - prev_pos[0]) + abs(new_pos[1] - prev_pos[1]) == 1 and \
+               abs(new_pos[0] - next_pos[0]) + abs(new_pos[1] - next_pos[1]) == 1:
+                
+                delta_e = _delta_energy(sequence, best_chain, i, new_pos, occupied)
+                if delta_e < 0:
+                    del occupied[old_pos]
+                    occupied[new_pos] = i
+                    best_chain[i] = new_pos
+                    best_energy += delta_e
+                    improved = True
+                    break
+        
+        if improved:
+            continue
+            
+        # Try rigid body move
+        if n >= 6:
+            seg_len = rng.randint(2, min(5, n - 2))
+            i = rng.randint(1, n - 1 - seg_len)
+            j = i + seg_len - 1
+            
+            result = _try_rigid_body_move(sequence, best_chain, occupied, i, j, rng)
+            if result:
+                new_chain, new_occupied = result
+                new_energy = _energy(sequence, new_chain)
+                if new_energy < best_energy:
+                    best_chain = new_chain
+                    best_energy = new_energy
+                    occupied = new_occupied
+                    improved = True
+        
+        if not improved:
+            kicked = False
+            for _ in range(10):
+                i = rng.randint(1, n - 2)
+                old_pos = best_chain[i]
+                for new_pos in _neighbours(old_pos):
+                    if new_pos in occupied:
+                        continue
+                    prev_pos = best_chain[i - 1]
+                    next_pos = best_chain[i + 1]
+                    if abs(new_pos[0] - prev_pos[0]) + abs(new_pos[1] - prev_pos[1]) == 1 and \
+                       abs(new_pos[0] - next_pos[0]) + abs(new_pos[1] - next_pos[1]) == 1:
+                        
+                        del occupied[old_pos]
+                        occupied[new_pos] = i
+                        best_chain[i] = new_pos
+                        best_energy = _energy(sequence, best_chain)
+                        kicked = True
+                        break
+                if kicked:
+                    break
+                    
+            if not kicked:
+                break
+                
+    return best_chain, best_energy
+
+def _local_search(sequence, chain, rng, max_iter=1000):
+    """Local search: try moving each interior residue to an adjacent empty position."""
+    n = len(sequence)
+    if n < 3:
+        return chain, _energy(sequence, chain)
+    
+    best_chain = list(chain)
+    best_energy = _energy(sequence, chain)
+    occupied = {p: i for i, p in enumerate(best_chain)}
+    
+    for _ in range(max_iter):
+        improved = False
+        
+        # Try moving residues in random order
+        order = list(range(1, n - 1))
+        rng.shuffle(order)
+        
+        for i in order:
+            old_pos = best_chain[i]
+            
+            for new_pos in _neighbours(old_pos):
+                if new_pos in occupied:
+                    continue
+                
+                prev_pos = best_chain[i - 1]
+                next_pos = best_chain[i + 1]
+                
+                dist_prev = abs(new_pos[0] - prev_pos[0]) + abs(new_pos[1] - prev_pos[1])
+                dist_next = abs(new_pos[0] - next_pos[0]) + abs(new_pos[1] - next_pos[1])
+                
+                if dist_prev != 1 or dist_next != 1:
+                    continue
+                
+                delta_e = _delta_energy(sequence, best_chain, i, new_pos, occupied)
+                
+                if delta_e < 0:
+                    del occupied[old_pos]
+                    occupied[new_pos] = i
+                    best_chain[i] = new_pos
+                    best_energy += delta_e
+                    improved = True
+                    break
+            
+            if improved:
+                break
+        
+        if not improved:
+            break
+    
+    return best_chain, best_energy
+
+def _two_point_move_search(sequence, chain, rng, max_iter=500):
+    """Try swapping positions of two non-adjacent interior residues when geometrically valid.
+    
+    This is a 2-opt style move: pick two interior residues i and j (|i-j| > 1),
+    and try to swap their lattice positions if the resulting chain remains
+    self-avoiding and has unit steps everywhere.
+    """
+    n = len(sequence)
+    if n < 5:
+        return chain, _energy(sequence, chain)
+    
+    best_chain = list(chain)
+    best_energy = _energy(sequence, chain)
+    occupied = {p: i for i, p in enumerate(best_chain)}
+    
+    for _ in range(max_iter):
+        improved = False
+        
+        # Pick two random interior residues
+        i = rng.randint(1, n - 2)
+        j = rng.randint(1, n - 2)
+        if abs(i - j) <= 1:
+            continue
+        
+        # Try swapping positions of i and j
+        pos_i = best_chain[i]
+        pos_j = best_chain[j]
+        
+        # Check if swap is geometrically valid
+        # After swap: residue i goes to pos_j, residue j goes to pos_i
+        # Need unit steps at i-1->i, i->i+1, j-1->j, j->j+1
+        # And no self-intersection
+        
+        # Check unit step constraints
+        valid = True
+        
+        # Residue i at pos_j: needs unit step from i-1 and to i+1
+        if abs(pos_j[0] - best_chain[i-1][0]) + abs(pos_j[1] - best_chain[i-1][1]) != 1:
+            valid = False
+        if valid and abs(best_chain[i+1][0] - pos_j[0]) + abs(best_chain[i+1][1] - pos_j[1]) != 1:
+            valid = False
+        
+        # Residue j at pos_i: needs unit step from j-1 and to j+1
+        if valid and abs(pos_i[0] - best_chain[j-1][0]) + abs(pos_i[1] - best_chain[j-1][1]) != 1:
+            valid = False
+        if valid and abs(best_chain[j+1][0] - pos_i[0]) + abs(best_chain[j+1][1] - pos_i[1]) != 1:
+            valid = False
+        
+        if not valid:
+            continue
+        
+        # Check self-avoidance: pos_j must not be occupied by any residue other than i
+        # and pos_i must not be occupied by any residue other than j
+        # Since we're swapping, the only concern is if pos_j == pos_k for some k != i,j
+        # or pos_i == pos_k for some k != i,j, but since the chain is self-avoiding,
+        # pos_j is only at position j and pos_i is only at position i.
+        # After swap, residue i is at pos_j (was j's position) and residue j is at pos_i (was i's position).
+        # This is valid as long as no other residue is at those positions, which is guaranteed
+        # by self-avoidance of the original chain.
+        
+        # Compute energy change
+        # Remove contributions from old positions, add from new
+        old_e = best_energy
+        
+        # Compute new energy directly for simplicity (n is small enough)
+        new_chain = list(best_chain)
+        new_chain[i] = pos_j
+        new_chain[j] = pos_i
+        
+        # Verify self-avoidance
+        if len(set(new_chain)) != n:
+            continue
+        
+        new_e = _energy(sequence, new_chain)
+        
+        if new_e < best_energy:
+            best_chain = new_chain
+            best_energy = new_e
+            occupied = {p: idx for idx, p in enumerate(best_chain)}
+            improved = True
+        
+        if improved:
+            break
+    
+    return best_chain, best_energy
+
+def _simulated_annealing(sequence, chain, rng, start_temp=2.0, end_temp=0.05, max_iter=3000):
+    """Simulated annealing to escape local minima."""
+    n = len(sequence)
+    if n < 3:
+        return chain, _energy(sequence, chain)
+    
+    current_chain = list(chain)
+    current_energy = _energy(sequence, chain)
+    best_chain = list(current_chain)
+    best_energy = current_energy
+    occupied = {p: i for i, p in enumerate(current_chain)}
+    
+    temp = start_temp
+    cooling = (math.log(start_temp / end_temp) / max_iter) if max_iter > 0 else 0
+    
+    for _ in range(max_iter):
+        temp *= math.exp(-cooling)
+        if temp < end_temp:
+            break
+        
+        # Choose move type: 80% single-residue move, 20% two-residue swap
+        if n >= 5 and rng.random() < 0.2:
+            # Two-residue swap
+            i = rng.randint(1, n - 2)
+            j = rng.randint(1, n - 2)
+            if abs(i - j) <= 1:
+                continue
+            
+            pos_i = current_chain[i]
+            pos_j = current_chain[j]
+            
+            # Check unit step constraints after swap
+            valid = True
+            if abs(pos_j[0] - current_chain[i-1][0]) + abs(pos_j[1] - current_chain[i-1][1]) != 1:
+                valid = False
+            if valid and abs(current_chain[i+1][0] - pos_j[0]) + abs(current_chain[i+1][1] - pos_j[1]) != 1:
+                valid = False
+            if valid and abs(pos_i[0] - current_chain[j-1][0]) + abs(pos_i[1] - current_chain[j-1][1]) != 1:
+                valid = False
+            if valid and abs(current_chain[j+1][0] - pos_i[0]) + abs(current_chain[j+1][1] - pos_i[1]) != 1:
+                valid = False
+            
+            if not valid:
+                continue
+            
+            new_chain = list(current_chain)
+            new_chain[i] = pos_j
+            new_chain[j] = pos_i
+            
+            if len(set(new_chain)) != n:
+                continue
+            
+            new_e = _energy(sequence, new_chain)
+            delta_e = new_e - current_energy
+            
+            if delta_e < 0 or rng.random() < math.exp(-delta_e / max(temp, 1e-10)):
+                current_chain = new_chain
+                current_energy = new_e
+                occupied = {p: idx for idx, p in enumerate(current_chain)}
+                
+                if current_energy < best_energy:
+                    best_energy = current_energy
+                    best_chain = list(current_chain)
+        else:
+            # Single-residue move
+            i = rng.randint(1, n - 2)
+            old_pos = current_chain[i]
+            
+            moves = []
+            for new_pos in _neighbours(old_pos):
+                if new_pos in occupied:
+                    continue
+                
+                prev_pos = current_chain[i - 1]
+                next_pos = current_chain[i + 1]
+                
+                dist_prev = abs(new_pos[0] - prev_pos[0]) + abs(new_pos[1] - prev_pos[1])
+                dist_next = abs(new_pos[0] - next_pos[0]) + abs(new_pos[1] - next_pos[1])
+                
+                if dist_prev == 1 and dist_next == 1:
+                    moves.append(new_pos)
+            
+            if not moves:
+                continue
+            
+            new_pos = moves[rng.randint(0, len(moves) - 1)]
+            delta_e = _delta_energy(sequence, current_chain, i, new_pos, occupied)
+            
+            if delta_e < 0 or rng.random() < math.exp(-delta_e / max(temp, 1e-10)):
+                del occupied[old_pos]
+                occupied[new_pos] = i
+                current_chain[i] = new_pos
+                current_energy += delta_e
+                
+                if current_energy < best_energy:
+                    best_energy = current_energy
+                    best_chain = list(current_chain)
+    
+    return best_chain, best_energy
+
+def _hill_climb_polish(sequence, chain, rng, max_iter=200):
+    """Aggressive hill-climbing polish pass."""
+    n = len(sequence)
+    if n < 3:
+        return chain, _energy(sequence, chain)
+    
+    current_chain = list(chain)
+    current_energy = _energy(sequence, chain)
+    occupied = {p: i for i, p in enumerate(current_chain)}
+    
+    for _ in range(max_iter):
+        improved = False
+        
+        for i in range(1, n - 1):
+            old_pos = current_chain[i]
+            
+            for new_pos in _neighbours(old_pos):
+                if new_pos in occupied:
+                    continue
+                
+                prev_pos = current_chain[i - 1]
+                next_pos = current_chain[i + 1]
+                
+                dist_prev = abs(new_pos[0] - prev_pos[0]) + abs(new_pos[1] - prev_pos[1])
+                dist_next = abs(new_pos[0] - next_pos[0]) + abs(new_pos[1] - next_pos[1])
+                
+                if dist_prev != 1 or dist_next != 1:
+                    continue
+                
+                delta_e = _delta_energy(sequence, current_chain, i, new_pos, occupied)
+                
+                if delta_e < 0:
+                    del occupied[old_pos]
+                    occupied[new_pos] = i
+                    current_chain[i] = new_pos
+                    current_energy += delta_e
+                    improved = True
+                    break
+            
+            if improved:
+                break
+        
+        if not improved:
+            break
+    
+    return current_chain, current_energy
+
+def _generate_compact_templates(n, num_templates=30, deadline=None):
+    """Generate compact self-avoiding walk templates using various strategies."""
+    templates = []
+    seen = set()
+    
+    def add_template(chain):
+        if chain is None or len(chain) != n:
+            return
+        # Normalize to start at origin
+        min_x = min(p[0] for p in chain)
+        min_y = min(p[1] for p in chain)
+        normalized = tuple((p[0] - min_x, p[1] - min_y) for p in chain)
+        if normalized not in seen:
+            seen.add(normalized)
+            templates.append(list(chain))
+    
+    # Standard spiral
+    for start_dir in [(1,0), (0,1), (-1,0), (0,-1)]:
+        if deadline and time.time() > deadline:
+            return templates
+        chain = _spiral_template(n, start_dir)
+        if chain:
+            add_template(chain)
+    
+    # Compact growth with different random seeds
+    for seed in range(num_templates):
+        if deadline and time.time() > deadline:
+            return templates
+        rng = random.Random(10000 + seed)
+        chain = _contact_guided_growth(sequence if 'sequence' in dir() else 'H'*n, rng)
+        if chain:
+            add_template(chain)
+    
+    return templates
+
+def _assign_sequence_to_template(sequence, template, rng):
+    """Assign H/P residues to template positions using greedy contact maximization.
+    
+    The template defines the geometric skeleton (positions and adjacency).
+    We assign sequence residues to template positions to maximize H-H contacts.
+    """
+    n = len(sequence)
+    if n != len(template):
+        return None
+    
+    # template[i] is the position for residue i in the template ordering
+    # We need to find a permutation of residues that maximizes contacts
+    # Use greedy: place residues one by one, choosing the assignment that maximizes contacts
+    
+    # Actually, the template IS the chain - positions are fixed in order.
+    # The "assignment" is just evaluating the energy of this specific conformation.
+    # For true assignment, we'd need to permute which residue goes to which position.
+    
+    # Let's try: reverse the template (flip the chain direction)
+    reversed_template = list(reversed(template))
+    
+    # Try both orientations
+    e1 = _energy(sequence, template)
+    e2 = _energy(sequence, reversed_template)
+    
+    if e1 <= e2:
+        return template, e1
+    else:
+        return reversed_template, e2
+
+def fold(sequence, dimension):
+    """Fold a sequence into a low-energy self-avoiding conformation."""
+    start_time = time.time()
+    deadline = start_time + 195.0  # Safety margin before 210s limit
+    n = len(sequence)
+    
+    rng = random.Random(42 + n)
+    
+    best_chain = None
+    best_energy = 0
+    
+    # Strategy 1: Beam Search
+    if time.time() < deadline - 60.0:
+        beam_chain = _beam_search(sequence, beam_width=20, max_time=10.0)
+        if beam_chain:
+            e = _energy(sequence, beam_chain)
+            if e < best_energy:
+                best_energy = e
+                best_chain = beam_chain
+            rev_chain = list(reversed(beam_chain))
+            e_rev = _energy(sequence, rev_chain)
+            if e_rev < best_energy:
+                best_energy = e_rev
+                best_chain = rev_chain
+
+    # Strategy 2: Multiple construction strategies
+    num_attempts = 0
+    max_attempts = 3000
+    
+    while num_attempts < max_attempts:
+        if time.time() > deadline - 60.0:
+            break
+        
+        strategy = rng.randint(0, 3)
+        
+        if strategy == 0:
+            chain = _greedy_contact_growth(sequence, rng)
+        elif strategy == 1:
+            # Spiral with random start
+            start_dir = [(1,0), (0,1), (-1,0), (0,-1)][rng.randint(0, 3)]
+            chain = _spiral_template(n, start_dir)
+        elif strategy == 2:
+            # Contact-guided growth
+            chain = _contact_guided_growth(sequence, rng)
+        else:
+            # Random walk with compactness bias
+            chain = [(0, 0)]
+            occupied = {(0, 0): 0}
+            for i in range(1, n):
+                last = chain[-1]
+                candidates = []
+                for site in _neighbours(last):
+                    if site in occupied:
+                        continue
+                    cx = sum(p[0] for p in chain) / len(chain)
+                    cy = sum(p[1] for p in chain) / len(chain)
+                    dist = abs(site[0] - cx) + abs(site[1] - cy)
+                    candidates.append((dist, site))
+                if not candidates:
+                    chain = None
+                    break
+                candidates.sort(key=lambda x: x[0])
+                if len(candidates) > 1 and rng.random() < 0.2:
+                    new_pos = candidates[rng.randint(1, min(2, len(candidates)-1))][1]
+                else:
+                    new_pos = candidates[0][1]
+                chain.append(new_pos)
+                occupied[new_pos] = i
+        
+        if chain is not None and len(chain) == n:
+            num_attempts += 1
+            energy = _energy(sequence, chain)
+            if energy < best_energy:
+                best_energy = energy
+                best_chain = list(chain)
+    
+    # Strategy 3: Local refinement with rigid body moves
+    if best_chain is not None and time.time() < deadline - 30.0:
+        improved_chain, improved_energy = _local_search_with_rigid(sequence, best_chain, rng, max_iter=500)
+        if improved_energy < best_energy:
+            best_chain = improved_chain
+            best_energy = improved_energy
+    
+    # Strategy 3b: Two-point move search
+    if best_chain is not None and time.time() < deadline - 25.0:
+        two_chain, two_energy = _two_point_move_search(sequence, best_chain, rng, max_iter=300)
+        if two_energy < best_energy:
+            best_chain = two_chain
+            best_energy = two_energy
+        # Polish after two-point moves
+        if time.time() < deadline - 20.0:
+            improved_chain, improved_energy = _local_search_with_rigid(sequence, best_chain, rng, max_iter=300)
+            if improved_energy < best_energy:
+                best_chain = improved_chain
+                best_energy = improved_energy
+    
+    # Strategy 4: Simulated annealing
+    if best_chain is not None and time.time() < deadline - 10.0:
+        sa_chain, sa_energy = _simulated_annealing(sequence, best_chain, rng, start_temp=2.0, end_temp=0.05, max_iter=2000)
+        if sa_energy < best_energy:
+            best_chain = sa_chain
+            best_energy = sa_energy
+    
+    # Strategy 5: Hill-climb polish
+    if best_chain is not None and time.time() < deadline - 2.0:
+        polish_chain, polish_energy = _hill_climb_polish(sequence, best_chain, rng, max_iter=300)
+        if polish_energy < best_energy:
+            best_chain = polish_chain
+            best_energy = polish_energy
+    
+    # Final two-point move polish
+    if best_chain is not None and time.time() < deadline - 1.0:
+        two_chain, two_energy = _two_point_move_search(sequence, best_chain, rng, max_iter=100)
+        if two_energy < best_energy:
+            best_chain = two_chain
+            best_energy = two_energy
+    
+    # Fallback
+    if best_chain is None:
+        best_chain = [(i, 0) for i in range(n)]
+    
+    return [list(p) for p in best_chain]

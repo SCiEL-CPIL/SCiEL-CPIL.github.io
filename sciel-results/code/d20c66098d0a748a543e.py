@@ -1,0 +1,1 @@
+BET: {mechanism: "Use SVD-based border rank exploitation: compute truncated SVD of unfolded tensor, round to rationals with small denominator, verify exactness. This leverages the fact that the tensor lies near a low-rank variety.", q: 0.25, delta: [0.0, 0.015]}

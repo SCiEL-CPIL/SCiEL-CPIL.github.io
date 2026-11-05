@@ -12,212 +12,624 @@ def construct(v, k, t):
     all_blocks = list(itertools.combinations(points, k))
     num_blocks = len(all_blocks)
     
-    # Precompute block to subsets mapping
+    # Precompute block_to_subsets and subset_to_blocks
     block_to_subsets = [[] for _ in range(num_blocks)]
+    subset_to_blocks = [[] for _ in range(num_subsets)]
+    
     for b_idx, block in enumerate(all_blocks):
         for s in itertools.combinations(block, t):
-            block_to_subsets[b_idx].append(subset_to_idx[s])
-            
-    # Precompute subset to blocks mapping
-    subset_to_blocks = [[] for _ in range(num_subsets)]
-    for b_idx in range(num_blocks):
-        for s_idx in block_to_subsets[b_idx]:
+            s_idx = subset_to_idx[s]
+            block_to_subsets[b_idx].append(s_idx)
             subset_to_blocks[s_idx].append(b_idx)
-
-    def get_greedy_solution():
+    
+    # Precompute numpy arrays for fast operations
+    block_subset_arrays = [np.array(subs, dtype=np.int32) for subs in block_to_subsets]
+    subset_block_arrays = [np.array(blocks, dtype=np.int32) for blocks in subset_to_blocks]
+    
+    # Precompute subset_to_blocks as sets for fast intersection in swap
+    subset_to_blocks_sets = [set(blocks) for blocks in subset_to_blocks]
+    
+    # Precompute unique coverage for each block (how many subsets it uniquely covers given a coverage array)
+    # This is computed on-the-fly in local search
+    
+    def run_greedy_full(random_seed=None):
+        if random_seed is not None:
+            rng = np.random.default_rng(random_seed)
+        else:
+            rng = np.random.default_rng()
+            
         uncovered = np.ones(num_subsets, dtype=bool)
-        gains = np.array([len(bs) for bs in block_to_subsets], dtype=np.int32)
-        selected = []
-        # Use a simple greedy with random tie-breaking or just max
-        # To add diversity, we can shuffle gains slightly or pick random among top k
-        # Here we use a randomized greedy: pick from top 10% with some noise
-        for _ in range(num_blocks): # Max blocks needed
-            if not uncovered.any():
+        gains = np.array([len(subs) for subs in block_to_subsets], dtype=np.int32)
+        
+        selected_blocks = []
+        
+        while True:
+            if not np.any(uncovered):
                 break
-            # Add small noise to break ties and introduce randomness
-            noise = np.random.uniform(0, 1, num_blocks) * 0.1
-            scores = gains + noise
-            best_idx = np.argmax(scores)
+                
+            # Use a smooth surrogate: add small random perturbation to break ties
+            # and encourage exploration. Scale noise with current max gain for adaptivity.
+            max_gain = np.max(gains)
+            noise_scale = 0.1 + 0.2 * (1.0 / (1.0 + max_gain))
+            noise = rng.uniform(0.0, noise_scale, size=num_blocks)
+            scores = gains.astype(np.float64) + noise
+            best_idx = int(np.argmax(scores))
+            
             if gains[best_idx] == 0:
                 break
-            selected.append(best_idx)
-            b_subs = block_to_subsets[best_idx]
-            for s in b_subs:
-                if uncovered[s]:
-                    uncovered[s] = False
-                    for b in subset_to_blocks[s]:
-                        gains[b] -= 1
-        return selected
-
-    def is_valid_swap(current_set, old_block, new_block, coverage_counts):
-        # Check if replacing old_block with new_block maintains validity
-        # We only need to check subsets that were uniquely covered by old_block
-        unique_subs = []
-        for s in block_to_subsets[old_block]:
-            if coverage_counts[s] == 1:
-                unique_subs.append(s)
-        
-        if not unique_subs:
-            return True
+                
+            selected_blocks.append(best_idx)
             
-        # New block must cover all unique_subs
-        new_subs_set = set(block_to_subsets[new_block])
-        for s in unique_subs:
-            if s not in new_subs_set:
-                return False
-        return True
+            b_subs = block_subset_arrays[best_idx]
+            newly_covered = b_subs[uncovered[b_subs]]
+            
+            if len(newly_covered) == 0:
+                continue
+                
+            uncovered[newly_covered] = False
+            # Vectorized gain update: for each newly covered subset, decrement gains of all blocks covering it
+            for s in newly_covered:
+                blocks_covering = subset_block_arrays[s]
+                gains[blocks_covering] -= 1
+                    
+        return selected_blocks
 
-    def perform_swap(current_set, old_idx, new_block, coverage_counts):
-        # old_idx is index in current_set list
-        old_block = current_set[old_idx]
-        # Remove old
-        for s in block_to_subsets[old_block]:
-            coverage_counts[s] -= 1
-        # Add new
-        for s in block_to_subsets[new_block]:
-            coverage_counts[s] += 1
-        current_set[old_idx] = new_block
-
-    def minimize_and_swap(start_time, time_limit):
-        # Initial greedy
-        current_set = get_greedy_solution()
-        if not current_set:
+    def run_greedy_partial(uncovered_mask, random_seed=None):
+        if random_seed is not None:
+            rng = np.random.default_rng(random_seed)
+        else:
+            rng = np.random.default_rng()
+            
+        uncovered_indices = np.where(uncovered_mask)[0]
+        if len(uncovered_indices) == 0:
             return []
             
-        # Calculate initial coverage counts
-        coverage_counts = np.zeros(num_subsets, dtype=np.int32)
-        for b in current_set:
-            for s in block_to_subsets[b]:
-                coverage_counts[s] += 1
+        gains = np.zeros(num_blocks, dtype=np.int32)
+        for s_idx in uncovered_indices:
+            blocks_covering = subset_block_arrays[s_idx]
+            gains[blocks_covering] += 1
                 
-        best_set = list(current_set)
-        best_len = len(current_set)
+        selected_blocks = []
+        current_uncovered = uncovered_mask.copy()
         
-        # Precompute sets for faster "in set" checks if needed, 
-        # but list membership is O(N). N is ~300. 
-        # We can use a set for current blocks to check if new_block is already in set
-        current_set_list = list(current_set)
-        
-        while time.time() - start_time < time_limit:
-            # 1. Deletion Pass
-            changed = True
-            while changed:
-                changed = False
-                # Random order for deletion
-                random.shuffle(current_set_list)
-                for i in range(len(current_set_list)):
-                    b = current_set_list[i]
-                    # Check if redundant
-                    redundant = True
-                    for s in block_to_subsets[b]:
-                        if coverage_counts[s] == 1:
-                            redundant = False
-                            break
-                    if redundant:
-                        # Remove
-                        for s in block_to_subsets[b]:
-                            coverage_counts[s] -= 1
-                        current_set_list.pop(i)
-                        changed = True
-                        break # Restart deletion pass
+        while True:
+            if not np.any(current_uncovered):
+                break
+                
+            # Adaptive noise scaling based on current max gain
+            max_gain = np.max(gains)
+            noise_scale = 0.1 + 0.2 * (1.0 / (1.0 + max_gain))
+            noise = rng.uniform(0.0, noise_scale, size=num_blocks)
+            scores = gains.astype(np.float64) + noise
+            best_idx = int(np.argmax(scores))
+            
+            if gains[best_idx] == 0:
+                break
+                
+            selected_blocks.append(best_idx)
+            
+            b_subs = block_subset_arrays[best_idx]
+            newly_covered = b_subs[current_uncovered[b_subs]]
+            
+            if len(newly_covered) == 0:
+                continue
+                
+            current_uncovered[newly_covered] = False
+            for s in newly_covered:
+                blocks_covering = subset_block_arrays[s]
+                gains[blocks_covering] -= 1
                     
-            if len(current_set_list) < best_len:
-                best_len = len(current_set_list)
-                best_set = list(current_set_list)
+        return selected_blocks
+
+    def run_greedy_hardest(random_seed=None):
+        """Greedy that prioritizes the 'hardest' uncovered subset (lowest degree among uncovered).
+        
+        At each step, find the uncovered 5-subset with the fewest available blocks
+        (blocks not yet selected that cover it), then pick a block covering it
+        that maximizes total new coverage. This ensures structurally isolated
+        subsets are addressed early.
+        """
+        if random_seed is not None:
+            rng = np.random.default_rng(random_seed)
+        else:
+            rng = np.random.default_rng()
+            
+        uncovered = np.ones(num_subsets, dtype=bool)
+        selected_set = set()
+        selected_blocks = []
+        
+        # Precompute: for each subset, list of blocks covering it (already have subset_block_arrays)
+        
+        while True:
+            if not np.any(uncovered):
+                break
+            
+            # Find the hardest uncovered subset: one with fewest non-selected covering blocks
+            uncovered_indices = np.where(uncovered)[0]
+            if len(uncovered_indices) == 0:
+                break
+            
+            # Sample a subset of hardest candidates to avoid O(num_subsets * num_blocks) per step
+            # Use the degree (number of blocks covering it minus already selected)
+            # Approximate: just pick randomly from uncovered, but weight toward low-degree ones
+            
+            # For efficiency, check a random sample of uncovered subsets
+            sample_size = min(50, len(uncovered_indices))
+            if len(uncovered_indices) <= sample_size:
+                candidates = uncovered_indices
+            else:
+                candidates = uncovered_indices[rng.choice(len(uncovered_indices), size=sample_size, replace=False)]
+            
+            best_subset = -1
+            best_degree = float('inf')
+            best_blocks_for_subset = None
+            
+            for s_idx in candidates:
+                # Count how many blocks cover this subset that are NOT yet selected
+                covering = subset_block_arrays[s_idx]
+                non_selected = 0
+                for b in covering:
+                    if b not in selected_set:
+                        non_selected += 1
+                if non_selected == 0:
+                    # This subset can't be covered - shouldn't happen in valid state
+                    break
+                if non_selected < best_degree:
+                    best_degree = non_selected
+                    best_subset = s_idx
+                    best_blocks_for_subset = covering
+            
+            if best_subset == -1 or best_degree == 0:
+                # Fallback: pick any uncovered subset
+                s_idx = uncovered_indices[0]
+                covering = subset_block_arrays[s_idx]
+                non_sel = [b for b in covering if b not in selected_set]
+                if not non_sel:
+                    break
+                # Pick the one with max new coverage
+                best_b = -1
+                best_gain = -1
+                for b in non_sel:
+                    b_subs = block_subset_arrays[b]
+                    gain = np.sum(uncovered[b_subs])
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_b = b
+                if best_b == -1:
+                    break
+                selected_blocks.append(best_b)
+                selected_set.add(best_b)
+                b_subs = block_subset_arrays[best_b]
+                newly = b_subs[uncovered[b_subs]]
+                uncovered[newly] = False
+                continue
+            
+            # Among blocks covering best_subset (and not yet selected), pick one with max new coverage
+            covering = best_blocks_for_subset
+            non_sel = [b for b in covering if b not in selected_set]
+            if not non_sel:
+                break
+            
+            best_b = -1
+            best_gain = -1
+            for b in non_sel:
+                b_subs = block_subset_arrays[b]
+                gain = np.sum(uncovered[b_subs])
+                if gain > best_gain:
+                    best_gain = gain
+                    best_b = b
+            
+            if best_b == -1 or best_gain == 0:
+                break
+            
+            selected_blocks.append(best_b)
+            selected_set.add(best_b)
+            b_subs = block_subset_arrays[best_b]
+            newly = b_subs[uncovered[b_subs]]
+            uncovered[newly] = False
+            
+        return selected_blocks
+
+    def minimize_with_swaps(blocks_indices, coverage_counts, time_limit, random_seed=None):
+        """Local search with deletion and swap operations."""
+        if random_seed is not None:
+            rng = random.Random(random_seed)
+        else:
+            rng = random.Random()
+            
+        current_blocks = list(blocks_indices)
+        
+        if not current_blocks:
+            return current_blocks, coverage_counts.copy()
+            
+        # Work with a copy of coverage counts
+        cover_count = coverage_counts.copy()
+        
+        # Use a set for O(1) membership testing
+        current_blocks_set = set(current_blocks)
+        
+        improved = True
+        start_time = time.time()
+        
+        while improved and (time.time() - start_time) < time_limit:
+            improved = False
+            
+            # Deletion pass
+            indices = list(range(len(current_blocks)))
+            rng.shuffle(indices)
+            
+            for i in indices:
+                if i >= len(current_blocks):
+                    continue
+                if (time.time() - start_time) > time_limit:
+                    break
+                b_idx = current_blocks[i]
+                is_redundant = True
+                b_subs = block_subset_arrays[b_idx]
+                for s_idx in b_subs:
+                    if cover_count[s_idx] == 1:
+                        is_redundant = False
+                        break
+                if is_redundant:
+                    for s_idx in b_subs:
+                        cover_count[s_idx] -= 1
+                    current_blocks_set.discard(b_idx)
+                    current_blocks.pop(i)
+                    improved = True
+                    break  # Restart scan after removal
+            
+            # Swap pass
+            if (time.time() - start_time) > time_limit:
+                break
                 
-            # 2. Swap Pass
-            # Try to swap blocks to improve structure
-            # We iterate through blocks and try to swap them
-            # We limit swaps per iteration to avoid getting stuck
+            indices = list(range(len(current_blocks)))
+            rng.shuffle(indices)
+            
             swaps_done = 0
             max_swaps = 50
             
-            # Shuffle order
-            indices = list(range(len(current_set_list)))
-            random.shuffle(indices)
-            
             for i in indices:
-                if time.time() - start_time > time_limit:
+                if (time.time() - start_time) > time_limit:
                     break
                 if swaps_done >= max_swaps:
                     break
+                if i >= len(current_blocks):
+                    continue
                     
-                old_block = current_set_list[i]
+                old_block = current_blocks[i]
+                old_subs = block_subset_arrays[old_block]
                 
-                # Find unique subsets
+                # Find unique subsets covered by old_block
                 unique_subs = []
-                for s in block_to_subsets[old_block]:
-                    if coverage_counts[s] == 1:
-                        unique_subs.append(s)
+                for s_idx in old_subs:
+                    if cover_count[s_idx] == 1:
+                        unique_subs.append(s_idx)
                 
                 if not unique_subs:
-                    # Block is not critical for any subset.
-                    # We can swap with any random block to diversify.
-                    # Pick a random block from all_blocks
-                    new_block = random.choice(all_blocks)
-                    # Avoid swapping with itself or a block already in the set (unless we allow duplicates, which we don't)
+                    # Block is not critical - try swapping with a random block
+                    # to diversify the solution
+                    new_block = rng.randint(0, num_blocks - 1)
                     if new_block == old_block:
                         continue
-                    if new_block in current_set_list:
+                    if new_block in current_blocks_set:
                         continue
                         
                     # Perform swap
-                    perform_swap(current_set_list, i, new_block, coverage_counts)
+                    for s_idx in old_subs:
+                        cover_count[s_idx] -= 1
+                    new_subs = block_subset_arrays[new_block]
+                    for s_idx in new_subs:
+                        cover_count[s_idx] += 1
+                    current_blocks_set.discard(old_block)
+                    current_blocks_set.add(new_block)
+                    current_blocks[i] = new_block
                     swaps_done += 1
-                    # Check if this swap allowed a deletion? 
-                    # We don't check immediately, we let the next deletion pass handle it.
-                    # But to be aggressive, we can check if the NEW block makes some OTHER block redundant?
-                    # That's complex. Let's just do deletion pass after swaps.
                 else:
-                    # Block is critical for unique_subs.
-                    # Find candidates that cover all unique_subs
-                    # Intersection of subset_to_blocks[s] for s in unique_subs
+                    # Block is critical - find candidates that cover all unique_subs
                     candidates = None
-                    for s in unique_subs:
+                    for s_idx in unique_subs:
                         if candidates is None:
-                            candidates = set(subset_to_blocks[s])
+                            candidates = subset_to_blocks_sets[s_idx].copy()
                         else:
-                            candidates.intersection_update(subset_to_blocks[s])
+                            candidates.intersection_update(subset_to_blocks_sets[s_idx])
                             if not candidates:
                                 break
                     
                     if candidates:
-                        # Remove self from candidates? 
-                        # If old_block is in candidates, swapping with itself is useless.
                         candidates.discard(old_block)
                         if candidates:
                             # Pick a random candidate
-                            new_block = random.choice(list(candidates))
-                            # Check if new_block is already in current_set_list
-                            if new_block in current_set_list:
-                                # If it's already there, swapping is a no-op in terms of set content, 
-                                # but effectively changes which instance we have? No, blocks are unique.
-                                # So if new_block is in current_set_list, we can't swap to it (duplicate).
-                                # We need a block NOT in current_set_list.
-                                # Filter candidates
-                                valid_candidates = [c for c in candidates if c not in current_set_list]
-                                if valid_candidates:
-                                    new_block = random.choice(valid_candidates)
-                                else:
-                                    continue # No valid swap
-                
-                            if new_block != old_block and new_block not in current_set_list:
-                                perform_swap(current_set_list, i, new_block, coverage_counts)
-                                swaps_done += 1
-                                # After a critical swap, it's good to restart deletion immediately
-                                # because the structure changed significantly
-                                break # Break inner loop, restart deletion pass
-            
-            # If we did swaps, run deletion pass again immediately
-            if swaps_done > 0:
-                # The loop continues, so it will hit the "1. Deletion Pass" at the top of the while loop
-                pass
+                            new_block = rng.choice(tuple(candidates))
+                            # Check if new_block is already in current_blocks
+                            if new_block in current_blocks_set:
+                                continue
+                                
+                            # Perform swap
+                            for s_idx in old_subs:
+                                cover_count[s_idx] -= 1
+                            new_subs = block_subset_arrays[new_block]
+                            for s_idx in new_subs:
+                                cover_count[s_idx] += 1
+                            current_blocks_set.discard(old_block)
+                            current_blocks_set.add(new_block)
+                            current_blocks[i] = new_block
+                            swaps_done += 1
+                            improved = True
+        
+        # Final high-precision polish: multiple aggressive deletion passes
+        if time.time() < start_time + time_limit:
+            for _ in range(3):
+                changed = True
+                while changed and (time.time() - start_time) < time_limit:
+                    changed = False
+                    idx_list = list(range(len(current_blocks)))
+                    rng.shuffle(idx_list)
+                    for i in idx_list:
+                        if i >= len(current_blocks):
+                            continue
+                        b_idx = current_blocks[i]
+                        b_subs = block_subset_arrays[b_idx]
+                        redundant = True
+                        for s_idx in b_subs:
+                            if cover_count[s_idx] == 1:
+                                redundant = False
+                                break
+                        if redundant:
+                            for s_idx in b_subs:
+                                cover_count[s_idx] -= 1
+                            current_blocks_set.discard(b_idx)
+                            current_blocks.pop(i)
+                            changed = True
+                            break
+        
+        return current_blocks, cover_count
 
-        return best_set
+    def compute_coverage(blocks_indices):
+        cover_count = np.zeros(num_subsets, dtype=np.int32)
+        for b_idx in blocks_indices:
+            b_subs = block_subset_arrays[b_idx]
+            cover_count[b_subs] += 1
+        return cover_count
 
-    start_time = time.time()
-    # Run for 110 seconds
-    result = minimize_and_swap(start_time, 110)
+    def lll_random_construction(random_seed=None, p=None):
+        """LLL-inspired probabilistic construction.
+        
+        Sample blocks with probability p, then iteratively remove locally redundant blocks.
+        A block is locally redundant if none of its covered subsets are uniquely covered by it
+        within the current set of selected blocks.
+        """
+        if random_seed is not None:
+            rng = np.random.default_rng(random_seed)
+        else:
+            rng = np.random.default_rng()
+        
+        if p is None:
+            # Estimate good p: we want ~expected number of blocks that gives good coverage
+            # Each block covers C(k,t) subsets out of C(v,t) total
+            # Probability a random subset is NOT in a given block = 1 - C(k,t)/C(v,t)
+            # For n blocks, prob not covered = (1 - C(k,t)/C(v,t))^n
+            # We want this small, say < 0.01
+            from math import comb, log
+            p_block = comb(k, t) / comb(v, t)
+            # n * p_block should be large enough
+            # Let's try a few values
+            p = 0.15  # Start with a reasonable default
+        
+        # Sample blocks
+        mask = rng.random(num_blocks) < p
+        selected = np.where(mask)[0].tolist()
+        
+        if not selected:
+            return []
+        
+        # Compute coverage
+        cover_count = np.zeros(num_subsets, dtype=np.int32)
+        for b_idx in selected:
+            b_subs = block_subset_arrays[b_idx]
+            cover_count[b_subs] += 1
+        
+        # Check if all subsets are covered
+        if np.any(cover_count == 0):
+            # Need to repair - add blocks to cover uncovered subsets
+            uncovered_mask = (cover_count == 0).astype(bool)
+            repair_res = run_greedy_partial(uncovered_mask, random_seed=random_seed)
+            selected.extend(repair_res)
+            # Recompute coverage
+            cover_count = np.zeros(num_subsets, dtype=np.int32)
+            for b_idx in selected:
+                b_subs = block_subset_arrays[b_idx]
+                cover_count[b_subs] += 1
+        
+        # Iteratively remove locally redundant blocks
+        # A block is locally redundant if all its subsets are covered by other blocks
+        changed = True
+        start_time = time.time()
+        while changed and (time.time() - start_time) < 2.0:
+            changed = False
+            # Shuffle for randomization
+            rng.shuffle(selected)
+            for b_idx in selected[:]:
+                if b_idx not in selected:
+                    continue
+                b_subs = block_subset_arrays[b_idx]
+                is_redundant = True
+                for s_idx in b_subs:
+                    if cover_count[s_idx] == 1:
+                        is_redundant = False
+                        break
+                if is_redundant:
+                    for s_idx in b_subs:
+                        cover_count[s_idx] -= 1
+                    selected.remove(b_idx)
+                    changed = True
+        
+        return selected
+
+    best_blocks = None
+    best_len = float('inf')
+    best_coverage = None
     
-    # Convert indices to blocks
-    return [list(all_blocks[i]) for i in result]
+    start_time = time.time()
+    deadline = start_time + 115.0
+    
+    trial = 0
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        if remaining < 15.0:
+            break
+            
+        # Strategy 1: Full Greedy + Local Search (deletion + swap)
+        greedy_res = run_greedy_full(trial)
+        coverage = compute_coverage(greedy_res)
+        
+        # Adaptive time limit for local search
+        ls_time = min(3.0, max(1.0, remaining * 0.15))
+        min_res, min_cov = minimize_with_swaps(greedy_res, coverage, time_limit=ls_time, random_seed=trial)
+        
+        if len(min_res) < best_len:
+            best_len = len(min_res)
+            best_blocks = min_res
+            best_coverage = min_cov
+            
+        # Strategy 2: Hardest-subset Greedy + Local Search
+        if time.time() < deadline - 15:
+            hardest_res = run_greedy_hardest(trial + 5000)
+            if hardest_res:
+                hardest_cov = compute_coverage(hardest_res)
+                ls_time_h = min(3.0, max(1.0, (deadline - time.time()) * 0.15))
+                min_res_h, min_cov_h = minimize_with_swaps(hardest_res, hardest_cov, time_limit=ls_time_h, random_seed=trial + 60000)
+                
+                if len(min_res_h) < best_len:
+                    best_len = len(min_res_h)
+                    best_blocks = min_res_h
+                    best_coverage = min_cov_h
+
+        # Strategy 3: LLL-inspired probabilistic construction + Local Search
+        if time.time() < deadline - 15:
+            # Try different probabilities
+            p_vals = [0.10, 0.15, 0.20, 0.25]
+            p = p_vals[trial % len(p_vals)]
+            lll_res = lll_random_construction(random_seed=trial + 10000, p=p)
+            
+            if lll_res:
+                lll_coverage = compute_coverage(lll_res)
+                
+                ls_time_lla = min(3.0, max(1.0, (deadline - time.time()) * 0.15))
+                min_res_lla, min_cov_lla = minimize_with_swaps(lll_res, lll_coverage, time_limit=ls_time_lla, random_seed=trial + 20000)
+                
+                if len(min_res_lla) < best_len:
+                    best_len = len(min_res_lla)
+                    best_blocks = min_res_lla
+                    best_coverage = min_cov_lla
+
+        # Strategy 4: Perturb Best + Repair + Local Search
+        if best_blocks is not None and len(best_blocks) > 20 and time.time() < deadline - 15:
+            perturbed = list(best_blocks)
+            # Vary the number of blocks removed based on trial
+            num_remove = min(max(2, len(perturbed) // (10 + trial % 10)), len(perturbed) - 1)
+            if num_remove > 0:
+                # Use coverage-weighted removal: prefer removing blocks with low unique coverage
+                cover_count_temp = best_coverage.copy()
+                unique_counts = []
+                for b_idx in perturbed:
+                    b_subs = block_subset_arrays[b_idx]
+                    unique = sum(1 for s_idx in b_subs if cover_count_temp[s_idx] == 1)
+                    unique_counts.append(unique)
+                
+                # Sort by unique coverage (ascending) - remove those with least unique coverage first
+                sorted_indices = sorted(range(len(perturbed)), key=lambda i: unique_counts[i])
+                # Take the first num_remove from the sorted list, but add some randomness
+                candidates = sorted_indices[:max(num_remove * 2, 4)]
+                remove_indices = random.sample(candidates, min(num_remove, len(candidates)))
+                blocks_to_remove = set(perturbed[i] for i in remove_indices)
+                
+                cover_count_temp2 = np.zeros(num_subsets, dtype=np.int32)
+                for b_idx in perturbed:
+                    if b_idx in blocks_to_remove:
+                        continue
+                    b_subs = block_subset_arrays[b_idx]
+                    cover_count_temp2[b_subs] += 1
+                        
+                uncovered_mask = (cover_count_temp2 == 0).astype(bool)
+                
+                repair_res = run_greedy_partial(uncovered_mask, trial + 30000)
+                
+                new_set = [b for b in perturbed if b not in blocks_to_remove]
+                new_set.extend(repair_res)
+                
+                # Compute coverage for new set
+                new_coverage = compute_coverage(new_set)
+                
+                ls_time2 = min(3.0, max(1.0, (deadline - time.time()) * 0.15))
+                min_res2, min_cov2 = minimize_with_swaps(new_set, new_coverage, time_limit=ls_time2, random_seed=trial + 40000)
+                
+                if len(min_res2) < best_len:
+                    best_len = len(min_res2)
+                    best_blocks = min_res2
+                    best_coverage = min_cov2
+
+        # Strategy 5: Pure swap-based diversification on best solution
+        if best_blocks is not None and len(best_blocks) > 20 and time.time() < deadline - 10:
+            ls_time3 = min(4.0, max(1.0, (deadline - time.time()) * 0.2))
+            swap_res, swap_cov = minimize_with_swaps(best_blocks, best_coverage, time_limit=ls_time3, random_seed=trial + 50000)
+            
+            if len(swap_res) < best_len:
+                best_len = len(swap_res)
+                best_blocks = swap_res
+                best_coverage = swap_cov
+
+        trial += 1
+        
+    # Final polish: aggressive deletion pass on best solution
+    if best_blocks is not None and time.time() < deadline - 5:
+        final_cov = best_coverage.copy()
+        final_blocks = list(best_blocks)
+        final_set = set(final_blocks)
+        # Multiple deletion passes with multiple restarts
+        for _ in range(5):
+            changed = True
+            while changed and time.time() < deadline - 5:
+                changed = False
+                # Shuffle order for diversity
+                idx_list = list(range(len(final_blocks)))
+                random.shuffle(idx_list)
+                for i in idx_list:
+                    if i >= len(final_blocks):
+                        continue
+                    b_idx = final_blocks[i]
+                    b_subs = block_subset_arrays[b_idx]
+                    redundant = True
+                    for s_idx in b_subs:
+                        if final_cov[s_idx] == 1:
+                            redundant = False
+                            break
+                    if redundant:
+                        for s_idx in b_subs:
+                            final_cov[s_idx] -= 1
+                        final_set.discard(b_idx)
+                        final_blocks.pop(i)
+                        changed = True
+                        break
+        if len(final_blocks) < best_len:
+            best_len = len(final_blocks)
+            best_blocks = final_blocks
+            best_coverage = final_cov
+        
+        # Additional swap-based diversification in final phase
+        if best_blocks is not None and time.time() < deadline - 3:
+            remaining_time = deadline - time.time() - 3
+            if remaining_time > 0.5:
+                final_swap_res, final_swap_cov = minimize_with_swaps(
+                    best_blocks, best_coverage, time_limit=remaining_time, random_seed=99999
+                )
+                if len(final_swap_res) < best_len:
+                    best_len = len(final_swap_res)
+                    best_blocks = final_swap_res
+                    best_coverage = final_swap_cov
+        
+    if best_blocks is None:
+        greedy_res = run_greedy_full(0)
+        coverage = compute_coverage(greedy_res)
+        best_blocks, best_coverage = minimize_with_swaps(greedy_res, coverage, time_limit=5.0, random_seed=0)
+        
+    return [list(all_blocks[i]) for i in best_blocks]

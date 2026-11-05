@@ -1,0 +1,460 @@
+import random
+import time
+import math
+from fractions import Fraction
+from itertools import combinations
+
+def construct():
+    start_time = time.time()
+    deadline = 140.0  # Leave 10s margin for 150s limit
+    
+    def is_square(n):
+        if n < 0:
+            return False
+        r = int(math.isqrt(n))
+        return r * r == n
+
+    def dist_sq(p1, p2):
+        dx = p1[0] - p2[0]
+        dy = p1[1] - p2[1]
+        return dx * dx + dy * dy
+
+    def is_rational_dist(p1, p2):
+        return is_square(dist_sq(p1, p2))
+
+    def are_collinear(p1, p2, p3):
+        return (p2[0] - p1[0]) * (p3[1] - p1[1]) - (p2[1] - p1[1]) * (p3[0] - p1[0]) == 0
+
+    def are_concyclic(p1, p2, p3, p4):
+        """Check if 4 points are concyclic using the determinant formula.
+        For points (xi, yi), they are concyclic iff:
+        |x^2+y^2  x  y  1| = 0
+        """
+        x1, y1 = p1
+        x2, y2 = p2
+        x3, y3 = p3
+        x4, y4 = p4
+        
+        # Use the cross product form for efficiency
+        # Vector from p1 to p2, p1 to p3, p1 to p4
+        ax, ay = x2 - x1, y2 - y1
+        bx, by = x3 - x1, y3 - y1
+        cx, cy = x4 - x1, y4 - y1
+        
+        # |ax ay ax^2+ay^2|
+        # |bx by bx^2+by^2| = 0
+        # |cx cy cx^2+cy^2|
+        
+        a2 = ax*ax + ay*ay
+        b2 = bx*bx + by*by
+        c2 = cx*cx + cy*cy
+        
+        # Correct determinant of 3x3 matrix:
+        # det = ax*(by*c2 - b2*cy) - ay*(bx*c2 - b2*cx) + a2*(bx*cy - by*cx)
+        det = ax*(by*c2 - b2*cy) - ay*(bx*c2 - b2*cx) + a2*(bx*cy - by*cx)
+        
+        return det == 0
+
+    # Precompute all valid displacement vectors
+    max_coord = 100
+    vectors = []
+    for dx in range(-max_coord, max_coord + 1):
+        for dy in range(-max_coord, max_coord + 1):
+            if dx == 0 and dy == 0:
+                continue
+            if is_square(dx * dx + dy * dy):
+                vectors.append((dx, dy))
+    
+    # Sort vectors by distance squared, prefer closer points
+    vectors.sort(key=lambda v: v[0]*v[0] + v[1]*v[1])
+    
+    def try_add_point(current_points, max_iter=5000):
+        n = len(current_points)
+        point_set = set(current_points)
+        
+        for _ in range(max_iter):
+            # Pick a random existing point as base
+            idx = random.randint(0, n - 1)
+            p_base = current_points[idx]
+            # Pick a random vector
+            dx, dy = random.choice(vectors)
+            p_new = (p_base[0] + dx, p_base[1] + dy)
+            
+            # Check if p_new is distinct
+            if p_new in point_set:
+                continue
+            
+            # Check distances to all existing points
+            valid_dist = True
+            for p in current_points:
+                if not is_rational_dist(p, p_new):
+                    valid_dist = False
+                    break
+            if not valid_dist:
+                continue
+            
+            # Check collinearity with all pairs
+            valid_collinear = True
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if are_collinear(current_points[i], current_points[j], p_new):
+                        valid_collinear = False
+                        break
+                if not valid_collinear:
+                    break
+            if not valid_collinear:
+                continue
+            
+            # Check concyclicity with all triples
+            valid_concyclic = True
+            for i in range(n):
+                for j in range(i + 1, n):
+                    for k in range(j + 1, n):
+                        if are_concyclic(current_points[i], current_points[j], current_points[k], p_new):
+                            valid_concyclic = False
+                            break
+                    if not valid_concyclic:
+                        break
+                if not valid_concyclic:
+                    break
+            if not valid_concyclic:
+                continue
+            
+            return p_new
+        return None
+
+    def try_add_point_deterministic(current_points, max_iter=2000):
+        """Try adding points using a more systematic approach with precomputation"""
+        n = len(current_points)
+        point_set = set(current_points)
+        
+        # Precompute pairwise squared distances for efficiency
+        pair_dists = {}
+        for i in range(n):
+            for j in range(i+1, n):
+                dx = current_points[i][0] - current_points[j][0]
+                dy = current_points[i][1] - current_points[j][1]
+                pair_dists[(i,j)] = dx*dx + dy*dy
+        
+        # Try vectors in order of increasing distance, but limit the search
+        vectors_tried = 0
+        for dx, dy in vectors:
+            if time.time() > deadline:
+                break
+            vectors_tried += 1
+            if vectors_tried > max_iter:
+                break
+                
+            # Try adding to each existing point
+            for p_base in current_points:
+                p_new = (p_base[0] + dx, p_base[1] + dy)
+                
+                # Check if p_new is distinct
+                if p_new in point_set:
+                    continue
+                
+                # Check distances to all existing points
+                valid_dist = True
+                for p in current_points:
+                    if not is_rational_dist(p, p_new):
+                        valid_dist = False
+                        break
+                if not valid_dist:
+                    continue
+                
+                # Check collinearity with all pairs
+                valid_collinear = True
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        if are_collinear(current_points[i], current_points[j], p_new):
+                            valid_collinear = False
+                            break
+                    if not valid_collinear:
+                        break
+                if not valid_collinear:
+                    continue
+                
+                # Check concyclicity with all triples
+                valid_concyclic = True
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        for k in range(j + 1, n):
+                            if are_concyclic(current_points[i], current_points[j], current_points[k], p_new):
+                                valid_concyclic = False
+                                break
+                        if not valid_concyclic:
+                            break
+                    if not valid_concyclic:
+                        break
+                if not valid_concyclic:
+                    continue
+                
+                return p_new
+        return None
+
+    best_points = None
+    best_size = 0
+    
+    # Known valid configuration with 5 points
+    known_5 = [(0, 0), (-56, 33), (-16, 63), (0, 33), (16, 63)]
+    best_points = known_5[:]
+    best_size = 5
+    
+    # Strategy 1: Try to extend the known 5-point configuration
+    if time.time() < deadline:
+        current = known_5[:]
+        # Use a more aggressive search with both deterministic and random
+        for attempt in range(50):
+            if time.time() > deadline:
+                break
+            if len(current) >= 12:
+                break
+            # Alternate between deterministic and random
+            if attempt % 3 == 0:
+                p_new = try_add_point_deterministic(current, max_iter=500)
+            elif attempt % 3 == 1:
+                p_new = try_add_point(current, max_iter=5000)
+            else:
+                # Try with different random seed
+                random.seed(attempt * 12345 + 67890)
+                p_new = try_add_point(current, max_iter=5000)
+            if p_new is None:
+                # Try a different approach: remove a point and try again
+                if len(current) > 5:
+                    # Remove the last added point and try a different path
+                    current.pop()
+                    continue
+                else:
+                    break
+            current.append(p_new)
+        
+        if len(current) > best_size:
+            best_size = len(current)
+            best_points = current[:]
+    
+    # Strategy 1b: Try different known 5-point configurations with more aggressive search
+    known_5_variants = [
+        [(0, 0), (-56, 33), (-16, 63), (0, 33), (16, 63)],
+        [(0, 0), (56, 33), (16, 63), (0, 33), (-16, 63)],
+        [(0, 0), (-56, -33), (-16, -63), (0, -33), (16, -63)],
+        [(0, 0), (56, -33), (16, -63), (0, -33), (-16, -63)],
+        # Additional variants with different symmetries
+        [(0, 0), (-56, 33), (16, 63), (0, 33), (-16, 63)],
+        [(0, 0), (56, -33), (-16, -63), (0, -33), (16, -63)],
+    ]
+    for variant in known_5_variants:
+        if time.time() > deadline:
+            break
+        current = variant[:]
+        for attempt in range(30):
+            if time.time() > deadline:
+                break
+            if len(current) >= 12:
+                break
+            if attempt % 2 == 0:
+                p_new = try_add_point_deterministic(current, max_iter=300)
+            else:
+                random.seed(hash(tuple(current)) + attempt)
+                p_new = try_add_point(current, max_iter=3000)
+            if p_new is None:
+                if len(current) > 5:
+                    current.pop()
+                    continue
+                else:
+                    break
+            current.append(p_new)
+        
+        if len(current) > best_size:
+            best_size = len(current)
+            best_points = current[:]
+    
+    # Strategy 2: Random restarts with different starting configurations
+    attempts = 0
+    while time.time() < deadline:
+        attempts += 1
+        
+        # Try different starting strategies
+        strategy = attempts % 4
+        
+        if strategy == 0:
+            # Start from known 5-point set with varied search
+            pts = known_5[:]
+            current = pts[:]
+            for attempt in range(20):
+                if time.time() > deadline:
+                    break
+                if len(current) >= 12:
+                    break
+                random.seed(attempts * 1000 + attempt)
+                p_new = try_add_point(current, max_iter=4000)
+                if p_new is None:
+                    if len(current) > 5:
+                        current.pop()
+                        continue
+                    else:
+                        break
+                current.append(p_new)
+            if len(current) > best_size:
+                best_size = len(current)
+                best_points = current[:]
+            continue
+        
+        elif strategy == 1:
+            # Start with 3 random points
+            pts = []
+            p1 = (0, 0)
+            pts.append(p1)
+            
+            # Point 2: Must be at integer distance from p1
+            while True:
+                dx, dy = random.choice(vectors)
+                p2 = (p1[0] + dx, p1[1] + dy)
+                if p2 != p1:
+                    break
+            pts.append(p2)
+            
+            # Point 3: Must be at integer distance from p1 and p2, and not collinear
+            found_p3 = False
+            for _ in range(5000):
+                if time.time() > deadline:
+                    break
+                base = random.choice(pts)
+                dx, dy = random.choice(vectors)
+                p3 = (base[0] + dx, base[1] + dy)
+                if p3 in pts:
+                    continue
+                valid = True
+                for p in pts:
+                    if not is_rational_dist(p, p3):
+                        valid = False
+                        break
+                if valid and not are_collinear(pts[0], pts[1], p3):
+                    pts.append(p3)
+                    found_p3 = True
+                    break
+            
+            if not found_p3:
+                continue
+            
+        elif strategy == 2:
+            # Start with a random triangle of integer distances
+            pts = []
+            p1 = (0, 0)
+            pts.append(p1)
+            
+            # Point 2
+            while True:
+                dx, dy = random.choice(vectors)
+                p2 = (p1[0] + dx, p1[1] + dy)
+                if p2 != p1:
+                    break
+            pts.append(p2)
+            
+            # Point 3: Try different bases
+            found_p3 = False
+            for _ in range(5000):
+                if time.time() > deadline:
+                    break
+                base = random.choice(pts)
+                dx, dy = random.choice(vectors)
+                p3 = (base[0] + dx, base[1] + dy)
+                if p3 in pts:
+                    continue
+                valid = True
+                for p in pts:
+                    if not is_rational_dist(p, p3):
+                        valid = False
+                        break
+                if valid and not are_collinear(pts[0], pts[1], p3):
+                    pts.append(p3)
+                    found_p3 = True
+                    break
+            
+            if not found_p3:
+                continue
+        
+        else:
+            # Strategy 3: Start from a 4-point configuration
+            # Use a known 4-point set and extend
+            known_4 = [(0, 0), (-56, 33), (-16, 63), (0, 33)]
+            pts = known_4[:]
+            found_p5 = False
+            for _ in range(5000):
+                if time.time() > deadline:
+                    break
+                base = random.choice(pts)
+                dx, dy = random.choice(vectors)
+                p5 = (base[0] + dx, base[1] + dy)
+                if p5 in pts:
+                    continue
+                valid = True
+                for p in pts:
+                    if not is_rational_dist(p, p5):
+                        valid = False
+                        break
+                if valid:
+                    # Check collinearity
+                    collinear = False
+                    for i in range(len(pts)):
+                        for j in range(i + 1, len(pts)):
+                            if are_collinear(pts[i], pts[j], p5):
+                                collinear = True
+                                break
+                        if collinear:
+                            break
+                    if not collinear:
+                        # Check concyclicity with existing triples
+                        concyclic = False
+                        for i in range(len(pts)):
+                            for j in range(i + 1, len(pts)):
+                                for k in range(j + 1, len(pts)):
+                                    if are_concyclic(pts[i], pts[j], pts[k], p5):
+                                        concyclic = True
+                                        break
+                                if concyclic:
+                                    break
+                            if concyclic:
+                                break
+                        if not concyclic:
+                            pts.append(p5)
+                            found_p5 = True
+                            break
+            
+            if not found_p5:
+                continue
+        
+        # Now try to extend with backtracking
+        current = pts[:]
+        for attempt in range(30):
+            if time.time() > deadline:
+                break
+            if len(current) >= 12:
+                break
+            if len(current) <= 5:
+                p_new = try_add_point_deterministic(current, max_iter=400)
+                if p_new is None:
+                    random.seed(attempts * 100 + attempt)
+                    p_new = try_add_point(current, max_iter=4000)
+            else:
+                random.seed(attempts * 100 + attempt)
+                p_new = try_add_point(current, max_iter=3000)
+            if p_new is None:
+                if len(current) > len(pts):
+                    current.pop()
+                    continue
+                else:
+                    break
+            current.append(p_new)
+        
+        if len(current) > best_size:
+            best_size = len(current)
+            best_points = current[:]
+            if best_size >= 8:
+                break
+    
+    if best_points is None:
+        points = known_5
+    else:
+        points = best_points
+    
+    return {'D': 1, 'points': [[[x, 1], [y, 1]] for x, y in points]}

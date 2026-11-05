@@ -1,0 +1,146 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+import time
+import numpy as np
+
+DIMENSIONS = [3, 4, 4]
+
+# EVOLVE-BLOCK-START
+def construct():
+    n, m, p = DIMENSIONS
+    start_time = time.time()
+    deadline = start_time + 130  # explicit safety margin below the 150 s kill
+
+    def schoolbook():
+        rank = n * m * p
+        U = np.zeros((n * m, rank), dtype=float)
+        V = np.zeros((m * p, rank), dtype=float)
+        W = np.zeros((p * n, rank), dtype=float)
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    c = i * m * p + j * p + k
+                    U[i * m + j, c] = 1
+                    V[j * p + k, c] = 1
+                    W[k * n + i, c] = 1
+        return U, V, W
+
+    def strassen_terms():
+        # Standard Strassen 7 terms for 2x2x2.
+        # Each term is (U_entries, V_entries, W_entries) with local offsets:
+        #   U: (li, lj)  -> A[li, lj]
+        #   V: (lj, lk)  -> B[lj, lk]
+        #   W: (li, lk)  -> C[li, lk]
+        T = []
+        # M1 = (A11+A22)(B11+B22) -> C11 +1, C22 +1
+        T.append(([((0, 0), 1), ((1, 1), 1)], [((0, 0), 1), ((1, 1), 1)],
+                 [((0, 0), 1), ((1, 1), 1)]))
+        # M2 = (A21+A22)B11 -> C21 +1, C22 -1
+        T.append(([((1, 0), 1), ((1, 1), 1)], [((0, 0), 1)],
+                 [((1, 0), 1), ((1, 1), -1)]))
+        # M3 = A11(B12-B22) -> C12 +1, C22 +1
+        T.append(([((0, 0), 1)], [((0, 1), 1), ((1, 1), -1)],
+                 [((0, 1), 1), ((1, 1), 1)]))
+        # M4 = A22(B21-B11) -> C11 +1, C21 +1
+        T.append(([((1, 1), 1)], [((1, 0), 1), ((0, 0), -1)],
+                 [((1, 0), 1), ((0, 0), 1)]))
+        # M5 = (A11+A12)B22 -> C12 +1, C11 -1
+        T.append(([((0, 0), 1), ((0, 1), 1)], [((1, 1), 1)],
+                 [((0, 1), 1), ((0, 0), -1)]))
+        # M6 = (A21-A11)(B11+B12) -> C22 +1
+        T.append(([((1, 0), 1), ((0, 0), -1)], [((0, 0), 1), ((0, 1), 1)],
+                 [((1, 1), 1)]))
+        # M7 = (A12-A22)(B21+B22) -> C11 +1
+        T.append(([((0, 1), 1), ((1, 1), -1)], [((1, 0), 1), ((1, 1), 1)],
+                 [((0, 0), 1)]))
+        return T
+
+    ST = strassen_terms()
+
+    # Rank-44 decomposition:
+    #   4 Strassen 2x2x2 blocks (rank 7 each)  -> 28
+    #   4 schoolbook 1x2x2 blocks (rank 4 each) -> 16
+    total_rank = 44
+    U = np.zeros((n * m, total_rank), dtype=float)
+    V = np.zeros((m * p, total_rank), dtype=float)
+    W = np.zeros((p * n, total_rank), dtype=float)
+
+    def add_rank7(i0, j0, k0, col_start):
+        for r in range(7):
+            u_e, v_e, w_e = ST[r]
+            c = col_start + r
+            for (li, lj), val in u_e:
+                U[(i0 + li) * m + (j0 + lj), c] += val
+            for (lj, lk), val in v_e:
+                V[(j0 + lj) * p + (k0 + lk), c] += val
+            for (li, lk), val in w_e:
+                W[(k0 + lk) * n + (i0 + li), c] += val
+        return col_start + 7
+
+    def add_rank4(i0, j0, k0, col_start):
+        for t in range(4):
+            c = col_start + t
+            j = j0 + (t % 2)
+            k = k0 + (t // 2)
+            U[i0 * m + j, c] = 1
+            V[j * p + k, c] = 1
+            W[k * n + i0, c] = 1
+        return col_start + 4
+
+    col = 0
+    # Top 2 rows, cols 0-1
+    col = add_rank7(0, 0, 0, col)
+    # Top 2 rows, cols 2-3
+    col = add_rank7(0, 0, 2, col)
+    # Top 2 rows, cols 0-1 (second j-pair of B)
+    col = add_rank7(0, 2, 0, col)
+    # Top 2 rows, cols 2-3
+    col = add_rank7(0, 2, 2, col)
+    # Bottom row (row 2), cols 0-1
+    col = add_rank4(2, 0, 0, col)
+    # Bottom row (row 2), cols 2-3
+    col = add_rank4(2, 0, 2, col)
+    # Bottom row (row 2), cols 0-1 (second j-pair)
+    col = add_rank4(2, 2, 0, col)
+    # Bottom row (row 2), cols 2-3
+    col = add_rank4(2, 2, 2, col)
+
+    assert col == total_rank, f"Column mismatch: {col} != {total_rank}"
+
+    # Rigorous verification: reconstruct the full tensor T[i,j,k] = sum_r U[i,j,r] V[j,k,r] W[k,i,r]
+    # and confirm it equals 1 everywhere (the exact matrix-multiplication tensor).
+    def verify_tensor(U, V, W, rank):
+        T = np.zeros((n, m, p), dtype=float)
+        for r in range(rank):
+            u = U[:, r].reshape(n, m)
+            v = V[:, r].reshape(m, p)
+            w = W[:, r].reshape(p, n)
+            T += np.einsum('ij,jk,ki->ijk', u, v, w)
+        return float(np.max(np.abs(T - 1.0)))
+
+    def verify_random(U, V, W, rank):
+        np.random.seed(42)
+        A = np.random.randn(n, m)
+        B = np.random.randn(m, p)
+        C_expected = A @ B
+        C_comp = np.zeros((n, p))
+        for r in range(rank):
+            ar = sum(U[i * m + j, r] * A[i, j] for i in range(n) for j in range(m))
+            br = sum(V[j * p + k, r] * B[j, k] for j in range(m) for k in range(p))
+            for i in range(n):
+                for k in range(p):
+                    C_comp[i, k] += W[k * n + i, r] * ar * br
+        return float(np.max(np.abs(C_comp - C_expected)))
+
+    max_err_tensor = verify_tensor(U, V, W, total_rank)
+    if max_err_tensor > 1e-9:
+        # Fallback: random check, then schoolbook
+        if verify_random(U, V, W, total_rank) > 1e-9:
+            U_sb, V_sb, W_sb = schoolbook()
+            return {"U": U_sb.tolist(), "V": V_sb.tolist(), "W": W_sb.tolist()}
+
+    # Time guard: if we are too close to the kill, return the verified result immediately.
+    if time.time() > deadline:
+        return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}
+
+    return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}
+# EVOLVE-BLOCK-END

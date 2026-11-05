@@ -1,403 +1,550 @@
-"""Combined program: vectorized greedy + enhanced local search for ternary covering code K_3(7,1)."""
-# EVOLVE-BLOCK-START
+import numpy as np
+import itertools
 import time
 import random
-import itertools
-import numpy as np
-
+import heapq
 
 def construct(q, n, radius):
     start_time = time.time()
-    deadline = start_time + 115.0  # Safety margin before 150s kill
+    deadline = start_time + 115.0  # Safety margin for 150s limit (evaluator kills at 120s usually, but contract says 120s, so 115 is safe)
 
-    # Fallback for non-specific parameters
-    if q != 3 or n != 7 or radius != 1:
-        if n <= 4 and q == 3 and radius == 1:
-            return [[a, b, (a + b) % 3, (a + 2 * b) % 3] for a in range(3) for b in range(3)]
-        tetracode = [[a, b, (a + b) % 3, (a + 2 * b) % 3] for a in range(3) for b in range(3)]
-        if n >= 4:
-            return [h + list(tail) for h in tetracode for tail in itertools.product(range(3), repeat=n - 4)]
-        else:
-            return [list(w) for w in itertools.product(range(q), repeat=n)]
+    # For the specific case of q=3, n=7, radius=1, we use specialized code
+    if q == 3 and n == 7 and radius == 1:
+        N = 3 ** n  # 2187
+        ball_size = 1 + n * (q - 1)  # 15
 
-    # Specific optimization for q=3, n=7, radius=1
-    N = 3 ** n  # 2187
+        def int_to_base3(num, length):
+            res = [0] * length
+            for i in range(length - 1, -1, -1):
+                res[i] = num % 3
+                num //= 3
+            return res
 
-    def idx_to_tuple(idx):
-        t = [0] * n
-        for i in range(n - 1, -1, -1):
-            t[i] = idx % 3
-            idx //= 3
-        return t
+        def base3_to_int(digits):
+            res = 0
+            for d in digits:
+                res = res * 3 + d
+            return res
 
-    def tuple_to_idx(t):
-        idx = 0
-        for x in t:
-            idx = idx * 3 + x
-        return idx
+        # Precompute balls (neighbors including self)
+        balls = []
+        for i in range(N):
+            digits = int_to_base3(i, n)
+            neighbors = [i]
+            for pos in range(n):
+                original = digits[pos]
+                for new_val in range(q):
+                    if new_val != original:
+                        new_digits = digits[:]
+                        new_digits[pos] = new_val
+                        neighbors.append(base3_to_int(new_digits))
+            balls.append(neighbors)
 
-    # Precompute neighbor lists as numpy arrays of int32 for fast operations
-    neighbors_list = []
-    neighbor_sets = []
-    for i in range(N):
-        w = idx_to_tuple(i)
-        nb = [i]
-        for pos in range(n):
-            val = w[pos]
-            for new_val in range(3):
-                if new_val != val:
-                    new_w = w[:]
-                    new_w[pos] = new_val
-                    nb.append(tuple_to_idx(new_w))
-        neighbors_list.append(np.array(nb, dtype=np.int32))
-        neighbor_sets.append(set(nb))
+        # Precompute cover_map: for each word w, which codewords cover it
+        cover_map = [[] for _ in range(N)]
+        for c in range(N):
+            for w in balls[c]:
+                cover_map[w].append(c)
 
-    # ---------- Phase 1: Greedy Set-Cover with vectorized gain computation ----------
-    # Instead of iterating over all candidates and computing np.sum(uncovered_mask[neighbors[c]]),
-    # we accumulate gains from uncovered points: for each uncovered point, add 1 to all its neighbors.
-    # This is much faster because it only touches uncovered points, not all N candidates.
+        # Precompute ball sets for fast membership (swap search)
+        ball_sets = [set(b) for b in balls]
+        # Precompute ball indices as numpy arrays for faster iteration in local search
+        ball_indices = [np.array(b, dtype=np.int32) for b in balls]
 
-    uncovered = np.ones(N, dtype=bool)
-    code = []
-    code_set = set()
+        def greedy_cover(seed, start_code=None):
+            """
+            Greedy set cover with heap-based candidate selection.
+            If start_code is given, start from that partial cover and continue
+            covering the remaining words (kick / re-greedy).
+            """
+            rng = random.Random(seed)
+            covered = [False] * N
+            cnt = [ball_size] * N
+            code = []
+            uncovered_count = N
 
-    while np.any(uncovered):
-        if time.time() > deadline - 30:
-            break
+            # Build heap: (-cnt[i], i) for max-heap behavior
+            # We only push candidates that are not in start_code initially? 
+            # No, we need to consider all candidates for covering *uncovered* words.
+            # But if a codeword is in start_code, it's already "used". 
+            # The greedy step picks a codeword to ADD to the code.
+            # If start_code is provided, those codewords are already in the code.
+            # We must not add them again.
+            
+            in_code = [False] * N
+            if start_code:
+                for c in start_code:
+                    code.append(c)
+                    in_code[c] = True
+                    for w in balls[c]:
+                        if not covered[w]:
+                            covered[w] = True
+                            uncovered_count -= 1
+                            for c2 in cover_map[w]:
+                                cnt[c2] -= 1
 
-        # Compute gains: for each candidate codeword, how many uncovered points does it cover?
-        # Accumulate from uncovered points
-        gains = np.zeros(N, dtype=np.int32)
-        uncovered_indices = np.where(uncovered)[0]
-        for idx in uncovered_indices:
-            gains[neighbors_list[idx]] += 1
+            # Initialize heap with all candidates
+            # We push (-cnt[i], i) for all i not in code
+            heap = []
+            for i in range(N):
+                if not in_code[i]:
+                    heap.append((-cnt[i], i))
+            heapq.heapify(heap)
 
-        best_idx = int(np.argmax(gains))
-        max_gain = gains[best_idx]
-
-        if max_gain == 0:
-            break
-
-        code.append(best_idx)
-        code_set.add(best_idx)
-        uncovered[neighbors_list[best_idx]] = False
-
-    # ---------- Phase 2: Local Search ----------
-    # Initialize coverage counts
-    counts = np.zeros(N, dtype=np.int32)
-    for idx in code:
-        counts[neighbors_list[idx]] += 1
-
-    best_size = len(code)
-    best_code = list(code)
-
-    def greedy_repair(uncovered_set):
-        """Given a set of uncovered points, greedily add codewords to cover them."""
-        if not uncovered_set:
-            return []
-        added = []
-        temp_uncovered = set(uncovered_set)
-
-        while temp_uncovered:
-            best_c = -1
-            best_count = 0
-
-            # Build candidate pool from neighbors of uncovered words
-            candidate_pool = set()
-            for w in temp_uncovered:
-                candidate_pool.update(neighbor_sets[w])
-
-            # Find best candidate
-            for c in candidate_pool:
-                if c in code_set:
-                    continue
-                cnt = 0
-                for x in neighbors_list[c]:
-                    if x in temp_uncovered:
-                        cnt += 1
-                        if cnt > best_count:
-                            best_count = cnt
-                            best_c = c
-                        if best_count == len(temp_uncovered):
-                            break
-                if best_count == len(temp_uncovered):
+            while uncovered_count > 0:
+                # Pop valid candidates from heap
+                # A candidate is valid if its cnt matches the heap entry and it's not in code
+                while heap:
+                    neg_val, i = heapq.heappop(heap)
+                    if cnt[i] == -neg_val and not in_code[i]:
+                        break
+                else:
                     break
 
-            if best_c == -1:
-                break
+                c = i
+                code.append(c)
+                in_code[c] = True
 
-            added.append(best_c)
-            for w in neighbors_list[best_c]:
-                temp_uncovered.discard(w)
+                ball_c = balls[c]
+                for w in ball_c:
+                    if not covered[w]:
+                        covered[w] = True
+                        uncovered_count -= 1
+                        for c2 in cover_map[w]:
+                            cnt[c2] -= 1
+                            if cnt[c2] > 0 and not in_code[c2]:
+                                heapq.heappush(heap, (-cnt[c2], c2))
 
-        return added
+            return code
 
-    def try_remove():
-        """Remove all redundant codewords (those whose neighbors are all covered by >1 codeword)."""
-        removed = False
-        for c in list(code):
-            if np.min(counts[neighbors_list[c]]) > 1:
-                code.remove(c)
-                code_set.remove(c)
-                counts[neighbors_list[c]] -= 1
-                removed = True
-        return removed
+        def refine(code):
+            """Remove redundant codewords."""
+            if not code:
+                return code
 
-    def try_swap(c):
-        """Try to swap codeword c with a better-positioned codeword.
-        Strategy 1: Find a replacement covering all critical points of c.
-        Strategy 2: Relocation - move c to cover would-be-uncovered points.
-        Returns True if a swap was made."""
-        # Check if c is currently removable
-        if np.min(counts[neighbors_list[c]]) > 1:
-            return False
+            cover_count = [0] * N
+            for c in code:
+                for w in balls[c]:
+                    cover_count[w] += 1
 
-        # Get critical points for c: points in neighbors[c] with counts == 1
-        crit_points = [i for i in neighbors_list[c] if counts[i] == 1]
+            code_list = list(code)
+            changed = True
+            while changed:
+                changed = False
+                for i in range(len(code_list)):
+                    c = code_list[i]
+                    safe = True
+                    for w in balls[c]:
+                        if cover_count[w] == 1:
+                            safe = False
+                            break
+                    if safe:
+                        for w in balls[c]:
+                            cover_count[w] -= 1
+                        code_list.pop(i)
+                        changed = True
+                        break
+            return code_list
 
-        if not crit_points:
-            return False
+        def local_search(code, seed, time_limit):
+            """
+            Local search with deletion and 1-swap moves.
+            Optimized for speed.
+            """
+            rng = random.Random(seed)
+            code_list = list(code)
+            if not code_list:
+                return code_list
 
-        # Strategy 1: Find replacement covering all critical points
-        found_swap = False
-        shuffled_crit = list(crit_points)
-        random.shuffle(shuffled_crit)
+            cover_count = [0] * N
+            for c in code_list:
+                for w in ball_indices[c]:
+                    cover_count[w] += 1
 
-        for p in shuffled_crit:
-            if found_swap:
-                break
+            in_code = [False] * N
+            for c in code_list:
+                in_code[c] = True
 
-            cands = [x for x in neighbor_sets[p] if x not in code_set]
+            improved = True
+            while improved and time.time() < time_limit:
+                improved = False
+                indices = list(range(len(code_list)))
+                rng.shuffle(indices)
+                for i in indices:
+                    if time.time() > time_limit:
+                        break
+                    c_remove = code_list[i]
 
-            best_w = -1
-            best_score = -1
+                    # Try deletion first
+                    newly_uncovered = []
+                    for w in ball_indices[c_remove]:
+                        cover_count[w] -= 1
+                        if cover_count[w] == 0:
+                            newly_uncovered.append(w)
 
-            for w in cands:
-                valid = True
-                for k in crit_points:
-                    if k not in neighbor_sets[w]:
-                        valid = False
+                    if not newly_uncovered:
+                        code_list.pop(i)
+                        in_code[c_remove] = False
+                        improved = True
                         break
 
-                if not valid:
-                    continue
+                    # Try 1-swap: find a single codeword covering all newly_uncovered
+                    found = -1
+                    # Heuristic: sort critical words by rarity (fewest coverers)
+                    crit_sorted = sorted(newly_uncovered, key=lambda w: len(cover_map[w]))
+                    cand_pool = None
+                    for w in crit_sorted:
+                        candidates_w = [c2 for c2 in cover_map[w] if not in_code[c2] and c2 != c_remove]
+                        if cand_pool is None:
+                            cand_pool = set(candidates_w)
+                        else:
+                            cand_pool.intersection_update(candidates_w)
+                        if not cand_pool:
+                            break
+                    
+                    if cand_pool:
+                        # Pick a candidate that minimizes "waste" or maximizes redundancy?
+                        # For now, just pick one that works. 
+                        # To be stochastic, we could shuffle cand_pool.
+                        # But finding *any* valid swap is good progress.
+                        # Let's pick the one that covers the most *other* uncovered words? 
+                        # No, just the first valid one is fine for deterministic local search.
+                        # To add stochasticity, shuffle the list before iterating?
+                        # The set iteration order is arbitrary. 
+                        # Let's convert to list and shuffle.
+                        cand_list = list(cand_pool)
+                        rng.shuffle(cand_list)
+                        for c_add in cand_list:
+                            bs = ball_sets[c_add]
+                            if all(w in bs for w in newly_uncovered):
+                                found = c_add
+                                break
 
-                # Score: maximize redundancy creation (points that would go from count 1 to 2)
-                score = int(np.sum(counts[neighbors_list[w]] == 1))
-                if score > best_score:
-                    best_score = score
-                    best_w = w
+                    if found >= 0:
+                        code_list[i] = found
+                        in_code[c_remove] = False
+                        in_code[found] = True
+                        for w in ball_indices[found]:
+                            cover_count[w] += 1
+                        improved = True
+                        break
 
-            if best_w != -1:
-                code.remove(c)
-                code_set.remove(c)
-                counts[neighbors_list[c]] -= 1
+                    # Restore if no improvement
+                    for w in ball_indices[c_remove]:
+                        cover_count[w] += 1
 
-                code.append(best_w)
-                code_set.add(best_w)
-                counts[neighbors_list[best_w]] += 1
+            return code_list
 
-                found_swap = True
-                return True
+        def run_greedy_local_search(seed):
+            code = greedy_cover(seed)
+            code = refine(code)
+            time_left = deadline - 5
+            code = local_search(code, seed, time_left)
+            
+            # Final validity check
+            cover_count = [0] * N
+            for c in code:
+                for w in balls[c]:
+                    cover_count[w] += 1
+            
+            if min(cover_count) < 1:
+                return None
+            return code
 
-        # Strategy 2: Relocation - try to move c to cover would-be-uncovered points
-        temp_counts = counts.copy()
-        temp_counts[neighbors_list[c]] -= 1
+        def run_perturbation(seed, base_code, time_limit):
+            """
+            Take base_code, remove a random subset, and re-greedy the rest.
+            """
+            if len(base_code) < 10:
+                return None
+            
+            rng = random.Random(seed)
+            # Remove 5-10% of codewords
+            removal_fraction = 0.05 + 0.05 * rng.random()
+            num_remove = max(1, int(len(base_code) * removal_fraction))
+            
+            code_list = list(base_code)
+            rng.shuffle(code_list)
+            to_remove = set(code_list[:num_remove])
+            
+            remaining_code = [c for c in code_list if c not in to_remove]
+            
+            # Check if remaining code is valid (it won't be, that's the point)
+            # We just pass it to greedy_cover which will cover the gaps.
+            
+            # Time budget for this perturbation run
+            # We want to leave time for refinement and local search
+            greedy_time_limit = time.time() + (time_limit - time.time()) * 0.5
+            
+            # greedy_cover doesn't have a time limit param in current impl.
+            # It's fast enough (O(N log N) roughly). 
+            # But to be safe, we can't easily interrupt it.
+            # Given N=2187, it's very fast.
+            
+            new_code = greedy_cover(seed, start_code=remaining_code)
+            
+            # Refine
+            new_code = refine(new_code)
+            
+            # Local Search
+            new_code = local_search(new_code, seed + 1, time_limit)
+            
+            # Validity check
+            cover_count = [0] * N
+            for c in new_code:
+                for w in balls[c]:
+                    cover_count[w] += 1
+            
+            if min(cover_count) < 1:
+                return None
+                
+            return new_code
 
-        would_be_uncovered = [i for i in neighbors_list[c] if temp_counts[i] == 0]
-
-        if not would_be_uncovered:
-            return False
-
-        all_needed = set(crit_points) | set(would_be_uncovered)
-
-        best_w = -1
-        best_score = -1
-
-        first_point = list(all_needed)[0]
-        cands = [x for x in neighbor_sets[first_point] if x not in code_set]
-
-        for w in cands:
-            valid = True
-            for k in all_needed:
-                if k not in neighbor_sets[w]:
-                    valid = False
+        best_code = None
+        best_size = float('inf')
+        
+        # Phase 1: Standard Multi-Start Greedy
+        num_restarts = 0
+        # We have ~115s. 
+        # Greedy is fast. Local search is the bottleneck.
+        # Let's do a few quick restarts first.
+        
+        while time.time() < deadline - 30:
+            seed = num_restarts * 1000 + 42
+            current_code = run_greedy_local_search(seed)
+            num_restarts += 1
+            
+            if current_code is not None:
+                if len(current_code) < best_size:
+                    best_size = len(current_code)
+                    best_code = list(current_code)
+            
+            # If we find a very good code (e.g., < 190), we might want to spend more time refining it
+            # via perturbation.
+            if num_restarts >= 5:
+                if time.time() > deadline - 40:
                     break
-            if not valid:
-                continue
 
-            score = int(np.sum(counts[neighbors_list[w]] == 1))
-            if score > best_score:
-                best_score = score
-                best_w = w
-
-        if best_w != -1:
-            code.remove(c)
-            code_set.remove(c)
-            counts[neighbors_list[c]] -= 1
-
-            code.append(best_w)
-            code_set.add(best_w)
-            counts[neighbors_list[best_w]] += 1
-            return True
-
-        return False
-
-    def kick():
-        """Remove a random codeword and try to repair. Accept if size decreases."""
-        if not code:
-            return False
-
-        old_size = len(code)
-
-        idx_to_remove = random.randint(0, len(code) - 1)
-        c_remove = code[idx_to_remove]
-
-        temp_coverage = counts.copy()
-        temp_coverage[neighbors_list[c_remove]] -= 1
-
-        uncovered = np.where(temp_coverage == 0)[0]
-
-        if len(uncovered) == 0:
-            code.remove(c_remove)
-            code_set.remove(c_remove)
-            counts[neighbors_list[c_remove]] -= 1
-            return True
-
-        uncovered_set = set(uncovered.tolist())
-        added = greedy_repair(uncovered_set)
-
-        new_size = old_size - 1 + len(added)
-
-        if new_size < old_size:
-            code.remove(c_remove)
-            code_set.remove(c_remove)
-            counts[neighbors_list[c_remove]] -= 1
-            for c in added:
-                code.append(c)
-                code_set.add(c)
-                counts[neighbors_list[c]] += 1
-            return True
+        # Phase 2: Perturbation / Kick Strategy on the best code found so far
+        if best_code is not None:
+            # We have some time left. Let's try to improve best_code.
+            # We will perform multiple perturbation steps.
+            num_perturbations = 0
+            # Allocate remaining time to perturbations
+            while time.time() < deadline - 5:
+                seed = num_perturbations * 10000 + 999
+                # Pass a tighter time limit to local search inside run_perturbation
+                # Actually, run_perturbation uses the global deadline for local search.
+                # We should be careful.
+                
+                perturbed_code = run_perturbation(seed, best_code, deadline - 5)
+                num_perturbations += 1
+                
+                if perturbed_code is not None:
+                    if len(perturbed_code) < best_size:
+                        best_size = len(perturbed_code)
+                        best_code = list(perturbed_code)
+                        # If we improved, we can try more perturbations on the new best
+                        # But if we didn't, we might be stuck. 
+                        # To avoid getting stuck in a loop of non-improving perturbations,
+                        # we could increase the perturbation strength or change seed strategy.
+                    else:
+                        # If no improvement, we might want to try a stronger perturbation
+                        # or just stop if we've tried many.
+                        if num_perturbations > 50:
+                            break
         else:
-            return False
+            # Fallback if Phase 1 failed (shouldn't happen)
+            best_code = run_greedy_local_search(0)
+            if best_code is None:
+                return []
 
-    def kick2():
-        """Remove two random codewords and try to repair. Accept if size decreases."""
-        if len(code) < 2:
-            return False
+        # Final Prune on the best code
+        best_code = refine(best_code)
+        
+        # Return as list of lists
+        words = [int_to_base3(i, n) for i in best_code]
+        return words
 
-        old_size = len(code)
-
-        i1 = random.randint(0, len(code) - 1)
-        i2 = random.randint(0, len(code) - 1)
-        if i1 == i2:
-            i2 = (i2 + 1) % len(code)
-
-        c1 = code[i1]
-        c2 = code[i2]
-
-        temp_coverage = counts.copy()
-        temp_coverage[neighbors_list[c1]] -= 1
-        temp_coverage[neighbors_list[c2]] -= 1
-
-        uncovered = np.where(temp_coverage == 0)[0]
-        uncovered_set = set(uncovered.tolist())
-        added = greedy_repair(uncovered_set)
-
-        new_size = old_size - 2 + len(added)
-
-        if new_size < old_size:
-            code.remove(c1)
-            code_set.remove(c1)
-            counts[neighbors_list[c1]] -= 1
-            code.remove(c2)
-            code_set.remove(c2)
-            counts[neighbors_list[c2]] -= 1
-            for c in added:
-                code.append(c)
-                code_set.add(c)
-                counts[neighbors_list[c]] += 1
-            return True
-        else:
-            return False
-
-    # ---------- Main Local Search Loop ----------
-    improved = True
-    while improved and time.time() < deadline - 10:
-        improved = False
-
-        # 1. Exhaustive removal pass
-        while try_remove():
-            improved = True
-
-        if len(code) < best_size:
-            best_size = len(code)
-            best_code = list(code)
-
-        if time.time() > deadline - 10:
-            break
-
-        # 2. Swap pass - try to improve each codeword's position
-        shuffled_code = list(code)
-        random.shuffle(shuffled_code)
-
-        for c in shuffled_code:
-            if time.time() > deadline - 10:
-                break
-            if c not in code_set:
-                continue
-            if try_swap(c):
-                improved = True
-
-        if len(code) < best_size:
-            best_size = len(code)
-            best_code = list(code)
-
-        if time.time() > deadline - 10:
-            break
-
-        # 3. Kick pass
-        kicks_tried = 0
-        max_kicks = 30
-        while kicks_tried < max_kicks and time.time() < deadline - 10:
-            if kick():
-                improved = True
-                kicks_tried = 0
-            else:
-                kicks_tried += 1
-
-        if len(code) < best_size:
-            best_size = len(code)
-            best_code = list(code)
-
-        if time.time() > deadline - 10:
-            break
-
-        # 4. 2-removal kick pass
-        if len(code) > 2:
-            kicks2_tried = 0
-            max_kicks2 = 15
-            while kicks2_tried < max_kicks2 and time.time() < deadline - 10:
-                if kick2():
-                    improved = True
-                    kicks2_tried = 0
-                else:
-                    kicks2_tried += 1
-
-            if len(code) < best_size:
-                best_size = len(code)
-                best_code = list(code)
-
-    # If we found a better code, restore it
-    if len(best_code) < len(code):
-        code = best_code
-        code_set = set(best_code)
+    # Fallback for other cases
+    words = list(itertools.product(range(q), repeat=n))
+    N = len(words)
+    word_to_idx = {w: i for i, w in enumerate(words)}
+    
+    neighbors = []
+    for i, w in enumerate(words):
+        neigh = [i]
+        w_list = list(w)
+        for pos in range(n):
+            orig_val = w_list[pos]
+            for val in range(q):
+                if val == orig_val:
+                    continue
+                w_list[pos] = val
+                idx = word_to_idx[tuple(w_list)]
+                neigh.append(idx)
+                w_list[pos] = orig_val
+        neighbors.append(neigh)
+    
+    def get_counts(code_list):
+        if not code_list:
+            return np.zeros(N, dtype=np.int32)
         counts = np.zeros(N, dtype=np.int32)
-        for idx in code:
-            counts[neighbors_list[idx]] += 1
+        flat_neighbors = np.concatenate([neighbors[i] for i in code_list])
+        np.add.at(counts, flat_neighbors, 1)
+        return counts
 
-    # Convert back to list of lists
-    result = [idx_to_tuple(cw) for cw in code]
+    def prune_code(code_list):
+        counts = get_counts(code_list)
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(code_list) - 1, -1, -1):
+                c = code_list[i]
+                if np.min(counts[neighbors[c]]) > 1:
+                    code_list.pop(i)
+                    for nb in neighbors[c]:
+                        counts[nb] -= 1
+                    changed = True
+        return code_list
 
-    return result
-# EVOLVE-BLOCK-END
+    def improve_by_swaps(code_list, max_iterations=100):
+        counts = get_counts(code_list)
+        code_set = set(code_list)
+        improved = True
+        iterations = 0
+        
+        neighbor_sets = [set(neigh) for neigh in neighbors]
+        
+        while improved and iterations < max_iterations and time.time() < deadline - 5:
+            improved = False
+            iterations += 1
+            
+            code_list = prune_code(code_list)
+            code_set = set(code_list)
+            counts = get_counts(code_list)
+            
+            random.shuffle(code_list)
+            
+            for c in code_list:
+                if time.time() > deadline - 5:
+                    break
+                
+                crit_points = []
+                for nb in neighbors[c]:
+                    if counts[nb] == 1:
+                        crit_points.append(nb)
+                        
+                if not crit_points:
+                    if np.min(counts[neighbors[c]]) > 1:
+                        code_list.remove(c)
+                        code_set.remove(c)
+                        for nb in neighbors[c]:
+                            counts[nb] -= 1
+                        improved = True
+                        break
+                    continue
+                
+                p = crit_points[0]
+                candidates = [x for x in neighbors[p] if x not in code_set]
+                
+                best_w = -1
+                best_score = -1
+                
+                for w in candidates:
+                    valid = True
+                    for k in crit_points:
+                        if k not in neighbor_sets[w]:
+                            valid = False
+                            break
+                    if not valid:
+                        continue
+                    
+                    score = 0
+                    for nb in neighbors[w]:
+                        if counts[nb] == 2:
+                            score += 1
+                            
+                    if score > best_score:
+                        best_score = score
+                        best_w = w
+                        
+                if best_w != -1:
+                    code_list.remove(c)
+                    code_set.remove(c)
+                    for nb in neighbors[c]:
+                        counts[nb] -= 1
+                        
+                    code_list.append(best_w)
+                    code_set.add(best_w)
+                    for nb in neighbors[best_w]:
+                        counts[nb] += 1
+                        
+                    improved = True
+                    break
+                    
+        return code_list
+
+    def run_greedy_local_search(seed):
+        random.seed(seed)
+        code = []
+        uncovered = np.ones(N, dtype=bool)
+        uncovered_count = N
+        
+        neighbor_array = np.zeros((N, 1 + n * (q - 1)), dtype=np.int32)
+        for i, neigh in enumerate(neighbors):
+            neighbor_array[i, :] = neigh
+        
+        while uncovered_count > 0 and time.time() < deadline - 20:
+            gains = uncovered[neighbor_array].sum(axis=1)
+            max_gain = np.max(gains)
+            if max_gain == 0:
+                break
+            candidates = np.where(gains == max_gain)[0]
+            best_idx = candidates[random.randint(0, len(candidates) - 1)]
+            
+            code.append(best_idx)
+            
+            new_uncovered = neighbors[best_idx]
+            newly_covered = 0
+            for nb in new_uncovered:
+                if uncovered[nb]:
+                    uncovered[nb] = False
+                    newly_covered += 1
+            uncovered_count -= newly_covered
+            
+        code = prune_code(code)
+        code = improve_by_swaps(code)
+        
+        counts = get_counts(code)
+        if np.min(counts) < 1:
+            return None
+            
+        return code
+
+    best_code = None
+    best_size = float('inf')
+    
+    num_restarts = 0
+    while time.time() < deadline - 10:
+        seed = num_restarts * 1000 + 42
+        current_code = run_greedy_local_search(seed)
+        num_restarts += 1
+        
+        if current_code is not None:
+            if len(current_code) < best_size:
+                best_size = len(current_code)
+                best_code = list(current_code)
+                
+        if num_restarts >= 10:
+             if time.time() > deadline - 30:
+                 break
+
+    if best_code is None:
+        best_code = run_greedy_local_search(0)
+        if best_code is None:
+             return []
+
+    best_code = prune_code(best_code)
+    
+    return [list(words[i]) for i in best_code]

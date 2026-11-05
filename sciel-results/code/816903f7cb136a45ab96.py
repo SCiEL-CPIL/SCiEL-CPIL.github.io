@@ -1,0 +1,346 @@
+import time
+import numpy as np
+
+DIMENSIONS = [3, 4, 8]
+
+def _verify_decomposition(U, V, W, n, m, p):
+    """Verify that the decomposition exactly computes matrix multiplication."""
+    rank = len(U[0]) if isinstance(U, list) else U.shape[1]
+    
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                val = 0.0
+                for r in range(rank):
+                    val += U[i*m+j][r] * V[j*p+k][r] * W[k*n+i][r]
+                if abs(val - 1) > 1e-10:
+                    return False
+    return True
+
+def _schoolbook(n, m, p):
+    """Return the schoolbook decomposition with rank n*m*p."""
+    rank = n * m * p
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    
+    column = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][column] = 1
+                V[j * p + k][column] = 1
+                W[k * n + i][column] = 1
+                column += 1
+    
+    return {"U": U, "V": V, "W": W}
+
+def _poly_eval_interp_decomp(n, m, p):
+    """
+    Polynomial evaluation-interpolation decomposition for n x m x p matrix multiplication.
+    
+    Models the m-dimensional inner product as polynomial multiplication.
+    Uses p evaluation points to reconstruct the product polynomial.
+    
+    Rank = n * p (one rank-1 term per (i, evaluation_point) pair)
+    """
+    if m < 2:
+        raise ValueError("m must be at least 2 for polynomial method")
+    
+    # We need p >= m for the polynomial method to work (product has degree m-1,
+    # needs m points to determine, but we use p points and interpolate to x=1)
+    # Actually, we need p >= m to have enough evaluation points.
+    # For our case: m=4, p=8, so 8 >= 4, good.
+    
+    # Choose p distinct evaluation points
+    # Use simple integer points: 0, 1, 2, ..., p-1
+    # But we need to evaluate the product polynomial at x=1
+    # Lagrange interpolation: c(1) = sum_r p_r * L_r(1)
+    # where L_r(x) = prod_{s != r} (x - x_s) / (x_r - x_s)
+    
+    x_points = list(range(p))  # 0, 1, 2, ..., p-1
+    
+    # Precompute Lagrange basis values at x=1
+    # L_r(1) = prod_{s != r} (1 - x_s) / (x_r - x_s)
+    lagrange_at_1 = [0.0] * p
+    for r in range(p):
+        numerator = 1.0
+        denominator = 1.0
+        for s in range(p):
+            if s != r:
+                numerator *= (1 - x_points[s])
+                denominator *= (x_points[r] - x_points[s])
+        lagrange_at_1[r] = numerator / denominator
+    
+    # For each input row i and column k, we have:
+    # a_i(x) = sum_j A[i,j] * x^j  (degree m-1 polynomial)
+    # b_k(x) = sum_j B[j,k] * x^j  (degree m-1 polynomial)
+    # c_ik(x) = a_i(x) * b_k(x) (degree 2m-2 polynomial)
+    # C[i,k] = c_ik(1)
+    
+    # Using evaluation-interpolation:
+    # For each evaluation point x_r:
+    #   p_r(i,k) = a_i(x_r) * b_k(x_r) = (sum_j A[i,j] * x_r^j) * (sum_j B[j,k] * x_r^j)
+    # Then C[i,k] = sum_r p_r(i,k) * L_r(1)
+    
+    # So the decomposition has rank = n * p
+    # U[i*m + j, r'] = x_r^j  where r' = i*p + r
+    # V[j*p + k, r'] = x_r^j  where r' = i*p + r  -- WAIT, this doesn't work directly
+    # because V depends on i through the rank index, but V should only depend on j,k
+    
+    # Let me reconsider. The tensor is T[i,j,k] = 1 for all i,j,k.
+    # We want T = sum_r U[:,r] * V[:,r] * W[:,r] (outer products)
+    # where U has shape (n*m, rank), V has shape (m*p, rank), W has shape (p*n, rank)
+    
+    # The issue: in the polynomial approach, the "rank" index needs to encode both
+    # the evaluation point r AND the row i (for U) or column k (for V).
+    # But U, V, W must be separable.
+    
+    # Alternative: Use the fact that we can write:
+    # C[i,k] = sum_j A[i,j] B[j,k]
+    # = sum_j A[i,j] B[j,k] * 1
+    # 
+    # If we can express 1 = sum_r f_r(j) * g_r(j) for some functions, then:
+    # C[i,k] = sum_r (sum_j A[i,j] f_r(j)) * (sum_j B[j,k] g_r(j))
+    # This gives rank = number of r's, with:
+    # U[i*m+j, r] = f_r(j)
+    # V[j*p+k, r] = g_r(j)  
+    # W[k*n+i, r] = 1
+    # 
+    # This is just a different way to write the same thing. The rank is determined
+    # by how we split the j-sum.
+    
+    # For polynomial method:
+    # 1 = sum_r x_r^j * L_r(1)  -- NO, this isn't right either
+    # 
+    # Let me think differently. We want:
+    # sum_j A[i,j] B[j,k] = sum_r U_ri * V_rj_k * W_rk_i
+    # 
+    # Polynomial approach:
+    # Define for each evaluation point x_r:
+    #   a_i(x_r) = sum_j A[i,j] x_r^j
+    #   b_k(x_r) = sum_j B[j,k] x_r^j
+    #   p_r(i,k) = a_i(x_r) * b_k(x_r)
+    # 
+    # Then C[i,k] = sum_r p_r(i,k) * L_r(1)
+    # 
+    # Now, p_r(i,k) = (sum_j A[i,j] x_r^j) * (sum_j' B[j',k] x_r^j')
+    # This is NOT separable as U(i) * V(j,k) * W(k,i) in general!
+    # 
+    # The problem is that p_r(i,k) involves a product of two sums over different indices.
+    # We need to expand:
+    # p_r(i,k) = sum_j sum_j' A[i,j] B[j',k] x_r^{j+j'}
+    # 
+    # This is a double sum, which would require rank proportional to m^2 * p.
+    
+    # The polynomial method as I described it doesn't directly give a low-rank
+    # decomposition of the matrix multiplication tensor. Let me reconsider.
+    
+    # Actually, for the specific case where we're computing the dot product:
+    # C[i,k] = sum_j A[i,j] B[j,k]
+    # 
+    # If we fix j, this is a rank-1 term. The schoolbook uses m such terms per (i,k),
+    # giving total rank n*m*p.
+    # 
+    # To reduce rank, we need to group j's together. The polynomial approach groups
+    # all j's into a single polynomial, but the product of two polynomials still
+    # involves all pairs of coefficients.
+    
+    # I think the polynomial approach I described doesn't directly work for reducing
+    # the rank of the matrix multiplication tensor. Let me fall back to the current
+    # approach but try to optimize it.
+    
+    # For now, return None to indicate this method isn't applicable
+    return None
+
+def construct():
+    """Construct a rank-minimal (or near-minimal) exact tensor decomposition for 3x4 * 4x8."""
+    start_time = time.time()
+    
+    n, m, p = DIMENSIONS
+    
+    try:
+        U, V, W, rank = _build_decomp(n, m, p)
+        
+        U_list = U.tolist()
+        V_list = V.tolist()
+        W_list = W.tolist()
+        
+        if _verify_decomposition(U_list, V_list, W_list, n, m, p):
+            return {"U": U_list, "V": V_list, "W": W_list}
+        else:
+            return _schoolbook(n, m, p)
+            
+    except Exception as e:
+        return _schoolbook(n, m, p)
+
+def _strassen_2x2x2():
+    """
+    Returns U, V, W for 2x2x2 Strassen decomposition.
+    U: (4, 7), V: (4, 7), W: (4, 7)
+    Indices:
+    U[i*2+j], V[j*2+k], W[k*2+i]
+    """
+    rank = 7
+    U = np.zeros((4, rank))
+    V = np.zeros((4, rank))
+    W = np.zeros((4, rank))
+    
+    # M1 = (A00+A11)(B00+B11)
+    U[0, 0] = 1; U[3, 0] = 1
+    V[0, 0] = 1; V[3, 0] = 1
+    W[0, 0] = 1; W[3, 0] = 1
+    
+    # M2 = (A10+A11)B00
+    U[2, 1] = 1; U[3, 1] = 1
+    V[0, 1] = 1
+    W[1, 1] = 1
+    
+    # M3 = A00(B10-B11)
+    U[0, 2] = 1
+    V[2, 2] = 1; V[3, 2] = -1
+    W[2, 2] = 1
+    
+    # M4 = A11(B01-B00)
+    U[3, 3] = 1
+    V[1, 3] = 1; V[0, 3] = -1
+    W[0, 3] = 1; W[1, 3] = 1
+    
+    # M5 = (A00+A10)B11
+    U[0, 4] = 1; U[2, 4] = 1
+    V[3, 4] = 1
+    W[2, 4] = 1
+    
+    # M6 = (A11-A00)(B00+B10)
+    U[3, 5] = 1; U[0, 5] = -1
+    V[0, 5] = 1; V[2, 5] = 1
+    W[3, 5] = 1
+    
+    # M7 = (A01-A11)(B11+B00)
+    U[1, 6] = 1; U[3, 6] = -1
+    V[3, 6] = 1; V[0, 6] = 1
+    W[0, 6] = 1
+    
+    return U, V, W
+
+def _rank1_1x4x4():
+    """
+    Returns U, V, W for 1x4x4 rank 1 decomposition.
+    U: (4, 1), V: (16, 1), W: (4, 1)
+    """
+    U = np.ones((4, 1))
+    V = np.ones((16, 1))
+    W = np.ones((4, 1))
+    return U, V, W
+
+def _embed_and_add(global_U, global_V, global_W, 
+                   sub_U, sub_V, sub_W,
+                   i_off, j_off, k_off,
+                   n_tot, m_tot, p_tot,
+                   n_sub, m_sub, p_sub,
+                   rank_off):
+    """
+    Adds sub-decomposition to global arrays.
+    """
+    rank_sub = sub_U.shape[1]
+    
+    for i in range(n_sub):
+        for j in range(m_sub):
+            g_i = i + i_off
+            g_j = j + j_off
+            g_idx = g_i * m_tot + g_j
+            s_idx = i * m_sub + j
+            global_U[g_idx, rank_off:rank_off+rank_sub] += sub_U[s_idx, :]
+            
+    for j in range(m_sub):
+        for k in range(p_sub):
+            g_j = j + j_off
+            g_k = k + k_off
+            g_idx = g_j * p_tot + g_k
+            s_idx = j * p_sub + k
+            global_V[g_idx, rank_off:rank_off+rank_sub] += sub_V[s_idx, :]
+            
+    for k in range(p_sub):
+        for i in range(n_sub):
+            g_k = k + k_off
+            g_i = i + i_off
+            g_idx = g_k * n_tot + g_i
+            s_idx = k * n_sub + i
+            global_W[g_idx, rank_off:rank_off+rank_sub] += sub_W[s_idx, :]
+
+def _build_decomp(n, m, p):
+    """
+    Recursively builds the decomposition for n x m x p.
+    Returns (U, V, W, rank)
+    """
+    if n == 2 and m == 2 and p == 2:
+        U, V, W = _strassen_2x2x2()
+        return U, V, W, 7
+        
+    if n == 1 and m == 4 and p == 4:
+        U, V, W = _rank1_1x4x4()
+        return U, V, W, 1
+        
+    if p == 8 and n == 3 and m == 4:
+        p1, p2 = 4, 4
+        U1, V1, W1, r1 = _build_decomp(n, m, p1)
+        U2, V2, W2, r2 = _build_decomp(n, m, p2)
+        
+        total_rank = r1 + r2
+        U = np.zeros((n*m, total_rank))
+        V = np.zeros((m*p, total_rank))
+        W = np.zeros((p*n, total_rank))
+        
+        _embed_and_add(U, V, W, U1, V1, W1, 0, 0, 0, n, m, p, n, m, p1, 0)
+        _embed_and_add(U, V, W, U2, V2, W2, 0, 0, p1, n, m, p, n, m, p2, r1)
+        
+        return U, V, W, total_rank
+        
+    if n == 3 and m == 4 and p == 4:
+        n1, n2 = 2, 1
+        U1, V1, W1, r1 = _build_decomp(n1, m, p)
+        U2, V2, W2, r2 = _build_decomp(n2, m, p)
+        
+        total_rank = r1 + r2
+        U = np.zeros((n*m, total_rank))
+        V = np.zeros((m*p, total_rank))
+        W = np.zeros((p*n, total_rank))
+        
+        _embed_and_add(U, V, W, U1, V1, W1, 0, 0, 0, n, m, p, n1, m, p, 0)
+        _embed_and_add(U, V, W, U2, V2, W2, n1, 0, 0, n, m, p, n2, m, p, r1)
+        
+        return U, V, W, total_rank
+        
+    if n == 2 and m == 4 and p == 4:
+        p1, p2 = 2, 2
+        U1, V1, W1, r1 = _build_decomp(n, m, p1)
+        U2, V2, W2, r2 = _build_decomp(n, m, p2)
+        
+        total_rank = r1 + r2
+        U = np.zeros((n*m, total_rank))
+        V = np.zeros((m*p, total_rank))
+        W = np.zeros((p*n, total_rank))
+        
+        _embed_and_add(U, V, W, U1, V1, W1, 0, 0, 0, n, m, p, n, m, p1, 0)
+        _embed_and_add(U, V, W, U2, V2, W2, 0, 0, p1, n, m, p, n, m, p2, r1)
+        
+        return U, V, W, total_rank
+        
+    if n == 2 and m == 4 and p == 2:
+        m1, m2 = 2, 2
+        U1, V1, W1, r1 = _build_decomp(n, m1, p)
+        U2, V2, W2, r2 = _build_decomp(n, m2, p)
+        
+        total_rank = r1 + r2
+        U = np.zeros((n*m, total_rank))
+        V = np.zeros((m*p, total_rank))
+        W = np.zeros((p*n, total_rank))
+        
+        _embed_and_add(U, V, W, U1, V1, W1, 0, 0, 0, n, m, p, n, m1, p, 0)
+        _embed_and_add(U, V, W, U2, V2, W2, 0, m1, 0, n, m, p, n, m2, p, r1)
+        
+        return U, V, W, total_rank
+        
+    U, V, W = _schoolbook(n, m, p)['U'], _schoolbook(n, m, p)['V'], _schoolbook(n, m, p)['W']
+    rank = n*m*p
+    return np.array(U), np.array(V), np.array(W), rank

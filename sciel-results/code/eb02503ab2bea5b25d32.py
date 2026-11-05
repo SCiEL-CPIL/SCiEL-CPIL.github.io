@@ -1,0 +1,481 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+import math
+from scipy.optimize import minimize
+from scipy.spatial.distance import cdist
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from autoresearch_suite.chem_clusters import relax, morse_energy_gradient
+
+# Global deadline guard
+_GLOBAL_START_TIME = None
+_DEADLINE = 325.0  # 325s wall clock limit (evaluator kills at 330s)
+
+def _get_remaining_time():
+    global _GLOBAL_START_TIME
+    if _GLOBAL_START_TIME is None:
+        _GLOBAL_START_TIME = time.time()
+    return _DEADLINE - (time.time() - _GLOBAL_START_TIME)
+
+def _morse_energy(x, rho):
+    """Compute Morse energy for a set of positions (vectorized with cdist)."""
+    n = x.shape[0]
+    if n < 2:
+        return 0.0
+    dist = cdist(x, x)
+    np.fill_diagonal(dist, np.inf)
+    er = rho * (1.0 - dist)
+    # Clip to avoid overflow
+    er = np.clip(er, -500, 500)
+    exp_er = np.exp(er)
+    energy = np.sum(exp_er * (exp_er - 2.0)) / 2.0
+    return energy
+
+def _min_distance(x):
+    """Compute minimum distance between any pair of atoms (vectorized with cdist)."""
+    n = x.shape[0]
+    if n < 2:
+        return np.inf
+    dist = cdist(x, x)
+    np.fill_diagonal(dist, np.inf)
+    return np.min(dist)
+
+def _is_valid(x):
+    """Check if the configuration is valid (atoms at least 0.5 apart)."""
+    return _min_distance(x) >= 0.5
+
+def _generate_shell(n, seed=42):
+    """
+    Generate a compact cluster by placing atoms in concentric shells.
+    """
+    rng = np.random.default_rng(seed)
+    
+    positions = [np.array([0.0, 0.0, 0.0])]
+    remaining = n - 1
+    
+    shell_index = 1
+    while remaining > 0:
+        shell_radius = shell_index * 1.05
+        max_in_shell = min(remaining, int(4 * shell_index * (shell_index + 1)))
+        
+        if max_in_shell <= 0:
+            max_in_shell = 1
+        
+        for _ in range(max_in_shell):
+            u = rng.uniform(-1, 1)
+            theta = rng.uniform(0, 2 * np.pi)
+            r = shell_radius
+            x = r * np.sqrt(1 - u**2) * np.cos(theta)
+            y = r * np.sqrt(1 - u**2) * np.sin(theta)
+            z = r * u
+            positions.append(np.array([x, y, z]))
+        
+        remaining -= max_in_shell
+        shell_index += 1
+    
+    return np.array(positions[:n])
+
+def _generate_icosahedral(n, seed=42):
+    """
+    Generate an icosahedral-like cluster. Good for N=13, 55, and nearby sizes.
+    Uses icosahedral vertices and their neighbors.
+    """
+    rng = np.random.default_rng(seed)
+    
+    # Golden ratio
+    phi = (1 + np.sqrt(5)) / 2
+    
+    # Icosahedron vertices (12 vertices)
+    ico_vertices = np.array([
+        [0, 1, phi], [0, -1, phi], [0, 1, -phi], [0, -1, -phi],
+        [1, phi, 0], [-1, phi, 0], [1, -phi, 0], [-1, -phi, 0],
+        [phi, 0, 1], [phi, 0, -1], [-phi, 0, 1], [-phi, 0, -1]
+    ], dtype=float)
+    ico_vertices /= np.linalg.norm(ico_vertices[0])  # Normalize to unit sphere
+    
+    # Octahedron vertices (6 vertices) - for second shell
+    oct_vertices = np.array([
+        [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]
+    ], dtype=float)
+    
+    # Cubic vertices (8 vertices) - for third shell
+    cube_vertices = np.array([
+        [1, 1, 1], [1, 1, -1], [1, -1, 1], [1, -1, -1],
+        [-1, 1, 1], [-1, 1, -1], [-1, -1, 1], [-1, -1, -1]
+    ], dtype=float)
+    cube_vertices /= np.sqrt(3)
+    
+    # Generate points in shells
+    positions = [np.array([0.0, 0.0, 0.0])]
+    
+    # Shell 1: icosahedron (12 points) at radius ~1
+    r1 = 1.0
+    for v in ico_vertices:
+        positions.append(r1 * v)
+    
+    # Shell 2: octahedron (6 points) at radius ~1.5
+    r2 = 1.5
+    for v in oct_vertices:
+        if len(positions) < n:
+            positions.append(r2 * v)
+    
+    # Shell 3: cube (8 points) at radius ~2.0
+    r3 = 2.0
+    for v in cube_vertices:
+        if len(positions) < n:
+            positions.append(r3 * v)
+    
+    # Shell 4: more icosahedron-like points at radius ~2.5
+    r4 = 2.5
+    while len(positions) < n:
+        u = rng.uniform(-1, 1)
+        theta = rng.uniform(0, 2 * np.pi)
+        x = r4 * np.sqrt(1 - u**2) * np.cos(theta)
+        y = r4 * np.sqrt(1 - u**2) * np.sin(theta)
+        z = r4 * u
+        positions.append(np.array([x, y, z]))
+    
+    pos = np.array(positions[:n])
+    # Add small jitter to break symmetry
+    jitter = rng.uniform(-0.02, 0.02, pos.shape)
+    return pos + jitter
+
+def _generate_fcc_cluster(n, seed=42):
+    """Generate an FCC-like cluster."""
+    rng = np.random.default_rng(seed)
+    
+    radius = 1.5 * (n ** (1.0/3.0))
+    points = []
+    
+    basis = [(0, 0, 0), (0, 0.5, 0.5), (0.5, 0, 0.5), (0.5, 0.5, 0)]
+    
+    max_coord = int(radius) + 2
+    for i in range(-max_coord, max_coord + 1):
+        for j in range(-max_coord, max_coord + 1):
+            for k in range(-max_coord, max_coord + 1):
+                for dx, dy, dz in basis:
+                    p = np.array([i + dx, j + dy, k + dz])
+                    if np.linalg.norm(p) <= radius:
+                        points.append(p)
+    
+    points.sort(key=lambda p: np.linalg.norm(p))
+    
+    if len(points) >= n:
+        jitter = rng.uniform(-0.05, 0.05, (n, 3))
+        return np.array(points[:n]) + jitter
+    else:
+        while len(points) < n:
+            p = rng.uniform(-radius, radius, 3)
+            points.append(p)
+        return np.array(points)
+
+def _generate_bcc_cluster(n, seed=42):
+    """Generate a BCC-like cluster."""
+    rng = np.random.default_rng(seed)
+    
+    radius = 1.5 * (n ** (1.0/3.0))
+    points = []
+    
+    basis = [(0, 0, 0), (0.5, 0.5, 0.5)]
+    
+    max_coord = int(radius) + 2
+    for i in range(-max_coord, max_coord + 1):
+        for j in range(-max_coord, max_coord + 1):
+            for k in range(-max_coord, max_coord + 1):
+                for dx, dy, dz in basis:
+                    p = np.array([i + dx, j + dy, k + dz])
+                    if np.linalg.norm(p) <= radius:
+                        points.append(p)
+    
+    points.sort(key=lambda p: np.linalg.norm(p))
+    
+    if len(points) >= n:
+        jitter = rng.uniform(-0.05, 0.05, (n, 3))
+        return np.array(points[:n]) + jitter
+    else:
+        while len(points) < n:
+            p = rng.uniform(-radius, radius, 3)
+            points.append(p)
+        return np.array(points)
+
+def _generate_random_cluster(n, seed=42, min_dist=0.6):
+    """Generate a random cluster with minimum distance constraint."""
+    rng = np.random.default_rng(seed)
+    
+    radius = 2.0 * (n ** (1.0/3.0))
+    points = []
+    attempts = 0
+    max_attempts = 50000
+    
+    while len(points) < n and attempts < max_attempts:
+        p = rng.uniform(-radius, radius, 3)
+        if np.linalg.norm(p) <= radius:
+            valid = True
+            for q in points:
+                if np.linalg.norm(p - q) < min_dist:
+                    valid = False
+                    break
+            if valid:
+                points.append(p)
+        attempts += 1
+    
+    while len(points) < n:
+        p = rng.uniform(-radius, radius, 3)
+        points.append(p)
+    
+    return np.array(points)
+
+def _relax_and_validate(positions, potential, rho):
+    """Relax positions and check validity."""
+    n = positions.shape[0]
+    try:
+        energy, relaxed = relax(positions, potential, rho)
+        if _min_distance(relaxed) >= 0.5:
+            return energy, relaxed
+        else:
+            return float('inf'), None
+    except Exception:
+        return float('inf'), None
+
+def _polish(positions, rho, max_iter=100):
+    """
+    Perform a high-precision local minimization using L-BFGS-B.
+    """
+    n = positions.shape[0]
+    x_flat = positions.flatten()
+    
+    def objective(x):
+        pos = x.reshape(-1, 3)
+        if _min_distance(pos) < 0.5:
+            return 1e10
+        return _morse_energy(pos, rho)
+    
+    def gradient(x):
+        pos = x.reshape(-1, 3)
+        if _min_distance(pos) < 0.5:
+            return np.zeros_like(x)
+        grad_3d = morse_energy_gradient(pos, rho)
+        return grad_3d.flatten()
+    
+    try:
+        res = minimize(objective, x_flat, jac=gradient, method='L-BFGS-B',
+                       options={'maxiter': max_iter, 'ftol': 1e-12, 'gtol': 1e-8})
+        if res.success or res.fun < 1e10:
+            pos_res = res.x.reshape(-1, 3)
+            if _min_distance(pos_res) >= 0.5:
+                return res.fun, pos_res
+    except Exception:
+        pass
+    
+    return _morse_energy(positions, rho), positions
+
+def _basin_hop(start_positions, potential, rho, max_iterations=50, initial_step=0.5, initial_temp=2.0):
+    """
+    Perform basin hopping optimization with adaptive step size and kick strategy.
+    Returns (best_energy, best_positions).
+    """
+    n = start_positions.shape[0]
+    current_energy, current_positions = _relax_and_validate(start_positions, potential, rho)
+    
+    if current_positions is None:
+        perturbed = start_positions + np.random.normal(0, 0.1, start_positions.shape)
+        current_energy, current_positions = _relax_and_validate(perturbed, potential, rho)
+        if current_positions is None:
+            return float('inf'), None
+    
+    best_energy = current_energy
+    best_positions = current_positions.copy()
+    
+    step_size = initial_step
+    temp = initial_temp
+    no_improve_count = 0
+    max_no_improve = 15
+    
+    for it in range(max_iterations):
+        if _get_remaining_time() < 5.0:
+            break
+        
+        # Adaptive step size: increase if stuck, decrease if improving
+        if no_improve_count > max_no_improve:
+            step_size *= 1.5
+            temp *= 1.5
+            no_improve_count = 0
+            # Kick: larger perturbation to escape local minimum
+            noise = np.random.normal(0, step_size * 2, current_positions.shape)
+        else:
+            noise = np.random.normal(0, step_size, current_positions.shape)
+        
+        new_positions = current_positions + noise
+        
+        new_energy, new_relaxed = _relax_and_validate(new_positions, potential, rho)
+        
+        if new_relaxed is None:
+            # Try smaller perturbation
+            noise = np.random.normal(0, step_size * 0.3, current_positions.shape)
+            new_positions = current_positions + noise
+            new_energy, new_relaxed = _relax_and_validate(new_positions, potential, rho)
+        
+        if new_relaxed is None:
+            no_improve_count += 1
+            continue
+        
+        delta_e = new_energy - current_energy
+        if delta_e < 0 or (temp > 1e-6 and np.random.rand() < math.exp(-delta_e / temp)):
+            current_energy = new_energy
+            current_positions = new_relaxed
+            
+            if current_energy < best_energy:
+                best_energy = current_energy
+                best_positions = current_positions.copy()
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+        
+        temp *= 0.95
+        step_size *= 0.98
+    
+    return best_energy, best_positions
+
+def construct(instance):
+    global _GLOBAL_START_TIME
+    if _GLOBAL_START_TIME is None:
+        _GLOBAL_START_TIME = time.time()
+        
+    n = instance["n"]
+    rho = instance.get("rho", instance.get("kind"))
+    potential = instance["potential"]
+    
+    if rho is None:
+        rho = 6
+    
+    best_energy = float('inf')
+    best_positions = None
+    
+    initial_guesses = []
+    
+    # Generate diverse initial structures
+    try:
+        initial_guesses.append(_generate_shell(n, seed=42))
+    except Exception:
+        pass
+    
+    try:
+        initial_guesses.append(_generate_icosahedral(n, seed=42))
+    except Exception:
+        pass
+    
+    try:
+        initial_guesses.append(_generate_fcc_cluster(n, seed=42))
+    except Exception:
+        pass
+    
+    try:
+        initial_guesses.append(_generate_bcc_cluster(n, seed=42))
+    except Exception:
+        pass
+    
+    # Random starts - more for larger N
+    num_random = 8 if n <= 50 else 12
+    for seed in range(1, num_random + 1):
+        try:
+            initial_guesses.append(_generate_random_cluster(n, seed=seed))
+        except Exception:
+            pass
+    
+    # Relax all initial guesses
+    relaxed_results = []
+    for guess in initial_guesses:
+        if _get_remaining_time() < 10.0:
+            break
+        
+        energy, positions = _relax_and_validate(guess, potential, rho)
+        if positions is not None and energy < float('inf'):
+            relaxed_results.append((energy, positions))
+    
+    relaxed_results.sort(key=lambda x: x[0])
+    
+    if relaxed_results:
+        best_energy = relaxed_results[0][0]
+        best_positions = relaxed_results[0][1].copy()
+    
+    # Parallel Basin Hopping from top relaxed starts
+    # Allocate time based on remaining budget
+    remaining = _get_remaining_time()
+    
+    # Determine number of BH starts and iterations based on N and time
+    if n <= 40:
+        num_bh_starts = min(len(relaxed_results), 8)
+        max_iter_base = 100
+    elif n <= 60:
+        num_bh_starts = min(len(relaxed_results), 6)
+        max_iter_base = 60
+    else:
+        num_bh_starts = min(len(relaxed_results), 4)
+        max_iter_base = 35
+    
+    # Adjust based on remaining time
+    # We use 4 threads, so we can run 4 BH chains in parallel
+    # Estimate time per iteration is roughly 0.1s for N=80, 0.05s for N=38
+    # Let's assume we can fit max_iter_base iterations in the remaining time if we parallelize well
+    
+    # Select the best starts for parallel BH
+    selected_starts = [r[1] for r in relaxed_results[:num_bh_starts]]
+    
+    # If we have fewer starts than threads, duplicate with jitter
+    while len(selected_starts) < 4:
+        base = relaxed_results[0][1]
+        jitter = np.random.normal(0, 0.5, base.shape)
+        selected_starts.append(base + jitter)
+    
+    # Run parallel BH
+    def run_bh(start_pos):
+        if rho <= 3:
+            initial_step = 0.8
+            initial_temp = 5.0
+        elif rho <= 6:
+            initial_step = 0.5
+            initial_temp = 3.0
+        else:
+            initial_step = 0.3
+            initial_temp = 2.0
+        
+        bh_energy, bh_positions = _basin_hop(
+            start_pos, potential, rho,
+            max_iterations=max_iter_base,
+            initial_step=initial_step,
+            initial_temp=initial_temp
+        )
+        return bh_energy, bh_positions
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(run_bh, start) for start in selected_starts]
+        for future in as_completed(futures):
+            if _get_remaining_time() < 10.0:
+                # Cancel pending futures if we are out of time
+                for f in futures:
+                    f.cancel()
+                break
+            try:
+                bh_energy, bh_positions = future.result()
+                if bh_positions is not None and bh_energy < best_energy:
+                    best_energy = bh_energy
+                    best_positions = bh_positions.copy()
+            except Exception as e:
+                pass
+
+    # Final polish with high precision
+    if best_positions is not None and _get_remaining_time() > 5.0:
+        polished_energy, polished_pos = _polish(best_positions, rho)
+        if polished_pos is not None and polished_energy < best_energy:
+            best_energy = polished_energy
+            best_positions = polished_pos
+    
+    if best_positions is None:
+        best_positions = _generate_shell(n, seed=0)
+        if not _is_valid(best_positions):
+            best_positions = best_positions * 1.5
+            if not _is_valid(best_positions):
+                best_positions = _generate_random_cluster(n, seed=99)
+    
+    return best_positions
+# EVOLVE-BLOCK-END
