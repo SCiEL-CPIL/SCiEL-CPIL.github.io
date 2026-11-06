@@ -1,0 +1,14 @@
+N = 100
+
+# EVOLVE-BLOCK-START
+def construct():
+    """
+    Constructs a 100-bit binary string maximizing the number of ones.
+    The global optimum for the OneMax problem is a string of all '1's.
+    This solution returns the optimal string directly, ensuring maximum score
+    with minimal execution time.
+    """
+    # Return the theoretical maximum: 100 ones
+    # This is O(1) and cannot be improved.
+    return "1" * N
+# EVOLVE-BLOCK-END

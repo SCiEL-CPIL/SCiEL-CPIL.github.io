@@ -1,0 +1,255 @@
+import time
+import random
+
+N = 16
+
+def construct():
+    # Precompute all 4-cycles (all three cycle decompositions for each 4-vertex subset)
+    # For vertices a<b<c<d, the three 4-cycles are:
+    # Cycle 1: (a,b),(b,c),(c,d),(d,a)
+    # Cycle 2: (a,b),(b,d),(c,d),(a,c)
+    # Cycle 3: (a,c),(b,c),(b,d),(a,d)
+    
+    def get_four_cycles():
+        cycles = []
+        for a in range(N):
+            for b in range(a+1, N):
+                for c in range(b+1, N):
+                    for d in range(c+1, N):
+                        cycles.append([(a,b), (b,c), (c,d), (a,d)])
+                        cycles.append([(a,b), (b,d), (c,d), (a,c)])
+                        cycles.append([(a,c), (b,c), (b,d), (a,d)])
+        return cycles
+    
+    four_cycles = get_four_cycles()
+    num_cycles = len(four_cycles)
+    
+    # Precompute edge-to-cycles mapping
+    all_edges = [(i, j) for i in range(N) for j in range(i+1, N)]
+    edge_to_cycles = {e: [] for e in all_edges}
+    for idx, cycle in enumerate(four_cycles):
+        for e in cycle:
+            edge_to_cycles[e].append(idx)
+    
+    # For fast checking, precompute for each edge and each cycle containing it,
+    # the other 3 edges in that cycle
+    edge_cycle_others = {}
+    for idx, cycle in enumerate(four_cycles):
+        for pos, e in enumerate(cycle):
+            others = [cycle[(pos + k) % 4] for k in range(1, 4)]
+            if e not in edge_cycle_others:
+                edge_cycle_others[e] = []
+            edge_cycle_others[e].append(others)
+    
+    # Helper to check if a coloring is valid (no rainbow C4)
+    def is_valid(coloring):
+        for cycle in four_cycles:
+            colors = [coloring[e] for e in cycle]
+            if len(set(colors)) == 4:
+                return False
+        return True
+    
+    # Helper to get number of distinct colors
+    def count_distinct(coloring):
+        return len(set(coloring.values()))
+    
+    # Fast validity check for a single edge recoloring
+    def check_edge_valid(e, new_color, coloring):
+        """Check if recoloring edge e to new_color keeps all affected cycles valid."""
+        for others in edge_cycle_others.get(e, []):
+            colors = [new_color]
+            for oe in others:
+                colors.append(coloring[oe])
+            if len(set(colors)) == 4:
+                return False
+        return True
+    
+    # Local search: try to recolor edges to increase distinct colors
+    def local_search(coloring, max_iter=50000, timeout=45.0):
+        start_time = time.time()
+        best_coloring = dict(coloring)
+        best_count = count_distinct(best_coloring)
+        
+        edges = list(coloring.keys())
+        
+        for it in range(max_iter):
+            if time.time() - start_time > timeout:
+                break
+            
+            # Pick a random edge
+            e = random.choice(edges)
+            old_color = coloring[e]
+            
+            # Try new colors from 0 to 119
+            # Prefer colors not currently used to increase diversity
+            used_colors = set(coloring.values())
+            
+            # Try unused colors first
+            candidate_colors = [c for c in range(120) if c not in used_colors]
+            random.shuffle(candidate_colors)
+            
+            # Also try some random colors from used set
+            for _ in range(5):
+                candidate_colors.append(random.randint(0, 119))
+            
+            improved = False
+            for new_color in candidate_colors:
+                if new_color == old_color:
+                    continue
+                    
+                coloring[e] = new_color
+                
+                # Check only affected cycles
+                valid = check_edge_valid(e, new_color, coloring)
+                
+                if valid:
+                    new_count = count_distinct(coloring)
+                    if new_count >= best_count:
+                        if new_count > best_count:
+                            best_coloring = dict(coloring)
+                            best_count = new_count
+                            improved = True
+                        break
+                else:
+                    coloring[e] = old_color
+            
+            if not improved and random.random() < 0.05:
+                # Occasionally revert to best
+                coloring = dict(best_coloring)
+        
+        return best_coloring, best_count
+    
+    # Backtracking search to add new colors
+    def backtracking_add_colors(coloring, max_depth=5, timeout=10.0):
+        """Try to add new colors by recoloring edges, using backtracking."""
+        start_time = time.time()
+        best_coloring = dict(coloring)
+        best_count = count_distinct(best_coloring)
+        
+        used_colors = set(coloring.values())
+        unused_colors = [c for c in range(120) if c not in used_colors]
+        random.shuffle(unused_colors)
+        
+        edges = list(coloring.keys())
+        random.shuffle(edges)
+        
+        # Try to assign unused colors to edges
+        for new_color in unused_colors:
+            if time.time() - start_time > timeout:
+                break
+            
+            # Try each edge with this new color
+            for e in edges:
+                if time.time() - start_time > timeout:
+                    break
+                
+                old_color = coloring[e]
+                coloring[e] = new_color
+                
+                if check_edge_valid(e, new_color, coloring):
+                    # Check if this increases distinct color count
+                    new_count = count_distinct(coloring)
+                    if new_count > best_count:
+                        best_coloring = dict(coloring)
+                        best_count = new_count
+                    # Keep the change if valid, even if not improving (for exploration)
+                else:
+                    coloring[e] = old_color
+        
+        return best_coloring, best_count
+    
+    # Build initial coloring using recursive construction
+    def get_base_coloring():
+        # Returns a dictionary mapping (local_i, local_j) to color
+        # and the max color value used
+        base = {
+            (0, 1): 1,
+            (0, 2): 4,
+            (0, 3): 1,
+            (1, 2): 2,
+            (1, 3): 4,
+            (2, 3): 3
+        }
+        return base, 4
+
+    def build_coloring(n):
+        # Returns a dictionary mapping (local_i, local_j) to color
+        # and the max color value used
+        if n == 1:
+            return {}, 0
+        if n == 2:
+            return {(0, 1): 1}, 1
+        if n == 3:
+            # K3. Any 3 edges. No C4. Can use 3 colors.
+            return {(0, 1): 1, (0, 2): 2, (1, 2): 3}, 3
+        if n == 4:
+            return get_base_coloring()
+        
+        n1 = n // 2
+        n2 = n - n1
+        
+        # Recursively build for first half and second half
+        col1, max1 = build_coloring(n1)
+        col2, max2 = build_coloring(n2)
+        
+        # Shift colors of col2 to be above max1
+        shifted_col2 = {}
+        for (i, j), c in col2.items():
+            shifted_col2[(i, j)] = c + max1
+            
+        bridge_color = max1 + max2 + 1
+        
+        new_col = {}
+        
+        # Edges in first half
+        for (i, j), c in col1.items():
+            new_col[(i, j)] = c
+            
+        # Edges in second half (shift indices)
+        for (i, j), c in shifted_col2.items():
+            new_col[(i + n1, j + n1)] = c
+            
+        # Edges between halves
+        for i in range(n1):
+            for j in range(n1, n):
+                new_col[(i, j)] = bridge_color
+                
+        return new_col, bridge_color
+
+    # Build for N=16
+    coloring_dict, max_color = build_coloring(N)
+    
+    # Run local search
+    deadline = 55.0
+    start = time.time()
+    
+    # First pass: local search
+    improved_coloring, improved_count = local_search(coloring_dict, max_iter=20000, timeout=min(20.0, deadline - (time.time() - start) - 10.0))
+    
+    if improved_count > count_distinct(coloring_dict):
+        coloring_dict = improved_coloring
+    
+    # Second pass: backtracking to add new colors
+    remaining = deadline - (time.time() - start)
+    if remaining > 10.0:
+        bt_coloring, bt_count = backtracking_add_colors(coloring_dict, max_depth=5, timeout=min(8.0, remaining - 5.0))
+        if bt_count > count_distinct(coloring_dict):
+            coloring_dict = bt_coloring
+    
+    # Third pass: more local search if time remains
+    remaining = deadline - (time.time() - start)
+    if remaining > 10.0:
+        improved_coloring2, improved_count2 = local_search(coloring_dict, max_iter=20000, timeout=min(8.0, remaining - 3.0))
+        if improved_count2 > count_distinct(coloring_dict):
+            coloring_dict = improved_coloring2
+    
+    # Create the final array
+    # Lexicographically ordered pairs (i,j), 0<=i<j<N
+    result = [0] * (N * (N - 1) // 2)
+    idx = 0
+    for i in range(N):
+        for j in range(i + 1, N):
+            result[idx] = coloring_dict[(i, j)]
+            idx += 1
+            
+    return result

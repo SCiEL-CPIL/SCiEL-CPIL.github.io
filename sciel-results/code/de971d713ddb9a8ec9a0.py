@@ -1,0 +1,190 @@
+"""Model-and-optimize: parameterize the 3-layer Ry/CZ circuit and directly
+minimize the exact mean energy gap per spin against the exact ground state."""
+# EVOLVE-BLOCK-START
+import time
+import numpy as np
+import scipy.optimize
+
+# Explicit global wall-clock deadline guard (evaluator kills at 150 s).
+_GLOBAL_DEADLINE = time.time() + 140.0
+_CACHE = {}
+
+
+_GATE_CACHE = {}
+
+
+def _get_ry_indices(n, qubit):
+    """Pre-compute index pairs for Ry on qubit."""
+    key = ('ry', n, qubit)
+    if key not in _GATE_CACHE:
+        dim = 2 ** n
+        mask = 1 << qubit
+        idx = np.arange(dim)
+        # For each state where qubit is 0, partner has qubit=1
+        zero_states = idx[(idx & mask) == 0]
+        one_states = zero_states | mask
+        _GATE_CACHE[key] = (zero_states, one_states)
+    return _GATE_CACHE[key]
+
+
+def _apply_ry(psi, n, qubit, theta):
+    """Apply single-qubit Ry(theta) on qubit (bit qubit). Returns new vector."""
+    c = np.cos(theta * 0.5)
+    s = np.sin(theta * 0.5)
+    zero_idx, one_idx = _get_ry_indices(n, qubit)
+    out = psi.copy()
+    a0 = psi[zero_idx]
+    a1 = psi[one_idx]
+    out[zero_idx] = c * a0 - s * a1
+    out[one_idx] = s * a0 + c * a1
+    return out
+
+
+def _apply_cz(psi, n, a, b):
+    """Apply controlled-Z on qubits (a, b). Returns new vector."""
+    out = psi.copy()
+    mask = (1 << a) | (1 << b)
+    dim = len(psi)
+    idx = np.arange(dim)
+    both_one = idx[(idx & mask) == mask]
+    out[both_one] = -out[both_one]
+    return out
+
+
+def _circuit_state(theta, n, layers):
+    dim = 2 ** n
+    psi = np.zeros(dim, dtype=complex)
+    psi[0] = 1.0
+    for l in range(layers):
+        for i in range(n):
+            psi = _apply_ry(psi, n, i, theta[l, i])
+        if l < layers - 1:
+            for i in range(n - 1):
+                psi = _apply_cz(psi, n, i, i + 1)
+    return psi
+
+
+def _build_H(n, coupling, field):
+    dim = 2 ** n
+    H = np.zeros((dim, dim), dtype=complex)
+    # ZZ (Ising) terms: -coupling * sum_i Z_i Z_{i+1}
+    for i in range(n - 1):
+        ma = 1 << i
+        mb = 1 << (i + 1)
+        for state in range(dim):
+            za = 1.0 if ((state & ma) == 0) else -1.0
+            zb = 1.0 if ((state & mb) == 0) else -1.0
+            H[state, state] += -coupling * za * zb
+    # Transverse-field terms: -field * sum_i X_i
+    for i in range(n):
+        m = 1 << i
+        for state in range(dim):
+            H[state, state ^ m] += -field
+    return H
+
+
+def _ground_energy(n, coupling, field):
+    H = _build_H(n, coupling, field)
+    return float(np.min(np.linalg.eigvalsh(H))), H
+
+
+def _optimize_case(n, coupling, field, layers, time_budget):
+    E0, H = _ground_energy(n, coupling, field)
+    dim = 2 ** n
+
+    def energy(theta):
+        psi = _circuit_state(theta, n, layers)
+        return float(np.real(np.vdot(psi, H @ psi)))
+
+    def obj(theta_flat):
+        theta = theta_flat.reshape(layers, n)
+        return (energy(theta) - E0) / n
+
+    bounds = [(-np.pi, np.pi)] * (layers * n)
+    rng = np.random.default_rng(12345)
+
+    # Physics-inspired starts: near-zero for Ising-dominated, near pi/2 for field-dominated
+    starts = [np.zeros((layers, n))]
+    
+    # Add structured starts based on field/coupling ratio
+    ratio = field / max(coupling, 1e-10)
+    for scale in [0.5, 1.0, 1.5]:
+        theta_struct = np.zeros((layers, n))
+        theta_struct[0] = scale * np.arctan(ratio)
+        theta_struct[1] = scale * np.arctan(ratio) * 0.8
+        theta_struct[2] = scale * np.arctan(ratio) * 0.6
+        starts.append(theta_struct)
+    
+    n_starts = 10
+    for _ in range(n_starts):
+        starts.append(rng.uniform(-np.pi, np.pi, size=(layers, n)))
+
+    best_theta = np.zeros((layers, n))
+    best_val = np.inf
+    t0 = time.time()
+
+    for s in starts:
+        if time.time() - t0 > time_budget - 3.0:
+            break
+        try:
+            res = scipy.optimize.minimize(
+                obj, s.reshape(-1), method="L-BFGS-B",
+                bounds=bounds,
+                options={"maxiter": 150, "ftol": 1e-12, "gtol": 1e-8},
+            )
+            if res.fun < best_val:
+                best_val = res.fun
+                best_theta = res.x.reshape(layers, n)
+        except Exception:
+            pass
+
+    # Final high-precision polish pass if time remains
+    remaining_time = time_budget - (time.time() - t0)
+    if remaining_time > 2.0 and np.all(np.isfinite(best_theta)):
+        try:
+            res = scipy.optimize.minimize(
+                obj, best_theta.reshape(-1), method="L-BFGS-B",
+                bounds=bounds,
+                options={"maxiter": 200, "ftol": 1e-15, "gtol": 1e-12},
+            )
+            if res.fun < best_val:
+                best_val = res.fun
+                best_theta = res.x.reshape(layers, n)
+        except Exception:
+            pass
+
+    # Guard against non-finite results.
+    if not np.all(np.isfinite(best_theta)):
+        best_theta = np.zeros((layers, n))
+    return best_theta
+
+
+def angles(n, coupling, field, layers):
+    key = (int(n), float(coupling), float(field), int(layers))
+    if key in _CACHE:
+        return _CACHE[key].copy()
+
+    remaining = _GLOBAL_DEADLINE - time.time()
+    if remaining <= 3.0:
+        # Not enough time: return a sane product-state default (|+>^n on last layer).
+        theta = np.zeros((layers, n))
+        theta[-1] = np.pi / 2
+        _CACHE[key] = theta
+        return theta.copy()
+
+    # Per-call budget: keep total under the deadline with a safety margin.
+    budget = min(remaining * 0.85, 18.0)
+
+    try:
+        theta = _optimize_case(n, coupling, field, layers, budget)
+    except Exception:
+        theta = np.zeros((layers, n))
+        theta[-1] = np.pi / 2
+
+    if not np.all(np.isfinite(theta)):
+        theta = np.zeros((layers, n))
+        theta[-1] = np.pi / 2
+
+    _CACHE[key] = theta
+    return theta.copy()
+# EVOLVE-BLOCK-END

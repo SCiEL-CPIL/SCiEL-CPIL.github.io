@@ -1,0 +1,555 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import time
+import math
+import random
+import numpy as np
+from itertools import permutations
+
+def _get_rotations(w, h, d):
+    """Get all unique rotations of a box, sorted to prefer lower z then y then x."""
+    rots = set()
+    for perm in permutations((w, h, d)):
+        rots.add(perm)
+    # Sort: prefer lower z-extent (last dim) to stack better, then lower y, then lower x
+    rots = sorted(rots, key=lambda r: (r[2], r[1], r[0]))
+    return list(rots)
+
+class VoxelOccupancy:
+    """3D voxel grid for fast overlap checking using numpy."""
+    def __init__(self, W, H, D):
+        self.W = W
+        self.H = H
+        self.D = D
+        self.grid = np.zeros((W, H, D), dtype=np.uint8)
+    
+    def is_free(self, x, y, z, w, h, d):
+        """Check if a box at (x,y,z) with dims (w,h,d) fits without overlap."""
+        if x + w > self.W or y + h > self.H or z + d > self.D:
+            return False
+        region = self.grid[x:x+w, y:y+h, z:z+d]
+        return not region.any()
+    
+    def place(self, x, y, z, w, h, d):
+        """Mark a box as occupied."""
+        self.grid[x:x+w, y:y+h, z:z+d] = 1
+    
+    def unplace(self, x, y, z, w, h, d):
+        """Unmark a box."""
+        self.grid[x:x+w, y:y+h, z:z+d] = 0
+
+def _try_place(boxes, container, sort_key='volume_desc', deadline=None, seed=None):
+    """
+    Attempt to place boxes into the container using a list-packing heuristic with
+    extreme-point candidate positions and voxel-based overlap checking.
+    Returns a list of placements: (bin, x, y, z, w, h, d) for each box.
+    """
+    W, H, D = container
+    n = len(boxes)
+    if n == 0:
+        return []
+    
+    # Sort boxes
+    indexed = list(enumerate(boxes))
+    if sort_key == 'volume_desc':
+        indexed.sort(key=lambda t: t[1][0]*t[1][1]*t[1][2], reverse=True)
+    elif sort_key == 'max_dim_desc':
+        indexed.sort(key=lambda t: max(t[1]), reverse=True)
+    elif sort_key == 'min_dim_asc':
+        indexed.sort(key=lambda t: min(t[1]))
+    elif sort_key == 'aspect_desc':
+        indexed.sort(key=lambda t: max(t[1])/max(min(t[1]),1e-9), reverse=True)
+    elif sort_key == 'volume_asc':
+        indexed.sort(key=lambda t: t[1][0]*t[1][1]*t[1][2])
+    elif sort_key == 'max_dim_asc':
+        indexed.sort(key=lambda t: max(t[1]))
+    elif sort_key == 'random':
+        if seed is not None:
+            random.seed(seed)
+        random.shuffle(indexed)
+    else:
+        indexed.sort(key=lambda t: t[1][0]*t[1][1]*t[1][2], reverse=True)
+    
+    occ = VoxelOccupancy(W, H, D)
+    placed = []  # list of (x, y, z, w, h, d)
+    result = [(-1, 0, 0, 0, 0, 0, 0)] * n
+    used_volume = 0.0
+    container_vol = W * H * D
+    
+    for idx, (bw, bh, bd) in indexed:
+        if deadline and time.time() > deadline:
+            break
+        rots = _get_rotations(bw, bh, bd)
+        best_pos = None
+        best_score = None
+        
+        # Generate candidate positions: origin + extreme points from placed boxes
+        candidates = set()
+        candidates.add((0, 0, 0))
+        for (px, py, pz, pw, ph, pd) in placed:
+            candidates.add((px + pw, py, pz))
+            candidates.add((px, py + ph, pz))
+            candidates.add((px, py, pz + pd))
+            # Also try combinations of two extreme points for better packing
+            candidates.add((px + pw, py + ph, pz))
+            candidates.add((px + pw, py, pz + pd))
+            candidates.add((px, py + ph, pz + pd))
+        
+        # Limit candidates to avoid combinatorial explosion
+        if len(candidates) > 400:
+            candidates = sorted(candidates, key=lambda c: c[0]+c[1]+c[2])[:400]
+        
+        for (rw, rh, rd) in rots:
+            for (cx, cy, cz) in candidates:
+                if not occ.is_free(cx, cy, cz, rw, rh, rd):
+                    continue
+                # Score: prefer positions closer to origin (more compact)
+                score = cx + cy + cz
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_pos = (cx, cy, cz, rw, rh, rd)
+        
+        if best_pos:
+            cx, cy, cz, rw, rh, rd = best_pos
+            occ.place(cx, cy, cz, rw, rh, rd)
+            placed.append((cx, cy, cz, rw, rh, rd))
+            result[idx] = (0, cx, cy, cz, rw, rh, rd)
+            used_volume += rw * rh * rd
+    
+    return result
+
+def _shake_local_search(boxes, container, initial_result, deadline):
+    """
+    Take an initial placement and try to improve it by moving boxes using voxel-based
+    overlap checking for speed.
+    Returns improved result.
+    """
+    W, H, D = container
+    n = len(boxes)
+    
+    # Parse initial result
+    loaded_indices = [i for i in range(n) if initial_result[i][0] == 0]
+    placed = []
+    occ = VoxelOccupancy(W, H, D)
+    for i in loaded_indices:
+        r = initial_result[i]
+        placed.append((i, r[1], r[2], r[3], r[4], r[5], r[6]))
+        occ.place(r[1], r[2], r[3], r[4], r[5], r[6])
+    
+    result = [(-1, 0, 0, 0, 0, 0, 0)] * n
+    for i, x, y, z, w, h, d in placed:
+        result[i] = (0, x, y, z, w, h, d)
+    
+    # Try to improve by moving boxes to better positions
+    improved = True
+    while improved and time.time() < deadline:
+        improved = False
+        
+        # For each loaded box, try to move it to a better (more compact) position
+        for idx in range(len(placed)):
+            box_idx, bx, by, bz, bw, bh, bd = placed[idx]
+            
+            # Remove this box temporarily from occupancy
+            occ.unplace(bx, by, bz, bw, bh, bd)
+            
+            best_pos = None
+            best_score = None
+            rots = _get_rotations(bw, bh, bd)
+            
+            # Generate candidates from other placed boxes
+            candidates = set()
+            candidates.add((0, 0, 0))
+            for j, (pi, px, py, pz, pw, ph, pd) in enumerate(placed):
+                if j == idx:
+                    continue
+                candidates.add((px + pw, py, pz))
+                candidates.add((px, py + ph, pz))
+                candidates.add((px, py, pz + pd))
+                candidates.add((px + pw, py + ph, pz))
+                candidates.add((px + pw, py, pz + pd))
+                candidates.add((px, py + ph, pz + pd))
+            
+            if len(candidates) > 400:
+                candidates = sorted(candidates, key=lambda c: c[0]+c[1]+c[2])[:400]
+            
+            for (rw, rh, rd) in rots:
+                for (cx, cy, cz) in candidates:
+                    if not occ.is_free(cx, cy, cz, rw, rh, rd):
+                        continue
+                    score = cx + cy + cz
+                    if best_score is None or score < best_score:
+                        best_score = score
+                        best_pos = (cx, cy, cz, rw, rh, rd)
+            
+            # Only accept if strictly better (more compact)
+            if best_pos and best_score < bx + by + bz:
+                cx, cy, cz, rw, rh, rd = best_pos
+                occ.place(cx, cy, cz, rw, rh, rd)
+                placed[idx] = (box_idx, cx, cy, cz, rw, rh, rd)
+                result[box_idx] = (0, cx, cy, cz, rw, rh, rd)
+                improved = True
+            else:
+                # Put back in original position
+                occ.place(bx, by, bz, bw, bh, bd)
+    
+    # Try to add unloaded boxes
+    unloaded = [i for i in range(n) if result[i][0] == -1]
+    # Sort by volume descending
+    unloaded.sort(key=lambda i: boxes[i][0]*boxes[i][1]*boxes[i][2], reverse=True)
+    
+    for box_idx in unloaded:
+        if time.time() > deadline:
+            break
+        bw, bh, bd = boxes[box_idx]
+        rots = _get_rotations(bw, bh, bd)
+        best_pos = None
+        best_score = None
+        
+        candidates = set()
+        candidates.add((0, 0, 0))
+        for (pi, px, py, pz, pw, ph, pd) in placed:
+            candidates.add((px + pw, py, pz))
+            candidates.add((px, py + ph, pz))
+            candidates.add((px, py, pz + pd))
+            candidates.add((px + pw, py + ph, pz))
+            candidates.add((px + pw, py, pz + pd))
+            candidates.add((px, py + ph, pz + pd))
+        
+        if len(candidates) > 400:
+            candidates = sorted(candidates, key=lambda c: c[0]+c[1]+c[2])[:400]
+        
+        for (rw, rh, rd) in rots:
+            for (cx, cy, cz) in candidates:
+                if not occ.is_free(cx, cy, cz, rw, rh, rd):
+                    continue
+                score = cx + cy + cz
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_pos = (cx, cy, cz, rw, rh, rd)
+        
+        if best_pos:
+            cx, cy, cz, rw, rh, rd = best_pos
+            occ.place(cx, cy, cz, rw, rh, rd)
+            placed.append((box_idx, cx, cy, cz, rw, rh, rd))
+            result[box_idx] = (0, cx, cy, cz, rw, rh, rd)
+    
+    return result
+
+def _swap_local_search(boxes, container, initial_result, deadline):
+    """
+    Try to swap out smaller loaded boxes for larger unloaded boxes to increase total volume.
+    """
+    W, H, D = container
+    n = len(boxes)
+    
+    # Parse initial result
+    loaded_indices = [i for i in range(n) if initial_result[i][0] == 0]
+    unloaded_indices = [i for i in range(n) if initial_result[i][0] == -1]
+    
+    # Build occupancy
+    occ = VoxelOccupancy(W, H, D)
+    placed = []
+    for i in loaded_indices:
+        r = initial_result[i]
+        placed.append((i, r[1], r[2], r[3], r[4], r[5], r[6]))
+        occ.place(r[1], r[2], r[3], r[4], r[5], r[6])
+    
+    result = [(-1, 0, 0, 0, 0, 0, 0)] * n
+    for i, x, y, z, w, h, d in placed:
+        result[i] = (0, x, y, z, w, h, d)
+    
+    best_vol = sum(r[4]*r[5]*r[6] for r in result if r[0] == 0)
+    
+    # Sort unloaded by volume descending (try to add big boxes first)
+    unloaded_indices.sort(key=lambda i: boxes[i][0]*boxes[i][1]*boxes[i][2], reverse=True)
+    
+    # For each unloaded box, try removing one or more small loaded boxes to make room
+    for un_idx in unloaded_indices:
+        if time.time() > deadline:
+            break
+        
+        uw, uh, ud = boxes[un_idx]
+        un_vol = uw * uh * ud
+        
+        # Try adding the unloaded box as-is first
+        rots = _get_rotations(uw, uh, ud)
+        best_pos = None
+        best_score = None
+        candidates = set()
+        candidates.add((0, 0, 0))
+        for (pi, px, py, pz, pw, ph, pd) in placed:
+            candidates.add((px + pw, py, pz))
+            candidates.add((px, py + ph, pz))
+            candidates.add((px, py, pz + pd))
+            candidates.add((px + pw, py + ph, pz))
+            candidates.add((px + pw, py, pz + pd))
+            candidates.add((px, py + ph, pz + pd))
+        
+        if len(candidates) > 400:
+            candidates = sorted(candidates, key=lambda c: c[0]+c[1]+c[2])[:400]
+        
+        for (rw, rh, rd) in rots:
+            for (cx, cy, cz) in candidates:
+                if not occ.is_free(cx, cy, cz, rw, rh, rd):
+                    continue
+                score = cx + cy + cz
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_pos = (cx, cy, cz, rw, rh, rd)
+        
+        if best_pos:
+            cx, cy, cz, rw, rh, rd = best_pos
+            occ.place(cx, cy, cz, rw, rh, rd)
+            placed.append((un_idx, cx, cy, cz, rw, rh, rd))
+            result[un_idx] = (0, cx, cy, cz, rw, rh, rd)
+            best_vol += un_vol
+            continue
+        
+        # Try removing one small loaded box to make room
+        # Sort loaded boxes by volume ascending (remove smallest first)
+        loaded_sorted = sorted(range(len(placed)), key=lambda j: placed[j][4]*placed[j][5]*placed[j][6])
+        
+        for rem_j in loaded_sorted:
+            if time.time() > deadline:
+                break
+            
+            rem_box = placed[rem_j]
+            rem_vol = rem_box[4] * rem_box[5] * rem_box[6]
+            
+            # Only swap if unloaded box is larger
+            if un_vol <= rem_vol:
+                continue
+            
+            # Remove the box
+            occ.unplace(rem_box[1], rem_box[2], rem_box[3], rem_box[4], rem_box[5], rem_box[6])
+            placed.pop(rem_j)
+            
+            # Try to place the unloaded box
+            rots = _get_rotations(uw, uh, ud)
+            found = False
+            best_pos2 = None
+            best_score2 = None
+            candidates2 = set()
+            candidates2.add((0, 0, 0))
+            for (pi, px, py, pz, pw, ph, pd) in placed:
+                candidates2.add((px + pw, py, pz))
+                candidates2.add((px, py + ph, pz))
+                candidates2.add((px, py, pz + pd))
+                candidates2.add((px + pw, py + ph, pz))
+                candidates2.add((px + pw, py, pz + pd))
+                candidates2.add((px, py + ph, pz + pd))
+            
+            if len(candidates2) > 400:
+                candidates2 = sorted(candidates2, key=lambda c: c[0]+c[1]+c[2])[:400]
+            
+            for (rw, rh, rd) in rots:
+                for (cx, cy, cz) in candidates2:
+                    if not occ.is_free(cx, cy, cz, rw, rh, rd):
+                        continue
+                    score = cx + cy + cz
+                    if best_score2 is None or score < best_score2:
+                        best_score2 = score
+                        best_pos2 = (cx, cy, cz, rw, rh, rd)
+            
+            if best_pos2:
+                cx, cy, cz, rw, rh, rd = best_pos2
+                occ.place(cx, cy, cz, rw, rh, rd)
+                placed.append((un_idx, cx, cy, cz, rw, rh, rd))
+                result[un_idx] = (0, cx, cy, cz, rw, rh, rd)
+                result[rem_box[0]] = (-1, 0, 0, 0, 0, 0, 0)
+                best_vol += un_vol - rem_vol
+                found = True
+            else:
+                # Put the removed box back
+                occ.place(rem_box[1], rem_box[2], rem_box[3], rem_box[4], rem_box[5], rem_box[6])
+                placed.insert(rem_j, rem_box)
+            
+            if found:
+                break
+    
+    return result
+
+def _better_local_search(boxes, container, initial_result, deadline):
+    """
+    More aggressive local search using voxel occupancy for fast re-packing.
+    """
+    W, H, D = container
+    n = len(boxes)
+    
+    # Parse initial result
+    loaded_indices = [i for i in range(n) if initial_result[i][0] == 0]
+    placed = []
+    for i in loaded_indices:
+        r = initial_result[i]
+        placed.append((i, r[1], r[2], r[3], r[4], r[5], r[6]))
+    
+    result = [(-1, 0, 0, 0, 0, 0, 0)] * n
+    for i, x, y, z, w, h, d in placed:
+        result[i] = (0, x, y, z, w, h, d)
+    
+    best_vol = sum(r[4]*r[5]*r[6] for r in result if r[0] == 0)
+    
+    # Try removing one box and re-packing everything with voxel-based checks
+    if time.time() > deadline:
+        return result
+    
+    # Strategy: remove one box, then re-pack everything
+    for remove_idx in range(len(placed)):
+        if time.time() > deadline:
+            break
+        
+        box_to_remove = placed[remove_idx]
+        remaining = [p for j, p in enumerate(placed) if j != remove_idx]
+        
+        # Re-pack remaining boxes + the removed box
+        all_boxes = [p[0] for p in remaining] + [box_to_remove[0]]
+        
+        # Try different sort orders
+        for sort_key in ['volume_desc', 'max_dim_desc']:
+            if time.time() > deadline:
+                break
+            
+            sorted_boxes = sorted(all_boxes, key=lambda i: boxes[i][0]*boxes[i][1]*boxes[i][2], reverse=True)
+            if sort_key == 'max_dim_desc':
+                sorted_boxes = sorted(all_boxes, key=lambda i: max(boxes[i]), reverse=True)
+            
+            new_occ = VoxelOccupancy(W, H, D)
+            new_placed = []
+            for box_idx in sorted_boxes:
+                bw, bh, bd = boxes[box_idx]
+                rots = _get_rotations(bw, bh, bd)
+                best_pos = None
+                best_score = None
+                
+                candidates = set()
+                candidates.add((0, 0, 0))
+                for (pi, px, py, pz, pw, ph, pd) in new_placed:
+                    candidates.add((px + pw, py, pz))
+                    candidates.add((px, py + ph, pz))
+                    candidates.add((px, py, pz + pd))
+                
+                if len(candidates) > 300:
+                    candidates = sorted(candidates, key=lambda c: c[0]+c[1]+c[2])[:300]
+                
+                for (rw, rh, rd) in rots:
+                    for (cx, cy, cz) in candidates:
+                        if not new_occ.is_free(cx, cy, cz, rw, rh, rd):
+                            continue
+                        score = cx + cy + cz
+                        if best_score is None or score < best_score:
+                            best_score = score
+                            best_pos = (cx, cy, cz, rw, rh, rd)
+                
+                if best_pos:
+                    cx, cy, cz, rw, rh, rd = best_pos
+                    new_occ.place(cx, cy, cz, rw, rh, rd)
+                    new_placed.append((box_idx, cx, cy, cz, rw, rh, rd))
+            
+            # Check if this re-packing is better
+            new_vol = sum(r[4]*r[5]*r[6] for r in new_placed)
+            if new_vol > best_vol:
+                best_vol = new_vol
+                result = [(-1, 0, 0, 0, 0, 0, 0)] * n
+                for i, x, y, z, w, h, d in new_placed:
+                    result[i] = (0, x, y, z, w, h, d)
+                placed = new_placed
+    
+    return result
+
+def load(boxes, container):
+    W, H, D = container
+    n = len(boxes)
+    if n == 0:
+        return []
+    
+    start_time = time.time()
+    deadline = start_time + 145.0  # Safety margin before 150s limit
+    
+    # Try multiple sorting strategies and keep the best
+    strategies = [
+        'volume_desc',
+        'max_dim_desc',
+        'min_dim_asc',
+        'aspect_desc',
+        'volume_asc',
+        'max_dim_asc',
+    ]
+    
+    best_result = None
+    best_vol = -1
+    
+    # Time budget per strategy: leave time for local search
+    total_strategies = len(strategies)
+    per_strategy_time = min(15.0, (deadline - time.time()) / max(1, total_strategies) * 0.6)
+    
+    for strat in strategies:
+        if time.time() > deadline:
+            break
+        strat_deadline = min(deadline, time.time() + per_strategy_time)
+        result = _try_place(boxes, container, sort_key=strat, deadline=strat_deadline)
+        vol = sum(r[4]*r[5]*r[6] for r in result if r[0] == 0)
+        if vol > best_vol:
+            best_vol = vol
+            best_result = result
+    
+    # If we have time, try a few random orderings
+    remaining_time = deadline - time.time()
+    if remaining_time > 5.0:
+        num_random = min(8, int(remaining_time / 3.0))
+        for seed in range(num_random):
+            if time.time() > deadline:
+                break
+            rand_deadline = min(deadline, time.time() + 2.5)
+            result = _try_place(boxes, container, sort_key='random', deadline=rand_deadline, seed=seed)
+            vol = sum(r[4]*r[5]*r[6] for r in result if r[0] == 0)
+            if vol > best_vol:
+                best_vol = vol
+                best_result = result
+    
+    # Apply local search shake to the best result if we have time
+    remaining_time = deadline - time.time()
+    if remaining_time > 8.0 and best_result is not None:
+        shake_deadline = start_time + 136.0  # Leave time for swap search
+        improved = _shake_local_search(boxes, container, best_result, shake_deadline)
+        vol = sum(r[4]*r[5]*r[6] for r in improved if r[0] == 0)
+        if vol > best_vol:
+            best_vol = vol
+            best_result = improved
+    
+    # Apply better local search if we still have time
+    remaining_time = deadline - time.time()
+    if remaining_time > 10.0 and best_result is not None:
+        better_deadline = start_time + 138.0
+        improved2 = _better_local_search(boxes, container, best_result, better_deadline)
+        vol = sum(r[4]*r[5]*r[6] for r in improved2 if r[0] == 0)
+        if vol > best_vol:
+            best_vol = vol
+            best_result = improved2
+    
+    # Apply swap local search if we still have time
+    remaining_time = deadline - time.time()
+    if remaining_time > 8.0 and best_result is not None:
+        swap_deadline = start_time + 144.0
+        improved3 = _swap_local_search(boxes, container, best_result, swap_deadline)
+        vol = sum(r[4]*r[5]*r[6] for r in improved3 if r[0] == 0)
+        if vol > best_vol:
+            best_vol = vol
+            best_result = improved3
+    
+    if best_result is None:
+        # Fallback: simple shelf packing
+        placements, x, y, z, row_h, layer_d = [], 0, 0, 0, 0, 0
+        for w, h, d in boxes:
+            if x + w > W:
+                x, y, row_h = 0, y + row_h, 0
+            if y + h > H:
+                y, z, layer_d, x, row_h = 0, z + layer_d, 0, 0, 0
+            if z + d > D:
+                placements.append((-1, 0, 0, 0, w, h, d))
+                continue
+            placements.append((0, x, y, z, w, h, d))
+            x, row_h, layer_d = x + w, max(row_h, h), max(layer_d, d)
+        return placements
+    
+    return best_result
+# EVOLVE-BLOCK-END

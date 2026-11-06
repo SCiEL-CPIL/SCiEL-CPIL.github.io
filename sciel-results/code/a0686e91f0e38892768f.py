@@ -1,0 +1,1 @@
+BET: {mechanism: "Fast vertex-based Q3 detection with iterative edge removal and greedy add-back local search should find 54+ edges, matching or exceeding the observed 1.385 score", q: 0.7, delta: [0.0, 0.15]}

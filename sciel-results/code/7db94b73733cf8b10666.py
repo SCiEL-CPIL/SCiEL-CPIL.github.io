@@ -1,0 +1,385 @@
+"""Improved program for the third autocorrelation inequality.
+
+Strategy:
+- Use a smooth log-sum-exp surrogate of the max(autoconv) term to make the objective differentiable.
+- Optimize in a low-dimensional DCT subspace (first ~20 modes) with L-BFGS-B, multiple restarts.
+- Use Golay complementary sequences and Zadoff-Chu chirps as additional initializations.
+- Perform full-dimensional coordinate descent with exact value evaluation for local refinement.
+- Use Nelder-Mead as a final polish step.
+- Explicit deadline guard returns best solution before 150s.
+"""
+import time
+import numpy as np
+from scipy.optimize import minimize
+
+N = 400
+_t0 = time.time()
+_DEADLINE = 145.0
+
+# Precompute
+_i_arr = np.arange(N, dtype=float)
+_conv_len = 2 * N - 1
+_fft_size = 2 * N
+
+def _autoconv(h):
+    H = np.fft.rfft(h, _fft_size)
+    c = np.fft.irfft(H * H, _fft_size)[:_conv_len]
+    return c
+
+def _value(h):
+    h = np.asarray(h, dtype=float)
+    s = float(np.sum(h))
+    if s == 0.0 or not np.all(np.isfinite(h)):
+        return np.inf
+    conv = _autoconv(h)
+    m = float(np.max(conv))
+    return abs(2.0 * N * m / (s * s))
+
+def _smooth_value(h, beta=200.0):
+    h = np.asarray(h, dtype=float)
+    s = float(np.sum(h))
+    if s == 0.0 or not np.all(np.isfinite(h)):
+        return np.inf
+    conv = _autoconv(h)
+    m = conv.max()
+    scaled = beta * (conv - m)
+    scaled = np.clip(scaled, -500.0, 500.0)
+    lse = m + np.log(np.sum(np.exp(scaled))) / beta
+    return abs(2.0 * N * lse / (s * s))
+
+# DCT-II basis (orthonormal, first K modes)
+_K = 20
+_n = np.arange(N)
+_k = np.arange(_K)
+_angles = np.pi * (2 * _n[:, None] + 1) * _k[None, :] / (2 * N)
+_DCT = np.cos(_angles)
+_norms = np.sqrt(np.sum(_DCT ** 2, axis=0))
+_norms[_norms == 0] = 1.0
+_DCT = _DCT / _norms
+_DCT_T = _DCT.T
+
+def _h_from_dct(c):
+    return _DCT @ c
+
+def _dct_obj(c):
+    return _smooth_value(_h_from_dct(c), beta=200.0)
+
+def _project_dct(h):
+    mean = float(np.mean(h))
+    coeffs = _DCT_T @ (h - mean)
+    return coeffs, mean
+
+def _golay_complementary_h():
+    """Generate Golay complementary sequences of length 400.
+    
+    Golay sequences have the property that the sum of their autocorrelations
+    is zero for all non-zero lags, which minimizes the max autocorrelation.
+    """
+    # Start with base Golay sequences of length 2^12 = 4096, then truncate
+    # Actually, let's use a different approach: generate binary Golay sequences
+    # and then map to real values with a smooth window
+    
+    # Generate a pair of complementary sequences
+    # Use the recursive construction
+    def golay_pair(n):
+        """Generate Golay complementary pair of length n (power of 2)."""
+        if n == 1:
+            return np.array([1.0]), np.array([1.0])
+        
+        a, b = golay_pair(n // 2)
+        a2 = np.concatenate([a, a])
+        b2 = np.concatenate([b, -b])
+        c = np.concatenate([a, -b])
+        d = np.concatenate([b, a])
+        return a2, c
+    
+    # Length 256 is the largest power of 2 <= 400
+    a, b = golay_pair(256)
+    
+    # Extend to length 400 by padding with a smooth window
+    h = np.zeros(N)
+    # Place the Golay sequence in the center
+    start = (N - 256) // 2
+    h[start:start+256] = a
+    
+    # Apply a smooth window to reduce discontinuities
+    window = np.hanning(N)
+    h = h * window
+    
+    # Normalize
+    h = h / np.sum(h) * N  # Keep sum approximately N
+    
+    return h
+
+def _zadoff_chu_h(root=1, window='hanning'):
+    """Generate a Zadoff-Chu sequence of length N."""
+    # Zadoff-Chu sequence: x[n] = exp(-j * pi * u * n * (n + (1 - N%2)/2) / N)
+    # Take real part and scale
+    n = np.arange(N)
+    u = root
+    # For real-valued, use a modified approach
+    phase = -np.pi * u * n * (n + (1 - N % 2) / 2) / N
+    h = np.cos(phase)
+    
+    # Apply window
+    if window == 'hanning':
+        w = np.hanning(N)
+    elif window == 'hamming':
+        w = np.hamming(N)
+    else:
+        w = np.ones(N)
+    h = h * w
+    
+    # Ensure non-zero sum
+    s = np.sum(h)
+    if abs(s) < 1e-10:
+        h[0] += 1.0
+        s = np.sum(h)
+    h = h / s * N
+    
+    return h
+
+def _local_refine_exact(h, max_rounds=8, step=0.02):
+    """Per-step coordinate descent on exact value."""
+    h = h.copy()
+    v = _value(h)
+    s = float(np.sum(h))
+    if s == 0 or not np.all(np.isfinite(h)):
+        return h
+    H = np.fft.rfft(h, _fft_size)
+    H2 = H * H
+
+    for rnd in range(max_rounds):
+        improved = False
+        for i in range(N):
+            old = h[i]
+            for delta in (step, -step):
+                new = old + delta
+                if new == old:
+                    continue
+                H[i] = H[i] + delta
+                H2[i] = H[i] * H[i]
+                conv = np.fft.irfft(H2, _fft_size)[:_conv_len]
+                s_new = s + delta
+                if abs(s_new) < 1e-12:
+                    H[i] = old
+                    continue
+                v_new = abs(2.0 * N * conv.max() / (s_new * s_new))
+                if v_new < v - 1e-12:
+                    v = v_new
+                    h[i] = new
+                    s = s_new
+                    improved = True
+                    break
+            else:
+                H[i] = old
+        if not improved:
+            step *= 0.5
+            if step < 1e-5:
+                break
+    return h
+
+def _local_refine_smooth(h, max_rounds=6, step=0.03, beta=200.0):
+    """Per-step coordinate descent on smooth surrogate."""
+    h = h.copy()
+    s = float(np.sum(h))
+    if s == 0 or not np.all(np.isfinite(h)):
+        return h
+    H = np.fft.rfft(h, _fft_size)
+    H2 = H * H
+    conv = np.fft.irfft(H2, _fft_size)[:_conv_len]
+    m = conv.max()
+    scaled = np.clip(beta * (conv - m), -500.0, 500.0)
+    exp_sum = np.sum(np.exp(scaled))
+    v = abs(2.0 * N * (m + np.log(exp_sum) / beta) / (s * s))
+
+    for rnd in range(max_rounds):
+        improved = False
+        for i in range(N):
+            old = h[i]
+            for delta in (step, -step):
+                new = old + delta
+                if new == old:
+                    continue
+                H[i] = H[i] + delta
+                H2[i] = H[i] * H[i]
+                conv_new = np.fft.irfft(H2, _fft_size)[:_conv_len]
+                m_new = conv_new.max()
+                scaled_new = np.clip(beta * (conv_new - m_new), -500.0, 500.0)
+                exp_sum_new = np.sum(np.exp(scaled_new))
+                s_new = s + delta
+                if abs(s_new) < 1e-12:
+                    H[i] = old
+                    continue
+                v_new = abs(2.0 * N * (m_new + np.log(exp_sum_new) / beta) / (s_new * s_new))
+                if v_new < v - 1e-12:
+                    v = v_new
+                    h[i] = new
+                    m = m_new
+                    s = s_new
+                    improved = True
+                    break
+            else:
+                H[i] = old
+        if not improved:
+            step *= 0.5
+            if step < 1e-5:
+                break
+    return h
+
+def construct():
+    global _t0
+    _t0 = time.time()
+
+    best_h = np.ones(N)
+    best_v = _value(best_h)
+
+    def deadline_ok():
+        return (time.time() - _t0) < _DEADLINE
+
+    def update_best(h):
+        nonlocal best_h, best_v
+        h = np.asarray(h, dtype=float)
+        if not np.all(np.isfinite(h)):
+            return best_v
+        s = float(np.sum(h))
+        if s == 0:
+            return best_v
+        v = _value(h)
+        if v < best_v:
+            best_v = v
+            best_h = h.copy()
+        return v
+
+    rng = np.random.default_rng(42)
+
+    # Phase 1: Try Golay and Zadoff-Chu initializations
+    if deadline_ok():
+        try:
+            # Golay complementary sequence
+            h_golay = _golay_complementary_h()
+            update_best(h_golay)
+        except Exception:
+            pass
+
+    if deadline_ok():
+        try:
+            # Zadoff-Chu sequences with different roots
+            for root in [1, 3, 5, 7, 11]:
+                h_zc = _zadoff_chu_h(root=root)
+                update_best(h_zc)
+        except Exception:
+            pass
+
+    # Phase 2: DCT spectral shaping with L-BFGS-B, multiple restarts
+    if deadline_ok():
+        try:
+            for restart in range(20):
+                if not deadline_ok():
+                    break
+                if restart == 0:
+                    coeffs = np.zeros(_K)
+                elif restart == 1:
+                    # Initialize from Golay
+                    h_init = _golay_complementary_h()
+                    coeffs, _ = _project_dct(h_init)
+                elif restart == 2:
+                    # Initialize from Zadoff-Chu
+                    h_init = _zadoff_chu_h(root=3)
+                    coeffs, _ = _project_dct(h_init)
+                else:
+                    n_active = int(rng.integers(3, min(12, _K)))
+                    active = rng.choice(_K, size=n_active, replace=False)
+                    coeffs = np.zeros(_K)
+                    coeffs[active] = rng.normal(0, 2.0, size=n_active)
+                res = minimize(_dct_obj, coeffs, method='L-BFGS-B',
+                               options={'maxiter': 300, 'ftol': 1e-15, 'gtol': 1e-12})
+                if res.x is not None:
+                    h = _h_from_dct(res.x)
+                    update_best(h)
+        except Exception:
+            pass
+
+    # Phase 3: Local smooth refinement
+    if deadline_ok():
+        try:
+            h_ref = _local_refine_smooth(best_h, max_rounds=8, step=0.04, beta=200.0)
+            update_best(h_ref)
+        except Exception:
+            pass
+
+    # Phase 4: More DCT restarts with different initializations
+    if deadline_ok():
+        try:
+            for restart in range(20, 40):
+                if not deadline_ok():
+                    break
+                n_active = int(rng.integers(4, min(15, _K)))
+                active = rng.choice(_K, size=n_active, replace=False)
+                coeffs = np.zeros(_K)
+                coeffs[active] = rng.normal(0, 2.5, size=n_active)
+                res = minimize(_dct_obj, coeffs, method='L-BFGS-B',
+                               options={'maxiter': 300, 'ftol': 1e-15, 'gtol': 1e-12})
+                if res.x is not None:
+                    h = _h_from_dct(res.x)
+                    update_best(h)
+        except Exception:
+            pass
+
+    # Phase 5: Local exact refinement
+    if deadline_ok():
+        try:
+            h_ref = _local_refine_exact(best_h, max_rounds=10, step=0.02)
+            update_best(h_ref)
+        except Exception:
+            pass
+
+    # Phase 6: Nelder-Mead polish on DCT coefficients
+    if deadline_ok():
+        try:
+            coeffs_init, mean_h = _project_dct(best_h)
+            res = minimize(_dct_obj, coeffs_init, method='Nelder-Mead',
+                           options={'maxiter': 500, 'xatol': 1e-10, 'fatol': 1e-12})
+            if res.x is not None:
+                h = _h_from_dct(res.x)
+                update_best(h)
+        except Exception:
+            pass
+
+    # Phase 7: Final local smooth refinement
+    if deadline_ok():
+        try:
+            h_ref = _local_refine_smooth(best_h, max_rounds=6, step=0.02, beta=300.0)
+            update_best(h_ref)
+        except Exception:
+            pass
+
+    # Phase 8: Final local exact refinement
+    if deadline_ok():
+        try:
+            h_ref = _local_refine_exact(best_h, max_rounds=8, step=0.01)
+            update_best(h_ref)
+        except Exception:
+            pass
+
+    # Phase 9: One more round of DCT optimization from current best
+    if deadline_ok():
+        try:
+            coeffs_init, mean_h = _project_dct(best_h)
+            res = minimize(_dct_obj, coeffs_init, method='L-BFGS-B',
+                           options={'maxiter': 500, 'ftol': 1e-15, 'gtol': 1e-14})
+            if res.x is not None:
+                h = _h_from_dct(res.x)
+                update_best(h)
+                # Final polish
+                if deadline_ok():
+                    h_ref = _local_refine_exact(h, max_rounds=6, step=0.01)
+                    update_best(h_ref)
+        except Exception:
+            pass
+
+    # Final validation
+    s = np.sum(best_h)
+    if s == 0 or not np.all(np.isfinite(best_h)):
+        return np.ones(N)
+    return best_h

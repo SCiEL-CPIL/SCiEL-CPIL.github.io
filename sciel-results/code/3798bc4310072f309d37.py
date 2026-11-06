@@ -1,0 +1,410 @@
+import time
+import random
+
+def construct():
+    deadline = time.time() + 58  # Safety margin
+    
+    P_data = {
+        'n': 100,
+        'edges': [[0, 10], [0, 27], [0, 80], [1, 59], [2, 50], [2, 74], [3, 12], [3, 18], [3, 62], [3, 87], [4, 48], [4, 72], [4, 89], [5, 11], [6, 36], [8, 13], [8, 45], [8, 52], [8, 94], [9, 26], [9, 47], [9, 78], [10, 81], [11, 18], [11, 21], [11, 84], [12, 22], [12, 65], [12, 83], [13, 30], [13, 76], [15, 82], [17, 35], [19, 38], [19, 49], [19, 61], [19, 96], [20, 52], [21, 23], [21, 58], [22, 33], [22, 48], [24, 29], [24, 31], [24, 55], [24, 58], [24, 89], [25, 82], [26, 44], [26, 69], [30, 45], [30, 70], [32, 96], [33, 55], [34, 66], [35, 38], [35, 93], [36, 81], [37, 42], [37, 70], [39, 59], [40, 69], [40, 97], [41, 80], [42, 44], [42, 48], [42, 68], [43, 53], [44, 50], [46, 50], [46, 73], [46, 97], [47, 78], [48, 77], [49, 59], [50, 59], [50, 62], [51, 57], [53, 68], [53, 80], [56, 58], [58, 95], [60, 65], [60, 90], [61, 88], [62, 90], [68, 81], [69, 90], [70, 92], [74, 85], [75, 82]]
+    }
+    
+    n = P_data['n']
+    adj = [set() for _ in range(n)]
+    for u, v in P_data['edges']:
+        adj[u].add(v)
+        adj[v].add(u)
+        
+    # Find largest component
+    visited = [False] * n
+    components = []
+    for i in range(n):
+        if not visited[i]:
+            comp = []
+            stack = [i]
+            visited[i] = True
+            while stack:
+                node = stack.pop()
+                comp.append(node)
+                for nei in adj[node]:
+                    if not visited[nei]:
+                        visited[nei] = True
+                        stack.append(nei)
+            components.append(comp)
+            
+    largest_comp = max(components, key=len)
+    largest_comp_set = set(largest_comp)
+    comp_size = len(largest_comp)
+    
+    best_path = []
+    
+    def greedy_walk(start, strategy, max_depth=10000):
+        """
+        strategy: 'warnsdorff', 'random', 'max_deg'
+        """
+        path = [start]
+        visited_set = {start}
+        steps = 0
+        while steps < max_depth:
+            steps += 1
+            current = path[-1]
+            neighbors = [v for v in adj[current] if v not in visited_set]
+            if not neighbors:
+                break
+            
+            if strategy == 'warnsdorff':
+                # Prefer neighbors with fewer unvisited neighbors
+                def score(v):
+                    return len([u for u in adj[v] if u not in visited_set])
+                neighbors.sort(key=score)
+                if len(neighbors) > 1:
+                    k = min(3, len(neighbors))
+                    top_k = neighbors[:k]
+                    next_node = random.choice(top_k)
+                else:
+                    next_node = neighbors[0]
+            elif strategy == 'random':
+                next_node = random.choice(neighbors)
+            elif strategy == 'max_deg':
+                def score(v):
+                    return len([u for u in adj[v] if u not in visited_set])
+                neighbors.sort(key=score, reverse=True)
+                next_node = neighbors[0]
+            else:
+                next_node = random.choice(neighbors)
+                
+            path.append(next_node)
+            visited_set.add(next_node)
+            
+        return path
+
+    def extend_path(path):
+        """Try to extend the path at both ends."""
+        path = path[:]
+        visited_set = set(path)
+        changed = True
+        while changed:
+            changed = False
+            # Extend start
+            if path:
+                start_node = path[0]
+                for nei in adj[start_node]:
+                    if nei not in visited_set:
+                        path.insert(0, nei)
+                        visited_set.add(nei)
+                        changed = True
+                        break
+            # Extend end
+            if path:
+                end_node = path[-1]
+                for nei in adj[end_node]:
+                    if nei not in visited_set:
+                        path.append(nei)
+                        visited_set.add(nei)
+                        changed = True
+                        break
+        return path
+
+    def insert_intermediates(path):
+        """Try to insert unvisited vertices between consecutive path vertices to lengthen the path."""
+        if len(path) < 2:
+            return path
+        new_path = path[:]
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(new_path) - 1):
+                u = new_path[i]
+                v = new_path[i + 1]
+                # Find a vertex w such that u-w and w-v are edges, and w is not in path
+                visited_set = set(new_path)
+                # Look for common neighbors of u and v that are not in path
+                common = adj[u] & adj[v] - visited_set
+                if common:
+                    # Pick one (prefer one with fewer other connections to avoid dead ends)
+                    best_w = min(common, key=lambda w: len(adj[w] - visited_set))
+                    new_path.insert(i + 1, best_w)
+                    changed = True
+                    break
+        return new_path
+
+    def deep_dfs_extend(path, remaining_budget=0.5):
+        """
+        Deep DFS to extend path from both ends, trying all branches with Warnsdorff ordering.
+        """
+        if not path:
+            return path
+        
+        best = path[:]
+        path = path[:]
+        start_time = time.time()
+        
+        def dfs_extend(sub_path, sub_visited, is_extending_start):
+            nonlocal best
+            if time.time() - start_time > remaining_budget:
+                return sub_path
+            if len(sub_path) >= len(best):
+                best = sub_path[:]
+            
+            current = sub_path[0] if is_extending_start else sub_path[-1]
+            neighbors = [v for v in adj[current] if v not in sub_visited]
+            if not neighbors:
+                return sub_path
+            
+            # Warnsdorff: prefer neighbors with fewer unvisited neighbors
+            def score(v):
+                return len([u for u in adj[v] if u not in sub_visited])
+            neighbors.sort(key=score)
+            
+            for nei in neighbors:
+                if time.time() - start_time > remaining_budget:
+                    break
+                new_path = sub_path[:]
+                new_visited = sub_visited | {nei}
+                if is_extending_start:
+                    new_path.insert(0, nei)
+                else:
+                    new_path.append(nei)
+                dfs_extend(new_path, new_visited, is_extending_start)
+                if len(best) >= comp_size:
+                    return best
+        
+        # Extend from end
+        dfs_extend(path, set(path), False)
+        # Extend from start
+        dfs_extend(best, set(best), True)
+        
+        return best
+
+    def local_search_polish(path, max_iterations=200):
+        """
+        Local search: try to extend path by finding a vertex that can be inserted
+        between two consecutive vertices, or by extending endpoints.
+        """
+        if not path:
+            return path
+        best = path[:]
+        for _ in range(max_iterations):
+            if time.time() > deadline - 1:
+                break
+            improved = False
+            
+            # Try inserting a vertex between consecutive pairs
+            for i in range(len(best) - 1):
+                u = best[i]
+                v = best[i + 1]
+                visited_set = set(best)
+                common = adj[u] & adj[v] - visited_set
+                if common:
+                    # Try each candidate
+                    for w in common:
+                        new_path = best[:i+1] + [w] + best[i+1:]
+                        # Validate
+                        if len(new_path) == len(set(new_path)):
+                            valid = True
+                            for k in range(len(new_path) - 1):
+                                if new_path[k+1] not in adj[new_path[k]]:
+                                    valid = False
+                                    break
+                            if valid and len(new_path) > len(best):
+                                best = new_path
+                                improved = True
+                                break
+                if improved:
+                    break
+            
+            # Try extending endpoints
+            if not improved and best:
+                start_node = best[0]
+                for nei in adj[start_node]:
+                    if nei not in set(best):
+                        best = [nei] + best
+                        improved = True
+                        break
+            if not improved and best:
+                end_node = best[-1]
+                for nei in adj[end_node]:
+                    if nei not in set(best):
+                        best = best + [nei]
+                        improved = True
+                        break
+            
+            if not improved:
+                break
+        
+        return best
+
+    def merge_paths(path1, path2):
+        """
+        Try to merge two paths into one longer path.
+        path1 and path2 are lists of distinct vertices.
+        Returns merged path or None.
+        """
+        if not path1 or not path2:
+            return None
+        
+        set1 = set(path1)
+        set2 = set(path2)
+        
+        # If they share vertices, we can't simply concatenate
+        if set1 & set2:
+            return None
+        
+        # Try to connect end of path1 to start of path2
+        # Or start of path1 to end of path2
+        # Or end of path1 to end of path2 (reversing path2)
+        # Or start of path1 to start of path2 (reversing path2)
+        
+        candidates = []
+        
+        # 1. path1 + path2
+        if path1[-1] in adj[path2[0]]:
+            candidates.append(path1 + path2)
+        
+        # 2. path1 + reversed(path2)
+        if path1[-1] in adj[path2[-1]]:
+            candidates.append(path1 + path2[::-1])
+        
+        # 3. reversed(path1) + path2
+        if path1[0] in adj[path2[0]]:
+            candidates.append(path1[::-1] + path2)
+        
+        # 4. reversed(path1) + reversed(path2)
+        if path1[0] in adj[path2[-1]]:
+            candidates.append(path1[::-1] + path2[::-1])
+        
+        if not candidates:
+            return None
+        
+        # Pick the longest (they should all be same length, but just in case)
+        best = max(candidates, key=len)
+        
+        # Validate
+        if len(best) != len(set(best)):
+            return None
+        for i in range(len(best) - 1):
+            if best[i+1] not in adj[best[i]]:
+                return None
+                
+        return best
+
+    strategies = ['warnsdorff', 'random', 'max_deg']
+    
+    # Generate a pool of initial paths
+    path_pool = []
+    
+    while time.time() < deadline:
+        for strat in strategies:
+            if time.time() >= deadline:
+                break
+            # Pick random start from largest component
+            start = random.choice(largest_comp)
+            path = greedy_walk(start, strat)
+            path = extend_path(path)
+            
+            # Try deep DFS improvement
+            if len(path) < comp_size and time.time() < deadline - 5:
+                improved = deep_dfs_extend(path, remaining_budget=2.0)
+                if improved and len(improved) > len(path):
+                    path = improved
+                    path = extend_path(path)
+            
+            # Try vertex insertion to fill gaps
+            if len(path) < comp_size:
+                inserted = insert_intermediates(path)
+                if len(inserted) > len(path):
+                    path = inserted
+                    path = extend_path(path)
+            
+            if len(path) > len(best_path):
+                best_path = path
+            
+            # Add to pool if it's good enough
+            if len(path) >= 10:
+                path_pool.append(path)
+            
+            # Keep pool size manageable
+            if len(path_pool) > 50:
+                path_pool.pop(0)
+        
+        # Try merging paths from the pool
+        if len(path_pool) >= 2 and time.time() < deadline - 2:
+            # Try a few random pairs
+            for _ in range(5):
+                if time.time() >= deadline:
+                    break
+                i = random.randint(0, len(path_pool) - 1)
+                j = random.randint(0, len(path_pool) - 1)
+                if i == j:
+                    continue
+                merged = merge_paths(path_pool[i], path_pool[j])
+                if merged:
+                    merged = extend_path(merged)
+                    if len(merged) > len(best_path):
+                        best_path = merged
+                    # Add merged path to pool
+                    if len(merged) >= 10:
+                        path_pool.append(merged)
+                        if len(path_pool) > 50:
+                            path_pool.pop(0)
+
+    # Final extension pass with deep DFS
+    if best_path:
+        best_path = extend_path(best_path)
+        if len(best_path) < comp_size and time.time() < deadline - 1:
+            improved = deep_dfs_extend(best_path, remaining_budget=3.0)
+            if improved and len(improved) > len(best_path):
+                best_path = improved
+                best_path = extend_path(best_path)
+        
+        # Final vertex insertion polish
+        if len(best_path) < comp_size and time.time() < deadline - 0.5:
+            inserted = insert_intermediates(best_path)
+            if len(inserted) > len(best_path):
+                best_path = inserted
+                best_path = extend_path(best_path)
+        
+        # Local search polish
+        if len(best_path) < comp_size and time.time() < deadline - 0.3:
+            polished = local_search_polish(best_path)
+            if len(polished) > len(best_path):
+                best_path = polished
+
+    # Fallback
+    if not best_path:
+        best_path = [largest_comp[0]]
+    
+    # Final validation to ensure distinct vertices and valid edges
+    if len(best_path) != len(set(best_path)):
+        # If duplicates found, try to recover a valid path
+        # Simplest recovery: take the prefix up to the first duplicate
+        seen = set()
+        valid_path = []
+        for node in best_path:
+            if node not in seen:
+                valid_path.append(node)
+                seen.add(node)
+            else:
+                break
+        best_path = valid_path
+        
+        # Verify edges
+        for i in range(len(best_path) - 1):
+            if best_path[i+1] not in adj[best_path[i]]:
+                # Path is broken, return single node
+                best_path = [best_path[0]]
+                break
+        else:
+            # All edges valid, but we might have cut it short due to duplicate
+            pass
+    
+    # Final sanity check: verify all edges are valid
+    final_valid = [best_path[0]]
+    for i in range(1, len(best_path)):
+        if best_path[i] in adj[best_path[i-1]]:
+            final_valid.append(best_path[i])
+        else:
+            break
+    best_path = final_valid
+    
+    return best_path

@@ -1,0 +1,9 @@
+    point_set = set(points)
+    # ...
+    if new_p in point_set: continue
+    # ...
+    if accept:
+        point_set.remove(old_p)
+        point_set.add(best_candidate_p)
+        points[idx] = best_candidate_p
+        # ...

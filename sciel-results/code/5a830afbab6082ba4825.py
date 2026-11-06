@@ -1,0 +1,188 @@
+"""Size-efficient sorting network search on 18 wires."""
+N = 18
+import time
+import random
+import numpy as np
+
+# EVOLVE-BLOCK-START
+def construct():
+    start_time = time.time()
+    deadline = start_time + 55.0  # Safety margin before 60s kill
+
+    def odd_even_transposition():
+        comparators = []
+        for phase in range(N):
+            for i in range(phase % 2, N - 1, 2):
+                comparators.append((i, i + 1))
+        return comparators
+
+    # Pre-compute bit masks for initialization
+    NUM_WORDS = (1 << N) // 64  # 4096 words of 64 bits each
+
+    # Pre-compute initial wires using efficient bit packing
+    total_inputs = 1 << N
+    indices = np.arange(total_inputs, dtype=np.uint32)
+    weights = 1 << np.arange(64, dtype=np.uint64)
+
+    initial_wires = [None] * N
+    for i in range(N):
+        bits_i = (indices >> i) & 1
+        bits_i_64 = bits_i.astype(np.uint64)
+        packed = (bits_i_64.reshape(NUM_WORDS, 64) * weights).sum(axis=1)
+        initial_wires[i] = packed
+
+    def verify_network(comparators):
+        """
+        Fast verification using bit-parallelism.
+        Returns True if the network sorts all Boolean inputs.
+        """
+        wires = [w.copy() for w in initial_wires]
+
+        for (i, j) in comparators:
+            wi = wires[i]
+            wj = wires[j]
+            wires[i] = wi & wj
+            wires[j] = wi | wj
+
+        # Check sorted: for all k, wires[k] is subset of wires[k+1]
+        for k in range(N - 1):
+            if np.any(wires[k] & ~wires[k + 1]):
+                return False
+        return True
+
+    def greedy_remove(comparators):
+        """
+        Iteratively remove redundant comparators using systematic + random scan.
+        """
+        current = list(comparators)
+        changed = True
+        while changed:
+            changed = False
+            if time.time() > deadline - 1.0:
+                break
+            n = len(current)
+            if n == 0:
+                break
+
+            # Build a diverse set of positions to test
+            positions = set()
+            # Always try first and last
+            positions.add(0)
+            positions.add(n - 1)
+            # Random positions
+            num_random = min(15, n)
+            for _ in range(num_random):
+                positions.add(random.randint(0, n - 1))
+            # Middle region
+            mid = n // 2
+            for offset in range(-4, 5):
+                pos = mid + offset
+                if 0 <= pos < n:
+                    positions.add(pos)
+
+            # Try each position
+            for idx in sorted(positions):
+                if idx >= len(current):
+                    continue
+                test = current[:idx] + current[idx + 1:]
+                if verify_network(test):
+                    current = test
+                    changed = True
+                    break
+
+        return current
+
+    # Start with odd-even transposition
+    current = odd_even_transposition()
+    current = greedy_remove(current)
+
+    best_network = list(current)
+    best_count = len(current)
+
+    random.seed(42)
+
+    # Local search with multiple move types
+    while time.time() < deadline - 2.0:
+        if not current:
+            break
+
+        candidate = list(current)
+        n_comp = len(candidate)
+
+        if n_comp == 0:
+            break
+
+        r = random.random()
+
+        if r < 0.30:
+            # Move a comparator to a new position
+            if n_comp > 1:
+                i = random.randint(0, n_comp - 1)
+                j = random.randint(0, n_comp - 1)
+                comp = candidate.pop(i)
+                if i < j:
+                    j -= 1
+                j = max(0, min(j, len(candidate)))
+                candidate.insert(j, comp)
+        elif r < 0.55:
+            # Swap two comparators
+            if n_comp > 1:
+                i, j = random.sample(range(n_comp), 2)
+                candidate[i], candidate[j] = candidate[j], candidate[i]
+        elif r < 0.75:
+            # Replace a comparator with a random one
+            i = random.randint(0, n_comp - 1)
+            u = random.randint(0, N - 1)
+            v = random.randint(0, N - 1)
+            if u == v:
+                continue
+            if u > v:
+                u, v = v, u
+            candidate[i] = (u, v)
+        elif r < 0.90:
+            # Targeted replace: near an existing comparator
+            i = random.randint(0, n_comp - 1)
+            old_u, old_v = candidate[i]
+            candidates = []
+            for du in [-1, 0, 1]:
+                for dv in [-1, 0, 1]:
+                    nu = old_u + du
+                    nv = old_v + dv
+                    if 0 <= nu < N and 0 <= nv < N and nu != nv:
+                        if nu > nv:
+                            nu, nv = nv, nu
+                        if (nu, nv) != (old_u, old_v):
+                            candidates.append((nu, nv))
+            if candidates:
+                candidate[i] = random.choice(candidates)
+            else:
+                continue
+        else:
+            # Insert a new comparator (then let greedy_remove trim)
+            u = random.randint(0, N - 1)
+            v = random.randint(0, N - 1)
+            if u == v:
+                continue
+            if u > v:
+                u, v = v, u
+            pos = random.randint(0, n_comp)
+            candidate.insert(pos, (u, v))
+
+        # Verify candidate
+        if verify_network(candidate):
+            candidate = greedy_remove(candidate)
+
+            if len(candidate) < best_count:
+                best_count = len(candidate)
+                best_network = list(candidate)
+                current = candidate
+            else:
+                if len(candidate) <= len(current):
+                    current = candidate
+
+    # Final verification
+    if not verify_network(best_network):
+        best_network = odd_even_transposition()
+
+    return best_network
+# EVOLVE-BLOCK-END

@@ -1,0 +1,582 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+import time
+import numpy as np
+from fractions import Fraction
+
+# EVOLVE-BLOCK-START
+
+def _sieve(n):
+    """Generate all primes up to n using Sieve of Eratosthenes."""
+    if n < 2:
+        return []
+    is_prime = [True] * (n + 1)
+    is_prime[0] = is_prime[1] = False
+    for i in range(2, int(n ** 0.5) + 1):
+        if is_prime[i]:
+            for j in range(i * i, n + 1, i):
+                is_prime[j] = False
+    return [i for i in range(2, n + 1) if is_prime[i]]
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140  # Safety margin before 150s limit
+
+    primes = _sieve(1000)
+    max_check = 100000
+
+    def compute_L(covered):
+        """Compute the largest L such that 1..L are all covered."""
+        sub = covered[1:]
+        false_indices = np.where(~sub)[0]
+        if len(false_indices) == 0:
+            return max_check
+        return false_indices[0]
+
+    def greedy_residues_numpy(prime_list, max_check=100000):
+        """Assign residues greedily using numpy for speed."""
+        if not prime_list:
+            return []
+
+        covered = np.zeros(max_check + 1, dtype=bool)
+        classes = []
+
+        for p in prime_list:
+            if time.time() > deadline:
+                break
+
+            # Find the first uncovered number
+            sub = covered[1:]
+            false_indices = np.where(~sub)[0]
+            if len(false_indices) == 0:
+                break  # All covered
+            first_uncovered = int(false_indices[0])
+
+            r_target = first_uncovered % p
+            best_r = r_target
+            best_L = first_uncovered - 1
+
+            # For small primes, try all residues; for medium, try wider neighborhood
+            if p <= 30:
+                residues_to_try = list(range(p))
+            elif p <= 100:
+                residues_to_try = [r_target]
+                for d in range(-10, 11):
+                    r_alt = (r_target + d) % p
+                    if r_alt != r_target:
+                        residues_to_try.append(r_alt)
+            else:
+                residues_to_try = [r_target]
+                for d in range(-5, 6):
+                    r_alt = (r_target + d) % p
+                    if r_alt != r_target:
+                        residues_to_try.append(r_alt)
+
+            for r in residues_to_try:
+                if r == 0:
+                    start = p
+                else:
+                    start = r
+                if start < 1:
+                    start += p
+                mask = np.zeros(max_check + 1, dtype=bool)
+                mask[start::p] = True
+                new_covered = covered | mask
+                new_L = compute_L(new_covered)
+                if new_L > best_L:
+                    best_L = new_L
+                    best_r = r
+
+            classes.append([p, int(best_r)])
+
+            # Update covered array
+            r = best_r
+            if r == 0:
+                start = p
+            else:
+                start = r
+            if start < 1:
+                start += p
+            covered[start::p] = True
+
+        return classes
+
+    def local_search_polish(classes, max_check=100000, max_iterations=50):
+        """Try to improve coverage by adjusting residues of individual primes, gap-focused."""
+        if not classes:
+            return classes, 0
+        
+        covered = np.zeros(max_check + 1, dtype=bool)
+        for p, r in classes:
+            if r == 0:
+                start = p
+            else:
+                start = r
+            if start < 1:
+                start += p
+            covered[start::p] = True
+        
+        current_L = compute_L(covered)
+        improved = True
+        iteration = 0
+        
+        while improved and iteration < max_iterations:
+            if time.time() > deadline - 5:
+                break
+            improved = False
+            iteration += 1
+            
+            # Find the current gap
+            sub = covered[1:]
+            false_indices = np.where(~sub)[0]
+            if len(false_indices) == 0:
+                break
+            gap_pos = int(false_indices[0])
+            
+            for idx, (p, r) in enumerate(classes):
+                if time.time() > deadline - 5:
+                    break
+                
+                # Determine which residues to try based on gap position
+                r_target = gap_pos % p
+                if p <= 20:
+                    # Small primes: try all residues
+                    residues_to_try = list(range(p))
+                elif p <= 50:
+                    # Medium: try target and neighbors
+                    residues_to_try = [r_target]
+                    for d in range(-15, 16):
+                        r_alt = (r_target + d) % p
+                        if r_alt not in residues_to_try:
+                            residues_to_try.append(r_alt)
+                else:
+                    # Large: try target and close neighbors
+                    residues_to_try = [r_target]
+                    for d in range(-8, 9):
+                        r_alt = (r_target + d) % p
+                        if r_alt not in residues_to_try:
+                            residues_to_try.append(r_alt)
+                
+                for new_r in residues_to_try:
+                    if new_r == r:
+                        continue
+                    
+                    # Remove current contribution
+                    if r == 0:
+                        start = p
+                    else:
+                        start = r
+                    if start < 1:
+                        start += p
+                    covered[start::p] = False
+                    
+                    # Add new residue
+                    if new_r == 0:
+                        new_start = p
+                    else:
+                        new_start = new_r
+                    if new_start < 1:
+                        new_start += p
+                    covered[new_start::p] = True
+                    
+                    new_L = compute_L(covered)
+                    if new_L > current_L:
+                        current_L = new_L
+                        classes[idx][1] = new_r
+                        r = new_r
+                        improved = True
+                    else:
+                        # Revert
+                        covered[new_start::p] = False
+                        if r == 0:
+                            start = p
+                        else:
+                            start = r
+                        if start < 1:
+                            start += p
+                        covered[start::p] = True
+        
+        return classes, current_L
+
+    def pair_swap_local_search(classes, max_check=100000, max_rounds=15):
+        """Try adjusting residues of pairs of primes to improve coverage, gap-focused."""
+        if not classes or len(classes) < 2:
+            return classes, compute_L(np.zeros(max_check+1, dtype=bool))
+        
+        covered = np.zeros(max_check + 1, dtype=bool)
+        for p, r in classes:
+            if r == 0:
+                start = p
+            else:
+                start = r
+            if start < 1:
+                start += p
+            covered[start::p] = True
+        
+        current_L = compute_L(covered)
+        
+        for round_num in range(max_rounds):
+            if time.time() > deadline - 10:
+                break
+            
+            improved_this_round = False
+            n = len(classes)
+            
+            # Find current gap
+            sub = covered[1:]
+            false_indices = np.where(~sub)[0]
+            if len(false_indices) == 0:
+                break
+            gap_pos = int(false_indices[0])
+            
+            # Sort by prime size (smaller primes first for more impact)
+            indices = list(range(n))
+            indices.sort(key=lambda i: classes[i][0])
+            
+            for i_idx in range(min(n, 20)):
+                if time.time() > deadline - 10:
+                    break
+                i = indices[i_idx]
+                p_i, r_i = classes[i]
+                
+                for j_idx in range(i_idx + 1, min(n, 20)):
+                    if time.time() > deadline - 10:
+                        break
+                    j = indices[j_idx]
+                    p_j, r_j = classes[j]
+                    
+                    # Try new residues targeting the gap
+                    target_i = gap_pos % p_i
+                    target_j = gap_pos % p_j
+                    
+                    # Try a few combinations
+                    candidate_pairs = [
+                        (target_i, target_j),
+                        ((target_i + 1) % p_i, target_j),
+                        (target_i, (target_j + 1) % p_j),
+                        ((target_i - 1) % p_i, (target_j - 1) % p_j),
+                    ]
+                    
+                    for new_r_i, new_r_j in candidate_pairs:
+                        if new_r_i == r_i and new_r_j == r_j:
+                            continue
+                        
+                        # Remove both
+                        if r_i == 0:
+                            start_i = p_i
+                        else:
+                            start_i = r_i
+                        if start_i < 1:
+                            start_i += p_i
+                        covered[start_i::p_i] = False
+                        
+                        if r_j == 0:
+                            start_j = p_j
+                        else:
+                            start_j = r_j
+                        if start_j < 1:
+                            start_j += p_j
+                        covered[start_j::p_j] = False
+                        
+                        # Add new
+                        if new_r_i == 0:
+                            new_start_i = p_i
+                        else:
+                            new_start_i = new_r_i
+                        if new_start_i < 1:
+                            new_start_i += p_i
+                        covered[new_start_i::p_i] = True
+                        
+                        if new_r_j == 0:
+                            new_start_j = p_j
+                        else:
+                            new_start_j = new_r_j
+                        if new_start_j < 1:
+                            new_start_j += p_j
+                        covered[new_start_j::p_j] = True
+                        
+                        new_L = compute_L(covered)
+                        if new_L > current_L:
+                            current_L = new_L
+                            classes[i][1] = new_r_i
+                            classes[j][1] = new_r_j
+                            r_i = new_r_i
+                            r_j = new_r_j
+                            improved_this_round = True
+                        else:
+                            # Revert
+                            covered[new_start_i::p_i] = False
+                            covered[new_start_j::p_j] = False
+                            covered[start_i::p_i] = True
+                            covered[start_j::p_j] = True
+                
+                if improved_this_round:
+                    # Rebuild covered after improvement
+                    covered = np.zeros(max_check + 1, dtype=bool)
+                    for p, r in classes:
+                        if r == 0:
+                            start = p
+                        else:
+                            start = r
+                        if start < 1:
+                            start += p
+                        covered[start::p] = True
+            
+            if not improved_this_round:
+                break
+        
+        return classes, current_L
+
+    best_classes = []
+    best_L = 0
+
+    def evaluate_strategy(selected_primes):
+        nonlocal best_classes, best_L
+        if time.time() > deadline - 5:
+            return
+        if not selected_primes:
+            return
+        classes = greedy_residues_numpy(selected_primes, max_check)
+        # Apply local search polish
+        classes, L = local_search_polish(classes, max_check)
+        # Apply pair swap local search
+        classes, L = pair_swap_local_search(classes, max_check)
+        # Final polish after swaps
+        classes, L = local_search_polish(classes, max_check)
+        if L > best_L:
+            best_L = L
+            best_classes = [list(c) for c in classes]
+
+    # Strategy 1: smallest primes first (densest)
+    primes_asc = sorted(primes)
+    budget = Fraction(1)
+    selected = []
+    for p in primes_asc:
+        cost = Fraction(1, p)
+        if budget >= cost:
+            budget -= cost
+            selected.append(p)
+        else:
+            break
+    evaluate_strategy(selected)
+
+    # Strategy 2: largest primes first (cheapest, most primes)
+    primes_desc = sorted(primes, reverse=True)
+    budget = Fraction(1)
+    selected = []
+    for p in primes_desc:
+        cost = Fraction(1, p)
+        if budget >= cost:
+            budget -= cost
+            selected.append(p)
+        else:
+            break
+    evaluate_strategy(selected)
+
+    # Strategy 3: mixed - use small primes for density, fill with large
+    if time.time() < deadline - 10:
+        for num_small in range(1, 8):
+            if time.time() > deadline - 10:
+                break
+            small_primes = primes_asc[:num_small]
+            budget = Fraction(1)
+            for p in small_primes:
+                budget -= Fraction(1, p)
+            if budget < 0:
+                break
+
+            selected = list(small_primes)
+            for p in primes_desc:
+                if p in small_primes:
+                    continue
+                cost = Fraction(1, p)
+                if budget >= cost:
+                    budget -= cost
+                    selected.append(p)
+
+            evaluate_strategy(selected)
+
+    # Strategy 4: skip some small primes to fit more medium primes
+    if time.time() < deadline - 10:
+        for exclude in [[2], [3], [2,3], [5], [2,5]]:
+            if time.time() > deadline - 10:
+                break
+            budget = Fraction(1)
+            selected = []
+            for p in primes_asc:
+                if p in exclude:
+                    continue
+                cost = Fraction(1, p)
+                if budget >= cost:
+                    budget -= cost
+                    selected.append(p)
+                else:
+                    break
+            evaluate_strategy(selected)
+
+    # Strategy 5: Random restarts with local search
+    if time.time() < deadline - 15:
+        import random
+        random.seed(42)
+        for restart in range(20):
+            if time.time() > deadline - 15:
+                break
+            
+            # Randomly select primes with budget constraint
+            random_primes = primes.copy()
+            random.shuffle(random_primes)
+            budget = Fraction(1)
+            selected = []
+            for p in random_primes:
+                cost = Fraction(1, p)
+                if budget >= cost:
+                    budget -= cost
+                    selected.append(p)
+                else:
+                    continue
+            
+            if selected:
+                evaluate_strategy(selected)
+
+    # Strategy 6: Prime swap local search on best solution
+    if time.time() < deadline - 10 and best_classes:
+        # Compute current budget usage
+        current_budget = Fraction(0)
+        used_primes = set()
+        for p, r in best_classes:
+            current_budget += Fraction(1, p)
+            used_primes.add(p)
+        
+        remaining_budget = Fraction(1) - current_budget
+        
+        # Try swapping out a prime for a cheaper one
+        improved_swap = True
+        swap_iter = 0
+        while improved_swap and swap_iter < 10:
+            if time.time() > deadline - 10:
+                break
+            improved_swap = False
+            swap_iter += 1
+            
+            for idx in range(len(best_classes)):
+                if time.time() > deadline - 10:
+                    break
+                p_out, r_out = best_classes[idx]
+                cost_out = Fraction(1, p_out)
+                
+                # Try replacing with an unused prime
+                for p_in in primes:
+                    if p_in in used_primes:
+                        continue
+                    cost_in = Fraction(1, p_in)
+                    
+                    # Check if swap maintains budget
+                    new_budget = current_budget - cost_out + cost_in
+                    if new_budget > Fraction(1):
+                        continue
+                    
+                    # Try the swap
+                    new_classes = [list(c) for c in best_classes]
+                    new_classes[idx] = [p_in, r_out % p_in]
+                    
+                    # Quick evaluate: just recompute L
+                    covered = np.zeros(max_check + 1, dtype=bool)
+                    for pp, rr in new_classes:
+                        if rr == 0:
+                            start = pp
+                        else:
+                            start = rr
+                        if start < 1:
+                            start += pp
+                        covered[start::pp] = True
+                    new_L = compute_L(covered)
+                    
+                    if new_L > best_L:
+                        best_L = new_L
+                        best_classes = new_classes
+                        current_budget = new_budget
+                        used_primes.add(p_in)
+                        used_primes.discard(p_out)
+                        improved_swap = True
+                        break
+        
+        # After swaps, do another local search polish
+        if best_classes:
+            best_classes, best_L = local_search_polish(best_classes, max_check)
+            best_classes, best_L = pair_swap_local_search(best_classes, max_check)
+            best_classes, best_L = local_search_polish(best_classes, max_check)
+    
+    # Strategy 7: Intensive final polish with multiple passes
+    if time.time() < deadline - 5 and best_classes:
+        for polish_pass in range(5):
+            if time.time() > deadline - 5:
+                break
+            best_classes, best_L = local_search_polish(best_classes, max_check, max_iterations=30)
+            best_classes, best_L = pair_swap_local_search(best_classes, max_check, max_rounds=10)
+            best_classes, best_L = local_search_polish(best_classes, max_check, max_iterations=20)
+    
+    # Strategy 8: Try adding one more prime if budget allows
+    if time.time() < deadline - 8 and best_classes:
+        current_budget = Fraction(0)
+        used_primes = set()
+        for p, r in best_classes:
+            current_budget += Fraction(1, p)
+            used_primes.add(p)
+        
+        remaining = Fraction(1) - current_budget
+        if remaining > 0:
+            # Find cheapest unused prime that fits
+            best_add = None
+            best_add_L = best_L
+            for p in sorted(primes):
+                if p in used_primes:
+                    continue
+                if Fraction(1, p) <= remaining:
+                    # Try adding this prime with optimal residue
+                    test_classes = [list(c) for c in best_classes] + [[p, 0]]
+                    covered = np.zeros(max_check + 1, dtype=bool)
+                    for pp, rr in test_classes:
+                        if rr == 0:
+                            start = pp
+                        else:
+                            start = rr
+                        if start < 1:
+                            start += pp
+                        covered[start::pp] = True
+                    
+                    # Find best residue for new prime
+                    best_r = 0
+                    best_r_L = compute_L(covered)
+                    sub = covered[1:]
+                    false_indices = np.where(~sub)[0]
+                    if len(false_indices) > 0:
+                        gap = int(false_indices[0])
+                        r_target = gap % p
+                        for d in range(-20, 21):
+                            r_try = (r_target + d) % p
+                            if r_try == 0:
+                                start = p
+                            else:
+                                start = r_try
+                            if start < 1:
+                                start += p
+                            test_covered = covered.copy()
+                            test_covered[start::p] = True
+                            test_L = compute_L(test_covered)
+                            if test_L > best_r_L:
+                                best_r_L = test_L
+                                best_r = r_try
+                    
+                    if best_r_L > best_add_L:
+                        best_add_L = best_r_L
+                        best_add = (p, best_r)
+            
+            if best_add and best_add_L > best_L:
+                p_new, r_new = best_add
+                best_classes.append([p_new, r_new])
+                best_L = best_add_L
+                # Final polish
+                best_classes, best_L = local_search_polish(best_classes, max_check, max_iterations=20)
+
+    return best_classes if best_classes else [[2, 1]]
+
+# EVOLVE-BLOCK-END

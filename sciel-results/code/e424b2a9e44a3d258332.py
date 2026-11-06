@@ -1,0 +1,238 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import time
+import numpy as np
+from itertools import product
+from scipy.optimize import linprog
+
+def construct_auction(distribution_spec, support, constraints):
+    """
+    Construct an incentive-compatible auction mechanism.
+    
+    Args:
+        distribution_spec: Specification of the type distribution
+        support: Support of types (values in {0,1,2,3} for 2 goods)
+        constraints: Additional constraints
+    
+    Returns:
+        dict with 'allocations' (16,2) and 'payments' (16,)
+    """
+    start_time = time.time()
+    deadline = start_time + 85.0  # Safety margin before 90s limit
+    
+    # Types: (v1, v2) where v1, v2 in {0,1,2,3}
+    types = list(product(range(4), range(4)))
+    n_types = len(types)
+    
+    # Parse distribution
+    probs = _parse_distribution(distribution_spec, support, constraints)
+    
+    # Solve the LP
+    result = _solve_auction_lp(types, probs)
+    
+    # If LP failed or timed out, return baseline
+    if result is None or time.time() > deadline:
+        return _baseline_result(types, probs)
+    
+    return result
+
+def _parse_distribution(distribution_spec, support, constraints):
+    """Parse distribution spec into probability vector over 16 types."""
+    n_types = 16
+    
+    if isinstance(distribution_spec, dict):
+        dist_type = distribution_spec.get('type', 'uniform')
+        if dist_type == 'uniform':
+            return np.ones(n_types) / n_types
+        elif dist_type == 'product':
+            marginals = distribution_spec.get('marginals', None)
+            if marginals is not None and len(marginals) == 2:
+                p1, p2 = marginals
+                probs = np.zeros(n_types)
+                for i, (v1, v2) in enumerate(product(range(4), range(4))):
+                    probs[i] = p1[v1] * p2[v2]
+                return probs
+            else:
+                return np.ones(n_types) / n_types
+        elif dist_type == 'explicit':
+            explicit_probs = distribution_spec.get('probs', None)
+            if explicit_probs is not None and len(explicit_probs) == n_types:
+                probs = np.array(explicit_probs, dtype=float)
+                probs = np.maximum(probs, 0)
+                total = probs.sum()
+                if total > 0:
+                    probs /= total
+                else:
+                    probs = np.ones(n_types) / n_types
+                return probs
+            else:
+                return np.ones(n_types) / n_types
+    
+    # Default: uniform
+    return np.ones(n_types) / n_types
+
+def _solve_auction_lp(types, probs):
+    """
+    Solve the LP for incentive-compatible auction design.
+    
+    Variables: x_1(t), x_2(t), p(t) for each type t
+    Objective: maximize sum_t probs[t] * p(t)
+    
+    Constraints:
+    1. Feasibility: 0 <= x_j(t) <= 1 for all j, t
+    2. IC: v(t)·x(t) - p(t) >= v(t)·x(t') - p(t') for all t, t'
+    3. IR: v(t)·x(t) - p(t) >= 0 for all t
+    """
+    n_types = len(types)
+    n_goods = 2
+    
+    # Number of variables: 2 * n_types (allocations) + n_types (payments) = 3 * n_types
+    n_vars = 3 * n_types
+    
+    # Variable indexing:
+    # x_1(t): index t
+    # x_2(t): index n_types + t
+    # p(t): index 2 * n_types + t
+    
+    # Objective: maximize sum_t probs[t] * p(t)
+    # linprog minimizes, so we minimize -sum_t probs[t] * p(t)
+    c = np.zeros(n_vars)
+    for t in range(n_types):
+        c[2 * n_types + t] = -probs[t]
+    
+    # Inequality constraints: A_ub @ x <= b_ub
+    A_ub_rows = []
+    b_ub_vals = []
+    
+    # IC constraints: v(t)·x(t) - p(t) >= v(t)·x(t') - p(t')
+    # Rearranged for linprog: -v(t)·x(t) + p(t) + v(t)·x(t') - p(t') <= 0
+    
+    for t in range(n_types):
+        for t_prime in range(n_types):
+            if t == t_prime:
+                continue
+            
+            v_t = np.array(types[t], dtype=float)
+            row = np.zeros(n_vars)
+            
+            # -v(t)·x(t)
+            row[t] = -v_t[0]
+            row[n_types + t] = -v_t[1]
+            
+            # +p(t)
+            row[2 * n_types + t] = 1.0
+            
+            # +v(t)·x(t')
+            row[t_prime] += v_t[0]
+            row[n_types + t_prime] += v_t[1]
+            
+            # -p(t')
+            row[2 * n_types + t_prime] -= 1.0
+            
+            A_ub_rows.append(row)
+            b_ub_vals.append(0.0)
+    
+    # IR constraints: v(t)·x(t) - p(t) >= 0
+    # Rearranged: -v(t)·x(t) + p(t) <= 0
+    
+    for t in range(n_types):
+        v_t = np.array(types[t], dtype=float)
+        row = np.zeros(n_vars)
+        
+        row[t] = -v_t[0]
+        row[n_types + t] = -v_t[1]
+        row[2 * n_types + t] = 1.0
+        
+        A_ub_rows.append(row)
+        b_ub_vals.append(0.0)
+    
+    A_ub = np.array(A_ub_rows)
+    b_ub = np.array(b_ub_vals)
+    
+    # Bounds:
+    # x_j(t) in [0, 1]
+    # p(t) in [0, inf)
+    bounds = []
+    for t in range(n_types):
+        bounds.append((0, 1))  # x_1(t)
+    for t in range(n_types):
+        bounds.append((0, 1))  # x_2(t)
+    for t in range(n_types):
+        bounds.append((0, None))  # p(t)
+    
+    # Solve LP
+    try:
+        result = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        
+        if not result.success:
+            return None
+        
+        x = result.x
+        
+        # Extract allocations and payments
+        allocations = np.zeros((n_types, n_goods))
+        payments = np.zeros(n_types)
+        
+        for t in range(n_types):
+            allocations[t, 0] = x[t]
+            allocations[t, 1] = x[n_types + t]
+            payments[t] = x[2 * n_types + t]
+        
+        # Clip to ensure feasibility (small numerical errors)
+        allocations = np.clip(allocations, 0.0, 1.0)
+        payments = np.clip(payments, 0.0, None)
+        
+        # Verify the solution
+        if _verify_mechanism(types, probs, allocations, payments):
+            return {
+                'allocations': allocations,
+                'payments': payments
+            }
+        else:
+            return None
+            
+    except Exception:
+        return None
+
+def _verify_mechanism(types, probs, allocations, payments):
+    """Verify that the mechanism satisfies all constraints."""
+    n_types = len(types)
+    eps = 1e-8
+    
+    # Check feasibility
+    if np.any(allocations < -eps) or np.any(allocations > 1 + eps):
+        return False
+    if np.any(payments < -eps):
+        return False
+    
+    # Check IC
+    for t in range(n_types):
+        v_t = np.array(types[t], dtype=float)
+        util_t = v_t @ allocations[t] - payments[t]
+        for t_prime in range(n_types):
+            if t == t_prime:
+                continue
+            util_misreport = v_t @ allocations[t_prime] - payments[t_prime]
+            if util_misreport > util_t + eps:
+                return False
+    
+    # Check IR
+    for t in range(n_types):
+        v_t = np.array(types[t], dtype=float)
+        util_t = v_t @ allocations[t] - payments[t]
+        if util_t < -eps:
+            return False
+    
+    return True
+
+def _baseline_result(types, probs):
+    """Return a simple baseline mechanism that is always feasible."""
+    n_types = len(types)
+    # Allocate nothing, charge nothing - always IR and IC
+    allocations = np.zeros((n_types, 2))
+    payments = np.zeros(n_types)
+    return {
+        'allocations': allocations,
+        'payments': payments
+    }
+# EVOLVE-BLOCK-END

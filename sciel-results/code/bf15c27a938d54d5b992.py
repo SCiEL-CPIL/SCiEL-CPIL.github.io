@@ -1,0 +1,376 @@
+"""Covering 1..L by prime residue classes with reciprocal budget 1."""
+import time
+import random
+from fractions import Fraction
+import numpy as np
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140.0  # 10s safety margin
+    
+    # Generate primes up to 1000
+    def sieve(n):
+        is_prime = [True] * (n + 1)
+        is_prime[0] = is_prime[1] = False
+        for i in range(2, int(n**0.5) + 1):
+            if is_prime[i]:
+                for j in range(i*i, n+1, i):
+                    is_prime[j] = False
+        return [i for i in range(2, n+1) if is_prime[i]]
+    
+    primes = sieve(1000)
+    prime_set = set(primes)
+    
+    # Precompute indices for each (p, r) for fast coverage updates
+    # We'll use a fixed max_L for precomputation to save memory
+    MAX_PRECOMP = 10000
+    indices_cache = {}
+    for p in primes:
+        indices_cache[p] = {}
+        for r in range(p):
+            start = r if r > 0 else p
+            if start <= MAX_PRECOMP:
+                indices_cache[p][r] = np.arange(start, MAX_PRECOMP + 1, p, dtype=np.int32)
+            else:
+                indices_cache[p][r] = np.array([], dtype=np.int32)
+    
+    def compute_coverage_fast(classes, max_L):
+        """Compute coverage using a boolean array for speed."""
+        covered = np.zeros(max_L + 1, dtype=np.uint8)
+        for p, r in classes:
+            if max_L <= MAX_PRECOMP:
+                idx = indices_cache[p][r]
+                if len(idx) > 0:
+                    covered[idx] = 1
+            else:
+                # For larger max_L, compute directly
+                if r == 0:
+                    start = p
+                else:
+                    start = r
+                for n in range(start, max_L + 1, p):
+                    covered[n] = 1
+        
+        # Find largest L such that 1..L all covered
+        L = 0
+        for i in range(1, max_L + 1):
+            if covered[i]:
+                L = i
+            else:
+                break
+        return L, covered
+    
+    def compute_coverage(classes, max_L):
+        """Legacy interface, uses fast version."""
+        return compute_coverage_fast(classes, max_L)
+    
+    # Start with the seed solution as baseline
+    # Seed: i-th prime from 13 upward covers integer i
+    seed_primes = [p for p in primes if p >= 13]
+    seed_classes = [[p, (i + 1) % p] for i, p in enumerate(seed_primes)]
+    seed_sum = sum(Fraction(1, p) for p in seed_primes)
+    
+    best_L = 0
+    best_classes = []
+    
+    # Compute seed coverage
+    seed_L, _ = compute_coverage_fast(seed_classes, 5000)
+    if seed_L > best_L:
+        best_L = seed_L
+        best_classes = seed_classes[:]
+    
+    def greedy_build(target_L, initial_classes=None):
+        """Build a covering of 1..target_L using greedy set cover with efficiency scoring."""
+        if initial_classes is not None:
+            classes = [c[:] for c in initial_classes]
+            used_primes = set(c[0] for c in classes)
+            budget_remaining = Fraction(1, 1) - sum(Fraction(1, c[0]) for c in classes)
+        else:
+            classes = []
+            used_primes = set()
+            budget_remaining = Fraction(1, 1)
+        
+        # Compute current coverage
+        covered_arr = np.zeros(target_L + 1, dtype=np.uint8)
+        for p, r in classes:
+            if target_L <= MAX_PRECOMP:
+                idx = indices_cache[p][r]
+                if len(idx) > 0:
+                    covered_arr[idx] = 1
+            else:
+                if r == 0:
+                    start = p
+                else:
+                    start = r
+                for n in range(start, target_L + 1, p):
+                    covered_arr[n] = 1
+        
+        # Count uncovered
+        uncovered_count = np.sum(1 - covered_arr[1:target_L + 1])
+        
+        if uncovered_count == 0:
+            return classes, target_L
+        
+        # Greedy: repeatedly pick the (p, r) that maximizes new_coverage * p
+        while uncovered_count > 0:
+            if time.time() > deadline:
+                break
+            
+            best_score = -1
+            best_p = None
+            best_r = None
+            best_new_count = 0
+            best_new_indices = None
+            
+            # For each unused prime, try all residues
+            for p in primes:
+                if p in used_primes:
+                    continue
+                if Fraction(1, p) > budget_remaining:
+                    continue
+                
+                for r in range(p):
+                    # Get indices for this (p, r)
+                    if target_L <= MAX_PRECOMP:
+                        idx = indices_cache[p][r]
+                        if len(idx) == 0:
+                            continue
+                        # Count how many are currently uncovered
+                        count = np.sum(1 - covered_arr[idx])
+                    else:
+                        count = 0
+                        if r == 0:
+                            start = p
+                        else:
+                            start = r
+                        idx_list = []
+                        for n in range(start, target_L + 1, p):
+                            if not covered_arr[n]:
+                                count += 1
+                                idx_list.append(n)
+                        if count == 0:
+                            continue
+                        idx = np.array(idx_list, dtype=np.int32)
+                    
+                    if count == 0:
+                        continue
+                    
+                    # Score: new_coverage * p (value per unit budget)
+                    score = count * p
+                    if score > best_score:
+                        best_score = score
+                        best_p = p
+                        best_r = r
+                        best_new_count = count
+                        best_new_indices = idx
+            
+            if best_p is None:
+                break
+            
+            # Add this class
+            used_primes.add(best_p)
+            classes.append([best_p, best_r])
+            budget_remaining -= Fraction(1, best_p)
+            
+            # Update coverage
+            if best_new_indices is not None and len(best_new_indices) > 0:
+                covered_arr[best_new_indices] = 1
+            
+            uncovered_count -= best_new_count
+        
+        # Compute final L
+        L = 0
+        for i in range(1, target_L + 1):
+            if covered_arr[i]:
+                L = i
+            else:
+                break
+        
+        return classes, L
+    
+    def local_search(classes, current_L, max_time=30.0):
+        """Try to improve coverage via local search (swaps and moves)."""
+        if time.time() > deadline - max_time:
+            return classes, current_L
+        
+        best_classes = [c[:] for c in classes]
+        best_L = current_L
+        
+        check_L = max(current_L + 200, 1500)
+        
+        # Local search: try replacing or adding classes
+        improved = True
+        while improved and time.time() < deadline - 10.0:
+            improved = False
+            
+            # Try removing a class and re-adding a different one
+            for i in range(len(best_classes)):
+                if time.time() > deadline - 10.0:
+                    break
+                old_p, old_r = best_classes[i]
+                
+                # Try replacing with each unused prime
+                for new_p in primes:
+                    if new_p == old_p:
+                        continue
+                    if any(c[0] == new_p for c in best_classes):
+                        continue
+                    
+                    # Check budget: new_p must not increase budget
+                    if Fraction(1, new_p) > Fraction(1, old_p):
+                        continue
+                    
+                    # Try all residues for new_p
+                    # Compute coverage without the old class
+                    temp_classes = best_classes[:i] + best_classes[i+1:]
+                    L_no_old, _ = compute_coverage_fast(temp_classes, check_L)
+                    
+                    # For each residue, compute new coverage
+                    best_new_r = None
+                    best_new_L = L_no_old
+                    
+                    for r in range(new_p):
+                        test_classes = temp_classes + [[new_p, r]]
+                        L_test, _ = compute_coverage_fast(test_classes, check_L)
+                        if L_test > best_new_L:
+                            best_new_L = L_test
+                            best_new_r = r
+                    
+                    if best_new_r is not None and best_new_L > best_L:
+                        best_classes[i] = [new_p, best_new_r]
+                        best_L = best_new_L
+                        improved = True
+                        break
+                
+                if improved:
+                    break
+            
+            # Try adding a new class if budget allows
+            current_budget = sum(Fraction(1, c[0]) for c in best_classes)
+            if current_budget < Fraction(1, 1):
+                for p in primes:
+                    if any(c[0] == p for c in best_classes):
+                        continue
+                    if Fraction(1, p) > Fraction(1, 1) - current_budget:
+                        continue
+                    
+                    # Try all residues
+                    best_new_r = None
+                    best_new_L = best_L
+                    
+                    for r in range(p):
+                        test_classes = best_classes + [[p, r]]
+                        L_test, _ = compute_coverage_fast(test_classes, check_L)
+                        if L_test > best_new_L:
+                            best_new_L = L_test
+                            best_new_r = r
+                    
+                    if best_new_r is not None and best_new_L > best_L:
+                        best_classes.append([p, best_new_r])
+                        best_L = best_new_L
+                        improved = True
+                        break
+        
+        return best_classes, best_L
+    
+    def simulated_annealing(classes, current_L, max_time=30.0):
+        """Simulated annealing to escape local minima."""
+        if time.time() > deadline - max_time:
+            return classes, current_L
+        
+        best_classes = [c[:] for c in classes]
+        best_L = current_L
+        current_classes = [c[:] for c in classes]
+        current_L = current_L
+        
+        check_L = max(current_L + 200, 1500)
+        T = 1.0
+        cooling = 0.9995
+        no_improve = 0
+        max_no_improve = 2000
+        
+        while time.time() < deadline - 10.0:
+            # Pick a random prime to change
+            idx = random.randint(0, len(current_classes) - 1)
+            p, old_r = current_classes[idx]
+            new_r = random.randint(0, p - 1)
+            
+            if new_r == old_r:
+                continue
+            
+            current_classes[idx] = [p, new_r]
+            new_L, _ = compute_coverage_fast(current_classes, check_L)
+            
+            if new_L > current_L:
+                current_L = new_L
+                no_improve = 0
+                if current_L > best_L:
+                    best_L = current_L
+                    best_classes = current_classes[:]
+            else:
+                delta = new_L - current_L
+                if delta < 0:
+                    # Accept bad moves to escape local minima
+                    if random.random() < np.exp(delta / T):
+                        current_L = new_L
+                    else:
+                        # Revert
+                        current_classes[idx] = [p, old_r]
+                # If delta == 0, accept to wander
+                
+                no_improve += 1
+                if no_improve > max_no_improve:
+                    break
+            
+            T *= cooling
+            if T < 0.01:
+                T = 0.01
+        
+        return best_classes, best_L
+    
+    # Phase 1: Greedy construction
+    # Try building from scratch with different target sizes
+    for target in [100, 200, 500, 1000, 1500, 2000, 3000, 5000]:
+        if time.time() > deadline - 20.0:
+            break
+        
+        classes, L = greedy_build(target)
+        if L > best_L:
+            best_L = L
+            best_classes = classes[:]
+    
+    # Phase 2: Local search to improve
+    if time.time() < deadline - 30.0:
+        best_classes, best_L = local_search(best_classes, best_L, max_time=30.0)
+    
+    # Phase 3: Simulated annealing to escape local minima
+    if time.time() < deadline - 30.0:
+        best_classes, best_L = simulated_annealing(best_classes, best_L, max_time=30.0)
+    
+    # Phase 4: Try greedy from current solution with higher target
+    if time.time() < deadline - 20.0:
+        for target in [best_L + 100, best_L + 500, best_L + 1000, 5000]:
+            if time.time() > deadline - 10.0:
+                break
+            if target <= best_L:
+                continue
+            
+            classes, L = greedy_build(target, initial_classes=best_classes)
+            if L > best_L:
+                best_L = L
+                best_classes = classes[:]
+        
+        # Another local search round
+        if time.time() < deadline - 10.0:
+            best_classes, best_L = local_search(best_classes, best_L, max_time=10.0)
+        
+        # Another simulated annealing round
+        if time.time() < deadline - 10.0:
+            best_classes, best_L = simulated_annealing(best_classes, best_L, max_time=10.0)
+    
+    # Final verification with a larger check
+    final_L, _ = compute_coverage_fast(best_classes, max(best_L + 500, 10000))
+    if final_L > best_L:
+        best_L = final_L
+    
+    return best_classes

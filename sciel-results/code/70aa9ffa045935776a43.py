@@ -1,0 +1,4 @@
+<<<<<<< SEARCH
+                                     pass
+=======
+>>>>>>> REPLACE

@@ -1,0 +1,229 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+import math
+
+def _makespan(order, P):
+    """
+    Calculate the makespan for a given job order in a flow shop.
+    P: (n_jobs, n_machines) array
+    order: list of job indices
+    """
+    if not order:
+        return 0.0
+    
+    n_machines = P.shape[1]
+    if n_machines == 0:
+        return 0.0
+    
+    # C[j] is the completion time of the current job on machine j
+    # We track the completion time of the previous job on each machine
+    prev_completion = np.zeros(n_machines)
+    
+    for j in order:
+        # Processing time for job j on all machines
+        p_j = P[j]
+        
+        # Completion time on machine 0
+        curr_completion = prev_completion[0] + p_j[0]
+        
+        if n_machines == 1:
+            prev_completion[0] = curr_completion
+            continue
+            
+        # For subsequent machines
+        for m in range(1, n_machines):
+            curr_completion = max(curr_completion, prev_completion[m]) + p_j[m]
+            prev_completion[m] = curr_completion
+            
+    return prev_completion[-1]
+
+def _eval_insertion(sequence, job, pos, P):
+    """
+    Evaluate the makespan of inserting 'job' at position 'pos' in 'sequence'.
+    This is O(N*M) but avoids creating new lists and full recomputation from scratch
+    in some contexts, though here it's a full recompute for simplicity but faster
+    than list concatenation + full makespan in Python loops.
+    """
+    n_machines = P.shape[1]
+    if n_machines == 0:
+        return 0.0
+    
+    prev_completion = np.zeros(n_machines)
+    
+    # Process jobs before pos
+    for k in range(pos):
+        j = sequence[k]
+        p_j = P[j]
+        curr_completion = prev_completion[0] + p_j[0]
+        for m in range(1, n_machines):
+            curr_completion = max(curr_completion, prev_completion[m]) + p_j[m]
+            prev_completion[m] = curr_completion
+    
+    # Process the new job
+    p_job = P[job]
+    curr_completion = prev_completion[0] + p_job[0]
+    for m in range(1, n_machines):
+        curr_completion = max(curr_completion, prev_completion[m]) + p_job[m]
+        prev_completion[m] = curr_completion
+    
+    # Process jobs after pos
+    for k in range(pos, len(sequence)):
+        j = sequence[k]
+        p_j = P[j]
+        curr_completion = prev_completion[0] + p_j[0]
+        for m in range(1, n_machines):
+            curr_completion = max(curr_completion, prev_completion[m]) + p_j[m]
+            prev_completion[m] = curr_completion
+            
+    return prev_completion[-1]
+
+def _neh_heuristic(P):
+    """
+    Nawaz, Enscore, and Ham (NEH) heuristic.
+    """
+    n_jobs, n_machines = P.shape
+    
+    # Sum of processing times for each job
+    sums = P.sum(axis=1)
+    
+    # Sort jobs by total processing time in descending order
+    sorted_jobs = list(np.argsort(-sums))
+    
+    sequence = []
+    
+    for job in sorted_jobs:
+        best_pos = 0
+        best_ms = float('inf')
+        
+        # Try inserting the job at every position
+        for pos in range(len(sequence) + 1):
+            ms = _eval_insertion(sequence, job, pos, P)
+            if ms < best_ms:
+                best_ms = ms
+                best_pos = pos
+        
+        sequence.insert(best_pos, job)
+        
+    return sequence
+
+def _local_search(initial_order, P, time_limit=110.0):
+    """
+    Local search using insertion moves.
+    """
+    start_time = time.time()
+    order = list(initial_order)
+    current_ms = _makespan(order, P)
+    n_jobs = len(order)
+    
+    improved = True
+    while improved:
+        improved = False
+        # Check time limit
+        if time.time() - start_time > time_limit:
+            break
+            
+        for i in range(n_jobs):
+            if time.time() - start_time > time_limit:
+                break
+            job = order[i]
+            # Try moving job i to every position j != i
+            for j in range(n_jobs):
+                if i == j:
+                    continue
+                
+                # Calculate the position in the sequence without the job
+                # If j > i, the job shifts left by 1 in the new sequence
+                # If j <= i, the position remains j
+                # We are removing order[i] and inserting at j.
+                
+                # Construct the sequence without the job
+                # This is O(N)
+                seq_without = order[:i] + order[i+1:]
+                
+                # Determine insertion index in seq_without
+                # If j <= i, insert at j
+                # If j > i, insert at j-1
+                insert_idx = j if j <= i else j - 1
+                
+                # Evaluate insertion
+                new_ms = _eval_insertion(seq_without, job, insert_idx, P)
+                
+                if new_ms < current_ms:
+                    order = seq_without
+                    order.insert(insert_idx, job)
+                    current_ms = new_ms
+                    improved = True
+                    break
+            if improved:
+                break
+                
+    return order, current_ms
+
+def _simulated_annealing(initial_order, P, time_limit=110.0):
+    """
+    Simulated annealing to escape local optima found by local search.
+    """
+    start_time = time.time()
+    order = list(initial_order)
+    current_ms = _makespan(order, P)
+    n_jobs = len(order)
+    
+    best_order = list(order)
+    best_ms = current_ms
+    
+    # Initial temperature
+    T = 1.0
+    cooling_rate = 0.995
+    
+    while time.time() - start_time < time_limit:
+        # Generate a random neighbor (swap two jobs)
+        i, j = np.random.choice(n_jobs, 2, replace=False)
+        
+        new_order = list(order)
+        new_order[i], new_order[j] = new_order[j], new_order[i]
+        
+        new_ms = _makespan(new_order, P)
+        
+        delta = new_ms - current_ms
+        
+        # Accept if better, or with probability exp(-delta/T)
+        if delta < 0 or np.random.rand() < np.exp(-delta / T):
+            order = new_order
+            current_ms = new_ms
+            
+            if current_ms < best_ms:
+                best_ms = current_ms
+                best_order = list(order)
+        
+        T *= cooling_rate
+        
+        # Check time limit
+        if time.time() - start_time > time_limit:
+            break
+            
+    return best_order, best_ms
+
+def order_jobs(processing_times):
+    # Convert to numpy array if not already
+    P = np.asarray(processing_times)
+    
+    if P.size == 0:
+        return []
+        
+    # 1. Generate initial solution using NEH
+    best_order = _neh_heuristic(P)
+    best_ms = _makespan(best_order, P)
+    
+    # 2. Improve using Local Search
+    # We have a 150s limit. Let's reserve 10s for safety.
+    # NEH is fast, so most time goes to LS.
+    improved_order, improved_ms = _local_search(best_order, P, time_limit=135.0)
+    
+    if improved_ms < best_ms:
+        best_order = improved_order
+        best_ms = improved_ms
+        
+    return best_order
+# EVOLVE-BLOCK-END

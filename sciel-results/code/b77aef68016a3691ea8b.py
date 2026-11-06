@@ -1,0 +1,185 @@
+"""Find the maximum-size dissociated subset of [1..22].
+
+A subset S is dissociated (reciprocal) iff every subset of S has a distinct
+sum of reciprocals: the map A -> sum_{a in A} 1/a is injective over all 2^|S|
+sub-sums (including the empty sum = 0).
+
+Strategy:
+  - Exact integer arithmetic via LCM(1..22).
+  - Fast randomized greedy construction with local search (add/swap/2-opt).
+  - Global deadline guard.
+  - Optimized collision checking using set intersection.
+"""
+import time
+import random
+from math import gcd
+from functools import reduce
+
+_T0 = time.time()
+_BUDGET = 55.0  # Wall-clock guard (evaluator kills at 60s; keep 5s margin)
+_N = 22
+
+# LCM(1..22) for exact integer representation of reciprocal sums
+def _lcm(a, b):
+    return a // gcd(a, b) * b
+
+_LCM = reduce(_lcm, range(1, _N + 1))
+# Reciprocal of i as integer: LCM // i
+_REC = [0] + [_LCM // i for i in range(1, _N + 1)]
+
+
+def _is_dissociated(elements):
+    """Independent verification: all 2^k reciprocal sub-sums distinct."""
+    sums = {0}
+    for e in elements:
+        v = _REC[e]
+        shifted = {s + v for s in sums}
+        if shifted & sums:
+            return False
+        sums = sums | shifted
+    return True
+
+
+def _greedy_construct(order):
+    """Greedy construction: pick elements in 'order' if they fit."""
+    current_set = []
+    sums = {0}
+    for idx in order:
+        v = _REC[idx]
+        # Check if adding v causes collision: (sums + v) must be disjoint from sums
+        if not (sums & {s + v for s in sums}):
+            current_set.append(idx)
+            sums |= {s + v for s in sums}
+    return current_set, sums
+
+
+def _try_add(current_set, sums, candidate):
+    """Try to add candidate to current_set. Returns (new_set, new_sums) or (None, None)."""
+    v = _REC[candidate]
+    if sums & {s + v for s in sums}:
+        return None, None
+    new_sums = sums | {s + v for s in sums}
+    new_set = current_set + [candidate]
+    return new_set, new_sums
+
+
+def _local_search(current_set, sums, deadline):
+    """Try to improve current_set by adding elements or swapping."""
+    unused = set(range(1, _N + 1)) - set(current_set)
+    
+    # Phase 1: Try to add any unused element
+    for cand in list(unused):
+        if time.time() > deadline:
+            break
+        new_set, new_sums = _try_add(current_set, sums, cand)
+        if new_set is not None:
+            return new_set, new_sums, True
+
+    # Phase 2: Try swaps (remove one, add one)
+    for _ in range(15):
+        if time.time() > deadline:
+            break
+        
+        unused_list = list(unused)
+        current_list = list(current_set)
+        random.shuffle(unused_list)
+        random.shuffle(current_list)
+        
+        improved = False
+        for rem in current_list:
+            if time.time() > deadline:
+                break
+            for add in unused_list:
+                if time.time() > deadline:
+                    break
+                new_set = [x for x in current_set if x != rem] + [add]
+                if _is_dissociated(new_set):
+                    # Recalculate sums
+                    new_sums = {0}
+                    for e in new_set:
+                        v = _REC[e]
+                        new_sums |= {s + v for s in new_sums}
+                    return new_set, new_sums, True
+        
+        # If no improvement after one full pass, try 2-opt (remove two, add two)
+        if not improved and time.time() < deadline - 5:
+            # 2-opt move
+            unused_list = list(unused)
+            current_list = list(current_set)
+            random.shuffle(unused_list)
+            random.shuffle(current_list)
+            
+            if len(current_list) >= 2 and len(unused_list) >= 2:
+                for i in range(min(20, len(current_list))):
+                    if time.time() > deadline:
+                        break
+                    rem1 = current_list[i]
+                    for j in range(i + 1, min(20, len(current_list))):
+                        if time.time() > deadline:
+                            break
+                        rem2 = current_list[j]
+                        for a in unused_list:
+                            if time.time() > deadline:
+                                break
+                            for b in unused_list:
+                                if a == b:
+                                    continue
+                                if time.time() > deadline:
+                                    break
+                                new_set = [x for x in current_set if x != rem1 and x != rem2] + [a, b]
+                                if _is_dissociated(new_set):
+                                    new_sums = {0}
+                                    for e in new_set:
+                                        v = _REC[e]
+                                        new_sums |= {s + v for s in new_sums}
+                                    return new_set, new_sums, True
+            break
+        
+        if not improved:
+            break
+            
+    return current_set, sums, False
+
+
+def construct():
+    """Return a nonempty subset of [1..22] maximising dissociated cardinality."""
+    deadline = _T0 + _BUDGET
+    
+    # Initial baseline: Greedy descending
+    best_set, best_sums = _greedy_construct(list(range(_N, 0, -1)))
+    best_size = len(best_set)
+    
+    # Ensure we have a valid nonempty set
+    if not best_set:
+        best_set = [1]
+        best_sums = {0, _REC[1]}
+        best_size = 1
+
+    # Randomized restarts
+    while time.time() < deadline - 2.0:
+        # Generate a random order
+        order = list(range(1, _N + 1))
+        random.shuffle(order)
+        
+        # Greedy construct
+        curr_set, curr_sums = _greedy_construct(order)
+        
+        # If this greedy result is better, update best
+        if len(curr_set) > best_size:
+            best_set = curr_set
+            best_sums = curr_sums
+            best_size = len(best_set)
+
+        # Try to improve the current best
+        if time.time() < deadline - 5.0:
+            new_set, new_sums, improved = _local_search(best_set, best_sums, deadline)
+            if improved:
+                best_set = new_set
+                best_sums = new_sums
+                best_size = len(best_set)
+
+    # Final verification
+    if not _is_dissociated(best_set):
+        return [1]
+        
+    return best_set

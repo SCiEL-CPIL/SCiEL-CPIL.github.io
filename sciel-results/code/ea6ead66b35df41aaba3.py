@@ -1,0 +1,6 @@
+DEADLINE = time.time() + 85  # 5s safety margin before 90s kill
+# ...
+def construct():
+    start_time = time.time()
+    # ...
+    while improved and (time.time() - start_time) < DEADLINE - 10:

@@ -1,0 +1,3 @@
+    def dfs(seq, used_sums, last_val, current_sum, target_len, deadline):
+        # ...
+        # Pass current_sum + s

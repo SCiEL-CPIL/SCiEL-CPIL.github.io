@@ -1,0 +1,229 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import random
+import time
+
+def solve(instance):
+    n = instance["n"]
+    clauses = instance["clauses"]
+    m = len(clauses)
+
+    if m == 0:
+        return [False] * n
+
+    start_time = time.time()
+    deadline = start_time + 310.0
+
+    # Pre-process: build per-variable clause lists and per-clause literal data
+    var_to_clauses = [[] for _ in range(n)]
+    clause_vars = []
+    clause_pol = []  # True if positive literal
+
+    for i, c in enumerate(clauses):
+        cv = []
+        cp = []
+        for lit in c:
+            v = abs(lit) - 1
+            p = lit > 0
+            cv.append(v)
+            cp.append(p)
+            var_to_clauses[v].append(i)
+        clause_vars.append(cv)
+        clause_pol.append(cp)
+
+    # State
+    assignment = [False] * n
+    sat_count = [0] * m  # number of satisfying literals per clause
+    unsat = []  # list of unsatisfied clause indices
+
+    def init_state(asm):
+        unsat.clear()
+        for i in range(m):
+            cnt = 0
+            cv = clause_vars[i]
+            cp = clause_pol[i]
+            for j in range(len(cv)):
+                if asm[cv[j]] == cp[j]:
+                    cnt += 1
+            sat_count[i] = cnt
+            if cnt == 0:
+                unsat.append(i)
+
+    def flip(v):
+        assignment[v] = not assignment[v]
+        for ci in var_to_clauses[v]:
+            cv = clause_vars[ci]
+            cp = clause_pol[ci]
+            cnt = 0
+            for j in range(len(cv)):
+                if assignment[cv[j]] == cp[j]:
+                    cnt += 1
+            was_sat = sat_count[ci] > 0
+            sat_count[ci] = cnt
+            is_sat = cnt > 0
+            if was_sat and not is_sat:
+                unsat.append(ci)
+            elif not was_sat and is_sat:
+                try:
+                    unsat.remove(ci)
+                except ValueError:
+                    pass
+
+    def breakage(v):
+        """Number of currently-sat clauses that become unsat if v flips."""
+        b = 0
+        for ci in var_to_clauses[v]:
+            if sat_count[ci] > 0:
+                # Check if v is the only satisfying literal
+                cv = clause_vars[ci]
+                cp = clause_pol[ci]
+                v_satisfies = False
+                for j in range(len(cv)):
+                    if cv[j] == v:
+                        if assignment[v] == cp[j]:
+                            v_satisfies = True
+                        break
+                if v_satisfies and sat_count[ci] == 1:
+                    b += 1
+        return b
+
+    def gain(v):
+        """Number of currently-unsat clauses that become sat if v flips."""
+        g = 0
+        for ci in var_to_clauses[v]:
+            if sat_count[ci] == 0:
+                cv = clause_vars[ci]
+                cp = clause_pol[ci]
+                for j in range(len(cv)):
+                    if cv[j] == v:
+                        if (not assignment[v]) == cp[j]:
+                            g += 1
+                        break
+        return g
+
+    rng = random.Random(42)
+    best_asm = None
+    best_unsat = m + 1
+
+    def local_search(noise, max_steps, stuck_limit):
+        nonlocal assignment, unsat
+        cur = len(unsat)
+        if cur == 0:
+            return assignment[:], 0
+
+        best_local = cur
+        best_local_asm = assignment[:]
+        stuck = 0
+        steps = 0
+
+        while steps < max_steps:
+            if time.time() > deadline - 3.0:
+                break
+            if not unsat:
+                return assignment[:], 0
+
+            ci = rng.choice(unsat)
+            cv = clause_vars[ci]
+
+            if rng.random() < noise:
+                v = rng.choice(cv)
+            else:
+                best_v = -1
+                best_b = 10**9
+                best_g = -10**9
+                for v in cv:
+                    b = breakage(v)
+                    if b < best_b:
+                        best_b = b
+                        best_g = gain(v)
+                        best_v = v
+                    elif b == best_b:
+                        g = gain(v)
+                        if g > best_g:
+                            best_g = g
+                            best_v = v
+                v = best_v
+
+            flip(v)
+            steps += 1
+            cur = len(unsat)
+
+            if cur == 0:
+                return assignment[:], 0
+
+            if cur < best_local:
+                best_local = cur
+                best_local_asm = assignment[:]
+                stuck = 0
+            else:
+                stuck += 1
+
+            if stuck > stuck_limit:
+                break
+
+        return best_local_asm, best_local
+
+    max_restarts = 2000
+    max_steps = 50000
+    noise = 0.3
+
+    for r in range(max_restarts):
+        if time.time() > deadline - 10.0:
+            break
+
+        assignment = [rng.random() < 0.5 for _ in range(n)]
+        init_state(assignment)
+        cur = len(unsat)
+
+        if cur == 0:
+            return assignment[:]
+
+        if cur < best_unsat:
+            best_unsat = cur
+            best_asm = assignment[:]
+
+        assignment, cur = local_search(noise, max_steps, 8000)
+
+        if cur == 0:
+            return assignment[:]
+
+        if cur < best_unsat:
+            best_unsat = cur
+            best_asm = assignment[:]
+
+        if best_unsat <= max(3, m // 50) and time.time() < deadline - 15.0:
+            assignment = best_asm[:]
+            init_state(assignment)
+            cur = len(unsat)
+            if cur == 0:
+                return assignment[:]
+            assignment, cur = local_search(0.1, 100000, 20000)
+            if cur == 0:
+                return assignment[:]
+            if cur < best_unsat:
+                best_unsat = cur
+                best_asm = assignment[:]
+
+    # Final polish: if close to solution, do extended low-noise search
+    if best_asm and best_unsat > 0 and time.time() < deadline - 5.0:
+        assignment = best_asm[:]
+        init_state(assignment)
+        cur = len(unsat)
+        if cur == 0:
+            return assignment[:]
+        # Progressive noise reduction for final polish
+        for polish_noise in [0.05, 0.02, 0.0]:
+            if time.time() > deadline - 5.0:
+                break
+            assignment, cur = local_search(polish_noise, 200000, 50000)
+            if cur == 0:
+                return assignment[:]
+            if cur < best_unsat:
+                best_unsat = cur
+                best_asm = assignment[:]
+
+    if best_asm:
+        return best_asm
+    return assignment
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,33 @@
+# import time
+# import random
+#
+# def construct():
+#     ...
+#     return best_seq
+#
+# # Keep the helper functions...
+#
+# def _is_valid(seq):
+#     ...
+#
+# def _greedy_construct():
+#     ...
+#
+# def _try_swap(seq, i, x):
+#     ...
+#
+# # The `construct` function above is the main entry point.
+# ...
+# def construct():
+#     ...
+#     return best_seq
+#
+# def _fast_greedy_impl():
+#     ...
+#
+# def _beam_search_impl(...):
+#     ...
+#
+# def _try_insert(seq, x):
+#     ...
+# 

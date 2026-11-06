@@ -1,0 +1,345 @@
+import time
+import random
+import math
+from collections import defaultdict
+
+def construct():
+    start_time = time.time()
+    deadline = 140.0  # Safety margin for 150s limit
+    
+    # Grid bounds for search - expanded to allow more diverse configurations
+    GRID_MIN = -30
+    GRID_MAX = 30
+    
+    # Initial configuration: 4x4 grid centered at 0
+    # This gives score 10
+    def initial_config():
+        pts = []
+        for x in range(-2, 2):
+            for y in range(-2, 2):
+                pts.append([x, y])
+        return pts
+    
+    def initial_config_5x5_subset():
+        """Create a 5x5 grid and select 16 points strategically"""
+        pts = []
+        # Use a 5x5 grid but skip some points to get 16
+        for x in range(-2, 3):
+            for y in range(-2, 3):
+                pts.append([x, y])
+        # Remove 9 points to get 16
+        # Keep corners and some strategic points
+        indices_to_keep = [0, 1, 2, 3, 4, 5, 10, 11, 12, 13, 15, 20, 21, 22, 23, 24]
+        selected = [pts[i] for i in indices_to_keep if i < len(pts)]
+        return selected
+    
+    def get_line_key(p1, p2):
+        x1, y1 = p1
+        x2, y2 = p2
+        # A = y1 - y2
+        # B = x2 - x1
+        # C = x1*y2 - x2*y1
+        A = y1 - y2
+        B = x2 - x1
+        C = x1 * y2 - x2 * y1
+        
+        # Normalize by GCD to get unique key for parallel lines
+        if A == 0 and B == 0:
+            return None # Should not happen for distinct points
+            
+        g = math.gcd(math.gcd(abs(A), abs(B)), abs(C))
+        if g == 0:
+            g = 1
+            
+        A //= g
+        B //= g
+        C //= g
+        
+        # Ensure consistent sign (e.g., first non-zero is positive)
+        if A < 0 or (A == 0 and B < 0) or (A == 0 and B == 0 and C < 0):
+            A = -A
+            B = -B
+            C = -C
+            
+        return (A, B, C)
+
+    def evaluate(points):
+        """
+        Returns (score, is_valid)
+        score: number of lines with exactly 4 points
+        is_valid: False if any line has >= 5 points or points are not distinct
+        """
+        n = len(points)
+        # Check distinctness
+        if len(set(tuple(p) for p in points)) != n:
+            return 0, False
+            
+        line_points = defaultdict(set)
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                key = get_line_key(points[i], points[j])
+                if key is None:
+                    return 0, False
+                line_points[key].add(i)
+                line_points[key].add(j)
+        
+        score = 0
+        for key, pts in line_points.items():
+            count = len(pts)
+            if count >= 5:
+                return 0, False
+            if count == 4:
+                score += 1
+                
+        return score, True
+
+    def evaluate_incremental(points, changed_idx, old_pos, new_pos):
+        """
+        Fast incremental evaluation: only recompute lines affected by the moved point.
+        Returns (score, is_valid)
+        """
+        n = len(points)
+        # Check distinctness
+        if len(set(tuple(p) for p in points)) != n:
+            return 0, False
+            
+        # First, compute all line keys from scratch (needed for correctness)
+        line_points = defaultdict(set)
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                key = get_line_key(points[i], points[j])
+                if key is None:
+                    return 0, False
+                line_points[key].add(i)
+                line_points[key].add(j)
+        
+        score = 0
+        for key, pts in line_points.items():
+            count = len(pts)
+            if count >= 5:
+                return 0, False
+            if count == 4:
+                score += 1
+                
+        return score, True
+
+    def try_improve_4point_line(points, idx):
+        """
+        Try to find a better position for point idx that creates or maintains 4-point lines.
+        """
+        best_new_pos = None
+        best_delta = 0
+        current_score, _ = evaluate(points)
+        
+        # Try positions near the current point
+        cx, cy = points[idx]
+        for dx in range(-5, 6):
+            for dy in range(-5, 6):
+                if dx == 0 and dy == 0:
+                    continue
+                nx, ny = cx + dx, cy + dy
+                if abs(nx) > GRID_MAX or abs(ny) > GRID_MAX:
+                    continue
+                new_points = [p[:] for p in points]
+                new_points[idx] = [nx, ny]
+                new_score, is_valid = evaluate(new_points)
+                if is_valid:
+                    delta = new_score - current_score
+                    if delta > best_delta:
+                        best_delta = delta
+                        best_new_pos = [nx, ny]
+        
+        return best_new_pos, best_delta
+
+    def local_search(points, max_iter=100):
+        """
+        Hill climbing local search: repeatedly move the point with the best improvement.
+        """
+        current_points = [p[:] for p in points]
+        current_score, _ = evaluate(current_points)
+        
+        for _ in range(max_iter):
+            best_improvement = 0
+            best_move = None
+            
+            for idx in range(16):
+                cx, cy = current_points[idx]
+                for dx in range(-3, 4):
+                    for dy in range(-3, 4):
+                        if dx == 0 and dy == 0:
+                            continue
+                        nx, ny = cx + dx, cy + dy
+                        if abs(nx) > GRID_MAX or abs(ny) > GRID_MAX:
+                            continue
+                        new_points = [p[:] for p in current_points]
+                        new_points[idx] = [nx, ny]
+                        new_score, is_valid = evaluate(new_points)
+                        if is_valid:
+                            delta = new_score - current_score
+                            if delta > best_improvement:
+                                best_improvement = delta
+                                best_move = (idx, nx, ny)
+            
+            if best_move is None:
+                break
+            
+            idx, nx, ny = best_move
+            current_points[idx] = [nx, ny]
+            current_score += best_improvement
+        
+        return current_points, current_score
+
+    # Simulated Annealing
+    best_points = initial_config()
+    best_score, _ = evaluate(best_points)
+    
+    # Run local search on initial config
+    best_points, best_score = local_search(best_points, max_iter=200)
+    
+    current_points = [p[:] for p in best_points]
+    current_score = best_score
+    
+    T = 15.0
+    cooling = 0.999
+    min_T = 0.05
+    
+    step_count = 0
+    stagnant_steps = 0
+    
+    while time.time() < deadline:
+        # Generate a move
+        move_type = random.random()
+        
+        if move_type < 0.5:
+            # Shift a point by small amount
+            idx = random.randint(0, 15)
+            dx = random.randint(-6, 6)
+            dy = random.randint(-6, 6)
+            if dx == 0 and dy == 0:
+                continue
+            new_points = [p[:] for p in current_points]
+            new_points[idx][0] += dx
+            new_points[idx][1] += dy
+            
+            # Check bounds
+            if abs(new_points[idx][0]) > 1000 or abs(new_points[idx][1]) > 1000:
+                continue
+            # Check if it stays within our search grid to maintain density
+            if abs(new_points[idx][0]) > GRID_MAX or abs(new_points[idx][1]) > GRID_MAX:
+                 # Allow escape less frequently
+                 if random.random() > 0.25:
+                     continue
+                     
+        elif move_type < 0.75:
+            # Try to improve a specific point to create 4-point lines
+            idx = random.randint(0, 15)
+            best_new_pos, best_delta = try_improve_4point_line(current_points, idx)
+            if best_new_pos is None or best_delta <= 0:
+                # Fall back to random shift
+                dx = random.randint(-5, 5)
+                dy = random.randint(-5, 5)
+                if dx == 0 and dy == 0:
+                    continue
+                new_points = [p[:] for p in current_points]
+                new_points[idx][0] += dx
+                new_points[idx][1] += dy
+                if abs(new_points[idx][0]) > GRID_MAX or abs(new_points[idx][1]) > GRID_MAX:
+                    if random.random() > 0.25:
+                        continue
+            else:
+                new_points = [p[:] for p in current_points]
+                new_points[idx] = best_new_pos
+                
+        elif move_type < 0.9:
+            # Replace a point with a random point in grid
+            idx = random.randint(0, 15)
+            new_points = [p[:] for p in current_points]
+            new_points[idx] = [random.randint(GRID_MIN, GRID_MAX), random.randint(GRID_MIN, GRID_MAX)]
+        else:
+            # Swap two points' positions with random offsets
+            idx1 = random.randint(0, 15)
+            idx2 = random.randint(0, 15)
+            if idx1 == idx2:
+                continue
+            new_points = [p[:] for p in current_points]
+            dx1 = random.randint(-4, 4)
+            dy1 = random.randint(-4, 4)
+            dx2 = random.randint(-4, 4)
+            dy2 = random.randint(-4, 4)
+            new_points[idx1][0] += dx1
+            new_points[idx1][1] += dy1
+            new_points[idx2][0] += dx2
+            new_points[idx2][1] += dy2
+            if abs(new_points[idx1][0]) > GRID_MAX or abs(new_points[idx1][1]) > GRID_MAX or \
+               abs(new_points[idx2][0]) > GRID_MAX or abs(new_points[idx2][1]) > GRID_MAX:
+                continue
+
+        new_score, is_valid = evaluate(new_points)
+        
+        if not is_valid:
+            # Reject invalid moves
+            stagnant_steps += 1
+        else:
+            delta = new_score - current_score
+            if delta >= 0 or random.random() < math.exp(delta / T):
+                current_points = new_points
+                current_score = new_score
+                stagnant_steps = 0
+                
+                if current_score > best_score:
+                    best_score = current_score
+                    best_points = [p[:] for p in current_points]
+                    # Reset temperature on improvement
+                    T = max(T, 10.0)
+            else:
+                stagnant_steps += 1
+        
+        T *= cooling
+        if T < min_T:
+            T = min_T
+            
+        step_count += 1
+        
+        # Periodic restart if stuck
+        if stagnant_steps > 2000 or (step_count % 3000 == 0 and best_score <= 12):
+            # Try a fresh random configuration or perturb best
+            if random.random() < 0.5:
+                # Random restart
+                current_points = []
+                for _ in range(16):
+                    current_points.append([random.randint(GRID_MIN, GRID_MAX), random.randint(GRID_MIN, GRID_MAX)])
+                current_score, is_valid = evaluate(current_points)
+                if not is_valid:
+                    current_points = [p[:] for p in best_points]
+                    current_score = best_score
+            else:
+                # Perturb best configuration
+                current_points = [p[:] for p in best_points]
+                for _ in range(random.randint(3, 6)):
+                    idx = random.randint(0, 15)
+                    current_points[idx][0] += random.randint(-8, 8)
+                    current_points[idx][1] += random.randint(-8, 8)
+                    if abs(current_points[idx][0]) > GRID_MAX or abs(current_points[idx][1]) > GRID_MAX:
+                        current_points[idx] = [random.randint(GRID_MIN, GRID_MAX), random.randint(GRID_MIN, GRID_MAX)]
+                current_score, is_valid = evaluate(current_points)
+                if not is_valid:
+                    current_points = [p[:] for p in best_points]
+                    current_score = best_score
+            
+            # Run local search after restart
+            current_points, current_score = local_search(current_points, max_iter=100)
+            if current_score > best_score:
+                best_score = current_score
+                best_points = [p[:] for p in current_points]
+            
+            stagnant_steps = 0
+            T = 15.0
+
+    # Final local search polish on best found
+    best_points, best_score = local_search(best_points, max_iter=300)
+
+    return best_points
+
+# EVOLVE-BLOCK-END

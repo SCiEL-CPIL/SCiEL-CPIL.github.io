@@ -1,0 +1,309 @@
+import time
+import random
+import sys
+
+def construct():
+    n = 40
+    start_time = time.time()
+    deadline = 115.0  # 5s buffer for 120s limit
+
+def construct():
+    n = 40
+    start_time = time.time()
+    deadline = 115.0  # 5s buffer for 120s limit
+    
+    def time_left():
+        return deadline - (time.time() - start_time)
+    
+    # Bitset adjacency
+    adj = [0] * n
+    
+    def can_add(u, v, adj_state):
+        """
+        Check if adding edge (u,v) creates a C6.
+        C6: u-v-x-y-z-w-u
+        u, v are the new edge.
+        x in N(v), w in N(u).
+        Need path x-y-z-w of length 2 (i.e., x~y, y~z, z~w) 
+        such that y,z are distinct and not in {u,v,x,w}.
+        """
+        Nv = adj_state[v] & ~(1 << u)
+        Nu = adj_state[u] & ~(1 << v)
+        
+        # Iterate over the smaller set to reduce outer loops
+        if Nv.bit_count() <= Nu.bit_count():
+            # x in N(v), w in N(u)
+            x_mask = Nv
+            while x_mask:
+                x = (x_mask & -x_mask).bit_length() - 1
+                x_mask &= x_mask - 1
+                if x == u:
+                    continue
+                w_mask = Nu
+                while w_mask:
+                    w = (w_mask & -w_mask).bit_length() - 1
+                    w_mask &= w_mask - 1
+                    if w == v or w == x:
+                        continue
+                    # Need y in N(x) \ {u,v,w}, z in N(w) \ {u,v,x}
+                    # such that y~z, y!=z.
+                    S_x = adj_state[x] & ~(1 << u) & ~(1 << v) & ~(1 << w)
+                    S_w = adj_state[w] & ~(1 << u) & ~(1 << v) & ~(1 << x)
+                    
+                    # Check if there is an edge between S_x and S_w
+                    # Iterate y in S_x
+                    y_mask = S_x
+                    while y_mask:
+                        y = (y_mask & -y_mask).bit_length() - 1
+                        y_mask &= y_mask - 1
+                        # Check if y is connected to any z in S_w, z != y
+                        if adj_state[y] & (S_w & ~(1 << y)):
+                            return False
+        else:
+            # deg(u) < deg(v): x in N(u), w in N(v)
+            # C6: u-v-w-z-y-x-u (renamed)
+            # x in N(u), w in N(v), y in N(x), z in N(w), y~z
+            x_mask = Nu
+            while x_mask:
+                x = (x_mask & -x_mask).bit_length() - 1
+                x_mask &= x_mask - 1
+                if x == v:
+                    continue
+                w_mask = Nv
+                while w_mask:
+                    w = (w_mask & -w_mask).bit_length() - 1
+                    w_mask &= w_mask - 1
+                    if w == u or w == x:
+                        continue
+                    # y in N(x)\{u,v,w}, z in N(w)\{u,v,x}, y~z, y!=z
+                    S_x = adj_state[x] & ~(1 << u) & ~(1 << v) & ~(1 << w)
+                    S_w = adj_state[w] & ~(1 << u) & ~(1 << v) & ~(1 << x)
+                    y_mask = S_x
+                    while y_mask:
+                        y = (y_mask & -y_mask).bit_length() - 1
+                        y_mask &= y_mask - 1
+                        if adj_state[y] & (S_w & ~(1 << y)):
+                            return False
+        return True
+
+    def get_non_edges(adj_state):
+        """Return list of all non-edges in the graph."""
+        non_edges = []
+        for i in range(n):
+            for j in range(i+1, n):
+                if not (adj_state[i] & (1 << j)):
+                    non_edges.append((i, j))
+        return non_edges
+
+    def get_edges(adj_state):
+        edges = []
+        for i in range(n):
+            mask = adj_state[i]
+            while mask:
+                j = (mask & -mask).bit_length() - 1
+                mask &= mask - 1
+                if i < j:
+                    edges.append([i, j])
+        return edges
+
+    all_pairs = [(i, j) for i in range(n) for j in range(i+1, n)]
+    
+    best_edges = 0
+    best_adj = [0] * n
+    
+    # Phase 1: Multiple Random Greedy Trials with varied seeds
+    for trial in range(100):
+        if time_left() < 10:
+            break
+        
+        random.seed(42 + trial)
+        adj_try = [0] * n
+        ec = 0
+        
+        shuffled = all_pairs[:]
+        random.shuffle(shuffled)
+        
+        for u, v in shuffled:
+            if time_left() < 2:
+                break
+            if can_add(u, v, adj_try):
+                adj_try[u] |= (1 << v)
+                adj_try[v] |= (1 << u)
+                ec += 1
+        
+        if ec > best_edges:
+            best_edges = ec
+            best_adj = adj_try[:]
+
+    # Fallback
+    if best_edges == 0:
+        # Simple fallback: disjoint cliques
+        for k in range(8):
+            for a in range(5):
+                for b in range(a+1, 5):
+                    u = 5*k+a
+                    v = 5*k+b
+                    best_adj[u] |= (1 << v)
+                    best_adj[v] |= (1 << u)
+        best_edges = 80
+
+    # Phase 2: Enhanced Local Search
+    adj = best_adj[:]
+    current_edges = best_edges
+    best_local_edges = best_edges
+    best_local_adj = best_adj[:]
+    
+    # Tabu list for recent removals to prevent immediate re-addition
+    tabu = {}
+    tabu_iteration = 0
+    stall_count = 0
+    MAX_STALL = 50
+    
+    while time_left() > 5:
+        tabu_iteration += 1
+        improved = False
+        
+        # 1. Systematically try to add any non-edge (0-for-1 move)
+        # Get current non-edges
+        non_edges = get_non_edges(adj)
+        
+        for u, v in non_edges:
+            if time_left() < 5:
+                break
+            if can_add(u, v, adj):
+                adj[u] |= (1 << v)
+                adj[v] |= (1 << u)
+                current_edges += 1
+                improved = True
+                if current_edges > best_local_edges:
+                    best_local_edges = current_edges
+                    best_local_adj = adj[:]
+                break
+        
+        if improved:
+            stall_count = 0
+            continue
+        
+        # 2. Try 1-for-1 edge swaps: Remove one edge, add another
+        edge_list = []
+        for i in range(n):
+            mask = adj[i]
+            while mask:
+                j = (mask & -mask).bit_length() - 1
+                mask &= mask - 1
+                if i < j:
+                    edge_list.append((i, j))
+        
+        if not edge_list:
+            break
+            
+        # Try a few candidate swaps
+        found_swap = False
+        for _ in range(10):
+            if time_left() < 5:
+                break
+            u_rem, v_rem = random.choice(edge_list)
+            
+            # Check if this removal is tabu
+            if tabu.get((u_rem, v_rem), 0) > tabu_iteration - 50:
+                continue
+            
+            # Temporarily remove edge
+            adj[u_rem] &= ~(1 << v_rem)
+            adj[v_rem] &= ~(1 << u_rem)
+            
+            # Try to add a different edge
+            added_edge = None
+            for u_add, v_add in non_edges:
+                if (u_add, v_add) == (u_rem, v_rem):
+                    continue
+                if adj[u_add] & (1 << v_add):
+                    continue
+                if can_add(u_add, v_add, adj):
+                    adj[u_add] |= (1 << v_add)
+                    adj[v_add] |= (1 << u_add)
+                    added_edge = (u_add, v_add)
+                    break
+            
+            if added_edge is not None:
+                # Accept the swap (edge count unchanged, but structure changed)
+                tabu[(u_rem, v_rem)] = tabu_iteration
+                found_swap = True
+                break
+            else:
+                # Undo removal
+                adj[u_rem] |= (1 << v_rem)
+                adj[v_rem] |= (1 << u_rem)
+        
+        if found_swap:
+            stall_count = 0
+            continue
+        
+        # 3. Try 1-for-2 moves: Remove one edge, add two
+        for _ in range(5):
+            if time_left() < 5:
+                break
+            u_rem, v_rem = random.choice(edge_list)
+            
+            # Check if this removal is tabu
+            if tabu.get((u_rem, v_rem), 0) > tabu_iteration - 50:
+                continue
+            
+            # Temporarily remove edge
+            adj[u_rem] &= ~(1 << v_rem)
+            adj[v_rem] &= ~(1 << u_rem)
+            
+            added_count = 0
+            added_edges = []
+            
+            # Try to add two edges
+            for u_add, v_add in non_edges:
+                if (u_add, v_add) == (u_rem, v_rem):
+                    continue
+                if adj[u_add] & (1 << v_add):
+                    continue
+                if (u_add, v_add) in added_edges:
+                    continue
+                if can_add(u_add, v_add, adj):
+                    adj[u_add] |= (1 << v_add)
+                    adj[v_add] |= (1 << u_add)
+                    added_edges.append((u_add, v_add))
+                    added_count += 1
+                    if added_count == 2:
+                        break
+            
+            if added_count >= 2:
+                # Net +1 edge
+                current_edges += (added_count - 1)
+                tabu[(u_rem, v_rem)] = tabu_iteration
+                improved = True
+                if current_edges > best_local_edges:
+                    best_local_edges = current_edges
+                    best_local_adj = adj[:]
+                break
+            else:
+                # Undo removal and any additions
+                for u_a, v_a in added_edges:
+                    adj[u_a] &= ~(1 << v_a)
+                    adj[v_a] &= ~(1 << u_a)
+                adj[u_rem] |= (1 << v_rem)
+                adj[v_rem] |= (1 << u_rem)
+        
+        if not improved:
+            stall_count += 1
+            # If stalled for too long, do a random restart from best
+            if stall_count > MAX_STALL:
+                adj = best_local_adj[:]
+                current_edges = best_local_edges
+                stall_count = 0
+                tabu = {}
+        
+        if not improved and not found_swap:
+            # No improvement, continue loop
+            pass
+
+    if best_local_edges > best_edges:
+        best_edges = best_local_edges
+        best_adj = best_local_adj
+
+    return get_edges(best_adj)

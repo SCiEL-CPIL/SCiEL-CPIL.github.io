@@ -1,0 +1,530 @@
+"""XOR-circuit synthesis: BFS-based subexpression sharing with
+exact GF(2) verification, gate elimination, and a tight time budget."""
+import time
+import numpy as np
+from collections import deque
+
+_DEADLINE = 45.0  # safety margin under the 90s wall-clock limit
+
+
+def _rows_to_masks(matrix):
+    M = np.asarray(matrix, dtype=np.uint8)
+    m, n = M.shape
+    rows = []
+    for i in range(m):
+        mask = 0
+        r = M[i]
+        for j in range(n):
+            if r[j]:
+                mask |= (1 << j)
+        rows.append(mask)
+    return rows, m, n
+
+
+def _min_need(A, targets, n):
+    """For each target, min number of elements of A that XOR to it (0 for target 0).
+    Uses bounded BFS to prevent timeout."""
+    A = list(A)
+    if not A:
+        return {t: 0 if t == 0 else 10**9 for t in targets}
+        
+    MAX_VISITS = 2000
+    MAX_DEPTH = 8
+    
+    result = {}
+    remaining = set()
+    for t in targets:
+        if t == 0:
+            result[0] = 0
+        elif t not in result:
+            remaining.add(t)
+            
+    if not remaining:
+        return result
+
+    visited = {0: 0}
+    queue = deque([(0, 0)])
+    visits = 0
+    
+    while queue and remaining and visits < MAX_VISITS:
+        curr, d = queue.popleft()
+        if d >= MAX_DEPTH:
+            continue
+        for a in A:
+            nm = curr ^ a
+            if nm not in visited:
+                visited[nm] = d + 1
+                visits += 1
+                if nm in remaining:
+                    result[nm] = d + 1
+                    remaining.discard(nm)
+                if not remaining:
+                    break
+                queue.append((nm, d + 1))
+        if not remaining:
+            break
+
+    for t in remaining:
+        result[t] = bin(t).count('1')
+        
+    return result
+
+
+def _decompose(A, t, n):
+    """BFS: list of elements of A that XOR to t (minimal count).
+    Uses bounded BFS to prevent timeout."""
+    A = list(A)
+    if t == 0:
+        return []
+    if not A:
+        return None
+        
+    MAX_VISITS = 2000
+    MAX_DEPTH = 8
+    
+    parent = {0: None}
+    q = deque([(0, 0)])
+    visits = 0
+    found = False
+    
+    while q and visits < MAX_VISITS:
+        m, d = q.popleft()
+        if d >= MAX_DEPTH:
+            continue
+        for a in A:
+            nm = m ^ a
+            if nm not in parent:
+                parent[nm] = (m, a)
+                visits += 1
+                if nm == t:
+                    found = True
+                    break
+                q.append((nm, d + 1))
+        if found:
+            break
+            
+    if not found or t not in parent:
+        return None
+        
+    elems = []
+    cur = t
+    while parent[cur] is not None:
+        prev, a = parent[cur]
+        elems.append(a)
+        cur = prev
+    return elems
+
+
+def _verify(matrix, result):
+    rows, m, n = _rows_to_masks(matrix)
+    val = {}
+    for j in range(n):
+        val[j] = 1 << j
+    val[n] = 0
+    depth = {j: 0 for j in range(n + 1)}
+    wid = n + 1
+    for (a, b) in result['gates']:
+        if a not in val or b not in val:
+            return False
+        val[wid] = val[a] ^ val[b]
+        depth[wid] = max(depth[a], depth[b]) + 1
+        if depth[wid] > 16:
+            return False
+        wid += 1
+    outs = result['outputs']
+    if len(outs) != m:
+        return False
+    for i in range(m):
+        if outs[i] not in val or val[outs[i]] != rows[i]:
+            return False
+    return True
+
+
+def _baseline(matrix):
+    rows, m, n = _rows_to_masks(matrix)
+    gates = []
+    outputs = []
+    next_id = n + 1
+    for t in rows:
+        bits = [j for j in range(n) if (t >> j) & 1]
+        if not bits:
+            outputs.append(n)
+            continue
+        cur = bits[0]
+        for j in bits[1:]:
+            gates.append([cur, j])
+            cur = next_id
+            next_id += 1
+        outputs.append(cur)
+    return {'gates': gates, 'outputs': outputs}
+
+
+def _eliminate_gates(gates, outputs, n):
+    """
+    Eliminate redundant gates by checking if a gate's output is already available.
+    Returns new_gates, new_outputs.
+    """
+    if not gates:
+        return gates, outputs
+
+    # Compute wire values
+    vals = [1 << i for i in range(n)]
+    vals.append(0)
+    for g in gates:
+        a, b = g
+        vals.append(vals[a] ^ vals[b])
+
+    new_gates = []
+    wire_remap = {i: i for i in range(n + 1)}
+    new_vals = vals[:n + 1]
+    val_to_wire = {v: i for i, v in enumerate(new_vals)}
+
+    for gi in range(len(gates)):
+        a, b = gates[gi]
+        old_wire = n + 1 + gi
+        val = vals[old_wire]
+
+        if val in val_to_wire:
+            wire_remap[old_wire] = val_to_wire[val]
+        else:
+            new_a = wire_remap[a]
+            new_b = wire_remap[b]
+            new_wire = n + 1 + len(new_gates)
+            new_gates.append([new_a, new_b])
+            new_vals.append(val)
+            wire_remap[old_wire] = new_wire
+            val_to_wire[val] = new_wire
+
+    new_outputs = []
+    for o in outputs:
+        if o in wire_remap:
+            new_outputs.append(wire_remap[o])
+        else:
+            new_outputs.append(n)
+
+    return new_gates, new_outputs
+
+
+def _synthesize_once(matrix, depth_limit, t0, deadline):
+    """Single synthesis attempt with greedy subexpression sharing."""
+    rows, m, n = _rows_to_masks(matrix)
+    if m == 0:
+        return {'gates': [], 'outputs': []}
+
+    wire_mask = {}
+    mask_id = {}
+    depth = {}
+    for j in range(n):
+        wire_mask[j] = 1 << j
+        mask_id[1 << j] = j
+        depth[j] = 0
+    wire_mask[n] = 0
+    mask_id[0] = n
+    depth[n] = 0
+
+    gates = []
+    next_id = [n + 1]
+
+    def add_gate(a, b):
+        c = wire_mask[a] ^ wire_mask[b]
+        if c in mask_id:
+            return mask_id[c]
+        wid = next_id[0]
+        next_id[0] += 1
+        wire_mask[wid] = c
+        depth[wid] = max(depth[a], depth[b]) + 1
+        mask_id[c] = wid
+        gates.append((a, b))
+        return wid
+
+    A_ids = list(range(n + 1))
+    A_masks = [wire_mask[i] for i in A_ids]
+    targets = rows
+
+    K = 20 if n >= 14 else 30
+    max_gates = 200
+
+    # ---- greedy subexpression sharing ----
+    while time.time() - t0 < deadline and (next_id[0] - (n + 1)) < max_gates:
+        need = _min_need(A_masks, targets, n)
+        if all(need[t] <= 1 for t in targets):
+            break
+        cur_fut = sum(max(0, need[t] - 1) for t in targets)
+
+        # build candidate pool
+        pool = {}
+        L = len(A_ids)
+        for i in range(L):
+            mi = A_masks[i]
+            di = depth[A_ids[i]]
+            for j in range(i + 1, L):
+                c = mi ^ A_masks[j]
+                if c in mask_id:
+                    continue
+                d = max(di, depth[A_ids[j]]) + 1
+                if d <= depth_limit:
+                    pool[c] = (A_ids[i], A_ids[j])
+        # target-adjacent candidates
+        for t in targets:
+            for i in range(L):
+                c = t ^ A_masks[i]
+                if c in mask_id:
+                    continue
+                d = depth[A_ids[i]] + 1
+                if d <= depth_limit:
+                    pool[c] = (A_ids[i], c)
+
+        cand = []
+        for c, (a, b) in pool.items():
+            if wire_mask.get(a, -1) ^ wire_mask.get(b, -1) != c:
+                found = False
+                for i in range(L):
+                    if A_masks[i] ^ c in mask_id:
+                        jid = mask_id[A_masks[i] ^ c]
+                        if jid in depth:
+                            a, b = A_ids[i], jid
+                            found = True
+                            break
+                if not found:
+                    continue
+            d = max(depth[a], depth[b]) + 1
+            if d > depth_limit:
+                continue
+            sc = 0
+            for t in targets:
+                wt = bin(t).count('1')
+                wt2 = bin(t ^ c).count('1')
+                if wt2 < wt:
+                    sc += (wt - wt2)
+            cand.append((sc, c, a, b))
+        if not cand:
+            break
+        cand.sort(key=lambda x: -x[0])
+        cand = cand[:K]
+
+        best = None
+        best_cost = None
+        for (sc, c, a, b) in cand:
+            if time.time() - t0 > deadline:
+                break
+            need2 = _min_need(A_masks + [c], targets, n)
+            cost = 1 + sum(max(0, need2[t] - 1) for t in targets)
+            if best_cost is None or cost < best_cost:
+                best_cost = cost
+                best = (c, a, b)
+        if best is None or best_cost >= cur_fut:
+            break
+        c, a, b = best
+        add_gate(a, b)
+        A_ids.append(next_id[0] - 1)
+        A_masks.append(c)
+
+    # ---- produce any target not yet an available wire (depth-safe) ----
+    need = _min_need(A_masks, targets, n)
+    for t in targets:
+        if need.get(t, 10 ** 9) <= 1:
+            continue
+        done = False
+        elems = _decompose(A_masks, t, n)
+        if elems is not None:
+            maxd = max(depth[mask_id[e]] for e in elems)
+            if (len(elems) - 1) + maxd <= 16:
+                cur = None
+                for e in elems:
+                    eid = mask_id[e]
+                    if cur is None:
+                        cur = eid
+                    else:
+                        cur = add_gate(cur, eid)
+                mask_id[t] = cur
+                done = True
+        if not done:
+            bits = [j for j in range(n) if (t >> j) & 1]
+            if not bits:
+                mask_id[t] = n
+            else:
+                cur = bits[0]
+                for j in bits[1:]:
+                    cur = add_gate(cur, j)
+                mask_id[t] = cur
+
+    outputs = [mask_id[t] for t in targets]
+
+    result = {'gates': [[a, b] for (a, b) in gates], 'outputs': outputs}
+
+    # Gate elimination
+    new_gates, new_outputs = _eliminate_gates(result['gates'], result['outputs'], n)
+    result = {'gates': new_gates, 'outputs': new_outputs}
+
+    if not _verify(matrix, result):
+        result = _baseline(matrix)
+    return result
+
+
+def synthesize(matrix, depth_limit):
+    t0 = time.time()
+    deadline = t0 + _DEADLINE
+    
+    # First attempt with default strategy
+    result = _synthesize_once(matrix, depth_limit, t0, deadline)
+    
+    # Check if we have time for a randomized restart
+    elapsed = time.time() - t0
+    remaining = deadline - time.time()
+    
+    if remaining > 5.0:
+        # Try a randomized restart with different candidate ordering
+        import random
+        rng = random.Random(42)
+        
+        rows, m, n = _rows_to_masks(matrix)
+        if m > 0:
+            # Randomized synthesis: shuffle target order
+            wire_mask = {}
+            mask_id = {}
+            depth = {}
+            for j in range(n):
+                wire_mask[j] = 1 << j
+                mask_id[1 << j] = j
+                depth[j] = 0
+            wire_mask[n] = 0
+            mask_id[0] = n
+            depth[n] = 0
+
+            gates = []
+            next_id = [n + 1]
+
+            def add_gate(a, b):
+                c = wire_mask[a] ^ wire_mask[b]
+                if c in mask_id:
+                    return mask_id[c]
+                wid = next_id[0]
+                next_id[0] += 1
+                wire_mask[wid] = c
+                depth[wid] = max(depth[a], depth[b]) + 1
+                mask_id[c] = wid
+                gates.append((a, b))
+                return wid
+
+            A_ids = list(range(n + 1))
+            A_masks = [wire_mask[i] for i in A_ids]
+            targets = rows[:]
+            
+            # Shuffle targets for different reduction order
+            shuffled_targets = targets[:]
+            rng.shuffle(shuffled_targets)
+            
+            K = 20 if n >= 14 else 30
+            max_gates = 200
+
+            # ---- randomized greedy subexpression sharing ----
+            while time.time() - t0 < deadline - 2.0 and (next_id[0] - (n + 1)) < max_gates:
+                need = _min_need(A_masks, targets, n)
+                if all(need[t] <= 1 for t in targets):
+                    break
+                cur_fut = sum(max(0, need[t] - 1) for t in targets)
+
+                # build candidate pool
+                pool = {}
+                L = len(A_ids)
+                for i in range(L):
+                    mi = A_masks[i]
+                    di = depth[A_ids[i]]
+                    for j in range(i + 1, L):
+                        c = mi ^ A_masks[j]
+                        if c in mask_id:
+                            continue
+                        d = max(di, depth[A_ids[j]]) + 1
+                        if d <= depth_limit:
+                            pool[c] = (A_ids[i], A_ids[j])
+                # target-adjacent candidates
+                for t in shuffled_targets:
+                    for i in range(L):
+                        c = t ^ A_masks[i]
+                        if c in mask_id:
+                            continue
+                        d = depth[A_ids[i]] + 1
+                        if d <= depth_limit:
+                            pool[c] = (A_ids[i], c)
+
+                cand = []
+                for c, (a, b) in pool.items():
+                    if wire_mask.get(a, -1) ^ wire_mask.get(b, -1) != c:
+                        found = False
+                        for i in range(L):
+                            if A_masks[i] ^ c in mask_id:
+                                jid = mask_id[A_masks[i] ^ c]
+                                if jid in depth:
+                                    a, b = A_ids[i], jid
+                                    found = True
+                                    break
+                        if not found:
+                            continue
+                    d = max(depth[a], depth[b]) + 1
+                    if d > depth_limit:
+                        continue
+                    sc = 0
+                    for t in targets:
+                        wt = bin(t).count('1')
+                        wt2 = bin(t ^ c).count('1')
+                        if wt2 < wt:
+                            sc += (wt - wt2)
+                    cand.append((sc, c, a, b))
+                if not cand:
+                    break
+                # Randomly select from top candidates
+                cand.sort(key=lambda x: -x[0])
+                top_k = min(K, len(cand))
+                if top_k > 1:
+                    idx = rng.randint(0, top_k - 1)
+                    best = cand[idx]
+                else:
+                    best = cand[0] if cand else None
+                
+                if best is None:
+                    break
+                c, a, b = best[1], best[2], best[3]
+                add_gate(a, b)
+                A_ids.append(next_id[0] - 1)
+                A_masks.append(c)
+
+            # ---- produce any target not yet an available wire (depth-safe) ----
+            need = _min_need(A_masks, targets, n)
+            for t in targets:
+                if need.get(t, 10 ** 9) <= 1:
+                    continue
+                done = False
+                elems = _decompose(A_masks, t, n)
+                if elems is not None:
+                    maxd = max(depth[mask_id[e]] for e in elems)
+                    if (len(elems) - 1) + maxd <= 16:
+                        cur = None
+                        for e in elems:
+                            eid = mask_id[e]
+                            if cur is None:
+                                cur = eid
+                            else:
+                                cur = add_gate(cur, eid)
+                        mask_id[t] = cur
+                        done = True
+                if not done:
+                    bits = [j for j in range(n) if (t >> j) & 1]
+                    if not bits:
+                        mask_id[t] = n
+                    else:
+                        cur = bits[0]
+                        for j in bits[1:]:
+                            cur = add_gate(cur, j)
+                        mask_id[t] = cur
+
+            outputs = [mask_id[t] for t in targets]
+            result2 = {'gates': [[a, b] for (a, b) in gates], 'outputs': outputs}
+            new_gates, new_outputs = _eliminate_gates(result2['gates'], result2['outputs'], n)
+            result2 = {'gates': new_gates, 'outputs': new_outputs}
+
+            if _verify(matrix, result2):
+                # Compare gate counts
+                if len(result2['gates']) < len(result['gates']):
+                    result = result2
+    
+    return result

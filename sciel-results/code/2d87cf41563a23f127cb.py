@@ -1,0 +1,378 @@
+"""Search-based approach for packing 50 equal circles in a unit square."""
+import time
+import numpy as np
+import random
+
+N = 50
+SEED = 42
+DEADLINE_FRACTION = 0.85  # Use 85% of the 150s budget as safety margin
+
+def _compute_radius(centers):
+    """Compute the largest common radius for given centers.
+    
+    Returns min( min_{i<j} |c_i - c_j|/2, min_i min_k (0.5 - |c_ik|) )
+    """
+    if centers.shape != (N, 2):
+        return 0.0
+    if not np.all(np.isfinite(centers)):
+        return 0.0
+    if np.any(np.abs(centers) > 0.5 + 1e-12):
+        return 0.0
+    
+    boundary_dists = 0.5 - np.abs(centers)
+    min_boundary = np.min(boundary_dists)
+    
+    if min_boundary <= 0:
+        return 0.0
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists = np.sqrt(np.sum(diff**2, axis=2))
+    np.fill_diagonal(dists, np.inf)
+    min_pair = np.min(dists) / 2.0
+    
+    return min(min_boundary, min_pair)
+
+def _soft_min_radius(centers, beta=50.0):
+    """Compute a smooth surrogate for the radius using log-sum-exp.
+    
+    This provides a differentiable approximation to the min-distance objective.
+    """
+    if centers.shape != (N, 2):
+        return 0.0
+    if not np.all(np.isfinite(centers)):
+        return 0.0
+    if np.any(np.abs(centers) > 0.5 + 1e-12):
+        return 0.0
+    
+    boundary_dists = 0.5 - np.abs(centers)
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists_sq = np.sum(diff**2, axis=2)
+    np.fill_diagonal(dists_sq, np.inf)
+    dists = np.sqrt(dists_sq)
+    
+    # Soft min of pairwise distances / 2
+    pair_dists = dists / 2.0
+    pair_dists_flat = pair_dists[np.triu_indices_from(pair_dists, k=1)]
+    
+    # Soft min using log-sum-exp
+    max_pd = np.max(pair_dists_flat)
+    soft_min_pair = max_pd - np.log(np.sum(np.exp(-(pair_dists_flat - max_pd) * beta))) / beta
+    
+    # Soft min of boundary distances
+    max_bd = np.max(boundary_dists)
+    soft_min_boundary = max_bd - np.log(np.sum(np.exp(-(boundary_dists - max_bd) * beta))) / beta
+    
+    return min(soft_min_pair, soft_min_boundary)
+
+def _gradient_soft_radius(centers, beta=50.0):
+    """Compute gradient of the soft-min radius surrogate.
+    
+    Returns gradient with respect to centers (N, 2).
+    """
+    grad = np.zeros_like(centers)
+    
+    diff = centers[:, np.newaxis, :] - centers[np.newaxis, :, :]
+    dists_sq = np.sum(diff**2, axis=2)
+    np.fill_diagonal(dists_sq, np.inf)
+    dists = np.sqrt(dists_sq)
+    
+    # Pairwise contribution
+    pair_dists = dists / 2.0
+    # Weights for soft min
+    max_pd = np.max(pair_dists[np.triu_indices_from(pair_dists, k=1)])
+    weights = np.exp(-(pair_dists - max_pd) * beta)
+    np.fill_diagonal(weights, 0)
+    weight_sum = np.sum(weights)
+    if weight_sum > 0:
+        weights /= weight_sum
+    
+    # Gradient of soft min of pairwise distances
+    for i in range(N):
+        for j in range(i + 1, N):
+            d = dists[i, j]
+            if d > 1e-10:
+                # d/dx_i of dist(i,j)/2 = (x_i - x_j) / (2 * dist)
+                factor = weights[i, j] / (2.0 * d)
+                grad[i] += factor * diff[i, j]
+                grad[j] -= factor * diff[i, j]
+    
+    # Boundary contribution
+    boundary_dists = 0.5 - np.abs(centers)
+    max_bd = np.max(boundary_dists)
+    b_weights = np.exp(-(boundary_dists - max_bd) * beta)
+    b_weight_sum = np.sum(b_weights)
+    if b_weight_sum > 0:
+        b_weights /= b_weight_sum
+        for i in range(N):
+            for k in range(2):
+                if centers[i, k] > 0:
+                    grad[i, k] -= b_weights[i, k]
+                else:
+                    grad[i, k] += b_weights[i, k]
+    
+    return grad
+
+def _initial_grid():
+    """Generate initial grid configuration."""
+    m = int(np.ceil(np.sqrt(N)))
+    ticks = (np.arange(m) + 0.5) / m - 0.5
+    grid = np.array([(x, y) for y in ticks for x in ticks])
+    return grid[:N].astype(float)
+
+def _hexagonal_initializer():
+    """Generate a hexagonal packing pattern as initial configuration."""
+    # Hexagonal packing: rows offset by half spacing
+    # For 50 circles, use roughly 8 columns x 7 rows with hexagonal offset
+    centers = []
+    # Try different arrangements
+    for cols in range(5, 11):
+        rows = int(np.ceil(N / cols))
+        if cols * rows < N:
+            continue
+        spacing_x = 1.0 / cols
+        spacing_y = 1.0 / rows
+        # Hexagonal offset: odd rows shifted by half spacing
+        for row in range(rows):
+            for col in range(cols):
+                if len(centers) >= N:
+                    break
+                x = (col + 0.5) * spacing_x - 0.5
+                if row % 2 == 1:
+                    x += spacing_x / 2
+                y = (row + 0.5) * spacing_y - 0.5
+                centers.append([x, y])
+        if len(centers) >= N:
+            break
+    if len(centers) < N:
+        # Fallback to grid
+        return _initial_grid()
+    return np.array(centers[:N]).astype(float)
+
+def _random_initializer(n_points=N, seed=None):
+    """Generate random initial positions within the square."""
+    rng = np.random.RandomState(seed)
+    return rng.uniform(-0.5 + 0.05, 0.5 - 0.05, size=(n_points, 2))
+
+def _force_relaxation(centers, n_iterations=5000, learning_rate=0.01, deadline=None):
+    """Physics-based relaxation: circles repel each other and are pushed to maximize min distance.
+    
+    Uses a force model where:
+    - Close pairs repel strongly
+    - Boundary proximity adds repulsive force
+    Vectorized for speed.
+    """
+    best_centers = centers.copy()
+    best_radius = _compute_radius(best_centers)
+    
+    lr = learning_rate
+    momentum = np.zeros_like(best_centers)
+    beta_momentum = 0.9
+    
+    for it in range(n_iterations):
+        if deadline is not None and time.time() > deadline:
+            break
+        
+        c = best_centers.copy()
+        forces = np.zeros_like(c)
+        
+        # Pairwise repulsion - vectorized
+        diff = c[:, np.newaxis, :] - c[np.newaxis, :, :]
+        dists_sq = np.sum(diff**2, axis=2)
+        np.fill_diagonal(dists_sq, np.inf)
+        dists = np.sqrt(dists_sq)
+        
+        # Force magnitude: strong repulsion for close pairs
+        min_dist = 0.08
+        # Force = (min_dist - d) / min_dist for d < min_dist, else 0
+        force_mag = np.zeros_like(dists)
+        mask = dists < min_dist
+        force_mag[mask] = (min_dist - dists[mask]) / min_dist
+        np.fill_diagonal(force_mag, 0)
+        
+        # Direction = diff / d
+        safe_dists = np.where(dists > 1e-10, dists, 1.0)
+        direction = diff / safe_dists[:, :, np.newaxis]
+        
+        # forces[i] += sum_j force_mag[i,j] * direction[i,j]
+        forces = np.sum(force_mag[:, :, np.newaxis] * direction, axis=1)
+        
+        # Boundary repulsion - vectorized
+        boundary_dists = 0.5 - np.abs(c)
+        boundary_mask = boundary_dists < 0.05
+        boundary_force = np.zeros_like(c)
+        boundary_force[boundary_mask] = (0.05 - boundary_dists[boundary_mask]) / 0.05
+        # Push away from boundary
+        boundary_force = np.where(c > 0, -boundary_force, boundary_force)
+        forces += boundary_force
+        
+        # Update with momentum
+        momentum = beta_momentum * momentum + forces
+        best_centers += lr * momentum
+        np.clip(best_centers, -0.5, 0.5, out=best_centers)
+        
+        new_radius = _compute_radius(best_centers)
+        if new_radius > best_radius:
+            best_radius = new_radius
+        else:
+            # Revert and reduce learning rate
+            best_centers = c
+            lr *= 0.97
+            momentum *= 0.5
+        
+        # Early stopping if converged
+        if lr < 1e-7:
+            break
+    
+    return best_centers, best_radius
+
+def _local_search(centers, n_iterations=2000, deadline=None):
+    """Improved local search: try moving pairs of points and single points."""
+    best_centers = centers.copy()
+    best_radius = _compute_radius(best_centers)
+    rng = np.random.RandomState(42)
+    
+    step_size = 0.02
+    
+    for i in range(n_iterations):
+        if deadline is not None and time.time() > deadline:
+            break
+        
+        # Randomly choose: move one point (70%) or two points (30%)
+        if rng.random() < 0.7:
+            idxs = [rng.randint(N)]
+        else:
+            idxs = list(rng.choice(N, size=2, replace=False))
+        
+        orig = best_centers[idxs].copy()
+        
+        # Try random perturbation
+        for idx in idxs:
+            perturbation = rng.normal(0, step_size, size=2)
+            best_centers[idx] = orig[idxs.index(idx)] + perturbation
+        
+        np.clip(best_centers, -0.5, 0.5, out=best_centers)
+        
+        new_radius = _compute_radius(best_centers)
+        
+        if new_radius > best_radius:
+            best_radius = new_radius
+        else:
+            best_centers[idxs] = orig
+    
+    return best_centers, best_radius
+
+def _polish_pass(centers, n_iterations=5000, deadline=None):
+    """High-precision polish: gradient-based optimization with adaptive step size."""
+    best_centers = centers.copy()
+    best_radius = _compute_radius(best_centers)
+    beta = 50.0
+    lr = 0.005
+    
+    for it in range(n_iterations):
+        if deadline is not None and time.time() > deadline:
+            break
+        
+        c = best_centers.copy()
+        grad = _gradient_soft_radius(c, beta)
+        
+        # Normalize gradient
+        grad_norm = np.linalg.norm(grad)
+        if grad_norm > 1e-10:
+            grad /= grad_norm
+        
+        # Try step
+        candidate = c + lr * grad
+        np.clip(candidate, -0.5, 0.5, out=candidate)
+        
+        new_radius = _compute_radius(candidate)
+        
+        if new_radius > best_radius:
+            best_radius = new_radius
+            best_centers = candidate
+            lr *= 1.05  # Increase step if improving
+        else:
+            lr *= 0.9  # Decrease step if not improving
+        
+        # Adaptive beta: increase for sharper approximation as we converge
+        if it % 100 == 0:
+            beta *= 1.1
+        
+        if lr < 1e-8:
+            break
+    
+    return best_centers, best_radius
+
+def construct():
+    """Main function that searches for the best packing configuration."""
+    start_time = time.time()
+    total_time_budget = 150.0
+    deadline = start_time + total_time_budget * DEADLINE_FRACTION
+    
+    best_centers = None
+    best_radius = 0.0
+    
+    # Try multiple initialization strategies
+    initializers = [
+        _initial_grid,
+        _hexagonal_initializer,
+    ]
+    
+    for init_func in initializers:
+        if time.time() > deadline:
+            break
+        
+        centers = init_func()
+        r = _compute_radius(centers)
+        if r > best_radius:
+            best_radius = r
+            best_centers = centers.copy()
+    
+    # Try random initializations with force relaxation
+    n_attempts = 15
+    
+    for attempt in range(n_attempts):
+        if time.time() > deadline:
+            break
+        
+        seed = SEED + attempt * 1000
+        centers = _random_initializer(seed=seed)
+        
+        r = _compute_radius(centers)
+        if r > best_radius:
+            best_radius = r
+            best_centers = centers.copy()
+        
+        remaining_time = deadline - time.time()
+        if remaining_time < 5:
+            break
+        
+        # Use force relaxation
+        n_iters = max(1000, int(5000 * remaining_time / 20.0))
+        optimized, r_opt = _force_relaxation(centers, n_iterations=n_iters, deadline=deadline)
+        
+        r = _compute_radius(optimized)
+        if r > best_radius:
+            best_radius = r
+            best_centers = optimized.copy()
+    
+    # If we have time, do local search on the best solution
+    if time.time() < deadline - 5.0:
+        remaining = deadline - time.time() - 5.0
+        n_iters = max(500, int(3000 * remaining / 30.0))
+        best_centers, best_radius = _local_search(best_centers, n_iterations=n_iters, deadline=deadline)
+    
+    # Final polish pass with gradient-based optimization
+    if time.time() < deadline - 2.0:
+        remaining = deadline - time.time() - 2.0
+        n_iters = max(1000, int(5000 * remaining / 10.0))
+        best_centers, best_radius = _polish_pass(best_centers, n_iterations=n_iters, deadline=deadline)
+    
+    # Final check
+    final_radius = _compute_radius(best_centers)
+    if final_radius <= 0:
+        best_centers = _initial_grid()
+    
+    return best_centers
+
+# EVOLVE-BLOCK-END

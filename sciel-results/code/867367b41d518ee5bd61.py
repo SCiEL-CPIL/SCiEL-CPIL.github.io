@@ -1,0 +1,501 @@
+"""HP lattice protein folding on the square lattice."""
+# EVOLVE-BLOCK-START
+import random
+import time
+import sys
+from collections import defaultdict
+
+_GLOBAL_START = time.time()
+_GLOBAL_LIMIT = 195.0  # Safety margin for 210s kill
+
+
+def _time_left():
+    return _GLOBAL_LIMIT - (time.time() - _GLOBAL_START)
+
+
+def _neighbours(point):
+    """Yield the 4 neighbours of a 2D lattice point."""
+    x, y = point
+    yield (x + 1, y)
+    yield (x - 1, y)
+    yield (x, y + 1)
+    yield (x, y - 1)
+
+
+def _neighbours_tuple(point):
+    """Return tuple of 4 neighbours of a 2D lattice point."""
+    x, y = point
+    return ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1))
+
+
+def _energy(sequence, chain):
+    """Compute the HP contact energy of a conformation."""
+    where = {p: i for i, p in enumerate(chain)}
+    contacts = 0
+    for i, p in enumerate(chain):
+        if sequence[i] == "H":
+            for q in _neighbours(p):
+                j = where.get(q)
+                if j is not None and j > i + 1 and sequence[j] == "H":
+                    contacts += 1
+    return -contacts
+
+
+def _build_contact_map(sequence, chain):
+    """Build a set of all H-H contacts (as frozensets of index pairs) and total count."""
+    where = {p: i for i, p in enumerate(chain)}
+    contacts = set()
+    for i, p in enumerate(chain):
+        if sequence[i] == "H":
+            for q in _neighbours_tuple(p):
+                j = where.get(q)
+                if j is not None and j > i + 1 and sequence[j] == "H":
+                    contacts.add(frozenset((i, j)))
+    return contacts, len(contacts)
+
+
+def _energy_delta(sequence, chain, old_pos, new_pos, idx):
+    """Compute energy delta when moving residue idx from old_pos to new_pos."""
+    where = {p: i for i, p in enumerate(chain)}
+    delta = 0
+    # Remove contacts involving idx at old_pos
+    if sequence[idx] == "H":
+        for q in _neighbours_tuple(old_pos):
+            j = where.get(q)
+            if j is not None and j != idx and sequence[j] == "H":
+                if j > idx + 1 or j < idx - 1:
+                    delta += 1
+    # Add contacts involving idx at new_pos
+    if sequence[idx] == "H":
+        for q in _neighbours_tuple(new_pos):
+            j = where.get(q)
+            if j is not None and j != idx and sequence[j] == "H":
+                if j > idx + 1 or j < idx - 1:
+                    delta -= 1
+    return delta
+
+
+def _energy_from_contacts(contacts):
+    """Energy is minus the number of H-H contacts."""
+    return -len(contacts)
+
+
+def _spiral_fold(sequence, dimension):
+    """Generate a spiral conformation as a strong initial guess."""
+    n = len(sequence)
+    if n <= 1:
+        return [(0, 0)]
+    
+    chain = [(0, 0)]
+    occupied = {(0, 0)}
+    # Spiral direction: right, down, left, up, right, down, ...
+    dirs = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+    dir_idx = 0
+    step_count = 0
+    steps_in_dir = 1
+    steps_needed = 1
+    
+    for i in range(1, n):
+        placed = False
+        for attempt in range(100):
+            dx, dy = dirs[dir_idx % 4]
+            new_pos = (chain[-1][0] + dx, chain[-1][1] + dy)
+            
+            if new_pos not in occupied:
+                chain.append(new_pos)
+                occupied.add(new_pos)
+                placed = True
+                step_count += 1
+                if step_count >= steps_needed:
+                    step_count = 0
+                    dir_idx += 1
+                    if dir_idx % 4 == 0:
+                        steps_needed += 1
+                break
+            else:
+                # Try next direction
+                dir_idx += 1
+                if dir_idx >= 16:  # Give up after trying many directions
+                    break
+        
+        if not placed:
+            # Fallback: just continue in a straight line
+            chain.append((chain[-1][0] + 1, chain[-1][1]))
+            occupied.add((chain[-1][0] + 1, chain[-1][1]))
+    
+    return chain
+
+
+def _grow(sequence, dimension, rng, bias=1.0):
+    """One randomized greedy chain growth: prefer sites with new H-H contacts."""
+    start = (0, 0)
+    chain, occupied = [start], {start: 0}
+    for i in range(1, len(sequence)):
+        options = []
+        for site in _neighbours(chain[-1]):
+            if site in occupied:
+                continue
+            gain = 0
+            if sequence[i] == "H":
+                gain = sum(1 for q in _neighbours(site)
+                           if q in occupied and occupied[q] < i - 1 and sequence[occupied[q]] == "H")
+            free = sum(1 for q in _neighbours(site) if q not in occupied)
+            score = gain * bias + 0.1 * free + rng.random()
+            options.append((score, site))
+        if not options:
+            return None
+        site = max(options)[1]
+        occupied[site] = i
+        chain.append(site)
+    return chain
+
+
+def _pivot_move(chain, rng):
+    """Perform a single pivot move: rotate a subchain by 90, 180, or 270 degrees around a pivot point."""
+    if len(chain) < 4:
+        return None
+    
+    # Choose a random pivot index (not the first or last)
+    pivot_idx = rng.randint(1, len(chain) - 2)
+    pivot = chain[pivot_idx]
+    
+    # Get the segment to rotate (from pivot_idx to end)
+    segment = chain[pivot_idx:]
+    
+    # Precompute fixed part positions for fast collision check
+    fixed_set = set(chain[:pivot_idx])
+    
+    # Try different rotations
+    for angle in [90, -90, 180, 270]:
+        # Rotate segment around pivot
+        rotated = []
+        valid = True
+        for p in segment:
+            dx, dy = p[0] - pivot[0], p[1] - pivot[1]
+            if angle == 90:
+                ndx, ndy = -dy, dx
+            elif angle == -90:
+                ndx, ndy = dy, -dx
+            elif angle == 180:
+                ndx, ndy = -dx, -dy
+            else:  # 270
+                ndx, ndy = dy, -dx
+            new_pos = (pivot[0] + ndx, pivot[1] + ndy)
+            # Check collision with fixed part (exclude pivot itself)
+            if new_pos in fixed_set and new_pos != pivot:
+                valid = False
+                break
+            rotated.append(new_pos)
+        
+        if not valid:
+            continue
+        
+        # Check for self-collisions within the rotated segment
+        rotated_set = set(rotated)
+        if len(rotated_set) != len(rotated):
+            continue
+        
+        # Check unit steps between rotated segment and fixed part, and within rotated
+        # Check connection at pivot
+        if pivot_idx > 0:
+            prev_pos = chain[pivot_idx - 1]
+            dx = abs(rotated[0][0] - prev_pos[0])
+            dy = abs(rotated[0][1] - prev_pos[1])
+            if dx + dy != 1:
+                continue
+        
+        # Check unit steps within rotated segment
+        for i in range(1, len(rotated)):
+            dx = abs(rotated[i][0] - rotated[i-1][0])
+            dy = abs(rotated[i][1] - rotated[i-1][1])
+            if dx + dy != 1:
+                valid = False
+                break
+        if not valid:
+            continue
+        
+        new_chain = chain[:pivot_idx] + rotated
+        return new_chain
+    
+    return None
+
+
+def _slither_move(chain, rng):
+    """Slither move: move the last residue to a random empty neighbor of its current position."""
+    if len(chain) < 3:
+        return None
+    
+    last_idx = len(chain) - 1
+    last_pos = chain[last_idx]
+    
+    # Get empty neighbors of the last position
+    empty_neighbors = [q for q in _neighbours_tuple(last_pos) if q not in set(chain)]
+    
+    if not empty_neighbors:
+        return None
+    
+    new_pos = rng.choice(empty_neighbors)
+    new_chain = chain[:-1] + [new_pos]
+    return new_chain
+
+
+def _crankshaft_move(chain, rng):
+    """Perform a crankshaft move: rotate a short segment (length 2-3) around two pivot points."""
+    n = len(chain)
+    if n < 5:
+        return None
+    
+    # Choose segment length
+    seg_len = rng.choice([2, 3])
+    
+    # Choose start index such that segment fits
+    max_start = n - seg_len - 2
+    if max_start < 1:
+        return None
+    start = rng.randint(1, max_start)
+    
+    # The segment is chain[start:start+seg_len]
+    # Pivot points are chain[start-1] and chain[start+seg_len]
+    pivot1 = chain[start - 1]
+    pivot2 = chain[start + seg_len]
+    
+    segment = chain[start:start + seg_len]
+    
+    # For 2D, we can try rotating the segment by 90, -90, 180 degrees
+    # around the midpoint or try all valid positions
+    # Simpler approach: try all 4 rotations of each point relative to pivot1
+    
+    # Actually, for crankshaft in 2D, we need to find new positions for the segment
+    # such that they connect pivot1 to pivot2 and are self-avoiding
+    
+    # Try rotating the entire segment around pivot1
+    for angle in [90, -90, 180]:
+        rotated = []
+        for p in segment:
+            dx, dy = p[0] - pivot1[0], p[1] - pivot1[1]
+            if angle == 90:
+                ndx, ndy = -dy, dx
+            elif angle == -90:
+                ndx, ndy = dy, -dx
+            else:  # 180
+                ndx, ndy = -dx, -dy
+            rotated.append((pivot1[0] + ndx, pivot1[1] + ndy))
+        
+        # Check if the last point connects to pivot2
+        if rotated[-1] != pivot2:
+            continue
+        
+        # Check self-avoidance with the rest of the chain
+        new_chain = chain[:start] + rotated + chain[start + seg_len:]
+        new_occupied = set(new_chain)
+        if len(new_occupied) == len(new_chain):
+            # Check unit steps
+            valid = True
+            for i in range(1, len(new_chain)):
+                dx = abs(new_chain[i][0] - new_chain[i-1][0])
+                dy = abs(new_chain[i][1] - new_chain[i-1][1])
+                if dx + dy != 1:
+                    valid = False
+                    break
+            if valid:
+                return new_chain
+    
+    return None
+
+
+def _local_search(sequence, chain, max_iterations=1000, time_limit=5.0, use_crankshaft=True):
+    """Simulated annealing local search to improve a conformation with incremental energy."""
+    if chain is None:
+        return None
+    
+    current_chain = list(chain)
+    current_contacts, n_contacts = _build_contact_map(sequence, current_chain)
+    current_energy = -n_contacts
+    best_chain = list(current_chain)
+    best_energy = current_energy
+    
+    start_time = time.time()
+    temperature = 2.0
+    cooling = 0.995
+    
+    rng = random.Random(hash(tuple(current_chain)) % (2**32))
+    
+    for iteration in range(max_iterations):
+        if time.time() - start_time > time_limit:
+            break
+        if _time_left() < 10:
+            break
+        
+        # Choose move type
+        if use_crankshaft and rng.random() < 0.3:
+            new_chain = _crankshaft_move(current_chain, rng)
+        else:
+            new_chain = _pivot_move(current_chain, rng)
+        
+        if new_chain is None:
+            continue
+        
+        # Recompute energy for the new chain
+        new_contacts, new_n_contacts = _build_contact_map(sequence, new_chain)
+        new_energy = -new_n_contacts
+        delta = new_energy - current_energy
+        
+        if delta < 0 or rng.random() < pow(2.718281828, -delta / max(temperature, 0.1)):
+            current_chain = new_chain
+            current_contacts = new_contacts
+            current_energy = new_energy
+            
+            if current_energy < best_energy:
+                best_energy = current_energy
+                best_chain = list(current_chain)
+        
+        temperature *= cooling
+    
+    # Deterministic polish pass: accept only strictly improving moves
+    polish_chain = list(best_chain)
+    polish_contacts, polish_n = _build_contact_map(sequence, polish_chain)
+    polish_energy = -polish_n
+    polish_time_limit = min(2.0, max(0.5, time_limit * 0.2))
+    polish_start = time.time()
+    
+    for _ in range(200):
+        if time.time() - polish_start > polish_time_limit:
+            break
+        if _time_left() < 8:
+            break
+        
+        # Try all single-residue moves
+        improved = False
+        for idx in range(1, len(polish_chain) - 1):
+            old_pos = polish_chain[idx]
+            for new_pos in _neighbours_tuple(old_pos):
+                if new_pos in set(polish_chain):
+                    continue
+                # Check if this move is valid (unit steps maintained)
+                if idx > 0:
+                    prev = polish_chain[idx - 1]
+                    if abs(new_pos[0] - prev[0]) + abs(new_pos[1] - prev[1]) != 1:
+                        continue
+                if idx < len(polish_chain) - 1:
+                    nxt = polish_chain[idx + 1]
+                    if abs(new_pos[0] - nxt[0]) + abs(new_pos[1] - nxt[1]) != 1:
+                        continue
+                
+                # Compute energy delta
+                delta = _energy_delta(sequence, polish_chain, old_pos, new_pos, idx)
+                if delta < 0:
+                    polish_chain[idx] = new_pos
+                    polish_energy += delta
+                    improved = True
+                    break
+            if improved:
+                break
+        
+        if not improved:
+            break
+    
+    if polish_energy < best_energy:
+        best_chain = polish_chain
+        best_energy = polish_energy
+    
+    return best_chain
+
+
+def fold(sequence, dimension):
+    """Best conformation using multiple strategies: spiral + greedy growth + local search."""
+    seq_len = len(sequence)
+    
+    # Adjust strategy based on sequence length
+    if seq_len <= 30:
+        num_grow = 500
+        local_search_iters = 3000
+        local_search_time = 10.0
+        num_ls_chains = 30
+    elif seq_len <= 50:
+        num_grow = 350
+        local_search_iters = 2000
+        local_search_time = 8.0
+        num_ls_chains = 25
+    elif seq_len <= 70:
+        num_grow = 250
+        local_search_iters = 1500
+        local_search_time = 6.0
+        num_ls_chains = 20
+    else:
+        num_grow = 180
+        local_search_iters = 1000
+        local_search_time = 4.0
+        num_ls_chains = 15
+    
+    rng = random.Random(12345 + seq_len)
+    best_chain = None
+    best_energy = 0
+    
+    # First: try spiral fold as a strong initial guess
+    spiral_chain = _spiral_fold(sequence, dimension)
+    if spiral_chain is not None and len(spiral_chain) == seq_len:
+        spiral_energy = _energy(sequence, spiral_chain)
+        if spiral_energy < best_energy:
+            best_energy = spiral_energy
+            best_chain = spiral_chain
+    
+    # Second pass: greedy growth with varying bias
+    for i in range(num_grow):
+        if _time_left() < 20:
+            break
+        
+        # Vary the bias to explore different strategies
+        if i < num_grow // 4:
+            bias = 1.0
+        elif i < num_grow // 2:
+            bias = 1.5
+        elif i < 3 * num_grow // 4:
+            bias = 0.5
+        else:
+            bias = 2.0
+        
+        chain = _grow(sequence, dimension, rng, bias=bias)
+        if chain is None:
+            continue
+        
+        value = _energy(sequence, chain)
+        if value < best_energy:
+            best_energy = value
+            best_chain = chain
+    
+    # Third pass: local search on best chains
+    if best_chain is not None and _time_left() > 30:
+        # Try local search on the best chain
+        improved = _local_search(sequence, best_chain, max_iterations=local_search_iters, 
+                                  time_limit=local_search_time, use_crankshaft=True)
+        if improved is not None:
+            improved_energy = _energy(sequence, improved)
+            if improved_energy < best_energy:
+                best_energy = improved_energy
+                best_chain = improved
+        
+        # Try local search on a few other good chains
+        for i in range(num_ls_chains):
+            if _time_left() < 25:
+                break
+            
+            chain = _grow(sequence, dimension, rng, bias=1.0 + 0.5 * rng.random())
+            if chain is None:
+                continue
+            
+            value = _energy(sequence, chain)
+            if value < best_energy + 4:  # Only improve chains close to best
+                improved = _local_search(sequence, chain, max_iterations=local_search_iters // 2,
+                                          time_limit=local_search_time / 2, use_crankshaft=True)
+                if improved is not None:
+                    improved_energy = _energy(sequence, improved)
+                    if improved_energy < best_energy:
+                        best_energy = improved_energy
+                        best_chain = improved
+    
+    # Final fallback: straight line
+    if best_chain is None:
+        best_chain = [tuple([i] + [0] * (dimension - 1)) for i in range(seq_len)]
+    
+    return [list(p) for p in best_chain]
+# EVOLVE-BLOCK-END

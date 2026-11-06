@@ -1,0 +1,3 @@
+        for others in k4s_other[e_idx]:
+            if all(colors[e] == 0 for e in others):
+                # ...

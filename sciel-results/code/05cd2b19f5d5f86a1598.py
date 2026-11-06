@@ -1,0 +1,101 @@
+import sys
+sys.setrecursionlimit(10000)
+
+def construct():
+    from random import Random
+    
+    def instance(n, p, seed):
+        rng = Random(seed)
+        order = list(range(n))
+        rng.shuffle(order)
+        edges = {tuple(sorted(e)) for e in zip(order, order[1:])}
+        edges |= {(u, v) for u in range(n) for v in range(u + 1, n) if rng.random() < p}
+        return sorted(edges)
+    
+    def find_cycle(adj, n, start, rng):
+        """Find a simple cycle. Returns list of vertices or None."""
+        if not adj[start]:
+            return None
+        
+        visited = [False] * n
+        parent = [-1] * n
+        path = []
+        
+        def dfs(u):
+            visited[u] = True
+            path.append(u)
+            # Get neighbors, shuffle them for randomness to explore different cycles
+            neighbors = list(adj[u])
+            rng.shuffle(neighbors)
+            for v in neighbors:
+                if v == path[0] and len(path) >= 3:
+                    return path[:]
+                if not visited[v]:
+                    result = dfs(v)
+                    if result:
+                        return result
+            path.pop()
+            return None
+        
+        result = dfs(start)
+        return result
+    
+    def decompose(edges):
+        if not edges:
+            return []
+        
+        n = max(max(u, v) for u, v in edges) + 1
+        adj = {i: set() for i in range(n)}
+        edge_set = set()
+        for u, v in edges:
+            adj[u].add(v)
+            adj[v].add(u)
+            edge_set.add((min(u, v), max(u, v)))
+        
+        pieces = []
+        rng = Random(42) # Fixed seed for heuristic stability
+        
+        while edge_set:
+            active_vertices = [v for v in range(n) if adj[v]]
+            if not active_vertices:
+                break
+                
+            # Try multiple random starts to find a long cycle
+            best_cycle = None
+            # Increase trials for better cycle length
+            for _ in range(100):
+                start = rng.choice(active_vertices)
+                cycle = find_cycle(adj, n, start, rng)
+                if cycle:
+                    if best_cycle is None or len(cycle) > len(best_cycle):
+                        best_cycle = cycle
+                        if len(best_cycle) == n: # Hamiltonian
+                            break
+            
+            if best_cycle is None:
+                # No cycles, add remaining edges
+                for u, v in sorted(edge_set):
+                    pieces.append([u, v])
+                break
+            
+            # Remove cycle edges
+            for i in range(len(best_cycle)):
+                u = best_cycle[i]
+                v = best_cycle[(i + 1) % len(best_cycle)]
+                edge = (min(u, v), max(u, v))
+                if edge in edge_set:
+                    edge_set.remove(edge)
+                    adj[u].discard(v)
+                    adj[v].discard(u)
+            
+            pieces.append(best_cycle[:])
+        
+        return pieces
+    
+    results = []
+    for spec in ((20, 0.4, 11), (25, 0.35, 12), (30, 0.3, 13)):
+        edges = instance(*spec)
+        pieces = decompose(edges)
+        results.append(pieces)
+    
+    return results

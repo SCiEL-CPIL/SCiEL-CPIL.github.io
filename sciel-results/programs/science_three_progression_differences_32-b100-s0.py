@@ -1,269 +1,174 @@
-import time
+"""Program for maximizing 3-AP differences in a 32-element set within 1..512 using Simulated Annealing."""
+
 import random
-import numpy as np
+import time
+import math
 
-# EVOLVE-BLOCK-START
-
-def _score(s):
-    """Calculate the number of distinct d > 0 such that a, a+d, a+2d are in s."""
-    s = set(s)
+def count_aps(s):
+    """
+    Calculate the number of distinct differences d > 0 such that
+    a, a+d, a+2d are all in the set s.
+    """
+    s_set = set(s)
     diffs = set()
+    # Iterate over pairs (a, b) with a < b
+    # d = b - a
+    # Check if a + 2*d is in s_set
+    # Note: We can optimize by iterating sorted elements
     elements = sorted(s)
-    for i in range(len(elements)):
+    n = len(elements)
+    for i in range(n):
         a = elements[i]
-        for j in range(i + 1, len(elements)):
+        for j in range(i + 1, n):
             b = elements[j]
             d = b - a
-            c = b + d
-            if c in s:
+            c = a + 2 * d
+            if c in s_set:
                 diffs.add(d)
     return len(diffs)
 
-def _score_with_diffs(s):
-    """Return (score, set_of_diffs) for a set."""
-    s = set(s)
-    diffs = set()
-    elements = sorted(s)
-    for i in range(len(elements)):
-        a = elements[i]
-        for j in range(i + 1, len(elements)):
-            b = elements[j]
-            d = b - a
-            c = b + d
-            if c in s:
-                diffs.add(d)
-    return len(diffs), diffs
-
-def _generate_initial_set():
-    """
-    Generate an initial set of 32 elements using multiple strategies.
-    Returns the best scoring initial set.
-    """
-    strategies = []
-    
-    # Strategy 1: Random
-    strategies.append(set(random.sample(range(1, 513), 32)))
-    
-    # Strategy 2: Arithmetic progression based
-    for _ in range(5):
-        d = random.choice([1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 25, 30, 40, 50])
-        max_start = 512 - 31 * d
-        if max_start >= 1:
-            a = random.randint(1, max_start)
-            s = set(a + i * d for i in range(32))
-            if all(1 <= x <= 512 for x in s):
-                strategies.append(s)
-    
-    # Strategy 3: Two interleaved APs
-    for _ in range(3):
-        d1 = random.choice([2, 3, 4, 5, 6, 8, 10])
-        d2 = random.choice([2, 3, 4, 5, 6, 8, 10, 12])
-        s = set()
-        a1 = random.randint(1, 512 - 15 * d1)
-        for i in range(16):
-            s.add(a1 + i * d1)
-        a2 = random.randint(1, 512 - 15 * d2)
-        for i in range(16):
-            val = a2 + i * d2
-            if val not in s:
-                s.add(val)
-        # Fill remaining if needed
-        while len(s) < 32:
-            val = random.randint(1, 512)
-            if val not in s:
-                s.add(val)
-        if len(s) == 32:
-            strategies.append(s)
-    
-    # Strategy 4: Clustered blocks
-    for _ in range(3):
-        s = set()
-        while len(s) < 32:
-            base = random.randint(1, 480)
-            for k in range(32):
-                if base + k <= 512 and len(s) < 32:
-                    s.add(base + k)
-        strategies.append(s)
-    
-    # Strategy 5: Weighted random - prefer elements that create many 3-APs
-    s = set()
-    while len(s) < 32:
-        # Pick from a random "region"
-        region_start = random.randint(1, 481)
-        region_end = min(region_start + 30, 512)
-        elem = random.randint(region_start, region_end)
-        if elem not in s:
-            s.add(elem)
-    strategies.append(s)
-    
-    # Strategy 6: Dense random with local structure
-    for _ in range(3):
-        s = set()
-        # Pick 4-6 anchor points
-        anchors = random.sample(range(1, 513), random.randint(4, 6))
-        for a in anchors:
-            for offset in random.sample(range(-15, 16), min(6, 31)):
-                val = a + offset
-                if 1 <= val <= 512 and val not in s:
-                    s.add(val)
-                    if len(s) >= 32:
-                        break
-            if len(s) >= 32:
-                break
-        while len(s) < 32:
-            val = random.randint(1, 512)
-            if val not in s:
-                s.add(val)
-        strategies.append(s)
-    
-    # Pick the best initial set
-    best = None
-    best_sc = -1
-    for s in strategies:
-        if len(s) != 32:
-            continue
-        sc, _ = _score_with_diffs(s)
-        if sc > best_sc:
-            best_sc = sc
-            best = s
-    
-    return best if best else set(random.sample(range(1, 513), 32))
-
 def construct():
+    """
+    Use Simulated Annealing to find a 32-element set in [1, 512]
+    that maximizes the number of distinct 3-AP differences.
+    """
+    N = 32
+    MAX_VAL = 512
     start_time = time.time()
-    deadline = start_time + 115  # Safety margin before 120s limit
+    time_limit = 115.0  # Leave 5s buffer
     
-    best_set = None
-    best_score = 0
+    # Initial candidate: A dense interval [1, 32] is a strong starting point (score ~15)
+    # We will also try a few random starts and pick the best initial one
+    initial_candidates = [
+        list(range(1, N + 1)),
+        random.sample(range(1, MAX_VAL + 1), N),
+        sorted(random.sample(range(1, MAX_VAL // 2 + 1), N // 2) + random.sample(range(MAX_VAL // 2 + 1, MAX_VAL + 1), N - N // 2))
+    ]
     
-    # Multiple restarts with different initializations
-    num_starts = 15
+    best_init_score = -1
+    current_set = None
+    for cand in initial_candidates:
+        score = count_aps(cand)
+        if score > best_init_score:
+            best_init_score = score
+            current_set = cand
     
-    for start_iter in range(num_starts):
-        if time.time() > deadline - 5:
-            break
+    current_score = best_init_score
+    best_set = list(current_set)
+    best_score = current_score
+    
+    # Simulated Annealing Parameters
+    T = 10.0  # Initial temperature
+    cooling_rate = 0.999  # Slight cooling per step
+    min_T = 0.1
+    
+    # Precompute nothing, just use the set for lookups
+    current_set_set = set(current_set)
+    
+    while time.time() - start_time < time_limit and T > min_T:
+        # Perform a move: pick a random element and replace it with a random new value
+        idx = random.randint(0, N - 1)
+        old_val = current_set[idx]
         
-        # Generate initial set using diverse strategies
-        current_set = _generate_initial_set()
-        current_score, current_diffs = _score_with_diffs(current_set)
+        # Generate a new value
+        # To avoid infinite loops picking existing values, we can just pick and check
+        new_val = random.randint(1, MAX_VAL)
         
-        if current_score > best_score:
-            best_score = current_score
-            best_set = set(current_set)
+        # If new_val is already in the set, we need to handle it.
+        # If new_val == old_val, skip.
+        # If new_val != old_val and new_val in current_set_set, this move is invalid (duplicate).
+        # We can retry or just reject. Rejecting is fine, it just wastes a bit of time.
+        # To be more efficient, we can pick from the complement, but that's O(N).
+        # Given MAX_VAL=512, collision probability is 32/512 = 6.25%. Acceptable.
         
-        # Simulated Annealing / Local Search
-        T = 50.0
-        cooling = 0.997
-        min_T = 0.5
+        if new_val == old_val:
+            continue
+            
+        if new_val in current_set_set:
+            # Invalid move, effectively skip this step (or count as non-improving)
+            # We'll just continue to next iteration to save time on evaluation
+            continue
+        
+        # Apply move
+        current_set_set.remove(old_val)
+        current_set_set.add(new_val)
+        current_set[idx] = new_val
+        
+        # Evaluate new score
+        new_score = count_aps(current_set_set)
+        delta = new_score - current_score
+        
+        # Acceptance criterion
+        if delta > 0 or (T > 0 and random.random() < math.exp(delta / T)):
+            current_score = new_score
+            if current_score > best_score:
+                best_score = current_score
+                best_set = list(current_set_set)
+        else:
+            # Revert
+            current_set_set.remove(new_val)
+            current_set_set.add(old_val)
+            current_set[idx] = old_val
+        
+        # Cool down
+        T *= cooling_rate
+        
+        # Optional: If we've been stuck for a while, reheat?
+        # For now, simple cooling.
+        
+    # Final refinement: Local search (Hill Climbing) on the best found
+    # This helps polish the solution
+    if time.time() - start_time < time_limit - 5:
+        current_set = list(best_set)
+        current_set_set = set(current_set)
+        current_score = best_score
         stuck_count = 0
-        max_stuck = 3000
         
-        while time.time() < deadline - 2:
-            # Generate a neighbor: pick an element to remove and one to add
-            elem_out = random.choice(list(current_set))
-            elem_in = random.randint(1, 512)
-            
-            if elem_in in current_set:
-                continue
-            
-            new_set = set(current_set)
-            new_set.remove(elem_out)
-            new_set.add(elem_in)
-            
-            new_score, new_diffs = _score_with_diffs(new_set)
-            delta = new_score - current_score
-            
-            if delta > 0:
-                current_set = new_set
-                current_score = new_score
-                current_diffs = new_diffs
-                stuck_count = 0
-                
-                if new_score > best_score:
-                    best_score = new_score
-                    best_set = set(current_set)
-            else:
-                # Accept with probability exp(delta/T)
-                if delta < -10:  # Skip very bad moves
-                    stuck_count += 1
-                elif random.random() < np.exp(delta / T):
-                    current_set = new_set
-                    current_score = new_score
-                    current_diffs = new_diffs
-                else:
-                    stuck_count += 1
-            
-            T *= cooling
-            if T < min_T:
-                T = min_T
-            
-            if stuck_count > max_stuck:
-                # Restart local search with new random perturbation
+        while time.time() - start_time < time_limit - 2 and stuck_count < 1000:
+            improved = False
+            elements = list(current_set_set)
+            random.shuffle(elements)
+            for old_val in elements:
+                # Try a few random new values
                 for _ in range(5):
-                    elem_out = random.choice(list(current_set))
-                    elem_in = random.randint(1, 512)
-                    if elem_in not in current_set:
-                        current_set = set(current_set)
-                        current_set.remove(elem_out)
-                        current_set.add(elem_in)
-                        current_score, current_diffs = _score_with_diffs(current_set)
-                stuck_count = 0
-                T = max(T, 30.0)
-        
-        # Final check
-        if current_score > best_score:
-            best_score = current_score
-            best_set = set(current_set)
-    
-    # Final polish: try to improve best_set with a focused search
-    if best_set is not None and time.time() < deadline - 1:
-        current_set = set(best_set)
-        current_score, current_diffs = _score_with_diffs(current_set)
-        
-        # Focused local search on the best solution
-        T = 10.0
-        cooling = 0.999
-        min_T = 0.1
-        stuck_count = 0
-        
-        while time.time() < deadline - 0.5:
-            elem_out = random.choice(list(current_set))
-            elem_in = random.randint(1, 512)
-            
-            if elem_in in current_set:
-                continue
-            
-            new_set = set(current_set)
-            new_set.remove(elem_out)
-            new_set.add(elem_in)
-            
-            new_score, new_diffs = _score_with_diffs(new_set)
-            delta = new_score - current_score
-            
-            if delta > 0:
-                current_set = new_set
-                current_score = new_score
-                current_diffs = new_diffs
-                stuck_count = 0
+                    new_val = random.randint(1, MAX_VAL)
+                    if new_val == old_val or new_val in current_set_set:
+                        continue
+                    
+                    # Apply
+                    current_set_set.remove(old_val)
+                    current_set_set.add(new_val)
+                    new_score = count_aps(current_set_set)
+                    
+                    if new_score > current_score:
+                        current_score = new_score
+                        if current_score > best_score:
+                            best_score = current_score
+                            best_set = list(current_set_set)
+                        improved = True
+                        break # Restart loop with new set
+                    else:
+                        # Revert
+                        current_set_set.remove(new_val)
+                        current_set_set.add(old_val)
                 
-                if new_score > best_score:
-                    best_score = new_score
-                    best_set = set(current_set)
-            else:
-                if random.random() < np.exp(delta / T):
-                    current_set = new_set
-                    current_score = new_score
-                    current_diffs = new_diffs
-                else:
-                    stuck_count += 1
+                if improved:
+                    break
             
-            T *= cooling
-            if T < min_T:
-                T = min_T
-            
-            if stuck_count > 2000:
-                break
+            if not improved:
+                stuck_count += 1
+                # If stuck, try a random perturbation
+                if stuck_count % 10 == 0:
+                    idx = random.randint(0, N - 1)
+                    old_val = list(current_set_set)[idx]
+                    new_val = random.randint(1, MAX_VAL)
+                    if new_val != old_val and new_val not in current_set_set:
+                        current_set_set.remove(old_val)
+                        current_set_set.add(new_val)
+                        current_score = count_aps(current_set_set)
+                        if current_score > best_score:
+                            best_score = current_score
+                            best_set = list(current_set_set)
+                    stuck_count = 0 # Reset counter after perturbation
     
-    return list(best_set) if best_set else list(range(1, 33))
-
-# EVOLVE-BLOCK-END
+    return best_set

@@ -1,0 +1,3 @@
+            for idx, k4_idx in enumerate(affected_k4s):
+                # ...
+                old_v = 1 if old_distincts[idx] < 5 else 0

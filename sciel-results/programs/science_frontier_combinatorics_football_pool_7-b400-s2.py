@@ -1,17 +1,17 @@
 import numpy as np
-import itertools
-import time
 import random
+import time
 import heapq
 
 def construct(q, n, radius):
-    start_time = time.time()
-    deadline = start_time + 115.0  # Safety margin for 150s limit (evaluator kills at 120s usually, but contract says 120s, so 115 is safe)
+    t_start = time.time()
+    deadline = t_start + 112.0  # Safety margin for 120s limit
 
     # For the specific case of q=3, n=7, radius=1, we use specialized code
     if q == 3 and n == 7 and radius == 1:
         N = 3 ** n  # 2187
         ball_size = 1 + n * (q - 1)  # 15
+        FULL_MASK = (1 << N) - 1
 
         def int_to_base3(num, length):
             res = [0] * length
@@ -26,94 +26,74 @@ def construct(q, n, radius):
                 res = res * 3 + d
             return res
 
-        # Precompute balls (neighbors including self)
-        balls = []
+        # Precompute cover_mask: bitset of words covered by each codeword
+        # Also precompute cover_map: for each word, list of codewords covering it
+        cover_mask = [0] * N
+        cover_map = [[] for _ in range(N)]
+
         for i in range(N):
             digits = int_to_base3(i, n)
-            neighbors = [i]
+            mask = 1 << i
+            cover_map[i].append(i)
+            
             for pos in range(n):
                 original = digits[pos]
                 for new_val in range(q):
                     if new_val != original:
                         new_digits = digits[:]
                         new_digits[pos] = new_val
-                        neighbors.append(base3_to_int(new_digits))
-            balls.append(neighbors)
+                        w = base3_to_int(new_digits)
+                        mask |= (1 << w)
+                        cover_map[w].append(i)
+            
+            cover_mask[i] = mask
 
-        # Precompute cover_map: for each word w, which codewords cover it
-        cover_map = [[] for _ in range(N)]
-        for c in range(N):
-            for w in balls[c]:
-                cover_map[w].append(c)
-
-        # Precompute ball sets for fast membership (swap search)
-        ball_sets = [set(b) for b in balls]
-        # Precompute ball indices as numpy arrays for faster iteration in local search
-        ball_indices = [np.array(b, dtype=np.int32) for b in balls]
+        # Precompute bit indices for each cover_mask for faster iteration
+        # cover_bits[i] = list of word indices covered by codeword i
+        cover_bits = []
+        for i in range(N):
+            bits = []
+            mask = cover_mask[i]
+            while mask:
+                lsb = mask & -mask
+                idx = lsb.bit_length() - 1
+                bits.append(idx)
+                mask ^= lsb
+            cover_bits.append(bits)
 
         def greedy_cover(seed, start_code=None):
-            """
-            Greedy set cover with heap-based candidate selection.
-            If start_code is given, start from that partial cover and continue
-            covering the remaining words (kick / re-greedy).
-            """
+            """Greedy set cover with random tie-breaking."""
             rng = random.Random(seed)
-            covered = [False] * N
-            cnt = [ball_size] * N
+            uncovered = FULL_MASK
             code = []
-            uncovered_count = N
-
-            # Build heap: (-cnt[i], i) for max-heap behavior
-            # We only push candidates that are not in start_code initially? 
-            # No, we need to consider all candidates for covering *uncovered* words.
-            # But if a codeword is in start_code, it's already "used". 
-            # The greedy step picks a codeword to ADD to the code.
-            # If start_code is provided, those codewords are already in the code.
-            # We must not add them again.
-            
             in_code = [False] * N
+            
             if start_code:
                 for c in start_code:
                     code.append(c)
                     in_code[c] = True
-                    for w in balls[c]:
-                        if not covered[w]:
-                            covered[w] = True
-                            uncovered_count -= 1
-                            for c2 in cover_map[w]:
-                                cnt[c2] -= 1
+                    uncovered &= ~cover_mask[c]
 
-            # Initialize heap with all candidates
-            # We push (-cnt[i], i) for all i not in code
-            heap = []
-            for i in range(N):
-                if not in_code[i]:
-                    heap.append((-cnt[i], i))
-            heapq.heapify(heap)
-
-            while uncovered_count > 0:
-                # Pop valid candidates from heap
-                # A candidate is valid if its cnt matches the heap entry and it's not in code
-                while heap:
-                    neg_val, i = heapq.heappop(heap)
-                    if cnt[i] == -neg_val and not in_code[i]:
-                        break
-                else:
+            while uncovered:
+                best_c = -1
+                best_gain = 0
+                candidates = []
+                for c in range(N):
+                    if not in_code[c]:
+                        gain = (cover_mask[c] & uncovered).bit_count()
+                        if gain > best_gain:
+                            best_gain = gain
+                            candidates = [c]
+                        elif gain == best_gain and gain > 0:
+                            candidates.append(c)
+                
+                if not candidates:
                     break
-
-                c = i
+                    
+                c = rng.choice(candidates)
                 code.append(c)
                 in_code[c] = True
-
-                ball_c = balls[c]
-                for w in ball_c:
-                    if not covered[w]:
-                        covered[w] = True
-                        uncovered_count -= 1
-                        for c2 in cover_map[w]:
-                            cnt[c2] -= 1
-                            if cnt[c2] > 0 and not in_code[c2]:
-                                heapq.heappush(heap, (-cnt[c2], c2))
+                uncovered &= ~cover_mask[c]
 
             return code
 
@@ -124,7 +104,7 @@ def construct(q, n, radius):
 
             cover_count = [0] * N
             for c in code:
-                for w in balls[c]:
+                for w in cover_bits[c]:
                     cover_count[w] += 1
 
             code_list = list(code)
@@ -134,12 +114,12 @@ def construct(q, n, radius):
                 for i in range(len(code_list)):
                     c = code_list[i]
                     safe = True
-                    for w in balls[c]:
+                    for w in cover_bits[c]:
                         if cover_count[w] == 1:
                             safe = False
                             break
                     if safe:
-                        for w in balls[c]:
+                        for w in cover_bits[c]:
                             cover_count[w] -= 1
                         code_list.pop(i)
                         changed = True
@@ -147,18 +127,16 @@ def construct(q, n, radius):
             return code_list
 
         def local_search(code, seed, time_limit):
-            """
-            Local search with deletion and 1-swap moves.
-            Optimized for speed.
-            """
+            """Local search with deletion, 1-swap, and 2-swap moves using bitsets."""
             rng = random.Random(seed)
             code_list = list(code)
             if not code_list:
                 return code_list
 
+            # Initialize cover_count
             cover_count = [0] * N
             for c in code_list:
-                for w in ball_indices[c]:
+                for w in cover_bits[c]:
                     cover_count[w] += 1
 
             in_code = [False] * N
@@ -170,381 +148,259 @@ def construct(q, n, radius):
                 improved = False
                 indices = list(range(len(code_list)))
                 rng.shuffle(indices)
+                
+                # 1. Try Deletion and 1-Swap
                 for i in indices:
                     if time.time() > time_limit:
                         break
                     c_remove = code_list[i]
+                    
+                    # Check if deletion is safe
+                    uncov_list = []
+                    for w in cover_bits[c_remove]:
+                        if cover_count[w] == 1:
+                            uncov_list.append(w)
 
-                    # Try deletion first
-                    newly_uncovered = []
-                    for w in ball_indices[c_remove]:
-                        cover_count[w] -= 1
-                        if cover_count[w] == 0:
-                            newly_uncovered.append(w)
-
-                    if not newly_uncovered:
+                    if not uncov_list:
+                        # Safe to delete
+                        for w in cover_bits[c_remove]:
+                            cover_count[w] -= 1
                         code_list.pop(i)
                         in_code[c_remove] = False
                         improved = True
                         break
 
-                    # Try 1-swap: find a single codeword covering all newly_uncovered
-                    found = -1
-                    # Heuristic: sort critical words by rarity (fewest coverers)
-                    crit_sorted = sorted(newly_uncovered, key=lambda w: len(cover_map[w]))
+                    # Try 1-Swap: Find c_add such that cover_mask[c_add] covers uncov_list
+                    # Sort uncov_list by rarity to speed up intersection
+                    uncov_sorted = sorted(uncov_list, key=lambda w: len(cover_map[w]))
                     cand_pool = None
-                    for w in crit_sorted:
-                        candidates_w = [c2 for c2 in cover_map[w] if not in_code[c2] and c2 != c_remove]
+                    for w in uncov_sorted:
+                        cands = [c for c in cover_map[w] if not in_code[c] and c != c_remove]
                         if cand_pool is None:
-                            cand_pool = set(candidates_w)
+                            cand_pool = set(cands)
                         else:
-                            cand_pool.intersection_update(candidates_w)
+                            cand_pool.intersection_update(cands)
                         if not cand_pool:
                             break
                     
                     if cand_pool:
-                        # Pick a candidate that minimizes "waste" or maximizes redundancy?
-                        # For now, just pick one that works. 
-                        # To be stochastic, we could shuffle cand_pool.
-                        # But finding *any* valid swap is good progress.
-                        # Let's pick the one that covers the most *other* uncovered words? 
-                        # No, just the first valid one is fine for deterministic local search.
-                        # To add stochasticity, shuffle the list before iterating?
-                        # The set iteration order is arbitrary. 
-                        # Let's convert to list and shuffle.
-                        cand_list = list(cand_pool)
-                        rng.shuffle(cand_list)
-                        for c_add in cand_list:
-                            bs = ball_sets[c_add]
-                            if all(w in bs for w in newly_uncovered):
-                                found = c_add
-                                break
-
-                    if found >= 0:
-                        code_list[i] = found
+                        # Pick one that maximizes overlap with current code (redundancy) or just random
+                        # To be fast, pick one that minimizes "waste" = covers words already well-covered
+                        # For now, random pick from pool
+                        found = rng.choice(list(cand_pool))
+                        
+                        # Execute swap
+                        for w in cover_bits[c_remove]:
+                            cover_count[w] -= 1
                         in_code[c_remove] = False
+                        
+                        code_list[i] = found
                         in_code[found] = True
-                        for w in ball_indices[found]:
+                        for w in cover_bits[found]:
                             cover_count[w] += 1
+                            
                         improved = True
                         break
 
-                    # Restore if no improvement
-                    for w in ball_indices[c_remove]:
-                        cover_count[w] += 1
+                # 2. Try 2-Swap: Remove c1, c2, add c3
+                if time.time() < time_limit and len(code_list) >= 3:
+                    n_codes = len(code_list)
+                    # Sample a subset of pairs if too many
+                    # n_codes ~ 186, pairs ~ 17k. This is fine.
+                    for i2 in range(n_codes):
+                        if time.time() > time_limit:
+                            break
+                        for j2 in range(i2 + 1, n_codes):
+                            if time.time() > time_limit:
+                                break
+                            c_rem1 = code_list[i2]
+                            c_rem2 = code_list[j2]
+                            
+                            # Calculate uncovered words
+                            uncov_list = []
+                            mask1 = cover_mask[c_rem1]
+                            mask2 = cover_mask[c_rem2]
+                            
+                            # Words covered by c_rem1
+                            for w in cover_bits[c_rem1]:
+                                if cover_count[w] == 1:
+                                    uncov_list.append(w)
+                                elif cover_count[w] == 2:
+                                    if mask2 & (1 << w):
+                                        uncov_list.append(w)
+                            
+                            # Words covered only by c_rem2 (not c_rem1)
+                            # If count is 1, it becomes 0.
+                            # If count is 2, the other coverer is not c_rem1 (since w not in mask1), so count becomes 1.
+                            for w in cover_bits[c_rem2]:
+                                if not (mask1 & (1 << w)):
+                                    if cover_count[w] == 1:
+                                        uncov_list.append(w)
+                            
+                            # Remove duplicates
+                            if uncov_list:
+                                uncov_list = list(set(uncov_list))
+
+                            if not uncov_list:
+                                # Safe to remove both?
+                                # This implies we can reduce size by 2.
+                                for w in cover_bits[c_rem1]:
+                                    cover_count[w] -= 1
+                                for w in cover_bits[c_rem2]:
+                                    cover_count[w] -= 1
+                                
+                                # Pop j2 first if j2 > i2
+                                code_list.pop(j2)
+                                code_list.pop(i2)
+                                in_code[c_rem1] = False
+                                in_code[c_rem2] = False
+                                improved = True
+                                break
+                            
+                            # Find c_add covering uncov_list
+                            uncov_sorted = sorted(uncov_list, key=lambda w: len(cover_map[w]))
+                            cand_pool = None
+                            for w in uncov_sorted:
+                                cands = [c for c in cover_map[w] if not in_code[c] and c != c_rem1 and c != c_rem2]
+                                if cand_pool is None:
+                                    cand_pool = set(cands)
+                                else:
+                                    cand_pool.intersection_update(cands)
+                                if not cand_pool:
+                                    break
+                            
+                            if cand_pool:
+                                found2 = rng.choice(list(cand_pool))
+                                
+                                # Execute 2-for-1
+                                for w in cover_bits[c_rem1]:
+                                    cover_count[w] -= 1
+                                for w in cover_bits[c_rem2]:
+                                    cover_count[w] -= 1
+                                in_code[c_rem1] = False
+                                in_code[c_rem2] = False
+                                
+                                # Replace c_rem2 with found2
+                                code_list[j2] = found2
+                                in_code[found2] = True
+                                for w in cover_bits[found2]:
+                                    cover_count[w] += 1
+                                
+                                code_list.pop(i2)
+                                improved = True
+                                break
+                            
+                            if improved:
+                                break
+                        if improved:
+                            break
 
             return code_list
 
-        def run_greedy_local_search(seed):
-            code = greedy_cover(seed)
-            code = refine(code)
-            time_left = deadline - 5
-            code = local_search(code, seed, time_left)
-            
-            # Final validity check
-            cover_count = [0] * N
-            for c in code:
-                for w in balls[c]:
-                    cover_count[w] += 1
-            
-            if min(cover_count) < 1:
-                return None
-            return code
-
-        def run_perturbation(seed, base_code, time_limit):
-            """
-            Take base_code, remove a random subset, and re-greedy the rest.
-            """
-            if len(base_code) < 10:
-                return None
-            
-            rng = random.Random(seed)
-            # Remove 5-10% of codewords
-            removal_fraction = 0.05 + 0.05 * rng.random()
-            num_remove = max(1, int(len(base_code) * removal_fraction))
-            
-            code_list = list(base_code)
-            rng.shuffle(code_list)
-            to_remove = set(code_list[:num_remove])
-            
-            remaining_code = [c for c in code_list if c not in to_remove]
-            
-            # Check if remaining code is valid (it won't be, that's the point)
-            # We just pass it to greedy_cover which will cover the gaps.
-            
-            # Time budget for this perturbation run
-            # We want to leave time for refinement and local search
-            greedy_time_limit = time.time() + (time_limit - time.time()) * 0.5
-            
-            # greedy_cover doesn't have a time limit param in current impl.
-            # It's fast enough (O(N log N) roughly). 
-            # But to be safe, we can't easily interrupt it.
-            # Given N=2187, it's very fast.
-            
-            new_code = greedy_cover(seed, start_code=remaining_code)
-            
-            # Refine
-            new_code = refine(new_code)
-            
-            # Local Search
-            new_code = local_search(new_code, seed + 1, time_limit)
-            
-            # Validity check
-            cover_count = [0] * N
-            for c in new_code:
-                for w in balls[c]:
-                    cover_count[w] += 1
-            
-            if min(cover_count) < 1:
-                return None
-                
-            return new_code
-
         best_code = None
-        best_size = float('inf')
-        
-        # Phase 1: Standard Multi-Start Greedy
-        num_restarts = 0
-        # We have ~115s. 
-        # Greedy is fast. Local search is the bottleneck.
-        # Let's do a few quick restarts first.
-        
-        while time.time() < deadline - 30:
-            seed = num_restarts * 1000 + 42
-            current_code = run_greedy_local_search(seed)
-            num_restarts += 1
-            
-            if current_code is not None:
-                if len(current_code) < best_size:
-                    best_size = len(current_code)
-                    best_code = list(current_code)
-            
-            # If we find a very good code (e.g., < 190), we might want to spend more time refining it
-            # via perturbation.
-            if num_restarts >= 5:
-                if time.time() > deadline - 40:
-                    break
+        best_len = float('inf')
 
-        # Phase 2: Perturbation / Kick Strategy on the best code found so far
+        # Multiple restarts
+        num_restarts = 150
+        for i in range(num_restarts):
+            if time.time() > deadline - 10:
+                break
+            code = greedy_cover(i)
+            refined = refine(code)
+            if len(refined) < best_len:
+                best_len = len(refined)
+                best_code = refined
+            
+            if time.time() > deadline - 5:
+                continue
+                
+            ls_time = min(deadline - 3, time.time() + 2.0)
+            ls_code = local_search(refined, i * 7 + 1, ls_time)
+            if len(ls_code) < best_len:
+                best_len = len(ls_code)
+                best_code = ls_code
+
+        # Kick / re-greedy restarts
         if best_code is not None:
-            # We have some time left. Let's try to improve best_code.
-            # We will perform multiple perturbation steps.
-            num_perturbations = 0
-            # Allocate remaining time to perturbations
-            while time.time() < deadline - 5:
-                seed = num_perturbations * 10000 + 999
-                # Pass a tighter time limit to local search inside run_perturbation
-                # Actually, run_perturbation uses the global deadline for local search.
-                # We should be careful.
+            for kick_iter in range(20):
+                if time.time() > deadline - 8:
+                    break
+                rng_k = random.Random(1000 + kick_iter)
+                k = min(5, len(best_code))
+                kick_set = set(rng_k.sample(best_code, k))
+                remaining = [c for c in best_code if c not in kick_set]
+                re_code = greedy_cover(2000 + kick_iter, start_code=remaining)
+                re_refined = refine(re_code)
+                if len(re_refined) < best_len:
+                    best_len = len(re_refined)
+                    best_code = re_refined
                 
-                perturbed_code = run_perturbation(seed, best_code, deadline - 5)
-                num_perturbations += 1
-                
-                if perturbed_code is not None:
-                    if len(perturbed_code) < best_size:
-                        best_size = len(perturbed_code)
-                        best_code = list(perturbed_code)
-                        # If we improved, we can try more perturbations on the new best
-                        # But if we didn't, we might be stuck. 
-                        # To avoid getting stuck in a loop of non-improving perturbations,
-                        # we could increase the perturbation strength or change seed strategy.
-                    else:
-                        # If no improvement, we might want to try a stronger perturbation
-                        # or just stop if we've tried many.
-                        if num_perturbations > 50:
-                            break
-        else:
-            # Fallback if Phase 1 failed (shouldn't happen)
-            best_code = run_greedy_local_search(0)
-            if best_code is None:
-                return []
-
-        # Final Prune on the best code
-        best_code = refine(best_code)
-        
-        # Return as list of lists
-        words = [int_to_base3(i, n) for i in best_code]
-        return words
-
-    # Fallback for other cases
-    words = list(itertools.product(range(q), repeat=n))
-    N = len(words)
-    word_to_idx = {w: i for i, w in enumerate(words)}
-    
-    neighbors = []
-    for i, w in enumerate(words):
-        neigh = [i]
-        w_list = list(w)
-        for pos in range(n):
-            orig_val = w_list[pos]
-            for val in range(q):
-                if val == orig_val:
-                    continue
-                w_list[pos] = val
-                idx = word_to_idx[tuple(w_list)]
-                neigh.append(idx)
-                w_list[pos] = orig_val
-        neighbors.append(neigh)
-    
-    def get_counts(code_list):
-        if not code_list:
-            return np.zeros(N, dtype=np.int32)
-        counts = np.zeros(N, dtype=np.int32)
-        flat_neighbors = np.concatenate([neighbors[i] for i in code_list])
-        np.add.at(counts, flat_neighbors, 1)
-        return counts
-
-    def prune_code(code_list):
-        counts = get_counts(code_list)
-        changed = True
-        while changed:
-            changed = False
-            for i in range(len(code_list) - 1, -1, -1):
-                c = code_list[i]
-                if np.min(counts[neighbors[c]]) > 1:
-                    code_list.pop(i)
-                    for nb in neighbors[c]:
-                        counts[nb] -= 1
-                    changed = True
-        return code_list
-
-    def improve_by_swaps(code_list, max_iterations=100):
-        counts = get_counts(code_list)
-        code_set = set(code_list)
-        improved = True
-        iterations = 0
-        
-        neighbor_sets = [set(neigh) for neigh in neighbors]
-        
-        while improved and iterations < max_iterations and time.time() < deadline - 5:
-            improved = False
-            iterations += 1
-            
-            code_list = prune_code(code_list)
-            code_set = set(code_list)
-            counts = get_counts(code_list)
-            
-            random.shuffle(code_list)
-            
-            for c in code_list:
                 if time.time() > deadline - 5:
                     break
-                
-                crit_points = []
-                for nb in neighbors[c]:
-                    if counts[nb] == 1:
-                        crit_points.append(nb)
-                        
-                if not crit_points:
-                    if np.min(counts[neighbors[c]]) > 1:
-                        code_list.remove(c)
-                        code_set.remove(c)
-                        for nb in neighbors[c]:
-                            counts[nb] -= 1
-                        improved = True
-                        break
+                ls_code = local_search(re_refined, 3000 + kick_iter, min(deadline - 3, time.time() + 2.0))
+                if len(ls_code) < best_len:
+                    best_len = len(ls_code)
+                    best_code = ls_code
+
+        # Final polish
+        if best_code is not None and time.time() < deadline - 2:
+            ls_code = local_search(best_code, 42, deadline - 1)
+            if len(ls_code) < best_len:
+                best_len = len(ls_code)
+                best_code = ls_code
+            final_code = refine(best_code)
+        elif best_code is not None:
+            final_code = refine(best_code)
+        else:
+            final_code = []
+
+        result = []
+        for c in final_code:
+            result.append(int_to_base3(c, n))
+        return result
+
+    # Generic case
+    N = q ** n
+    q_powers = [1] * (n + 1)
+    for i in range(1, n + 1):
+        q_powers[i] = q_powers[i - 1] * q
+
+    def idx_to_word(idx):
+        w = [0] * n
+        for pos in range(n):
+            w[pos] = (idx // q_powers[n - 1 - pos]) % q
+        return w
+
+    nb_count = 1 + n * (q - 1)
+    neighbors = np.empty((N, nb_count), dtype=np.int32)
+    for idx in range(N):
+        w = [0] * n
+        for pos in range(n):
+            w[pos] = (idx // q_powers[n - 1 - pos]) % q
+        nb_list = [idx]
+        for pos in range(n):
+            for new_d in range(q):
+                if new_d == w[pos]:
                     continue
-                
-                p = crit_points[0]
-                candidates = [x for x in neighbors[p] if x not in code_set]
-                
-                best_w = -1
-                best_score = -1
-                
-                for w in candidates:
-                    valid = True
-                    for k in crit_points:
-                        if k not in neighbor_sets[w]:
-                            valid = False
-                            break
-                    if not valid:
-                        continue
-                    
-                    score = 0
-                    for nb in neighbors[w]:
-                        if counts[nb] == 2:
-                            score += 1
-                            
-                    if score > best_score:
-                        best_score = score
-                        best_w = w
-                        
-                if best_w != -1:
-                    code_list.remove(c)
-                    code_set.remove(c)
-                    for nb in neighbors[c]:
-                        counts[nb] -= 1
-                        
-                    code_list.append(best_w)
-                    code_set.add(best_w)
-                    for nb in neighbors[best_w]:
-                        counts[nb] += 1
-                        
-                    improved = True
-                    break
-                    
-        return code_list
+                delta = (new_d - w[pos]) * q_powers[n - 1 - pos]
+                nb_list.append(idx + delta)
+        neighbors[idx] = nb_list
 
-    def run_greedy_local_search(seed):
-        random.seed(seed)
-        code = []
-        uncovered = np.ones(N, dtype=bool)
-        uncovered_count = N
-        
-        neighbor_array = np.zeros((N, 1 + n * (q - 1)), dtype=np.int32)
-        for i, neigh in enumerate(neighbors):
-            neighbor_array[i, :] = neigh
-        
-        while uncovered_count > 0 and time.time() < deadline - 20:
-            gains = uncovered[neighbor_array].sum(axis=1)
-            max_gain = np.max(gains)
-            if max_gain == 0:
-                break
-            candidates = np.where(gains == max_gain)[0]
-            best_idx = candidates[random.randint(0, len(candidates) - 1)]
-            
-            code.append(best_idx)
-            
-            new_uncovered = neighbors[best_idx]
-            newly_covered = 0
-            for nb in new_uncovered:
-                if uncovered[nb]:
-                    uncovered[nb] = False
-                    newly_covered += 1
-            uncovered_count -= newly_covered
-            
-        code = prune_code(code)
-        code = improve_by_swaps(code)
-        
-        counts = get_counts(code)
-        if np.min(counts) < 1:
-            return None
-            
-        return code
+    uncovered = np.ones(N, dtype=bool)
+    code = []
+    while np.any(uncovered):
+        if time.time() > deadline:
+            break
+        best_idx = -1
+        max_gain = 0
+        for i in range(N):
+            gain = np.sum(uncovered[neighbors[i]])
+            if gain > max_gain:
+                max_gain = gain
+                best_idx = i
+        if max_gain == 0:
+            break
+        code.append(best_idx)
+        uncovered[neighbors[best_idx]] = False
 
-    best_code = None
-    best_size = float('inf')
-    
-    num_restarts = 0
-    while time.time() < deadline - 10:
-        seed = num_restarts * 1000 + 42
-        current_code = run_greedy_local_search(seed)
-        num_restarts += 1
-        
-        if current_code is not None:
-            if len(current_code) < best_size:
-                best_size = len(current_code)
-                best_code = list(current_code)
-                
-        if num_restarts >= 10:
-             if time.time() > deadline - 30:
-                 break
-
-    if best_code is None:
-        best_code = run_greedy_local_search(0)
-        if best_code is None:
-             return []
-
-    best_code = prune_code(best_code)
-    
-    return [list(words[i]) for i in best_code]
+    return [idx_to_word(i) for i in code]

@@ -1,0 +1,703 @@
+"""Job-shop dispatch rule: SEARCH approach.
+At import time we generate many candidate dispatch heuristics (varied weights/rules),
+evaluate each on small synthetic job-shop instances via an event-driven simulation,
+and keep the best one within a wall-clock budget. dispatch() then just applies the
+chosen rule with a cheap deadline guard."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time as _time
+import random
+import heapq
+
+_DEADLINE = 130.0        # Safety margin before 150s kill
+_START_TIME = _time.time()
+_BUDGET_FOR_SEARCH = 115.0  # leave margin for evaluation overhead
+
+# ---------------------------------------------------------------------------
+# Candidate rule definitions.
+# Each rule is a function of (op, time, n_ops) -> score (higher = more urgent).
+# op has keys: job, op, machine_options {machine: duration}, remaining_ops, remaining_work
+# ---------------------------------------------------------------------------
+def _min_dur(op):
+    return min(op["machine_options"].values())
+
+def _mean_dur(op):
+    v = op["machine_options"].values()
+    return sum(v) / len(v)
+
+def _max_dur(op):
+    return max(op["machine_options"].values())
+
+def _num_machines(op):
+    return len(op["machine_options"])
+
+def _remaining_work(op):
+    return op["remaining_work"]
+
+def _remaining_ops(op):
+    return op["remaining_ops"]
+
+def _avg_remaining(op):
+    ro = op["remaining_ops"]
+    return op["remaining_work"] / ro if ro > 0 else op["remaining_work"]
+
+def _machine_load(op):
+    """Estimate machine load: sum of durations across all machine options."""
+    return sum(op["machine_options"].values())
+
+def _bottleneck_factor(op):
+    """Higher for ops with fewer machine options (more constrained)."""
+    nm = _num_machines(op)
+    return 1.0 / (nm + 1.0) if nm > 0 else 1.0
+
+def _contention_ratio(op):
+    """Ratio of min duration to total machine load. Higher = less contention."""
+    ml = _machine_load(op)
+    if ml <= 0:
+        return 1.0
+    return _min_dur(op) / ml
+
+def _smooth_contention(op, temperature=1.0):
+    """Soft-min based contention score: uses log-sum-exp for smooth min approximation.
+    Higher score = operation can be done on a less loaded machine."""
+    durations = list(op["machine_options"].values())
+    if not durations:
+        return 1.0
+    # Soft-min: -log(sum(exp(-d/T)))/T approximates min(d) smoothly
+    max_d = max(durations)
+    exp_terms = [np.exp(-(d - max_d) / temperature) for d in durations]
+    soft_min = max_d - temperature * np.log(sum(exp_terms))
+    total_load = sum(durations)
+    if total_load <= 0:
+        return 1.0
+    return soft_min / total_load
+
+def _machine_specific_contention(op, time=0.0):
+    """Estimate contention considering that machines with longer durations
+    are more likely to be busy. Weight by inverse of duration (shorter = less likely blocked)."""
+    durations = list(op["machine_options"].values())
+    if not durations:
+        return 0.0
+    # For each machine option, estimate probability it's free:
+    # shorter duration -> more likely to be available
+    inv_durs = [1.0 / (d + 0.1) for d in durations]
+    total_inv = sum(inv_durs)
+    if total_inv <= 0:
+        return 0.0
+    # Weighted average: machines with shorter durations get higher weight
+    # This gives higher score when the operation can use a "fast" machine
+    weighted_score = sum((1.0 / (d + 0.1)) * (1.0 / d) for d in durations) / total_inv
+    return weighted_score
+
+# Rule families with tunable weights (a, b, c, d, e):
+# score = a*eff + b*remaining_work - c*remaining_ops + d*mean_duration + e*num_machines
+# where eff = remaining_work / min_duration  (efficiency)
+
+def make_rule(a, b, c, d, e):
+    def rule(op, time, n_ops):
+        md = _min_dur(op)
+        eff = _remaining_work(op) / md if md > 0 else _remaining_work(op) + 1000.0
+        return (a * eff + b * _remaining_work(op) - c * _remaining_ops(op)
+                + d * _mean_dur(op) + e * _num_machines(op))
+    return rule
+
+# SPT rule: minimize min duration -> score = -min_duration
+def rule_spt(op, time, n_ops):
+    return -_min_dur(op)
+
+# Longest remaining work
+def rule_lrw(op, time, n_ops):
+    return _remaining_work(op)
+
+# Most remaining ops
+def rule_mro(op, time, n_ops):
+    return _remaining_ops(op)
+
+# Fewest remaining ops
+def rule_fro(op, time, n_ops):
+    return -_remaining_ops(op)
+
+# Min remaining work
+def rule_mrw(op, time, n_ops):
+    return -_remaining_work(op)
+
+# Mean duration (SPT on mean)
+def rule_spt_mean(op, time, n_ops):
+    return -_mean_dur(op)
+
+# Ratio: remaining_work / num_machines
+def rule_ratio(op, time, n_ops):
+    nm = _num_machines(op)
+    return _remaining_work(op) / nm if nm > 0 else _remaining_work(op)
+
+# ATC: Apparent Tardiness Cost - prioritize jobs with more remaining work relative to time
+def rule_atc(op, time, n_ops):
+    rw = _remaining_work(op)
+    md = _min_dur(op)
+    if md <= 0:
+        return rw
+    # Higher score for ops with more remaining work that can be done quickly
+    return rw / (md + 1.0)
+
+# Machine contention aware: prefer ops that go to less loaded machines
+def rule_machine_contention(op, time, n_ops):
+    md = _min_dur(op)
+    rw = _remaining_work(op)
+    # Penalize if the op goes to a machine that's likely busy (long duration)
+    # and reward if it can finish quickly
+    return -md * 0.3 + rw / (md + 1.0) * 0.7
+
+# Contention avoidance: score by inverse of machine utilization
+def rule_contention_avoidance(op, time, n_ops):
+    """Prioritize ops on machines with lower utilization (min_dur / total_load)."""
+    cr = _contention_ratio(op)
+    rw = _remaining_work(op)
+    ro = _remaining_ops(op)
+    urgency = 1.0 / (ro + 1.0) if ro > 0 else 1.0
+    # Higher contention ratio = less loaded machine = better
+    # Combine with urgency to balance short-term vs long-term
+    return cr * 0.6 + urgency * 0.4
+
+# Weighted contention: tunable blend of contention ratio and efficiency
+def make_contention_rule(w_cr, w_eff, w_urg, use_smooth=False, use_machine_specific=False):
+    def rule(op, time, n_ops):
+        if use_smooth:
+            cr = _smooth_contention(op, temperature=1.0)
+        elif use_machine_specific:
+            cr = _machine_specific_contention(op, time)
+        else:
+            cr = _contention_ratio(op)
+        md = _min_dur(op)
+        rw = _remaining_work(op)
+        eff = rw / (md + 1.0) if md > 0 else rw
+        ro = _remaining_ops(op)
+        urg = 1.0 / (ro + 1.0) if ro > 0 else 1.0
+        return w_cr * cr + w_eff * eff * 0.1 + w_urg * urg
+    return rule
+
+# New: contention with time-awareness - penalize operations on machines that are likely busy
+def make_time_aware_contention(w_cr, w_time, w_eff, w_urg):
+    def rule(op, time, n_ops):
+        cr = _contention_ratio(op)
+        md = _min_dur(op)
+        rw = _remaining_work(op)
+        eff = rw / (md + 1.0) if md > 0 else rw
+        ro = _remaining_ops(op)
+        urg = 1.0 / (ro + 1.0) if ro > 0 else 1.0
+        # Time penalty: longer operations are more likely to cause delays
+        time_penalty = md / (time + md + 1.0)
+        return w_cr * cr + w_time * (1.0 - time_penalty) + w_eff * eff * 0.1 + w_urg * urg
+    return rule
+
+# Critical ratio with machine awareness
+def rule_cr_machine(op, time, n_ops):
+    rw = _remaining_work(op)
+    md = _min_dur(op)
+    ro = _remaining_ops(op)
+    if ro <= 0:
+        return rw
+    # Critical ratio: remaining work / time to complete
+    # Adjust for machine contention
+    cr = rw / (md * ro + 1.0)
+    return cr
+
+# CR: Critical Ratio - remaining_work / (time_limit - current_time)
+# We don't have a time limit, so use a normalized version
+def rule_cr(op, time, n_ops):
+    rw = _remaining_work(op)
+    ro = _remaining_ops(op)
+    if ro <= 0:
+        return rw
+    avg_remaining = rw / ro
+    # Prioritize jobs where remaining work is large relative to average
+    return rw - avg_remaining * 0.5
+
+# EDD-like: prioritize jobs with fewer remaining ops (closer to completion)
+def rule_edd(op, time, n_ops):
+    return -_remaining_ops(op) * 0.1 - _min_dur(op) * 0.1
+
+# Composite: combine SPT with remaining work
+def rule_spt_rw(op, time, n_ops):
+    return -_min_dur(op) * 0.5 + _remaining_work(op) * 0.5
+
+# Machine utilization aware: prefer ops on machines with fewer options (bottleneck)
+def rule_bottleneck(op, time, n_ops):
+    nm = _num_machines(op)
+    md = _min_dur(op)
+    # Fewer machine options = more constrained = higher priority
+    return (1.0 / (nm + 1.0)) * _remaining_work(op) - md * 0.1
+
+# Machine-load-aware: prioritize ops that clear work relative to machine congestion
+def make_machine_load_rule(w_load, w_spt, w_urgency, w_rw):
+    def rule(op, time, n_ops):
+        md = _min_dur(op)
+        rw = _remaining_work(op)
+        ro = _remaining_ops(op)
+        m_load = op.get("_machine_load", 0.0)
+        m_avail = op.get("_machine_avail", 0.0)
+        # Work cleared per unit of machine congestion
+        # Higher when machine is less loaded relative to the work this op clears
+        load_factor = rw / (m_load + md + 1.0)
+        # SPT component
+        spt = -md
+        # Urgency: closer to completion
+        urg = 1.0 / (ro + 1.0) if ro > 0 else 1.0
+        # Remaining work
+        rw_norm = rw * 0.1
+        return w_load * load_factor + w_spt * spt * 0.1 + w_urgency * urg + w_rw * rw_norm
+    return rule
+
+# Machine availability aware: prefer ops whose machine is soonest available
+def make_machine_avail_rule(w_avail, w_spt, w_urgency):
+    def rule(op, time, n_ops):
+        md = _min_dur(op)
+        ro = _remaining_ops(op)
+        m_avail = op.get("_machine_avail", 0.0)
+        # Time until machine is free
+        wait = max(0.0, m_avail - time)
+        # Prefer ops with less wait (machine soonest free)
+        avail_score = -wait * 0.1
+        spt = -md
+        urg = 1.0 / (ro + 1.0) if ro > 0 else 1.0
+        return w_avail * avail_score + w_spt * spt * 0.1 + w_urgency * urg
+    return rule
+
+# Combined machine-aware: blend load, availability, and SPT
+def make_combined_machine_rule(w_load, w_avail, w_spt, w_urg):
+    def rule(op, time, n_ops):
+        md = _min_dur(op)
+        rw = _remaining_work(op)
+        ro = _remaining_ops(op)
+        m_load = op.get("_machine_load", 0.0)
+        m_avail = op.get("_machine_avail", 0.0)
+        wait = max(0.0, m_avail - time)
+        load_factor = rw / (m_load + md + 1.0)
+        avail_score = -wait * 0.1
+        spt = -md
+        urg = 1.0 / (ro + 1.0) if ro > 0 else 1.0
+        return w_load * load_factor + w_avail * avail_score + w_spt * spt * 0.1 + w_urg * urg
+    return rule
+
+# Priority based on job completion urgency
+def rule_completion_urgency(op, time, n_ops):
+    ro = _remaining_ops(op)
+    rw = _remaining_work(op)
+    md = _min_dur(op)
+    # Jobs closer to completion get higher priority
+    urgency = 1.0 / (ro + 1.0)
+    # But also consider how much work remains relative to what can be done now
+    efficiency = rw / (md + 1.0) if md > 0 else rw
+    return urgency * 0.6 + efficiency * 0.4
+
+# Load balancing: spread work across machines
+def rule_load_balance(op, time, n_ops):
+    md = _min_dur(op)
+    rw = _remaining_work(op)
+    nm = _num_machines(op)
+    # Prefer ops that can go to any machine (flexible) but also consider load
+    flexibility = 1.0 / (nm + 1.0)
+    load = rw / nm if nm > 0 else rw
+    return flexibility * 0.5 - load * 0.1
+
+# ---------------------------------------------------------------------------
+# Event-driven job-shop simulator.
+# ready_operations: list of dicts for the ready ops at each event.
+# The simulator maintains, for each job, its operation sequence and machine
+# availability, and uses the dispatch rule to pick which ready op to start.
+# ---------------------------------------------------------------------------
+class JobShopInstance:
+    def __init__(self, jobs_ops):
+        # jobs_ops: list of jobs, each a list of (machine, duration)
+        self.jobs = jobs_ops
+        self.n_jobs = len(jobs_ops)
+        self.machines = set()
+        for job in jobs_ops:
+            for m, d in job:
+                self.machines.add(m)
+        self.machines = sorted(self.machines)
+        self.n_machines = len(self.machines)
+
+    def total_work(self):
+        return sum(d for job in self.jobs for _, d in job)
+
+def simulate(instance, rule, max_steps=100000):
+    """Event-driven simulation with proper machine availability.
+    At each dispatch event, the chosen operation starts at max(t, machine_avail).
+    The simulation time advances to the next completion event."""
+    n_jobs = instance.n_jobs
+    n_machines = instance.n_machines
+
+    job_cur_op = [0] * n_jobs
+    job_remaining_ops = [len(instance.jobs[i]) for i in range(n_jobs)]
+    job_remaining_work = [sum(d for _, d in instance.jobs[i]) for i in range(n_jobs)]
+
+    machine_avail = [0] * n_machines
+    machine_to_idx = {m: idx for idx, m in enumerate(instance.machines)}
+
+    # Heap of (completion_time, machine_idx, job_idx, op_idx)
+    # for tracking when machines become free
+    completed_count = 0
+    t = 0.0
+
+    # Track per-machine scheduled load for load-aware rules
+    machine_scheduled_load = [0.0] * n_machines
+
+    steps = 0
+    max_t = 0.0
+
+    while completed_count < n_jobs and steps < max_steps:
+        steps += 1
+
+        # Build ready operations: all jobs whose current op's machine is free
+        # (machine_avail[m] <= t) OR we just pick from all ready ops and
+        # the start time accounts for machine availability.
+        # In classic event-driven JSS: at time t, an op is ready if:
+        #   1. Its job's previous op is done
+        #   2. We can start it (we schedule it; if machine busy, start later)
+        # The dispatch rule picks WHICH ready op to start next.
+        # The op starts at max(t, machine_avail[m]).
+
+        ready = []
+        for i in range(n_jobs):
+            if job_cur_op[i] < len(instance.jobs[i]):
+                m, d = instance.jobs[i][job_cur_op[i]]
+                m_idx = machine_to_idx[m]
+                ready.append({
+                    "job": i,
+                    "op": job_cur_op[i],
+                    "machine_options": {m: d},
+                    "remaining_ops": job_remaining_ops[i],
+                    "remaining_work": job_remaining_work[i],
+                    "_m_idx": m_idx,
+                    "_machine_avail": machine_avail[m_idx],
+                    "_machine_load": machine_scheduled_load[m_idx],
+                })
+
+        if not ready:
+            break
+
+        # Dispatch: pick which ready op to start
+        if len(ready) == 1:
+            idx = 0
+        else:
+            scores = [rule(op, t, len(ready)) for op in ready]
+            idx = int(np.argmax(scores))
+
+        op = ready[idx]
+        i = op["job"]
+        m, d = instance.jobs[i][job_cur_op[i]]
+        m_idx = machine_to_idx[m]
+
+        start = max(t, machine_avail[m_idx])
+        end = start + d
+        machine_avail[m_idx] = end
+        machine_scheduled_load[m_idx] += d
+
+        # Update job state
+        job_cur_op[i] += 1
+        job_remaining_ops[i] -= 1
+        job_remaining_work[i] -= d
+
+        if end > max_t:
+            max_t = end
+
+        if job_cur_op[i] >= len(instance.jobs[i]):
+            completed_count += 1
+
+        # Advance time to the next completion event
+        # Find the earliest machine completion time >= t
+        # Actually, we should advance to the next event where something changes.
+        # The next event is the minimum completion time among all machines that have work.
+        # But we just scheduled one op; other ops may be queued on machines.
+        # In this simplified model (one op at a time per machine), the next
+        # dispatch event is when the earliest machine finishes its current work.
+        if machine_avail:
+            t = min(machine_avail)
+        else:
+            break
+
+    return max_t
+
+# ---------------------------------------------------------------------------
+# Instance generator
+# ---------------------------------------------------------------------------
+def generate_instance(n_jobs=6, n_machines=4, seed=0):
+    rng = random.Random(seed)
+    jobs = []
+    for j in range(n_jobs):
+        ops = []
+        # Each job visits a random permutation of machines (classic job-shop)
+        ms = list(range(n_machines))
+        rng.shuffle(ms)
+        for m in ms:
+            d = rng.randint(1, 10)
+            ops.append((m, d))
+        jobs.append(ops)
+    return JobShopInstance(jobs)
+
+# ---------------------------------------------------------------------------
+# Candidate generation
+# ---------------------------------------------------------------------------
+def generate_candidates():
+    candidates = []
+    # Base rules
+    candidates.append(("spt", rule_spt))
+    candidates.append(("lrw", rule_lrw))
+    candidates.append(("mro", rule_mro))
+    candidates.append(("fro", rule_fro))
+    candidates.append(("mrw", rule_mrw))
+    candidates.append(("spt_mean", rule_spt_mean))
+    candidates.append(("ratio", rule_ratio))
+    candidates.append(("atc", rule_atc))
+    candidates.append(("cr", rule_cr))
+    candidates.append(("edd", rule_edd))
+    candidates.append(("spt_rw", rule_spt_rw))
+    candidates.append(("bottleneck", rule_bottleneck))
+    candidates.append(("machine_contention", rule_machine_contention))
+    candidates.append(("cr_machine", rule_cr_machine))
+    candidates.append(("completion_urgency", rule_completion_urgency))
+    candidates.append(("load_balance", rule_load_balance))
+    candidates.append(("contention_avoidance", rule_contention_avoidance))
+
+    # Contentious rule variants with different weightings
+    for w_cr in [0.3, 0.5, 0.7, 0.9]:
+        for w_eff in [0.0, 0.2, 0.5]:
+            w_urg = max(0.0, 1.0 - w_cr - w_eff)
+            if w_urg < 0:
+                continue
+            rule = make_contention_rule(w_cr, w_eff, w_urg)
+            name = f"cont_{w_cr}_{w_eff}_{w_urg:.1f}"
+            candidates.append((name, rule))
+            # Smooth version
+            rule_smooth = make_contention_rule(w_cr, w_eff, w_urg, use_smooth=True)
+            name_smooth = f"cont_smooth_{w_cr}_{w_eff}_{w_urg:.1f}"
+            candidates.append((name_smooth, rule_smooth))
+            # Machine-specific version
+            rule_ms = make_contention_rule(w_cr, w_eff, w_urg, use_machine_specific=True)
+            name_ms = f"cont_ms_{w_cr}_{w_eff}_{w_urg:.1f}"
+            candidates.append((name_ms, rule_ms))
+
+    # Time-aware contention rules
+    for w_cr in [0.3, 0.5, 0.7]:
+        for w_time in [0.1, 0.3, 0.5]:
+            for w_eff in [0.0, 0.2]:
+                w_urg = max(0.0, 1.0 - w_cr - w_time - w_eff)
+                if w_urg < 0:
+                    continue
+                rule_ta = make_time_aware_contention(w_cr, w_time, w_eff, w_urg)
+                name_ta = f"cont_ta_{w_cr}_{w_time}_{w_eff}_{w_urg:.1f}"
+                candidates.append((name_ta, rule_ta))
+
+    # Weighted hybrid rules
+    # a: efficiency weight, b: remaining_work weight, c: remaining_ops weight,
+    # d: mean_duration weight, e: num_machines weight
+    grid_a = [0.0, 0.5, 1.0, 2.0]
+    grid_b = [0.0, 0.1, 0.5]
+    grid_c = [0.0, 0.05, 0.1]
+    grid_d = [-0.1, 0.0, 0.1]
+    grid_e = [-0.05, 0.0, 0.05]
+
+    for a in grid_a:
+        for b in grid_b:
+            for c in grid_c:
+                for d in grid_d:
+                    for e in grid_e:
+                        rule = make_rule(a, b, c, d, e)
+                        name = f"hyb_{a}_{b}_{c}_{d}_{e}"
+                        candidates.append((name, rule))
+
+    # Additional targeted combinations
+    # Combine SPT with completion urgency
+    for w1 in [0.3, 0.5, 0.7]:
+        for w2 in [0.3, 0.5, 0.7]:
+            if abs(w1 + w2 - 1.0) < 0.01:
+                def make_comb(w1, w2):
+                    def rule(op, time, n_ops):
+                        s1 = rule_spt(op, time, n_ops)
+                        s2 = rule_completion_urgency(op, time, n_ops)
+                        return w1 * s1 + w2 * s2
+                    return rule
+                candidates.append((f"spt_urgency_{w1}_{w2}", make_comb(w1, w2)))
+
+    # Combine ATC with machine contention
+    for w1 in [0.3, 0.5, 0.7]:
+        for w2 in [0.3, 0.5, 0.7]:
+            if abs(w1 + w2 - 1.0) < 0.01:
+                def make_comb2(w1, w2):
+                    def rule(op, time, n_ops):
+                        s1 = rule_atc(op, time, n_ops)
+                        s2 = rule_machine_contention(op, time, n_ops)
+                        return w1 * s1 + w2 * s2
+                    return rule
+                candidates.append((f"atc_contention_{w1}_{w2}", make_comb2(w1, w2)))
+
+    # Combine SPT with contention avoidance
+    for w1 in [0.3, 0.5, 0.7]:
+        for w2 in [0.3, 0.5, 0.7]:
+            if abs(w1 + w2 - 1.0) < 0.01:
+                def make_comb3(w1, w2):
+                    def rule(op, time, n_ops):
+                        s1 = rule_spt(op, time, n_ops)
+                        s2 = rule_contention_avoidance(op, time, n_ops)
+                        return w1 * s1 + w2 * s2
+                    return rule
+                candidates.append((f"spt_contention_{w1}_{w2}", make_comb3(w1, w2)))
+
+    # New: combine smooth contention with SPT
+    for w1 in [0.3, 0.5, 0.7]:
+        for w2 in [0.3, 0.5, 0.7]:
+            if abs(w1 + w2 - 1.0) < 0.01:
+                def make_comb5(w1, w2):
+                    def rule(op, time, n_ops):
+                        s1 = rule_spt(op, time, n_ops)
+                        s2 = _smooth_contention(op, temperature=1.0)
+                        return w1 * s1 + w2 * s2
+                    return rule
+                candidates.append((f"spt_smooth_{w1}_{w2}", make_comb5(w1, w2)))
+
+    # New: combine machine-specific contention with completion urgency
+    for w1 in [0.3, 0.5, 0.7]:
+        for w2 in [0.3, 0.5, 0.7]:
+            if abs(w1 + w2 - 1.0) < 0.01:
+                def make_comb6(w1, w2):
+                    def rule(op, time, n_ops):
+                        s1 = rule_completion_urgency(op, time, n_ops)
+                        s2 = _machine_specific_contention(op, time)
+                        return w1 * s1 + w2 * s2
+                    return rule
+                candidates.append((f"urgency_ms_{w1}_{w2}", make_comb6(w1, w2)))
+
+    # Machine-load-aware rules
+    for w_load in [0.3, 0.5, 0.7, 0.9]:
+        for w_spt in [0.0, 0.2, 0.4]:
+            for w_urg in [0.0, 0.2, 0.3]:
+                w_rw = max(0.0, 1.0 - w_load - w_spt - w_urg)
+                if w_rw < 0:
+                    continue
+                rule_ml = make_machine_load_rule(w_load, w_spt, w_urg, w_rw)
+                candidates.append((f"ml_{w_load}_{w_spt}_{w_urg}_{w_rw:.1f}", rule_ml))
+
+    # Machine-availability-aware rules
+    for w_avail in [0.3, 0.5, 0.7, 0.9]:
+        for w_spt in [0.0, 0.2, 0.4]:
+            for w_urg in [0.0, 0.2, 0.3]:
+                rule_ma = make_machine_avail_rule(w_avail, w_spt, w_urg)
+                candidates.append((f"ma_{w_avail}_{w_spt}_{w_urg}", rule_ma))
+
+    # Combined machine-aware rules
+    for w_load in [0.3, 0.5, 0.7]:
+        for w_avail in [0.1, 0.2, 0.3]:
+            for w_spt in [0.0, 0.2]:
+                w_urg = max(0.0, 1.0 - w_load - w_avail - w_spt)
+                if w_urg < 0:
+                    continue
+                rule_cm = make_combined_machine_rule(w_load, w_avail, w_spt, w_urg)
+                candidates.append((f"cm_{w_load}_{w_avail}_{w_spt}_{w_urg:.1f}", rule_cm))
+
+    # Combine completion urgency with contention
+    for w1 in [0.3, 0.5, 0.7]:
+        for w2 in [0.3, 0.5, 0.7]:
+            if abs(w1 + w2 - 1.0) < 0.01:
+                def make_comb4(w1, w2):
+                    def rule(op, time, n_ops):
+                        s1 = rule_completion_urgency(op, time, n_ops)
+                        s2 = rule_contention_avoidance(op, time, n_ops)
+                        return w1 * s1 + w2 * s2
+                    return rule
+                candidates.append((f"urgency_contention_{w1}_{w2}", make_comb4(w1, w2)))
+    return candidates
+
+# ---------------------------------------------------------------------------
+# Tournament: evaluate each candidate on a set of instances, pick best
+# ---------------------------------------------------------------------------
+def run_tournament():
+    candidates = generate_candidates()
+    rng = random.Random(42)
+    # Generate test instances closer to actual evaluation size (10 jobs, 5 machines)
+    # Use a mix of sizes for robustness
+    test_instances = []
+    # Primary: 10 jobs, 5 machines (matches evaluation) - more instances
+    for s in range(12):
+        test_instances.append(generate_instance(n_jobs=10, n_machines=5, seed=s))
+    # Secondary: smaller instances for diversity
+    for s in range(3):
+        test_instances.append(generate_instance(n_jobs=8, n_machines=5, seed=s + 100))
+    for s in range(2):
+        test_instances.append(generate_instance(n_jobs=6, n_machines=4, seed=s + 200))
+    # Tertiary: larger instances to stress-test
+    for s in range(2):
+        test_instances.append(generate_instance(n_jobs=12, n_machines=5, seed=s + 300))
+
+    results = []
+    # First pass: quick screening with fewer instances
+    quick_instances = test_instances[:5]
+    for name, rule in candidates:
+        if _time.time() - _START_TIME > _BUDGET_FOR_SEARCH:
+            break
+        total = 0.0
+        for inst in quick_instances:
+            ms = simulate(inst, rule)
+            total += ms
+        mean_ms = total / len(quick_instances)
+        results.append((mean_ms, name, rule))
+
+    if not results:
+        return rule_spt  # fallback
+    results.sort(key=lambda x: x[0])
+    
+    # Second pass: full evaluation of top candidates
+    top_k = min(20, len(results))
+    top_candidates = results[:top_k]
+    refined_results = []
+    for mean_ms_quick, name, rule in top_candidates:
+        if _time.time() - _START_TIME > _BUDGET_FOR_SEARCH:
+            break
+        total = 0.0
+        for inst in test_instances:
+            ms = simulate(inst, rule)
+            total += ms
+        mean_ms = total / len(test_instances)
+        refined_results.append((mean_ms, name, rule))
+
+    if not refined_results:
+        return results[0][2]
+    refined_results.sort(key=lambda x: x[0])
+    best_rule = refined_results[0][2]
+    return best_rule
+
+# ---------------------------------------------------------------------------
+# Run search at import time
+# ---------------------------------------------------------------------------
+_best_rule = None
+if _time.time() - _START_TIME < _BUDGET_FOR_SEARCH:
+    try:
+        _best_rule = run_tournament()
+    except Exception:
+        _best_rule = None
+if _best_rule is None:
+    _best_rule = rule_spt  # safe fallback
+
+# ---------------------------------------------------------------------------
+# Public dispatch function
+# ---------------------------------------------------------------------------
+def dispatch(ready_operations, time):
+    """Dispatch rule for job-shop scheduling.
+    Uses the best rule found by the import-time tournament search."""
+    if not ready_operations:
+        return 0
+    # Deadline guard
+    if _time.time() - _START_TIME > _DEADLINE:
+        return 0
+
+    n = len(ready_operations)
+    if n == 1:
+        return 0
+
+    # Compute scores using the chosen rule
+    scores = np.zeros(n)
+    for i in range(n):
+        scores[i] = _best_rule(ready_operations[i], time, n)
+
+    best_idx = int(np.argmax(scores))
+    return best_idx
+# EVOLVE-BLOCK-END

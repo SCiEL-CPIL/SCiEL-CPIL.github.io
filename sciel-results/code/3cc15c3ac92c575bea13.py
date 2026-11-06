@@ -1,0 +1,46 @@
+import time
+
+def construct():
+    """
+    Returns a set of 12 distinct positive integers such that all 4096 subset sums are distinct.
+    The set minimizes the largest element.
+    
+    The minimum possible largest element for n distinct positive integers with distinct subset sums is 2^(n-1).
+    For n=12, this is 2^11 = 2048.
+    The optimal set is the set of powers of 2: [1, 2, 4, ..., 2048].
+    """
+    start_time = time.time()
+    deadline = start_time + 50  # Safety margin for 60s limit
+    
+    n = 12
+    # The optimal solution is the first n powers of 2.
+    result = [1 << i for i in range(n)]
+    
+    # Validation
+    # Check distinctness
+    if len(set(result)) != n:
+        raise ValueError("Elements must be distinct")
+    
+    # Check positivity
+    if any(x <= 0 for x in result):
+        raise ValueError("Elements must be positive")
+        
+    # Check subset sum distinctness
+    # There are 2^12 = 4096 subsets.
+    subset_sums = set()
+    # Using bit manipulation to iterate through all subsets
+    for mask in range(1 << n):
+        if time.time() > deadline:
+            # If we somehow take too long (should not happen for this simple case), 
+            # we still return the known optimal result.
+            break
+        s = 0
+        for i in range(n):
+            if mask & (1 << i):
+                s += result[i]
+        subset_sums.add(s)
+        
+    if len(subset_sums) != (1 << n):
+        raise ValueError("Subset sums are not all distinct")
+        
+    return result

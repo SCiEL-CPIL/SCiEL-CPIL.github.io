@@ -1,0 +1,1 @@
+BET: {mechanism: "Bitmask common-neighbor queries are O(n) instead of O(n^2) set lookups, enabling faster greedy expansion; local search clique-merging moves can reduce clique count by combining compatible cliques, a structural change from the random-restart approach", q: 0.45, delta: [0.5, 2.0]}

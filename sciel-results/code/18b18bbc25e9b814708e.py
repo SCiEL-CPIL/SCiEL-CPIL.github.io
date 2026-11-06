@@ -1,0 +1,6 @@
+        for site in _neighbours(last_pt):
+            if site in occupied: continue # O(1) if set, O(N) if list
+            # ...
+            for j in range(i - 1): # O(N)
+                if new_chain[j] == q ...
+        

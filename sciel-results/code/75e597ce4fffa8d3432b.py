@@ -1,0 +1,747 @@
+import time
+import random
+import numpy as np
+
+N = 128
+TARGET_LO = 128
+TARGET_HI = 256
+NUM_TARGETS = 129  # targets 128..256 inclusive
+
+_START_TIME = time.time()
+DEADLINE = 85.0
+
+
+def _elapsed():
+    return time.time() - _START_TIME
+
+
+def _pair_counts(A):
+    """Compute representation counts for each target in [128,256]."""
+    counts = np.zeros(NUM_TARGETS, dtype=np.int32)
+    n = len(A)
+    for i in range(n):
+        ai = A[i]
+        for j in range(i, n):
+            s = ai + A[j]
+            if TARGET_LO <= s <= TARGET_HI:
+                counts[s - TARGET_LO] += 1
+    return counts
+
+
+def _is_valid(counts):
+    return np.min(counts) > 0
+
+
+def _get_peak(counts):
+    return int(np.max(counts))
+
+
+def _variance_penalty(counts):
+    return float(np.var(counts.astype(np.float64)))
+
+
+def _score(counts):
+    if not _is_valid(counts):
+        return float('inf')
+    return _get_peak(counts) + 0.05 * _variance_penalty(counts)
+
+
+def _try_swap(A, A_set, counts, i, x_new):
+    ai = A[i]
+    if x_new == ai or x_new in A_set:
+        return None
+
+    n = len(A)
+    new_counts = counts.copy()
+
+    s = ai + ai
+    if TARGET_LO <= s <= TARGET_HI:
+        new_counts[s - TARGET_LO] -= 1
+
+    for j in range(n):
+        if j == i:
+            continue
+        aj = A[j]
+        s = ai + aj
+        if TARGET_LO <= s <= TARGET_HI:
+            new_counts[s - TARGET_LO] -= 1
+
+    s = x_new + x_new
+    if TARGET_LO <= s <= TARGET_HI:
+        new_counts[s - TARGET_LO] += 1
+
+    for j in range(n):
+        if j == i:
+            continue
+        aj = A[j]
+        s = x_new + aj
+        if TARGET_LO <= s <= TARGET_HI:
+            new_counts[s - TARGET_LO] += 1
+
+    if np.min(new_counts) <= 0:
+        return None
+
+    new_score = _score(new_counts)
+    return (new_counts, new_score)
+
+
+def _local_search(A, max_time=80.0):
+    A = sorted(A)
+    A_set = set(A)
+    counts = _pair_counts(A)
+
+    if not _is_valid(counts):
+        return (A, float('inf'))
+
+    current_score = _score(counts)
+    current_peak = _get_peak(counts)
+    best_A = list(A)
+    best_peak = current_peak
+    best_score = current_score
+
+    n = len(A)
+    improved = True
+    stall_count = 0
+    max_stall = 30
+
+    while improved and _elapsed() < max_time:
+        improved = False
+        stall_count += 1
+
+        indices = list(range(n))
+        random.shuffle(indices)
+
+        for i in indices:
+            if _elapsed() > max_time:
+                break
+            ai = A[i]
+
+            candidates = [x for x in range(0, N + 1) if x not in A_set and x != ai]
+            random.shuffle(candidates)
+
+            for x_new in candidates:
+                result = _try_swap(A, A_set, counts, i, x_new)
+                if result is None:
+                    continue
+                new_counts, new_score = result
+
+                if new_score < current_score - 1e-9:
+                    A[i] = x_new
+                    A_set.discard(ai)
+                    A_set.add(x_new)
+                    A.sort()
+                    counts = new_counts
+                    current_score = new_score
+                    current_peak = _get_peak(counts)
+                    improved = True
+                    stall_count = 0
+                    if current_peak < best_peak or (current_peak == best_peak and current_score < best_score):
+                        best_peak = current_peak
+                        best_score = current_score
+                        best_A = list(A)
+                    break
+
+        if not improved and stall_count >= max_stall:
+            break
+
+    return (best_A, best_peak)
+
+
+def _balance_polish(A, max_time=80.0):
+    A = sorted(A)
+    A_set = set(A)
+    counts = _pair_counts(A)
+
+    if not _is_valid(counts):
+        return (A, float('inf'))
+
+    current_peak = _get_peak(counts)
+    current_var = _variance_penalty(counts)
+    best_A = list(A)
+    best_peak = current_peak
+    best_var = current_var
+
+    n = len(A)
+    improved = True
+    stall_count = 0
+    max_stall = 20
+
+    while improved and _elapsed() < max_time:
+        improved = False
+        stall_count += 1
+
+        indices = list(range(n))
+        random.shuffle(indices)
+
+        for i in indices:
+            if _elapsed() > max_time:
+                break
+            ai = A[i]
+
+            candidates = [x for x in range(0, N + 1) if x not in A_set and x != ai]
+            random.shuffle(candidates)
+
+            for x_new in candidates:
+                result = _try_swap(A, A_set, counts, i, x_new)
+                if result is None:
+                    continue
+                new_counts, new_score = result
+
+                new_peak = _get_peak(new_counts)
+                new_var = _variance_penalty(new_counts)
+
+                if new_peak < current_peak or (new_peak == current_peak and new_var < best_var - 1e-9):
+                    A[i] = x_new
+                    A_set.discard(ai)
+                    A_set.add(x_new)
+                    A.sort()
+                    counts = new_counts
+                    current_peak = new_peak
+                    current_var = new_var
+                    improved = True
+                    stall_count = 0
+
+                    if current_peak < best_peak or (current_peak == best_peak and new_var < best_var - 1e-9):
+                        best_peak = current_peak
+                        best_var = new_var
+                        best_A = list(A)
+                    break
+
+        if not improved and stall_count >= max_stall:
+            break
+
+    return (best_A, best_peak)
+
+
+def _simulated_annealing(A, max_time=80.0):
+    A = sorted(A)
+    A_set = set(A)
+    counts = _pair_counts(A)
+
+    if not _is_valid(counts):
+        return (A, float('inf'))
+
+    current_score = _score(counts)
+    current_peak = _get_peak(counts)
+    best_A = list(A)
+    best_peak = current_peak
+    best_score = current_score
+
+    n = len(A)
+    T = 3.0
+    cooling = 0.997
+
+    while _elapsed() < max_time:
+        T *= cooling
+        if T < 0.01:
+            break
+
+        i = random.randint(0, n - 1)
+        ai = A[i]
+
+        candidates = [x for x in range(0, N + 1) if x not in A_set and x != ai]
+        if not candidates:
+            continue
+        x_new = random.choice(candidates)
+
+        result = _try_swap(A, A_set, counts, i, x_new)
+        if result is None:
+            continue
+        new_counts, new_score = result
+
+        delta = new_score - current_score
+        if delta <= 0:
+            A[i] = x_new
+            A_set.discard(ai)
+            A_set.add(x_new)
+            A.sort()
+            counts = new_counts
+            current_score = new_score
+            current_peak = _get_peak(counts)
+
+            if current_peak < best_peak or (current_peak == best_peak and current_score < best_score):
+                best_peak = current_peak
+                best_score = current_score
+                best_A = list(A)
+        else:
+            if random.random() < np.exp(-delta / T):
+                A[i] = x_new
+                A_set.discard(ai)
+                A_set.add(x_new)
+                A.sort()
+                counts = new_counts
+                current_score = new_score
+                current_peak = _get_peak(counts)
+
+    return (best_A, best_peak)
+
+
+def _greedy_balanced_build(rng, target_size=20, max_time=80.0):
+    A = []
+    A_set = set()
+    counts = np.zeros(NUM_TARGETS, dtype=np.int32)
+
+    remaining = list(range(0, N + 1))
+    rng.shuffle(remaining)
+
+    for _ in range(8):
+        if remaining:
+            x = remaining.pop()
+            A.append(x)
+            A_set.add(x)
+
+    A.sort()
+    counts = _pair_counts(A)
+
+    max_iter = 80
+    for _ in range(max_iter):
+        if _elapsed() > max_time:
+            break
+        if _is_valid(counts) and len(A) >= target_size:
+            break
+
+        min_count = np.min(counts)
+        min_indices = np.where(counts == min_count)[0]
+        min_target_idx = rng.choice(min_indices)
+
+        best_x = None
+        best_gain = -1
+
+        for x in remaining:
+            if x in A_set:
+                continue
+            gain = 0
+            for y in A:
+                s = x + y
+                if TARGET_LO <= s <= TARGET_HI and counts[s - TARGET_LO] <= 2:
+                    gain += 1
+            s = x + x
+            if TARGET_LO <= s <= TARGET_HI and counts[s - TARGET_LO] <= 2:
+                gain += 1
+
+            if gain > best_gain:
+                best_gain = gain
+                best_x = x
+
+        if best_x is None or best_gain <= 0:
+            if remaining:
+                best_x = remaining.pop()
+            else:
+                break
+
+        if best_x in remaining:
+            remaining.remove(best_x)
+
+        A.append(best_x)
+        A_set.add(best_x)
+        A.sort()
+        counts = _pair_counts(A)
+
+    changed = True
+    while changed and len(A) > 12:
+        changed = False
+        for i in range(len(A)):
+            ai = A[i]
+            new_counts = counts.copy()
+            n = len(A)
+            for j in range(n):
+                if j == i:
+                    continue
+                aj = A[j]
+                s = ai + aj
+                if TARGET_LO <= s <= TARGET_HI:
+                    new_counts[s - TARGET_LO] -= 1
+            s = ai + ai
+            if TARGET_LO <= s <= TARGET_HI:
+                new_counts[s - TARGET_LO] -= 1
+
+            if _is_valid(new_counts):
+                A.pop(i)
+                A_set.discard(ai)
+                counts = new_counts
+                changed = True
+                break
+
+    return A, counts
+
+
+def _greedy_build(rng, max_time=80.0):
+    A = []
+    A_set = set()
+    counts = np.zeros(NUM_TARGETS, dtype=np.int32)
+
+    initial = [0, 128, 64]
+    for x in initial:
+        if x not in A_set:
+            A.append(x)
+            A_set.add(x)
+    A.sort()
+    counts = _pair_counts(A)
+
+    while _elapsed() < max_time:
+        if _is_valid(counts):
+            break
+
+        uncovered_indices = np.where(counts == 0)[0]
+        if len(uncovered_indices) == 0:
+            break
+
+        target_idx = rng.choice(uncovered_indices)
+        target_val = TARGET_LO + target_idx
+
+        best_x = None
+        best_gain = -1
+
+        for x in range(0, N + 1):
+            if x in A_set:
+                continue
+
+            gain = 0
+            for y in A:
+                s = x + y
+                if TARGET_LO <= s <= TARGET_HI:
+                    if counts[s - TARGET_LO] == 0:
+                        gain += 1
+            s = x + x
+            if TARGET_LO <= s <= TARGET_HI:
+                if counts[s - TARGET_LO] == 0:
+                    gain += 1
+
+            if gain > best_gain:
+                best_gain = gain
+                best_x = x
+
+        if best_x is None or best_gain <= 0:
+            break
+
+        A.append(best_x)
+        A_set.add(best_x)
+        A.sort()
+        counts = _pair_counts(A)
+
+    return A, counts
+
+
+def _fix_coverage(A_init, rng, max_time=80.0):
+    A_temp = list(A_init)
+    A_set = set(A_temp)
+    counts_temp = _pair_counts(A_temp)
+
+    for _ in range(15):
+        if _elapsed() > max_time:
+            break
+        if _is_valid(counts_temp):
+            break
+        uncovered = np.where(counts_temp == 0)[0]
+        if len(uncovered) == 0:
+            break
+        target_idx = rng.choice(uncovered)
+        best_x = None
+        best_gain = -1
+        for x in range(0, N + 1):
+            if x in A_set:
+                continue
+            gain = 0
+            for y in A_temp:
+                s = x + y
+                if TARGET_LO <= s <= TARGET_HI and counts_temp[s - TARGET_LO] == 0:
+                    gain += 1
+            s = x + x
+            if TARGET_LO <= s <= TARGET_HI and counts_temp[s - TARGET_LO] == 0:
+                gain += 1
+            if gain > best_gain:
+                best_gain = gain
+                best_x = x
+        if best_x is None or best_gain <= 0:
+            break
+        A_temp.append(best_x)
+        A_set.add(best_x)
+        A_temp.sort()
+        counts_temp = _pair_counts(A_temp)
+
+    if _is_valid(counts_temp):
+        return A_temp
+    return None
+
+
+def _two_move_search(A, max_time=80.0):
+    """
+    Structural change: explore 2-swap neighborhoods to escape local optima
+    that single swaps cannot. For each pair of indices (i, j), try replacing
+    both simultaneously with new values. This allows coordinated moves that
+    can reduce peak by redistributing representations across multiple targets.
+    """
+    A = sorted(A)
+    A_set = set(A)
+    counts = _pair_counts(A)
+
+    if not _is_valid(counts):
+        return (A, float('inf'))
+
+    current_peak = _get_peak(counts)
+    current_score = _score(counts)
+    best_A = list(A)
+    best_peak = current_peak
+    best_score = current_score
+
+    n = len(A)
+    if n < 2:
+        return (best_A, best_peak)
+
+    improved = True
+    stall_count = 0
+    max_stall = 15
+
+    while improved and _elapsed() < max_time:
+        improved = False
+        stall_count += 1
+
+        # Randomly select pairs of indices to try two-swap moves
+        pair_indices = list(range(n))
+        random.shuffle(pair_indices)
+
+        for i in pair_indices:
+            if _elapsed() > max_time:
+                break
+            for j in pair_indices[i + 1:]:
+                if _elapsed() > max_time:
+                    break
+
+                ai = A[i]
+                aj = A[j]
+
+                # Generate candidate replacements
+                candidates_i = [x for x in range(0, N + 1) if x not in A_set and x != ai and x != aj]
+                candidates_j = [x for x in range(0, N + 1) if x not in A_set and x != ai and x != aj and x != ai]
+
+                if not candidates_i or not candidates_j:
+                    continue
+
+                # Limit candidates to keep computation manageable
+                random.shuffle(candidates_i)
+                random.shuffle(candidates_j)
+                candidates_i = candidates_i[:20]
+                candidates_j = candidates_j[:20]
+
+                for x_i in candidates_i:
+                    if _elapsed() > max_time:
+                        break
+                    for x_j in candidates_j:
+                        if x_i == x_j:
+                            continue
+
+                        # Compute new counts after removing ai, aj and adding x_i, x_j
+                        new_counts = counts.copy()
+
+                        # Remove contributions of ai
+                        s = ai + ai
+                        if TARGET_LO <= s <= TARGET_HI:
+                            new_counts[s - TARGET_LO] -= 1
+                        for k in range(n):
+                            if k == i or k == j:
+                                continue
+                            ak = A[k]
+                            s = ai + ak
+                            if TARGET_LO <= s <= TARGET_HI:
+                                new_counts[s - TARGET_LO] -= 1
+
+                        # Remove contributions of aj
+                        s = aj + aj
+                        if TARGET_LO <= s <= TARGET_HI:
+                            new_counts[s - TARGET_LO] -= 1
+                        for k in range(n):
+                            if k == i or k == j:
+                                continue
+                            ak = A[k]
+                            s = aj + ak
+                            if TARGET_LO <= s <= TARGET_HI:
+                                new_counts[s - TARGET_LO] -= 1
+
+                        # Remove pair (ai, aj)
+                        s = ai + aj
+                        if TARGET_LO <= s <= TARGET_HI:
+                            new_counts[s - TARGET_LO] -= 1
+
+                        # Add contributions of x_i
+                        s = x_i + x_i
+                        if TARGET_LO <= s <= TARGET_HI:
+                            new_counts[s - TARGET_LO] += 1
+                        for k in range(n):
+                            if k == i or k == j:
+                                continue
+                            ak = A[k]
+                            s = x_i + ak
+                            if TARGET_LO <= s <= TARGET_HI:
+                                new_counts[s - TARGET_LO] += 1
+
+                        # Add contributions of x_j
+                        s = x_j + x_j
+                        if TARGET_LO <= s <= TARGET_HI:
+                            new_counts[s - TARGET_LO] += 1
+                        for k in range(n):
+                            if k == i or k == j:
+                                continue
+                            ak = A[k]
+                            s = x_j + ak
+                            if TARGET_LO <= s <= TARGET_HI:
+                                new_counts[s - TARGET_LO] += 1
+
+                        # Add pair (x_i, x_j)
+                        s = x_i + x_j
+                        if TARGET_LO <= s <= TARGET_HI:
+                            new_counts[s - TARGET_LO] += 1
+
+                        # Check validity
+                        if np.min(new_counts) <= 0:
+                            continue
+
+                        new_peak = _get_peak(new_counts)
+                        new_score = _score(new_counts)
+
+                        if new_score < current_score - 1e-9:
+                            # Accept the two-swap move
+                            A[i] = x_i
+                            A[j] = x_j
+                            A_set.discard(ai)
+                            A_set.discard(aj)
+                            A_set.add(x_i)
+                            A_set.add(x_j)
+                            A.sort()
+                            counts = new_counts
+                            current_score = new_score
+                            current_peak = new_peak
+                            improved = True
+                            stall_count = 0
+
+                            if current_peak < best_peak or (current_peak == best_peak and current_score < best_score):
+                                best_peak = current_peak
+                                best_score = current_score
+                                best_A = list(A)
+                            break  # Restart after a successful move
+
+                    if improved:
+                        break
+
+        if not improved and stall_count >= max_stall:
+            break
+
+    return (best_A, best_peak)
+
+
+def construct():
+    global _START_TIME
+    _START_TIME = time.time()
+
+    rng = random.Random(42)
+
+    best_A = None
+    best_peak = float('inf')
+
+    # Strategy:
+    # 1. Generate initial sets using greedy methods with different seeds.
+    # 2. Apply local search, balance polish, simulated annealing, and two-move search.
+    # 3. Keep the best.
+
+    sizes_to_try = [15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25]
+
+    for size in sizes_to_try:
+        if _elapsed() > DEADLINE - 5:
+            break
+
+        restarts = 4
+
+        for r in range(restarts):
+            if _elapsed() > DEADLINE - 2:
+                break
+
+            # Generate initial A
+            if r == 0:
+                A_init, _ = _greedy_balanced_build(rng, target_size=size, max_time=DEADLINE - 10)
+                if len(A_init) < size:
+                    A_set = set(A_init)
+                    while len(A_init) < size:
+                        x = rng.randint(0, N)
+                        if x not in A_set:
+                            A_init.append(x)
+                            A_set.add(x)
+                elif len(A_init) > size:
+                    A_init = rng.sample(A_init, size)
+            elif r == 1:
+                A_init, _ = _greedy_build(rng, max_time=DEADLINE - 10)
+                if len(A_init) < size:
+                    A_set = set(A_init)
+                    while len(A_init) < size:
+                        x = rng.randint(0, N)
+                        if x not in A_set:
+                            A_init.append(x)
+                            A_set.add(x)
+                elif len(A_init) > size:
+                    A_init = rng.sample(A_init, size)
+            elif r == 2:
+                A_init = rng.sample(range(0, N + 1), size)
+            else:
+                rng2 = random.Random(42 + r * 1000)
+                A_init, _ = _greedy_balanced_build(rng2, target_size=size, max_time=DEADLINE - 10)
+                if len(A_init) < size:
+                    A_set = set(A_init)
+                    while len(A_init) < size:
+                        x = rng2.randint(0, N)
+                        if x not in A_set:
+                            A_init.append(x)
+                            A_set.add(x)
+                elif len(A_init) > size:
+                    A_init = rng2.sample(A_init, size)
+
+            A_init = sorted(A_init)
+
+            # Check validity
+            counts = _pair_counts(A_init)
+            if not _is_valid(counts):
+                A_fixed = _fix_coverage(A_init, rng, max_time=DEADLINE - 10)
+                if A_fixed is None:
+                    continue
+                A_init = A_fixed
+
+            # Local Search
+            A_opt, peak = _local_search(A_init, max_time=DEADLINE - 15)
+
+            if peak < best_peak:
+                best_peak = peak
+                best_A = A_opt
+
+            # Balance Polish
+            if _elapsed() < DEADLINE - 10:
+                A_polished, peak_polished = _balance_polish(A_opt, max_time=DEADLINE - 15)
+                if peak_polished < best_peak:
+                    best_peak = peak_polished
+                    best_A = A_polished
+
+            # Two-move search (new structural component)
+            if _elapsed() < DEADLINE - 10 and best_peak > 3:
+                A_two, peak_two = _two_move_search(A_polished, max_time=DEADLINE - 15)
+                if peak_two < best_peak:
+                    best_peak = peak_two
+                    best_A = A_two
+
+            # Simulated Annealing (only if we have time)
+            if _elapsed() < DEADLINE - 5 and best_peak > 3:
+                A_sa, peak_sa = _simulated_annealing(
+                    A_two if _elapsed() < DEADLINE - 10 else A_opt,
+                    max_time=DEADLINE - 5
+                )
+                if peak_sa < best_peak:
+                    best_peak = peak_sa
+                    best_A = A_sa
+
+            # Early termination if peak is very low
+            if best_peak <= 3:
+                break
+
+        if best_peak <= 3:
+            break
+
+    # Fallback
+    if best_A is None:
+        best_A = list(range(0, 129))
+
+    return best_A

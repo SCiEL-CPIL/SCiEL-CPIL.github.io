@@ -4,6 +4,7 @@ import random
 import math
 from typing import List, Tuple
 from collections import defaultdict
+from functools import lru_cache
 
 def pack(boxes, container):
     W, H, D = container
@@ -26,6 +27,7 @@ def pack(boxes, container):
         """
         Find a position (x, y, z) where box (w, h, d) fits without overlap.
         Uses all unique coordinate combinations from box faces.
+        Optimized with early exit and spatial sorting.
         """
         if not existing_items:
             if w <= W and h <= H and d <= D:
@@ -61,13 +63,16 @@ def pack(boxes, container):
         
         candidates.sort(key=lambda c: (c[2], c[1], c[0]))
         
+        # Pre-compute item boundaries for faster overlap check
+        items_bounds = [(ex, ex + ew, ey, ey + eh, ez, ez + ed) for (ex, ey, ez, ew, eh, ed) in existing_items]
+        
         for (cx, cy, cz) in candidates:
             # Check overlap with all existing items
             overlap = False
-            for (ex, ey, ez, ew, eh, ed) in existing_items:
-                if (cx < ex + ew and ex < cx + w and
-                    cy < ey + eh and ey < cy + h and
-                    cz < ez + ed and ez < cz + d):
+            for (ex_min, ex_max, ey_min, ey_max, ez_min, ez_max) in items_bounds:
+                if (cx < ex_max and ex_min < cx + w and
+                    cy < ey_max and ey_min < cy + h and
+                    cz < ez_max and ez_min < cz + d):
                     overlap = True
                     break
             if not overlap:
@@ -75,95 +80,53 @@ def pack(boxes, container):
         
         return None
     
-    def try_place_in_bin(bin_items, w, h, d, W, H, D):
-        """Try to place box in a specific bin, return position or None."""
-        return find_position(bin_items, w, h, d, W, H, D)
-    
-    def compute_bin_fragmentation(bin_items, W, H, D):
-        """Estimate spatial fragmentation of a bin by checking how many small cubes fit."""
-        if not bin_items:
-            return 0.0
-        # Sample a grid of small test cubes
-        test_size = max(1, min(W, H, D) // 8)
-        free_cells = 0
-        total_cells = (W // test_size) * (H // test_size) * (D // test_size)
-        if total_cells == 0:
-            return 0.0
-        for gx in range(0, W, test_size):
-            for gy in range(0, H, test_size):
-                for gz in range(0, D, test_size):
-                    fits = True
-                    for (ex, ey, ez, ew, eh, ed) in bin_items:
-                        if (gx < ex + ew and ex < gx + test_size and
-                            gy < ey + eh and ey < gy + test_size and
-                            gz < ez + ed and ez < gz + test_size):
-                            fits = False
-                            break
-                    if fits:
-                        free_cells += 1
-        return 1.0 - free_cells / total_cells
-    
-    def bin_score(bin_items, new_vol, W, H, D):
-        """
-        Score a bin for placing a new box. Lower is better.
-        Combines fill fraction and fragmentation penalty.
-        """
-        current_vol = sum(ew*eh*ed for (_,_,_,ew,eh,ed) in bin_items)
-        fill_frac = (current_vol + new_vol) / container_vol
-        frag = compute_bin_fragmentation(bin_items, W, H, D)
-        # Prefer higher fill, lower fragmentation
-        return -fill_frac + 0.3 * frag
-    
-    def pack_with_order(ordering, state_init=None):
-        """Pack boxes in given order. Returns placements list or None."""
-        state = {} if state_init is None else dict(state_init)
+    def pack_with_order(ordering):
+        """Pack boxes in given order using best-fit-decreasing heuristic.
+        Returns placements list or None."""
         placements = [None] * n
-        all_placed = True
+        bins = []  # list of (bin_id, items_list, current_vol)
         
         for box_idx in ordering:
             if time.time() > deadline:
-                all_placed = False
-                break
+                return None
             
             w, h, d = boxes[box_idx]
             box_vol = w * h * d
             
-            # Try existing bins: prefer bin that minimizes waste + fragmentation
-            best_bin = None
+            # Try existing bins: best-fit (place in bin with least remaining space after placement)
+            best_bin_idx = -1
             best_pos = None
-            best_score_val = float('inf')
+            best_remaining = float('inf')
             
-            bin_ids = list(state.keys())
-            # Sort bins by current fill volume descending (check fuller bins first)
-            bin_vols = {bid: sum(ew*eh*ed for (_,_,_,ew,eh,ed) in state[bid]) for bid in bin_ids}
-            bin_ids_sorted = sorted(bin_ids, key=lambda bid: bin_vols[bid], reverse=True)
-            
-            for bin_id in bin_ids_sorted:
-                pos = try_place_in_bin(state[bin_id], w, h, d, W, H, D)
+            for bi, (bid, items, cur_vol) in enumerate(bins):
+                pos = find_position(items, w, h, d, W, H, D)
                 if pos is not None:
-                    score_val = bin_score(state[bin_id], box_vol, W, H, D)
-                    if score_val < best_score_val:
-                        best_score_val = score_val
-                        best_bin = bin_id
+                    remaining = container_vol - (cur_vol + box_vol)
+                    if remaining < best_remaining:
+                        best_remaining = remaining
+                        best_bin_idx = bi
                         best_pos = pos
             
-            if best_bin is not None:
-                state[best_bin] = state[best_bin] + [(best_pos[0], best_pos[1], best_pos[2], w, h, d)]
-                placements[box_idx] = (best_bin, best_pos[0], best_pos[1], best_pos[2], w, h, d)
+            if best_bin_idx >= 0:
+                bid, items, cur_vol = bins[best_bin_idx]
+                items.append((best_pos[0], best_pos[1], best_pos[2], w, h, d))
+                bins[best_bin_idx] = (bid, items, cur_vol + box_vol)
+                placements[box_idx] = (bid, best_pos[0], best_pos[1], best_pos[2], w, h, d)
             else:
                 # Open new bin
-                new_bin_id = max(state.keys()) + 1 if state else 0
-                state[new_bin_id] = [(0, 0, 0, w, h, d)]
+                new_bin_id = len(bins)
+                items = [(0, 0, 0, w, h, d)]
+                bins.append((new_bin_id, items, box_vol))
                 placements[box_idx] = (new_bin_id, 0, 0, 0, w, h, d)
         
-        if all_placed and all(p is not None for p in placements):
+        if all(p is not None for p in placements):
             return placements
         return None
     
-    def local_search_polish(placements, W, H, D, max_iterations=50):
+    def local_search_polish(placements, max_iterations=100):
         """
-        Local search: try to move boxes to other bins or reposition within bins
-        to reduce total bins used or improve last-bin fill.
+        Local search: try to move boxes to other bins to reduce total bins used
+        or improve last-bin fill.
         """
         if not placements:
             return placements
@@ -182,7 +145,7 @@ def pack(boxes, container):
             iterations += 1
             
             # Try moving each box to another bin if it fits
-            for box_idx in list(range(n)):
+            for box_idx in sorted(range(n), key=lambda i: -box_vols[i]):
                 if time.time() > deadline - 5:
                     break
                 b, x, y, z, w, h, d = placements[box_idx]
@@ -220,49 +183,43 @@ def pack(boxes, container):
     # Generate diverse orderings
     orderings = []
     
-    # 1. Volume descending
+    # 1. Volume descending (primary)
     orderings.append(indices_sorted)
     
-    # 2. Volume ascending
-    orderings.append(list(reversed(indices_sorted)))
-    
-    # 3. Original order
-    orderings.append(indices)
-    
-    # 4. Max dimension descending
+    # 2. Max dimension descending
     orderings.append(sorted(indices, key=lambda i: max(boxes[i]), reverse=True))
     
-    # 5. Surface area descending
+    # 3. Surface area descending
     orderings.append(sorted(indices, key=lambda i: 2*(boxes[i][0]*boxes[i][1] + boxes[i][1]*boxes[i][2] + boxes[i][0]*boxes[i][2]), reverse=True))
     
-    # 6. Aspect ratio based
+    # 4. Sort by (w+h+d) descending
+    orderings.append(sorted(indices, key=lambda i: boxes[i][0]+boxes[i][1]+boxes[i][2], reverse=True))
+    
+    # 5. Sort by min(w,h) descending
+    orderings.append(sorted(indices, key=lambda i: min(boxes[i][0], boxes[i][1]), reverse=True))
+    
+    # 6. Sort by aspect ratio (square-ish first)
     orderings.append(sorted(indices, key=lambda i: min(boxes[i][0], boxes[i][1], boxes[i][2]) / max(boxes[i][0], boxes[i][1], boxes[i][2]), reverse=True))
     
-    # 7. Randomized volume descending (two variants)
-    for seed in [42, 123]:
+    # 7. Randomized volume descending (several variants)
+    for seed in [42, 123, 7, 99, 256]:
         random.seed(seed)
         shuffled = indices_sorted[:]
         random.shuffle(shuffled)
         orderings.append(shuffled)
     
-    # 8. Weighted by volume^0.5
-    orderings.append(sorted(indices, key=lambda i: math.sqrt(box_vols[i]), reverse=True))
+    # 8. Sort by max dimension, then volume
+    orderings.append(sorted(indices, key=lambda i: (max(boxes[i]), box_vols[i]), reverse=True))
     
-    # 9. Sort by minimum dimension
-    orderings.append(sorted(indices, key=lambda i: min(boxes[i]), reverse=True))
+    # 9. Sort by surface area, then volume
+    orderings.append(sorted(indices, key=lambda i: (2*(boxes[i][0]*boxes[i][1] + boxes[i][1]*boxes[i][2] + boxes[i][0]*boxes[i][2]), box_vols[i]), reverse=True))
     
-    # 10. Sort by maximum dimension
-    orderings.append(sorted(indices, key=lambda i: max(boxes[i]), reverse=True))
-    
-    # 11. Sort by (w+h+d) descending - larger perimeter first
-    orderings.append(sorted(indices, key=lambda i: boxes[i][0]+boxes[i][1]+boxes[i][2], reverse=True))
-    
-    # 12. Sort by min(w,h) descending - wider bases first
-    orderings.append(sorted(indices, key=lambda i: min(boxes[i][0], boxes[i][1]), reverse=True))
+    # 10. Sort by min dimension, then volume
+    orderings.append(sorted(indices, key=lambda i: (min(boxes[i]), box_vols[i]), reverse=True))
     
     # Run all orderings and keep the best
     for ordering in orderings:
-        if time.time() > deadline:
+        if time.time() > deadline - 10:
             break
         
         result = pack_with_order(ordering)
@@ -289,8 +246,8 @@ def pack(boxes, container):
         best_result = placements
     
     # Local search polish to improve packing
-    if best_result and time.time() < deadline - 10:
-        best_result = local_search_polish(best_result, W, H, D)
+    if best_result and time.time() < deadline - 15:
+        best_result = local_search_polish(best_result, max_iterations=150)
         best_score = compute_score(best_result, W, H, D)
     
     # Post-process: relabel bins to be consecutive starting from 0

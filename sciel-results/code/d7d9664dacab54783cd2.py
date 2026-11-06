@@ -1,0 +1,38 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import time
+
+def construct():
+    """
+    Return the smallest integer n in [1, 1000000] such that phi(n) is divisible by 120.
+    Uses a totient sieve for efficiency.
+    """
+    start_time = time.time()
+    deadline = start_time + 85.0  # Safety margin before 90s limit
+    
+    N = 1000000
+    # Initialize phi[i] = i
+    phi = list(range(N + 1))
+    
+    # Sieve for totient
+    for i in range(2, N + 1):
+        if phi[i] == i:  # i is prime
+            # Check deadline
+            if time.time() > deadline:
+                # If we've run out of time, we can't complete the sieve.
+                # However, the sieve is fast enough that this shouldn't happen.
+                # We'll just break and try to return the best we can, but we can't
+                # really return a valid answer without the full phi array.
+                # For now, just raise an error or return a fallback.
+                # Actually, the sieve for N=1e6 is very fast (<0.1s), so this is safe.
+                pass
+            for j in range(i, N + 1, i):
+                phi[j] = phi[j] // i * (i - 1)
+    
+    # Find smallest n with phi[n] divisible by 120
+    for n in range(1, N + 1):
+        if phi[n] % 120 == 0:
+            return n
+    
+    return -1
+# EVOLVE-BLOCK-END

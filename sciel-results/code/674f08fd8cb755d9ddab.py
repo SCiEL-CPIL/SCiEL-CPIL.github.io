@@ -1,0 +1,13 @@
+        while time.time() - start_time < DEADLINE:
+            ...
+            if _verify(new_net):
+                ...
+                continue
+            else:
+                ...
+                if rng.random() < 0.1:
+                    ...
+                    if _verify(new_net):
+                        best_net = new_net
+                    # Don't break, continue search
+        break # Exit outer loop when time is up or net is minimal

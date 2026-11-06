@@ -1,0 +1,195 @@
+"""Quantum information: fixed-depth QAOA parameter design."""
+# EVOLVE-BLOCK-START
+import time
+import numpy as np
+from scipy.optimize import minimize
+
+_DEADLINE = 145.0
+_SAFETY = 5.0
+_T0 = time.time()
+_RNG_SEED = 713
+
+def _remaining():
+    return _DEADLINE - _SAFETY - (time.time() - _T0)
+
+def _precompute_cuts(n, edges):
+    """Precompute cut values for all 2^n basis states."""
+    num_states = 2**n
+    cuts = np.zeros(num_states, dtype=np.float64)
+    states = np.arange(num_states, dtype=np.int64)
+    for u, v in edges:
+        bits_u = (states >> u) & 1
+        bits_v = (states >> v) & 1
+        mask = bits_u != bits_v
+        cuts[mask] += 1
+    return cuts
+
+def _expected_cut(n, cuts, gamma1, beta1, gamma2, beta2):
+    """
+    Compute expected cut for 2-layer QAOA.
+    Optimized state-vector simulation.
+    """
+    psi = np.ones(2**n, dtype=np.complex128) / np.sqrt(2**n)
+    
+    # Layer 1
+    psi = psi * np.exp(-1j * gamma1 * cuts)
+    if abs(beta1) > 1e-9:
+        c = np.cos(beta1)
+        s = np.sin(beta1)
+        for k in range(n):
+            shape = (2**(n-k-1), 2, 2**k)
+            psi_reshaped = psi.reshape(shape)
+            p0 = psi_reshaped[:, 0, :].copy()
+            p1 = psi_reshaped[:, 1, :].copy()
+            psi_reshaped[:, 0, :] = c * p0 - 1j * s * p1
+            psi_reshaped[:, 1, :] = -1j * s * p0 + c * p1
+            psi = psi_reshaped.reshape(-1)
+            
+    # Layer 2
+    psi = psi * np.exp(-1j * gamma2 * cuts)
+    if abs(beta2) > 1e-9:
+        c = np.cos(beta2)
+        s = np.sin(beta2)
+        for k in range(n):
+            shape = (2**(n-k-1), 2, 2**k)
+            psi_reshaped = psi.reshape(shape)
+            p0 = psi_reshaped[:, 0, :].copy()
+            p1 = psi_reshaped[:, 1, :].copy()
+            psi_reshaped[:, 0, :] = c * p0 - 1j * s * p1
+            psi_reshaped[:, 1, :] = -1j * s * p0 + c * p1
+            psi = psi_reshaped.reshape(-1)
+
+    probs = np.abs(psi)**2
+    return np.sum(probs * cuts)
+
+def _local_search(n, cuts, x0, maxiter=500, tol=1e-8):
+    """Perform a local Nelder-Mead search starting from x0."""
+    def obj(x):
+        if _remaining() < 1.0:
+            return 1e10
+        g1, b1, g2, b2 = x
+        val = _expected_cut(n, cuts, g1, b1, g2, b2)
+        return -val
+    
+    lower = [0.0, 0.0, 0.0, 0.0]
+    upper = [np.pi, np.pi/2, np.pi, np.pi/2]
+    
+    # Clip initial point to bounds
+    x0_clipped = np.clip(x0, lower, upper)
+    
+    try:
+        res = minimize(
+            obj, 
+            x0_clipped, 
+            method='Nelder-Mead', 
+            options={'maxiter': maxiter, 'xatol': tol, 'fatol': tol, 'adaptive': True, 'maxfev': maxiter * 5}
+        )
+        return res.x, -res.fun
+    except Exception:
+        return x0, _expected_cut(n, cuts, *x0)
+
+def _polish(n, cuts, x0):
+    """High-precision polish using L-BFGS-B with tighter tolerances."""
+    def obj(x):
+        if _remaining() < 0.5:
+            return 1e10
+        g1, b1, g2, b2 = x
+        val = _expected_cut(n, cuts, g1, b1, g2, b2)
+        return -val
+    
+    lower = [0.0, 0.0, 0.0, 0.0]
+    upper = [np.pi, np.pi/2, np.pi, np.pi/2]
+    
+    # Clip initial point to bounds
+    x0_clipped = np.clip(x0, lower, upper)
+    
+    try:
+        res = minimize(
+            obj,
+            x0_clipped,
+            method='L-BFGS-B',
+            bounds=list(zip(lower, upper)),
+            options={'maxiter': 3000, 'ftol': 1e-14, 'gtol': 1e-12, 'maxls': 50}
+        )
+        return res.x, -res.fun
+    except Exception:
+        return x0, _expected_cut(n, cuts, *x0)
+
+def angles(n, edges, p):
+    if _remaining() < 1.0:
+        return np.array([[0.5, 0.5], [0.5, 0.5]], dtype=np.float64)
+    
+    cuts = _precompute_cuts(n, edges)
+    
+    best_x = [0.5, 0.5, 0.5, 0.5]
+    best_val = _expected_cut(n, cuts, *best_x)
+    
+    rng = np.random.default_rng(_RNG_SEED)
+    
+    # Phase 1: Structured grid + random search for diverse starting points
+    # Use a moderate grid (6^4 = 1296 points) for systematic coverage
+    grid_size = 6
+    grid_points = []
+    for g1 in np.linspace(0.1, np.pi - 0.1, grid_size):
+        for b1 in np.linspace(0.05, np.pi/2 - 0.05, grid_size):
+            for g2 in np.linspace(0.1, np.pi - 0.1, grid_size):
+                for b2 in np.linspace(0.05, np.pi/2 - 0.05, grid_size):
+                    grid_points.append((g1, b1, g2, b2))
+    
+    # Add random points for better coverage
+    n_random = 200
+    for i in range(n_random):
+        if _remaining() < 5.0:
+            break
+        g1 = rng.uniform(0.05, np.pi - 0.05)
+        b1 = rng.uniform(0.02, np.pi/2 - 0.02)
+        g2 = rng.uniform(0.05, np.pi - 0.05)
+        b2 = rng.uniform(0.02, np.pi/2 - 0.02)
+        grid_points.append((g1, b1, g2, b2))
+    
+    # Evaluate all candidates
+    candidates = []
+    for pt in grid_points:
+        if _remaining() < 3.0:
+            break
+        val = _expected_cut(n, cuts, *pt)
+        candidates.append((val, list(pt)))
+    
+    # Sort by value (descending)
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    
+    # Phase 2: Local Refinement on Top Candidates
+    n_refine = min(20, len(candidates))
+    for i in range(n_refine):
+        if _remaining() < 8.0:
+            break
+        
+        val, x = candidates[i]
+        refined_x, refined_val = _local_search(n, cuts, x, maxiter=400, tol=1e-8)
+        
+        if refined_val > best_val:
+            best_val = refined_val
+            best_x = refined_x
+            
+    # Phase 3: Deep Polish on the Best Result
+    if _remaining() > 8.0:
+        final_x, final_val = _local_search(n, cuts, best_x, maxiter=2000, tol=1e-10)
+        if final_val > best_val:
+            best_val = final_val
+            best_x = final_x
+    
+    # Phase 4: High-precision polish with L-BFGS-B
+    if _remaining() > 4.0:
+        polished_x, polished_val = _polish(n, cuts, best_x)
+        if polished_val > best_val:
+            best_val = polished_val
+            best_x = polished_x
+
+    result = np.array([
+        [best_x[0], best_x[1]],
+        [best_x[2], best_x[3]]
+    ], dtype=np.float64)
+    
+    return result
+
+# EVOLVE-BLOCK-END
