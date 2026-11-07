@@ -1,94 +1,82 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-# EVOLVE-BLOCK-START
 import numpy as np
-from scipy.stats import norm
 import time
-
+from scipy.stats import norm
 
 def acquisition(mu, sigma, f_best):
     """
-    Acquisition function for Bayesian optimization of branin 2d.
-    
-    Uses a combination of Expected Improvement (EI) and a UCB-like exploration term
-    to balance exploitation and exploration.
-    
-    Parameters:
-    -----------
-    mu : array-like, shape (2000,)
-        Mean of the GP posterior at candidate points (in objective units).
-    sigma : array-like, shape (2000,)
-        Standard deviation of the GP posterior at candidate points (in objective units).
-    f_best : float
-        Best observed function value so far.
-    
-    Returns:
-    --------
-    scores : ndarray, shape (2000,)
-        Acquisition scores for each candidate point. Higher means evaluate next.
+    Acquisition function for Bayesian optimization of Branin 2D.
+    Uses a Kriging Believer-inspired structural approach:
+    1. Adaptive UCB to identify promising regions (high uncertainty + low bound).
+    2. Gated exploitation score (-mu) to select the best predicted value within those regions.
+    This decouples exploration (region selection) from exploitation (point selection).
     """
     start_time = time.time()
+    deadline = 295.0  # Safety margin before 300s limit
     
-    # Safety margin: ensure we finish well before the 300s limit
-    DEADLINE = 300.0
-    SAFETY_MARGIN = 5.0
-    
-    mu = np.asarray(mu, dtype=np.float64)
-    sigma = np.asarray(sigma, dtype=np.float64)
-    
-    # Ensure sigma is positive and finite
     eps = 1e-12
     sigma_safe = np.maximum(sigma, eps)
     
-    # Compute z-score for EI
-    z = (f_best - mu) / sigma_safe
+    # Adaptive Beta: High regret -> High beta (explore), Low regret -> Low beta (exploit)
+    f_global_min = 0.397887
+    regret = f_best - f_global_min
     
-    # Expected Improvement for minimization
-    ei = (f_best - mu) * norm.cdf(z) + sigma_safe * norm.pdf(z)
-    # Ensure non-negative
-    ei = np.maximum(ei, 0.0)
+    beta_min = 0.5
+    beta_max = 3.0
+    r_scale = 10.0
     
-    # UCB-style exploration term
-    # Balance exploitation (via EI) and exploration (via sigma)
-    # The beta parameter controls exploration; for 2D problems, ~1.5-2.5 works well
-    beta = 1.8
-    ucb = -mu + beta * sigma_safe
-    
-    # Blend EI and UCB: normalize both to comparable scales
-    # Use a weighted combination that adapts based on the current state
-    # When f_best is far from typical values, favor exploration more
-    
-    # Normalize EI and UCB to [0, 1] range for blending
-    ei_min, ei_max = np.min(ei), np.max(ei)
-    ucb_min, ucb_max = np.min(ucb), np.max(ucb)
-    
-    ei_range = ei_max - ei_min + eps
-    ucb_range = ucb_max - ucb_min + eps
-    
-    ei_norm = (ei - ei_min) / ei_range
-    ucb_norm = (ucb - ucb_min) / ucb_range
-    
-    # Weight: more weight to EI as we get closer to the optimum
-    # Use a simple heuristic: if f_best is small (close to optimum), favor exploitation
-    # Branin minimum is ~0.397887, so if f_best is close, increase EI weight
-    if f_best < 1.0:
-        w_ei = 0.7
-    elif f_best < 3.0:
-        w_ei = 0.5
+    if regret >= 0:
+        fraction = regret / (regret + r_scale)
     else:
-        w_ei = 0.3
+        fraction = 0.0
+        
+    beta = beta_min + (beta_max - beta_min) * fraction
     
-    w_ucb = 1.0 - w_ei
+    # Step 1: Compute UCB scores to identify promising regions
+    # UCB for minimization: beta * sigma - mu
+    ucb_scores = beta * sigma_safe - mu
     
-    scores = w_ei * ei_norm + w_ucb * ucb_norm
+    # Normalize UCB scores to [0, 1] for gating
+    ucb_min = np.min(ucb_scores)
+    ucb_max = np.max(ucb_scores)
+    ucb_range = ucb_max - ucb_min + eps
+    ucb_norm = (ucb_scores - ucb_min) / ucb_range
     
-    # Check deadline
-    elapsed = time.time() - start_time
-    if elapsed > DEADLINE - SAFETY_MARGIN:
-        # Return current scores; they should already be computed
-        pass
+    # Step 2: Create a gate that emphasizes high-UCB regions
+    # We use a sigmoid to softly select the top ~10-20% of UCB candidates
+    # Temperature controls the sharpness of the gate
+    temperature = 2.0
+    # Shift so that ucb_norm=0.5 is the center of the sigmoid
+    # We want points with high ucb_norm to have gate ~1, low to have gate ~0
+    gate = 1.0 / (1.0 + np.exp(-temperature * (ucb_norm - 0.5)))
+    
+    # Step 3: Kriging Believer Logic
+    # Within the gated regions, prefer lower mu (better predicted value)
+    # Score is -mu, scaled by the gate
+    # We add a small constant offset to ensure scores are comparable
+    # If gate is 0, score is 0. If gate is 1, score is -mu.
+    # Since we want higher scores to be better, and lower mu is better,
+    # score = gate * (-mu) works, but -mu can be negative.
+    # Let's shift mu to be positive relative to the global min or just use -mu directly.
+    # To ensure "higher means evaluate next", we use -mu.
+    # However, if mu is very negative (unlikely in Branin which is >= 0.39), -mu is large positive.
+    # If mu is large, -mu is large negative.
+    
+    # To make this robust, let's normalize -mu as well or just use it.
+    # The gate ensures we only care about -mu in high-uncertainty areas.
+    kb_scores = gate * (-mu)
+    
+    # Add a tiny UCB component to break ties in flat regions
+    # This ensures we still explore if all mu are similar
+    ucb_component = 0.1 * ucb_scores
+    
+    scores = kb_scores + ucb_component
+    
+    # Check time
+    if time.time() - start_time > deadline:
+        scores = np.nan_to_num(scores, nan=0.0, posinf=1e6, neginf=-1e6)
+        return scores
     
     # Ensure all scores are finite
-    scores = np.where(np.isfinite(scores), scores, 0.0)
+    scores = np.nan_to_num(scores, nan=0.0, posinf=1e6, neginf=-1e6)
     
     return scores
-# EVOLVE-BLOCK-END

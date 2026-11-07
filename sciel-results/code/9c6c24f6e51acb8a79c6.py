@@ -1,0 +1,228 @@
+"""Hybrid (1+1)-ES with CMA-style adaptation + Nelder-Mead local refinement."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+
+class Optimizer:
+    """Hybrid (1+1)-ES exploration + Nelder-Mead refinement with time guard."""
+
+    def __init__(self, budget, dim):
+        self.budget = budget
+        self.dim = dim
+
+    def __call__(self, func):
+        start_time = time.time()
+        deadline = start_time + 290.0  # Safety margin for 330s limit
+        dim = self.dim
+        budget = self.budget
+        calls = 0
+        best_x = None
+        best_f = np.inf
+
+        def time_ok():
+            return time.time() < deadline
+
+        def budget_ok():
+            return calls < budget
+
+        def record(x, f):
+            nonlocal best_x, best_f
+            if f < best_f:
+                best_f = f
+                best_x = x.copy()
+
+        rng = np.random.default_rng(42)
+
+        # Phase 1: (1+1)-ES with adaptive step size for global exploration
+        # Start from origin, which is a reasonable default
+        x = np.zeros(dim)
+        f_x = func(x)
+        calls += 1
+        record(x, f_x)
+
+        sigma = 2.0  # Initial step size - larger for better global exploration
+        target_success = 1 / (dim + 1)  # ~16% success rate for dim=5
+        no_improve = 0
+        success_count = 0
+        total_count = 0
+
+        # Run (1+1)-ES for a portion of the budget
+        es_budget = int(budget * 0.4)  # Use 40% of budget for exploration
+        es_calls = 0
+
+        while es_calls < es_budget and time_ok() and budget_ok():
+            # Generate mutant
+            step = rng.standard_normal(dim) * sigma
+            x_new = x + step
+            x_new = np.clip(x_new, -5, 5)
+
+            f_new = func(x_new)
+            calls += 1
+            es_calls += 1
+            record(x_new, f_new)
+            total_count += 1
+
+            if f_new <= f_x:
+                # Success: move to new point
+                x = x_new
+                f_x = f_new
+                no_improve = 0
+                success_count += 1
+                # Increase sigma slightly on success
+                sigma *= 1.1
+            else:
+                # Failure: stay at current point
+                no_improve += 1
+                # Decrease sigma on failure
+                sigma *= 0.9
+
+            # Clamp sigma to reasonable range
+            sigma = np.clip(sigma, 0.01, 10.0)
+
+            # If no improvement for a long time, restart from a random point
+            if no_improve > 20:
+                x = rng.uniform(-5, 5, dim)
+                f_x = func(x)
+                calls += 1
+                es_calls += 1
+                record(x, f_x)
+                sigma = 2.0
+                no_improve = 0
+
+        # Phase 2: Nelder-Mead refinement from the best point found by ES
+        if best_x is not None:
+            x0 = best_x.copy()
+            f0 = best_f
+
+            # Build initial simplex with adaptive alpha based on recent sigma
+            alpha = min(0.3, max(0.1, sigma * 0.5))
+            simplex = [x0.copy()]
+            f_simplex = [f0]
+
+            for i in range(dim):
+                if not time_ok() or not budget_ok():
+                    break
+                x_i = x0.copy()
+                x_i[i] += alpha
+                x_i = np.clip(x_i, -5, 5)
+                f_i = func(x_i)
+                calls += 1
+                simplex.append(x_i)
+                f_simplex.append(f_i)
+                record(x_i, f_i)
+
+            if len(simplex) >= 2:
+                # Nelder-Mead parameters
+                gamma = 1.0
+                rho = 2.0
+                sigma_nm = 0.5
+                shrink = 0.5
+
+                # Track best in this phase
+                phase_best_x = best_x.copy()
+                phase_best_f = best_f
+
+                while time_ok() and budget_ok():
+                    # Sort simplex by function value
+                    indices = np.argsort(f_simplex)
+                    simplex = [simplex[i] for i in indices]
+                    f_simplex = [f_simplex[i] for i in indices]
+
+                    x_best = simplex[0]
+                    f_best = f_simplex[0]
+                    x_worst = simplex[-1]
+                    f_worst = f_simplex[-1]
+                    x_second_worst = simplex[-2]
+                    f_second_worst = f_simplex[-2]
+
+                    # Centroid of all but worst
+                    centroid = np.mean(simplex[:-1], axis=0)
+
+                    # Reflection
+                    x_r = centroid + gamma * (centroid - x_worst)
+                    x_r = np.clip(x_r, -5, 5)
+                    if not time_ok() or not budget_ok():
+                        break
+                    f_r = func(x_r)
+                    calls += 1
+                    record(x_r, f_r)
+                    if f_r < phase_best_f:
+                        phase_best_f = f_r
+                        phase_best_x = x_r.copy()
+
+                    if f_r < f_best:
+                        # Expansion
+                        x_e = centroid + rho * (x_r - centroid)
+                        x_e = np.clip(x_e, -5, 5)
+                        if not time_ok() or not budget_ok():
+                            break
+                        f_e = func(x_e)
+                        calls += 1
+                        record(x_e, f_e)
+                        if f_e < phase_best_f:
+                            phase_best_f = f_e
+                            phase_best_x = x_e.copy()
+                        if f_e < f_r:
+                            simplex[-1] = x_e
+                            f_simplex[-1] = f_e
+                        else:
+                            simplex[-1] = x_r
+                            f_simplex[-1] = f_r
+                    elif f_r < f_second_worst:
+                        simplex[-1] = x_r
+                        f_simplex[-1] = f_r
+                    else:
+                        # Contraction
+                        if f_r < f_worst:
+                            # Outside contraction
+                            x_c = centroid + sigma_nm * (x_r - centroid)
+                        else:
+                            # Inside contraction
+                            x_c = centroid - sigma_nm * (x_worst - centroid)
+                        x_c = np.clip(x_c, -5, 5)
+
+                        if not time_ok() or not budget_ok():
+                            break
+                        f_c = func(x_c)
+                        calls += 1
+                        record(x_c, f_c)
+                        if f_c < phase_best_f:
+                            phase_best_f = f_c
+                            phase_best_x = x_c.copy()
+
+                        if f_c < min(f_r, f_worst):
+                            simplex[-1] = x_c
+                            f_simplex[-1] = f_c
+                        else:
+                            # Shrink
+                            for i in range(1, len(simplex)):
+                                if not time_ok() or not budget_ok():
+                                    break
+                                simplex[i] = x_best + shrink * (simplex[i] - x_best)
+                                simplex[i] = np.clip(simplex[i], -5, 5)
+                                f_simplex[i] = func(simplex[i])
+                                calls += 1
+                                record(simplex[i], f_simplex[i])
+                                if f_simplex[i] < phase_best_f:
+                                    phase_best_f = f_simplex[i]
+                                    phase_best_x = simplex[i].copy()
+                            if not time_ok():
+                                break
+
+                    # Check for convergence
+                    f_spread = np.max(f_simplex) - np.min(f_simplex)
+                    if f_spread < 1e-12 or np.max(np.abs(f_simplex)) < 1e-14:
+                        break
+
+                    # Also check if simplex has collapsed in space
+                    max_dist = 0
+                    for i in range(len(simplex)):
+                        for j in range(i + 1, len(simplex)):
+                            d = np.max(np.abs(simplex[i] - simplex[j]))
+                            max_dist = max(max_dist, d)
+                    if max_dist < 1e-10:
+                        break
+
+        return best_x, best_f
+# EVOLVE-BLOCK-END

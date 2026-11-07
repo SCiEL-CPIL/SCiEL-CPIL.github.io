@@ -1,0 +1,52 @@
+# EVOLVE-BLOCK-START
+import time
+import numpy as np
+from scipy.stats import norm
+
+_T0 = time.time()
+_DEADLINE = _T0 + 315.0  # safety margin vs 330s kill
+
+
+def acquisition(mu, sigma, f_best):
+    """
+    Acquisition function for Bayesian optimization of 1D sphere function.
+    Uses normalized Expected Improvement (EI) with adaptive scaling.
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+    fb = float(f_best)
+
+    # Ensure sigma is positive for stable computation
+    sigma_safe = np.maximum(sigma, 1e-8)
+
+    # Compute Expected Improvement (EI)
+    # EI(x) = (fb - mu) * Phi((fb - mu)/sigma) + sigma * phi((fb - mu)/sigma)
+    z = (fb - mu) / sigma_safe
+    ei = (fb - mu) * norm.cdf(z) + sigma_safe * norm.pdf(z)
+
+    # Clip small negative values from numerical error
+    ei = np.maximum(ei, 0.0)
+
+    # Normalize EI by the scale of f_best to make it dimensionless
+    # This helps with numerical stability and better early-stage exploration
+    scale = max(abs(fb), 1e-8)
+    ei_normalized = ei / scale
+
+    # For the sphere function, as fb approaches 0, we want pure exploitation
+    # When fb is large, we want more exploration
+    # Add a small exploration bonus that decays as fb improves
+    fb_scale = fb / (25.0 + fb)  # Maps [0, inf) to [0, 1)
+    exploration_bonus = 0.1 * fb_scale * (sigma_safe / scale)
+
+    # Final score: normalized EI plus small exploration bonus
+    score = ei_normalized + exploration_bonus
+
+    # Ensure finite values
+    score = np.where(np.isfinite(score), score, 0.0)
+
+    # If time is running out, return immediately
+    if time.time() > _DEADLINE:
+        return score
+
+    return score
+# EVOLVE-BLOCK-END

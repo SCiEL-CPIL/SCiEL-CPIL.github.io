@@ -1,0 +1,9 @@
+        best_x = np.zeros(n)
+        best_f = np.inf
+        try:
+            # ...
+            m = rng.uniform(-5, 5, n)
+            # ...
+            best_f = func(m)
+            best_x = m.copy()
+            # ...

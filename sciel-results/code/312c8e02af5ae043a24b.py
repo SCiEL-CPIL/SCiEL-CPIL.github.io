@@ -1,0 +1,246 @@
+import time
+import random
+import sys
+from collections import deque
+
+sys.setrecursionlimit(100000)
+
+def instance_trees(n=20, seed=611):
+    rng = random.Random(seed)
+    trees = []
+    for k in range(1, n + 1):
+        if k <= 2:
+            trees.append([] if k == 1 else [(0, 1)])
+            continue
+        code = [rng.randrange(k) for _ in range(k - 2)]
+        degree = [1] * k
+        for x in code:
+            degree[x] += 1
+        edges = []
+        for x in code:
+            leaf = min(v for v in range(k) if degree[v] == 1)
+            edges.append((leaf, x))
+            degree[leaf] -= 1
+            degree[x] -= 1
+        u, w = [v for v in range(k) if degree[v] == 1]
+        edges.append((u, w))
+        trees.append(edges)
+    return trees
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 145
+    
+    trees = instance_trees(20, 611)
+    n_trees = 20
+    n_vertices = 20
+    
+    # Precompute tree adjacencies and degrees
+    tree_adj = []
+    tree_edges = []
+    tree_deg = []
+    for i in range(n_trees):
+        edges = trees[i]
+        k = i + 1
+        adj_list = [[] for _ in range(k)]
+        for u, v in edges:
+            adj_list[u].append(v)
+            adj_list[v].append(u)
+        tree_adj.append(adj_list)
+        tree_edges.append(edges)
+        tree_deg.append([len(adj_list[v]) for v in range(k)])
+    
+    # Sort trees: largest first, then by "difficulty" (max degree, then total edge count)
+    # Larger trees are harder to place, so do them first
+    tree_indices = list(range(n_trees))
+    tree_indices.sort(key=lambda x: (
+        -(x + 1),  # size descending
+        -(max(tree_deg[x]) if tree_deg[x] else 0),  # max degree descending
+        -len(tree_edges[x])  # edge count descending (same as size-1 for trees)
+    ))
+    
+    best_score = 0
+    best_mappings = [None] * n_trees
+    
+    def try_packing(attempt_seed):
+        nonlocal best_score, best_mappings
+        local_rng = random.Random(attempt_seed)
+        used_edges = set()
+        mappings = [None] * n_trees
+        
+        # Precompute for each tree: list of vertices sorted by degree descending
+        # This helps with initial ordering in backtracking
+        tree_vert_order = []
+        for t_idx in range(n_trees):
+            k = t_idx + 1
+            if k <= 1:
+                tree_vert_order.append([])
+            else:
+                # Sort tree vertices by degree descending, then by index
+                order = list(range(k))
+                order.sort(key=lambda v: (-tree_deg[t_idx][v], v))
+                tree_vert_order.append(order)
+        
+        def pack_tree(tree_order_idx):
+            t_idx = tree_indices[tree_order_idx]
+            k = t_idx + 1
+            adj_t = tree_adj[t_idx]
+            edges_t = tree_edges[t_idx]
+            
+            if k == 1:
+                mappings[t_idx] = [0]
+                return True
+            
+            mapping = [-1] * k
+            used_verts = set()
+            
+            nodes_visited = 0
+            # Adaptive node limit: smaller for larger trees to avoid wasting time
+            if k >= 15:
+                max_nodes = 150000
+            elif k >= 10:
+                max_nodes = 250000
+            else:
+                max_nodes = 400000
+            
+            # Precompute edge set for quick lookup
+            edge_set_t = set((min(u, v), max(u, v)) for u, v in edges_t)
+            
+            # For value ordering: precompute adjacency in tree for conflict counting
+            def backtrack(pos):
+                nonlocal nodes_visited
+                nodes_visited += 1
+                if nodes_visited > max_nodes or time.time() > deadline:
+                    return False
+                
+                if pos == k:
+                    # Commit: add all tree edges to used_edges
+                    for u, v in edges_t:
+                        hu, hv = mapping[u], mapping[v]
+                        used_edges.add((min(hu, hv), max(hu, hv)))
+                    mappings[t_idx] = mapping[:]
+                    return True
+                
+                # MCV: Pick unmapped vertex with fewest valid host candidates
+                # Tie-break by higher degree (more constrained)
+                best_tv = -1
+                best_candidates = None
+                min_cand_count = float('inf')
+                best_tv_deg = -1
+                
+                for tv in range(k):
+                    if mapping[tv] != -1:
+                        continue
+                    
+                    candidates = []
+                    for hv in range(n_vertices):
+                        if hv in used_verts:
+                            continue
+                        valid = True
+                        for nb in adj_t[tv]:
+                            if mapping[nb] != -1:
+                                hn = mapping[nb]
+                                e = (min(hv, hn), max(hv, hn))
+                                if e in used_edges:
+                                    valid = False
+                                    break
+                        if valid:
+                            candidates.append(hv)
+                    
+                    if not candidates:
+                        return False
+                    
+                    if len(candidates) < min_cand_count or (len(candidates) == min_cand_count and tree_deg[t_idx][tv] > best_tv_deg):
+                        min_cand_count = len(candidates)
+                        best_tv = tv
+                        best_candidates = candidates
+                        best_tv_deg = tree_deg[t_idx][tv]
+                        if min_cand_count == 1:
+                            break
+                
+                if best_tv == -1:
+                    return False
+                
+                # Value ordering: prefer host vertices that are "less used" by other trees
+                # Count how many used edges touch each candidate
+                if len(best_candidates) > 1:
+                    if local_rng.random() < 0.25:
+                        local_rng.shuffle(best_candidates)
+                    else:
+                        # Prefer host vertices with fewer adjacent used edges (less constrained)
+                        def constraint_score(hv):
+                            cnt = 0
+                            for nb in adj_t[best_tv]:
+                                if mapping[nb] != -1:
+                                    hn = mapping[nb]
+                                    e = (min(hv, hn), max(hv, hn))
+                                    if e in used_edges:
+                                        cnt += 10  # heavy penalty for direct conflict with mapped neighbors
+                            # Also count used edges adjacent to hv in general (softer constraint)
+                            for e in used_edges:
+                                if hv in e:
+                                    cnt += 1
+                            return cnt
+                        best_candidates.sort(key=constraint_score)
+                
+                for hv in best_candidates:
+                    mapping[best_tv] = hv
+                    used_verts.add(hv)
+                    if backtrack(pos + 1):
+                        return True
+                    used_verts.remove(hv)
+                    mapping[best_tv] = -1
+                
+                return False
+            
+            return backtrack(0)
+        
+        success = True
+        for i in range(n_trees):
+            if time.time() > deadline:
+                success = False
+                break
+            if pack_tree(i):
+                pass
+            else:
+                success = False
+                break
+        
+        score = 0
+        for i in range(n_trees):
+            if mappings[i] is not None:
+                score += len(tree_edges[i])
+        
+        if score > best_score:
+            best_score = score
+            best_mappings = [mappings[i][:] if mappings[i] is not None else None for i in range(n_trees)]
+        
+        return success
+    
+    attempt = 0
+    while time.time() < deadline:
+        try_packing(attempt)
+        attempt += 1
+        if best_score == 190:
+            break
+        # After first few attempts, also try with shuffled tree order
+        if attempt > 5 and attempt % 3 == 0 and time.time() < deadline:
+            # Try a different tree ordering
+            alt_indices = tree_indices[:]
+            random.Random(attempt * 7 + 13).shuffle(alt_indices[1:])  # keep largest first
+            # Temporarily swap
+            old_indices = tree_indices[:]
+            tree_indices[:] = alt_indices
+            try_packing(attempt * 1000 + 7)
+            tree_indices[:] = old_indices
+    
+    # Final validation and cleanup
+    result = [None] * n_trees
+    for i in range(n_trees):
+        if best_mappings[i] is not None:
+            # Ensure all values are Python ints
+            result[i] = [int(v) for v in best_mappings[i]]
+        else:
+            result[i] = None
+    
+    return result

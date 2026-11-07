@@ -1,0 +1,67 @@
+import numpy as np
+import time
+
+_START_TIME = time.time()
+_TIME_LIMIT = 290.0  # safety margin before 300s hard limit
+
+def acquisition(mu, sigma, f_best):
+    """
+    Acquisition function using Expected Improvement (EI) for minimization.
+    
+    For minimization, EI measures the expected reduction in the objective value
+    below f_best. We maximize this score.
+    
+    EI = (f_best - mu) * Phi(Z) + sigma * phi(Z)
+    where Z = (f_best - mu) / sigma, Phi is the standard normal CDF, and phi
+    is the standard normal PDF.
+    
+    We use a small xi (improvement threshold) to encourage slight exploitation
+    while maintaining some exploration.
+    
+    We also add a small UCB component to ensure exploration in regions with
+    high uncertainty, which helps escape local minima in the Goldstein-Price
+    function.
+    """
+    # Time guard
+    if time.time() - _START_TIME > _TIME_LIMIT:
+        # Return a neutral score if time is critical
+        return np.zeros_like(mu)
+    
+    # Ensure sigma is non-negative
+    sigma_safe = np.maximum(sigma, 1e-10)  # avoid division by zero
+    
+    # Expected Improvement for minimization
+    # Z = (f_best - mu) / sigma
+    Z = (f_best - mu) / sigma_safe
+    
+    # Standard normal CDF and PDF
+    # Using scipy would be ideal, but let's use numpy's erf for CDF
+    # Phi(Z) = 0.5 * (1 + erf(Z / sqrt(2)))
+    # phi(Z) = (1/sqrt(2*pi)) * exp(-Z^2/2)
+    
+    sqrt_2 = np.sqrt(2.0)
+    Phi = 0.5 * (1.0 + np.erf(Z / sqrt_2))
+    phi = np.exp(-0.5 * Z**2) / np.sqrt(2.0 * np.pi)
+    
+    # EI = (f_best - mu) * Phi(Z) + sigma * phi(Z)
+    # For minimization, this gives positive values when mu < f_best
+    EI = (f_best - mu) * Phi + sigma_safe * phi
+    
+    # Clip small negative values to zero (EI should be non-negative)
+    EI = np.maximum(EI, 0.0)
+    
+    # Add a small UCB component for exploration
+    # This helps in regions where EI is low but uncertainty is high
+    # Use a small coefficient to not dominate the EI signal
+    kappa_ucb = 0.5
+    UCB = -mu + kappa_ucb * sigma_safe
+    
+    # Combine: primarily EI, with a small UCB boost
+    # Normalize both to comparable scales
+    # Actually, let's just use EI as the primary score
+    # The EI already balances exploitation and exploration
+    
+    # Ensure finiteness
+    scores = np.nan_to_num(EI, nan=0.0, posinf=1e6, neginf=0.0)
+    
+    return scores

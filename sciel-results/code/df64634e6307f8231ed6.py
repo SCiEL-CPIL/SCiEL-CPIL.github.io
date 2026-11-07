@@ -1,0 +1,521 @@
+"""
+Sutton-Chen transition-metal cluster global minima search.
+Uses multi-scale basin hopping with diverse structural templates,
+simulated annealing escape moves, and parallel multi-start optimization.
+"""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from autoresearch_suite.chem_clusters import relax, sutton_chen_energy_gradient
+
+_TOTAL_TIME_LIMIT = 285.0
+_START_TIME = None
+
+def _time_left():
+    if _START_TIME is None:
+        return _TOTAL_TIME_LIMIT
+    return _TOTAL_TIME_LIMIT - (time.time() - _START_TIME)
+
+def _validate(positions):
+    """Check if positions are valid: finite and min distance >= 0.35."""
+    if not np.all(np.isfinite(positions)):
+        return False
+    n = len(positions)
+    if n < 2:
+        return True
+    i_idx, j_idx = np.triu_indices(n, k=1)
+    d = np.linalg.norm(positions[i_idx] - positions[j_idx])
+    if np.any(d < 0.35):
+        return False
+    return True
+
+def _get_icosahedron_vertices():
+    """Return 12 vertices of a regular icosahedron centered at origin, normalized to unit radius."""
+    phi = (1 + np.sqrt(5)) / 2
+    verts = np.array([
+        [-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+        [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+        [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1]
+    ], dtype=float)
+    norms = np.linalg.norm(verts, axis=1, keepdims=True)
+    verts = verts / norms
+    return verts
+
+def _generate_icosahedral_cluster(n, seed=0):
+    """
+    Generate an icosahedral cluster with shells.
+    Shell 0: 1 atom at origin.
+    Shell 1: 12 atoms at radius R1 = 1.0.
+    Shell 2: 30 atoms (edge midpoints) at radius R2.
+    Shell 3: 20 atoms (face centers) at radius R3.
+    Total atoms available: 1 + 12 + 30 + 20 = 63.
+    If n > 63, add random atoms on the surface.
+    """
+    rng = np.random.default_rng(seed)
+    
+    ico_verts = _get_icosahedron_vertices()
+    points = [np.array([0.0, 0.0, 0.0])]
+    
+    # Shell 1: 12 vertices
+    R1 = 1.0
+    shell1 = ico_verts * R1
+    for v in shell1:
+        points.append(v)
+        
+    # Calculate R2 (edge midpoints)
+    v0 = ico_verts[0]
+    v1 = ico_verts[1]
+    edge_len = np.linalg.norm(v0 - v1)
+    R2 = np.sqrt(R1**2 - (edge_len/2.0)**2)
+    
+    # Find edges
+    edges = set()
+    for i in range(12):
+        for j in range(i+1, 12):
+            d = np.linalg.norm(ico_verts[i] - ico_verts[j])
+            if np.isclose(d, edge_len, atol=1e-6):
+                edges.add((i, j))
+                
+    shell2 = []
+    for (i, j) in edges:
+        mid = (ico_verts[i] + ico_verts[j]) / 2.0
+        mid_dir = mid / np.linalg.norm(mid)
+        shell2.append(mid_dir * R2)
+    for v in shell2:
+        points.append(v)
+        
+    # Calculate R3 (face centers)
+    faces = set()
+    for i in range(12):
+        for j in range(i+1, 12):
+            if (i, j) not in edges: continue
+            for k in range(j+1, 12):
+                if (j, k) not in edges: continue
+                if (i, k) not in edges: continue
+                faces.add(tuple(sorted([i, j, k])))
+                
+    shell3 = []
+    R3 = 0.0
+    for (i, j, k) in faces:
+        center = (ico_verts[i] + ico_verts[j] + ico_verts[k]) / 3.0
+        center_dir = center / np.linalg.norm(center)
+        R3 = np.linalg.norm(center)
+        shell3.append(center_dir * R3)
+    for v in shell3:
+        points.append(v)
+        
+    points = np.array(points)
+    
+    if len(points) >= n:
+        return points[:n]
+    else:
+        surface_dirs = [v / np.linalg.norm(v) for v in points if np.linalg.norm(v) > 0.5]
+        remaining = n - len(points)
+        for _ in range(remaining):
+            if surface_dirs:
+                idx = rng.integers(0, len(surface_dirs))
+                dir_vec = surface_dirs[idx]
+            else:
+                dir_vec = rng.normal(0, 1, 3)
+                dir_vec /= np.linalg.norm(dir_vec)
+            
+            r = R3 * (1.0 + rng.uniform(0.1, 0.3))
+            new_p = dir_vec * r
+            points = np.vstack([points, [new_p]])
+            
+        return points[:n]
+
+def _generate_fcc(n, seed=0):
+    """Generate points from an FCC lattice inside a sphere."""
+    rng = np.random.default_rng(seed)
+    a = 1.0
+    R = (3.0 * n / (4.0 / a**3) / (4.0 * np.pi)) ** (1.0/3.0) * 1.2
+    
+    max_coord = int(np.ceil(R / a)) + 2
+    points = []
+    for ix in range(-max_coord, max_coord + 1):
+        for iy in range(-max_coord, max_coord + 1):
+            for iz in range(-max_coord, max_coord + 1):
+                points.append(np.array([ix, iy, iz]) * a)
+                points.append(np.array([ix + 0.5, iy + 0.5, iz]) * a)
+                points.append(np.array([ix + 0.5, iy, iz + 0.5]) * a)
+                points.append(np.array([ix, iy + 0.5, iz + 0.5]) * a)
+                
+    points = np.array(points)
+    dists = np.linalg.norm(points, axis=1)
+    order = np.argsort(dists)
+    sorted_pts = points[order]
+    
+    if len(sorted_pts) >= n:
+        return sorted_pts[:n]
+    else:
+        pts = list(sorted_pts)
+        while len(pts) < n:
+            p = rng.uniform(-R, R, 3)
+            pts.append(p)
+        return np.array(pts)
+
+def _generate_hcp(n, seed=0):
+    """Generate points from an HCP lattice inside a sphere."""
+    rng = np.random.default_rng(seed)
+    a = 1.0
+    c = a * np.sqrt(8.0 / 3.0)
+    R = (3.0 * n / (2.0 / (np.sqrt(3) * a**2 * c)) / (4.0 * np.pi)) ** (1.0/3.0) * 1.2
+    
+    max_coord = int(np.ceil(R / a)) + 2
+    points = []
+    for ix in range(-max_coord, max_coord + 1):
+        for iy in range(-max_coord, max_coord + 1):
+            for iz in range(-max_coord, max_coord + 1):
+                # A-layer
+                x = ix * a + (iy % 2) * a * 0.5
+                y = iy * a * np.sqrt(3) / 2
+                z = iz * c
+                points.append(np.array([x, y, z]))
+                # B-layer
+                x_b = ix * a + (iy % 2) * a * 0.5 + a * 0.5
+                y_b = iy * a * np.sqrt(3) / 2 + a * np.sqrt(3) / 6
+                z_b = iz * c + c / 2
+                points.append(np.array([x_b, y_b, z_b]))
+                
+    points = np.array(points)
+    dists = np.linalg.norm(points, axis=1)
+    order = np.argsort(dists)
+    sorted_pts = points[order]
+    
+    if len(sorted_pts) >= n:
+        return sorted_pts[:n]
+    else:
+        pts = list(sorted_pts)
+        while len(pts) < n:
+            p = rng.uniform(-R, R, 3)
+            pts.append(p)
+        return np.array(pts)
+
+def _generate_random_compact(n, seed=0):
+    """Generate a random compact cluster using rejection sampling."""
+    rng = np.random.default_rng(seed)
+    radius = n ** (1.0 / 3.0) * 0.8
+    points = []
+    attempts = 0
+    max_attempts = n * 2000
+    
+    while len(points) < n and attempts < max_attempts:
+        p = rng.uniform(-radius, radius, 3)
+        if np.linalg.norm(p) <= radius:
+            if points:
+                dists = np.linalg.norm(np.array(points) - p, axis=1)
+                if np.min(dists) >= 0.5:
+                    points.append(p)
+            else:
+                points.append(p)
+        attempts += 1
+        
+    while len(points) < n:
+        points.append(rng.uniform(-radius, radius, 3))
+        
+    return np.array(points)
+
+def _perturb(positions, magnitude=0.2, seed=0):
+    """Perturb positions by adding random noise."""
+    rng = np.random.default_rng(seed)
+    noise = rng.normal(0, magnitude, positions.shape)
+    return positions + noise
+
+def _adaptive_perturb(positions, energy, best_energy, step, seed=0):
+    """
+    Adaptive perturbation: larger steps when far from best, smaller when close.
+    Also adds a directional bias toward the center of mass.
+    """
+    rng = np.random.default_rng(seed)
+    
+    # Scale perturbation based on energy difference
+    energy_diff = max(energy - best_energy, 0.0)
+    base_mag = 0.15 + 0.3 * np.exp(-energy_diff * 2.0)
+    
+    # Add some anisotropy: perturb more along radial direction
+    com = np.mean(positions, axis=0)
+    radial_dirs = positions - com
+    radial_norms = np.linalg.norm(radial_dirs, axis=1, keepdims=True)
+    radial_dirs = np.where(radial_norms > 1e-10, radial_dirs / radial_norms, 0)
+    
+    noise = rng.normal(0, base_mag, positions.shape)
+    # Add radial component
+    radial_perturb = rng.normal(0, base_mag * 0.5, (len(positions), 1)) * radial_dirs
+    return positions + noise + radial_perturb
+
+def _sa_perturb(positions, temperature, seed=0):
+    """
+    Simulated annealing style perturbation with temperature-controlled acceptance.
+    Returns a perturbed position.
+    """
+    rng = np.random.default_rng(seed)
+    
+    # Temperature controls the magnitude of perturbation
+    mag = 0.1 + 0.3 * temperature
+    
+    # Random Gaussian perturbation
+    noise = rng.normal(0, mag, positions.shape)
+    return positions + noise
+
+def _relax_worker(start, kind, max_steps=6, seed=0):
+    """
+    Worker function: performs adaptive basin-hopping with relax-perturb-relax.
+    Includes simulated annealing escape moves for better exploration.
+    Returns best energy and positions found in the trajectory.
+    """
+    try:
+        current_pos = start.copy()
+        best_energy, best_pos = np.inf, None
+        
+        # First relaxation
+        if _time_left() < 5.0:
+            return None, None
+            
+        energy, pos = relax(current_pos, 'sutton_chen', kind)
+        if not (np.all(np.isfinite(pos)) and _validate(pos)):
+            return None, None
+            
+        best_energy = energy
+        best_pos = pos.copy()
+        
+        # Temperature schedule for SA component
+        T = 1.0
+        T_min = 0.05
+        cooling_rate = 0.85
+        
+        # Basin hopping loop with SA escape moves
+        for step in range(max_steps):
+            if _time_left() < 10.0:
+                break
+            
+            # Decide whether to use SA-style perturbation or adaptive perturbation
+            use_sa = (step % 3 == 2)  # Every 3rd step uses SA-style
+            
+            if use_sa:
+                current_pos = _sa_perturb(pos, T, seed=seed + step * 7)
+            else:
+                current_pos = _adaptive_perturb(pos, energy, best_energy, step, seed=seed + step)
+            
+            if not _validate(current_pos):
+                # Try smaller perturbation
+                current_pos = _perturb(pos, magnitude=0.05, seed=seed + step + 1000)
+                if not _validate(current_pos):
+                    continue
+                    
+            new_energy, new_pos = relax(current_pos, 'sutton_chen', kind)
+            if not (np.all(np.isfinite(new_pos)) and _validate(new_pos)):
+                continue
+                
+            # Metropolis acceptance: accept if better, or with probability exp(-ΔE/T)
+            dE = new_energy - energy
+            if dE < 0:
+                # Accept improvement
+                energy, pos = new_energy, new_pos
+                if energy < best_energy:
+                    best_energy = energy
+                    best_pos = pos.copy()
+            else:
+                # Metropolis criterion
+                if T > 0:
+                    accept_prob = np.exp(-dE / (T + 1e-10))
+                    if np.random.default_rng(seed + step * 13).random() < accept_prob:
+                        energy, pos = new_energy, new_pos
+                        if energy < best_energy:
+                            best_energy = energy
+                            best_pos = pos.copy()
+            
+            # Cool down
+            T = max(T * cooling_rate, T_min)
+                
+        return best_energy, best_pos
+    except Exception:
+        return None, None
+
+def _symmetry_guided_start(n, kind, seed=0):
+    """
+    Generate a symmetry-guided starting structure.
+    For icosahedral magic numbers (13, 55, 147), use exact icosahedral shells.
+    For other sizes, use the nearest magic number structure plus/minus atoms.
+    """
+    rng = np.random.default_rng(seed)
+    
+    # Icosahedral magic numbers
+    ico_magic = [1, 13, 55, 147]
+    
+    # Find nearest magic number
+    nearest = min(ico_magic, key=lambda m: abs(m - n))
+    
+    # Generate base structure
+    base = _generate_icosahedral_cluster(nearest, seed=seed)
+    
+    if n == nearest:
+        return base
+    elif n < nearest:
+        # Remove outermost atoms to get to size n
+        if len(base) >= n:
+            return base[:n]
+        else:
+            return _generate_icosahedral_cluster(n, seed=seed)
+    else:
+        # Add atoms to reach size n
+        base = _generate_icosahedral_cluster(nearest, seed=seed)
+        if len(base) < n:
+            surface_dirs = [v / np.linalg.norm(v) for v in base if np.linalg.norm(v) > 0.5]
+            remaining = n - len(base)
+            points = list(base)
+            for _ in range(remaining):
+                if surface_dirs:
+                    idx = rng.integers(0, len(surface_dirs))
+                    dir_vec = surface_dirs[idx]
+                else:
+                    dir_vec = rng.normal(0, 1, 3)
+                    dir_vec /= np.linalg.norm(dir_vec)
+                r = 1.5 + rng.uniform(0.1, 0.3)
+                new_p = dir_vec * r
+                points.append(new_p)
+            return np.array(points)
+        return base[:n]
+
+def _generate_bcc(n, seed=0):
+    """Generate points from a BCC lattice inside a sphere."""
+    rng = np.random.default_rng(seed)
+    a = 1.0
+    R = (3.0 * n / (2.0 / a**3) / (4.0 * np.pi)) ** (1.0/3.0) * 1.2
+    
+    max_coord = int(np.ceil(R / a)) + 2
+    points = []
+    for ix in range(-max_coord, max_coord + 1):
+        for iy in range(-max_coord, max_coord + 1):
+            for iz in range(-max_coord, max_coord + 1):
+                points.append(np.array([ix, iy, iz]) * a)
+                points.append(np.array([ix + 0.5, iy + 0.5, iz + 0.5]) * a)
+                
+    points = np.array(points)
+    dists = np.linalg.norm(points, axis=1)
+    order = np.argsort(dists)
+    sorted_pts = points[order]
+    
+    if len(sorted_pts) >= n:
+        return sorted_pts[:n]
+    else:
+        pts = list(sorted_pts)
+        while len(pts) < n:
+            p = rng.uniform(-R, R, 3)
+            pts.append(p)
+        return np.array(pts)
+
+def construct(instance):
+    """Find near-global minimum for Sutton-Chen transition-metal clusters."""
+    global _START_TIME
+    _START_TIME = time.time()
+    
+    n = instance["n"]
+    kind = instance.get("kind", "12-6")
+    
+    starts = []
+    
+    # Symmetry-guided starts (highest priority)
+    for i in range(6):
+        try:
+            sym = _symmetry_guided_start(n, kind, seed=i)
+            if len(sym) == n and _validate(sym):
+                starts.append(sym)
+        except:
+            pass
+            
+    # Icosahedral starts
+    for i in range(6):
+        try:
+            ico = _generate_icosahedral_cluster(n, seed=100+i)
+            if len(ico) == n and _validate(ico):
+                starts.append(ico)
+        except:
+            pass
+            
+    # FCC starts
+    for i in range(3):
+        try:
+            fcc = _generate_fcc(n, seed=200+i)
+            if len(fcc) == n and _validate(fcc):
+                starts.append(fcc)
+        except:
+            pass
+
+    # HCP starts (new structural family)
+    for i in range(3):
+        try:
+            hcp = _generate_hcp(n, seed=250+i)
+            if len(hcp) == n and _validate(hcp):
+                starts.append(hcp)
+        except:
+            pass
+
+    # BCC starts
+    for i in range(2):
+        try:
+            bcc = _generate_bcc(n, seed=270+i)
+            if len(bcc) == n and _validate(bcc):
+                starts.append(bcc)
+        except:
+            pass
+
+    # Random compact starts
+    for i in range(4):
+        try:
+            rand = _generate_random_compact(n, seed=300+i)
+            if len(rand) == n and _validate(rand):
+                starts.append(rand)
+        except:
+            pass
+
+    if not starts:
+        starts = [_generate_random_compact(n, seed=0)]
+        
+    best_energy = np.inf
+    best_positions = starts[0]
+    
+    # Limit starts to manage time
+    starts = starts[:20]
+    
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(_relax_worker, start, kind, max_steps=5, seed=i*100): i for i, start in enumerate(starts)}
+        
+        for future in as_completed(futures):
+            if _time_left() < 15.0:
+                break
+                
+            res = future.result()
+            if res[0] is not None:
+                energy, positions = res
+                if energy < best_energy:
+                    best_energy = energy
+                    best_positions = positions.copy()
+                    
+    # Final polish: one more relaxation from best position
+    if _validate(best_positions) and _time_left() > 5.0:
+        try:
+            final_energy, final_pos = relax(best_positions, 'sutton_chen', kind)
+            if np.all(np.isfinite(final_pos)) and _validate(final_pos):
+                if final_energy < best_energy:
+                    best_energy = final_energy
+                    best_positions = final_pos
+        except:
+            pass
+    
+    if not _validate(best_positions):
+        best_positions = _generate_random_compact(n, seed=999)
+        for i in range(len(best_positions)):
+            for j in range(i + 1, len(best_positions)):
+                d = np.linalg.norm(best_positions[i] - best_positions[j])
+                if d < 0.35:
+                    direction = best_positions[i] - best_positions[j]
+                    if np.linalg.norm(direction) > 1e-10:
+                        direction = direction / np.linalg.norm(direction)
+                    else:
+                        direction = np.array([1.0, 0, 0])
+                    best_positions[j] = best_positions[i] + direction * 0.36
+    
+    return best_positions
+# EVOLVE-BLOCK-END

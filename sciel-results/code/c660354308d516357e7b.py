@@ -1,0 +1,3 @@
+    L_super = -1j * (np.kron(I_mat, H.T) - np.kron(H.T, I_mat))
+    # ...
+    L_super += np.kron(L.conj(), L) - 0.5 * np.kron(I_mat, LdagL.T) - 0.5 * np.kron(LdagL.T, I_mat)

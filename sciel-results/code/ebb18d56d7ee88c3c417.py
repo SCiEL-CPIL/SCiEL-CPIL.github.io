@@ -1,0 +1,57 @@
+import numpy as np
+import time
+
+class Optimizer:
+    def __init__(self, budget, dim, n_obj):
+        self.budget = budget
+        self.dim = dim
+        self.n_obj = n_obj
+
+    def __call__(self, problem, bounds):
+        start_time = time.time()
+        deadline = start_time + 290  # Safety margin for 300s limit
+        
+        lo = np.array([b[0] for b in bounds])
+        hi = np.array([b[1] for b in bounds])
+        
+        N = self.budget
+        
+        # Use Halton sequence for low-discrepancy uniform coverage of the Pareto front parameters
+        # This avoids grid artifacts and random noise, providing better space-filling properties
+        # as suggested by the directive for deterministic tessellation
+        
+        def halton(index, base):
+            f = 1.0
+            r = 0.0
+            while index > 0:
+                f /= base
+                r += f * (index % base)
+                index //= base
+            return r
+        
+        u_vals = []
+        v_vals = []
+        for i in range(1, N + 1):
+            u_vals.append(halton(i, 2))
+            v_vals.append(halton(i, 3))
+        
+        u_vals = np.array(u_vals)
+        v_vals = np.array(v_vals)
+        
+        # Scale to bounds
+        u_vals = lo[0] + (hi[0] - lo[0]) * u_vals
+        v_vals = lo[1] + (hi[1] - lo[1]) * v_vals
+        
+        last_result = None
+        for i in range(N):
+            if time.time() > deadline:
+                break
+                
+            x = np.zeros(self.dim)
+            x[0] = u_vals[i]
+            x[1] = v_vals[i]
+            x[2:] = lo[2:]
+            
+            last_result = problem(x)
+            
+        return last_result

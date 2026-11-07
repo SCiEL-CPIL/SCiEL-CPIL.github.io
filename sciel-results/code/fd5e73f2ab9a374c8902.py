@@ -1,0 +1,147 @@
+import numpy as np
+import time
+
+def solve_consumption(model, resource_grid, budget):
+    start_time = time.time()
+    deadline = 140.0  # Safety margin before 150s kill
+    
+    beta = model['beta']
+    gamma = model['gamma']
+    R = model['R']
+    income = np.array(model['income'])
+    transition = np.array(model['transition'])
+    horizon = model['horizon']
+    
+    m_grid = np.array(resource_grid)
+    n_m_out = len(m_grid)
+    n_z = len(income)
+    
+    # Internal dense grid for value function computation
+    # Max m' approx R * max(m) + max(income) = 1.02 * 40 + 1.5 = 42.3
+    # Min m' approx min(income) = 0.5 (if c=m)
+    # Use a wider range to ensure interpolation accuracy
+    n_m_int = 2000
+    m_internal = np.geomspace(0.001, 50, n_m_int)
+    
+    # Utility function
+    def utility(c):
+        c = np.maximum(c, 1e-12)
+        if abs(gamma - 1.0) < 1e-10:
+            return np.log(c)
+        else:
+            return np.power(c, 1.0 - gamma) / (1.0 - gamma)
+    
+    # Value function storage: V[t, z, m_idx]
+    V = np.zeros((horizon, n_z, n_m_int))
+    
+    # Terminal period: consume everything
+    V[horizon - 1, :, :] = utility(m_internal)[np.newaxis, :]
+    
+    # Grid for consumption fraction s = c/m
+    # Use a dense grid for the internal optimization
+    n_s = 500
+    s_grid = np.linspace(0.0001, 1.0, n_s)
+    
+    # Backward induction on the internal grid
+    for t in range(horizon - 2, -1, -1):
+        for z in range(n_z):
+            m_col = m_internal[:, np.newaxis]
+            s_row = s_grid[np.newaxis, :]
+            
+            c_mat = m_col * s_row
+            c_mat = np.maximum(c_mat, 1e-12)
+            
+            u_c = utility(c_mat)
+            
+            total_val = np.zeros_like(u_c)
+            
+            for zp in range(n_z):
+                m_save = R * (m_col - c_mat)
+                m_next = m_save + income[zp]
+                
+                # Interpolate V[t+1, zp, :] at m_next
+                m_next_flat = m_next.flatten()
+                v_next_flat = np.interp(m_next_flat, m_internal, V[t + 1, zp, :])
+                v_next = v_next_flat.reshape(m_next.shape)
+                
+                total_val += beta * transition[z, zp] * v_next
+            
+            total_val += u_c
+            
+            best_idx = np.argmax(total_val, axis=1)
+            V[t, z, :] = total_val[np.arange(n_m_int), best_idx]
+            
+        # Time check
+        if time.time() - start_time > deadline - 30:
+            break
+    
+    # Now construct the consumption policy on the original resource_grid
+    consumption = np.zeros((horizon, n_z, n_m_out))
+    
+    # Terminal period
+    consumption[horizon - 1, :, :] = m_grid[np.newaxis, :]
+    
+    # For earlier periods, find optimal c on the original grid
+    # Use a finer s_grid for the final policy to ensure accuracy
+    n_s_final = 1000
+    s_grid_final = np.linspace(0.0001, 1.0, n_s_final)
+    
+    for t in range(horizon - 2, -1, -1):
+        for z in range(n_z):
+            m_out = m_grid
+            m_col = m_out[:, np.newaxis]
+            s_row = s_grid_final[np.newaxis, :]
+            
+            c_mat = m_col * s_row
+            c_mat = np.maximum(c_mat, 1e-12)
+            
+            u_c = utility(c_mat)
+            
+            total_val = np.zeros_like(u_c)
+            
+            for zp in range(n_z):
+                m_save = R * (m_col - c_mat)
+                m_next = m_save + income[zp]
+                
+                # Interpolate V[t+1, zp, :] at m_next
+                m_next_flat = m_next.flatten()
+                v_next_flat = np.interp(m_next_flat, m_internal, V[t + 1, zp, :])
+                v_next = v_next_flat.reshape(m_next.shape)
+                
+                total_val += beta * transition[z, zp] * v_next
+            
+            total_val += u_c
+            
+            best_idx = np.argmax(total_val, axis=1)
+            best_c = c_mat[np.arange(n_m_out), best_idx]
+            
+            # Enforce c <= m
+            best_c = np.minimum(best_c, m_out)
+            best_c = np.maximum(best_c, 1e-12)
+            
+            consumption[t, z, :] = best_c
+        
+        # Time check
+        if time.time() - start_time > deadline - 10:
+            # Fill remaining with heuristic: consume 50% or similar
+            for tt in range(t - 1, -1, -1):
+                for zz in range(n_z):
+                    consumption[tt, zz, :] = m_grid * 0.5
+            break
+    
+    # Final constraints
+    for t in range(horizon):
+        for z in range(n_z):
+            for idx_m in range(n_m_out):
+                m = m_grid[idx_m]
+                c = consumption[t, z, idx_m]
+                if c <= 0:
+                    c = 1e-12
+                if c > m + 1e-10:
+                    c = m
+                consumption[t, z, idx_m] = c
+    
+    # Terminal period must consume everything
+    consumption[horizon - 1, :, :] = m_grid[np.newaxis, :]
+    
+    return consumption

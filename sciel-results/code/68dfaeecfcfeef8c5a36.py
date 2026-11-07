@@ -1,0 +1,336 @@
+import numpy as np
+import time
+
+
+class Optimizer:
+    def __init__(self, budget, dim, n_obj):
+        self.budget = budget
+        self.dim = dim
+        self.n_obj = n_obj
+
+    def __call__(self, problem, bounds):
+        start_time = time.time()
+        deadline = start_time + 295  # safety margin before 300s limit
+
+        lo = np.array([b[0] for b in bounds])
+        hi = np.array([b[1] for b in bounds])
+        dim = self.dim
+        n_obj = self.n_obj
+        ref = np.array([1.1, 1.3, 1.1])  # scoring reference point
+
+        eval_count = 0
+        max_budget = self.budget
+
+        def time_ok():
+            return time.time() < deadline
+
+        def evaluate(x):
+            nonlocal eval_count
+            if eval_count >= max_budget or not time_ok():
+                return None
+            eval_count += 1
+            try:
+                return np.asarray(problem(x), dtype=float).reshape(-1)[:n_obj]
+            except Exception:
+                return None
+
+        # ---------- Pareto / hypervolume helpers (3 objectives) ----------
+        def non_dominated_indices(F):
+            F = np.asarray(F)
+            n = len(F)
+            if n == 0:
+                return np.array([], dtype=int)
+            mask = np.ones(n, dtype=bool)
+            for i in range(n):
+                if not mask[i]:
+                    continue
+                for j in range(n):
+                    if i == j or not mask[j]:
+                        continue
+                    if np.all(F[j] <= F[i]) and np.any(F[j] < F[i]):
+                        mask[i] = False
+                        break
+            return np.where(mask)[0]
+
+        def hypervolume_3d(F, ref):
+            """Exact 3D hypervolume of the non-dominated set F w.r.t. ref.
+            Only points strictly better than ref in every objective count."""
+            F = np.asarray(F, dtype=float)
+            if len(F) == 0:
+                return 0.0
+            keep = np.all(F < ref, axis=1)
+            F = F[keep]
+            if len(F) == 0:
+                return 0.0
+            idx = non_dominated_indices(F)
+            F = F[idx]
+            n = len(F)
+            if n == 0:
+                return 0.0
+
+            order = np.argsort(F[:, 0])
+            P = F[order]
+            total = 0.0
+            for i in range(n):
+                p = P[i]
+                if i + 1 < n:
+                    next0 = P[i + 1][0]
+                else:
+                    next0 = ref[0]
+                w0 = next0 - p[0]
+                if w0 <= 0:
+                    continue
+                p1, p2 = p[1], p[2]
+                r1, r2 = ref[1], ref[2]
+                area = (r1 - p1) * (r2 - p2)
+                rects = []
+                for j in range(i):
+                    q = P[j]
+                    if q[1] < p1 and q[2] < p2:
+                        a1 = max(q[1], p1)
+                        a2 = max(q[2], p2)
+                        if a1 < p1 and a2 < p2:
+                            rects.append((a1, a2, p1, p2))
+                if rects:
+                    min_a1 = min(r[0] for r in rects)
+                    min_a2 = min(r[1] for r in rects)
+                    union = (p1 - min_a1) * (p2 - min_a2)
+                    area -= union
+                if area > 0:
+                    total += w0 * area
+            return total
+
+        # ---------- Gap-filling in objective space ----------
+        def compute_gaps(nd_F, ref):
+            """Given non-dominated set in 3D objective space, compute the
+            hypervolume of each 'gap' hyper-rectangle. A gap is defined by
+            three consecutive non-dominated points (in sorted order) that
+            form a corner. We use a simpler approach: for each point in nd_F,
+            compute the hypervolume contribution if it were the only point,
+            and use that as a proxy for the gap size around it.
+            
+            Actually, a better approach: the gaps are the regions between
+            non-dominated points. In 3D, we can compute the hypervolume
+            contribution of each point in the sorted list. The gap 'center'
+            for a point is the midpoint between it and its neighbors.
+            
+            For simplicity and speed, we compute the hypervolume contribution
+            of each point and use that to guide where to sample next in
+            objective space, then map back to decision space via random
+            sampling near promising regions.
+            """
+            F = np.asarray(nd_F, dtype=float)
+            if len(F) == 0:
+                return []
+            keep = np.all(F < ref, axis=1)
+            F = F[keep]
+            if len(F) == 0:
+                return []
+            idx = non_dominated_indices(F)
+            F = F[idx]
+            n = len(F)
+            if n == 0:
+                return []
+
+            # Compute hypervolume contribution of each point
+            order = np.argsort(F[:, 0])
+            P = F[order]
+            contributions = np.zeros(n)
+            for i in range(n):
+                p = P[i]
+                if i + 1 < n:
+                    next0 = P[i + 1][0]
+                else:
+                    next0 = ref[0]
+                w0 = next0 - p[0]
+                if w0 <= 0:
+                    continue
+                p1, p2 = p[1], p[2]
+                r1, r2 = ref[1], ref[2]
+                area = (r1 - p1) * (r2 - p2)
+                for j in range(i):
+                    q = P[j]
+                    if q[1] < p1 and q[2] < p2:
+                        # This point blocks part of the area
+                        # Simplified: subtract overlapping region
+                        overlap_w = min(p1 - q[1], p2 - q[2])
+                        if overlap_w > 0:
+                            area -= overlap_w * min(p1 - q[1], r1 - q[1])
+                if area > 0:
+                    contributions[i] = w0 * area
+            return list(zip(P, contributions))
+
+        # ---------- Main optimization loop ----------
+        X = []
+        F = []
+
+        # Phase 1: LHS initialization for broad coverage
+        n_initial = min(30, max_budget)
+        if n_initial > 0:
+            samples = np.zeros((n_initial, dim))
+            for d in range(dim):
+                perm = np.random.permutation(n_initial)
+                samples[:, d] = (perm + np.random.random(n_initial)) / n_initial
+            samples = lo + (hi - lo) * samples
+            for x in samples:
+                if not time_ok():
+                    break
+                f = evaluate(x)
+                if f is None:
+                    break
+                X.append(x)
+                F.append(f)
+
+        if len(X) == 0:
+            # Fallback: evaluate center
+            x0 = lo + 0.5 * (hi - lo)
+            f0 = evaluate(x0)
+            if f0 is not None:
+                X.append(x0)
+                F.append(f0)
+            return X[0] if len(X) > 0 else x0
+
+        X = np.array(X)
+        F = np.array(F)
+
+        # Phase 2: Hypervolume-driven adaptive sampling
+        # Maintain the non-dominated set and use gap-filling to guide new samples
+        nd_idx = non_dominated_indices(F)
+        nd_F = F[nd_idx].copy() if len(nd_idx) > 0 else F.copy()
+
+        # We'll iterate: compute gaps, sample near gap centers in decision space
+        # Since we can't directly map objective gaps to decision space, we use
+        # a hybrid: sample randomly but weight toward regions that have
+        # produced good hypervolume contributions.
+
+        # Strategy: 
+        # 1. Keep the non-dominated set
+        # 2. For each remaining evaluation, try a few candidate points:
+        #    - Random points
+        #    - Points perturbed from existing non-dominated points
+        #    - Points interpolated between pairs of non-dominated points
+        # 3. Accept the candidate that gives the best hypervolume improvement
+
+        # Precompute: store all evaluated points
+        all_X = list(X)
+        all_F = list(F)
+
+        # Local search around promising points
+        def local_refine(x_start, f_start, nd_F, n_steps=8):
+            """Refine a point using hypervolume-guided local search."""
+            x_best = x_start.copy()
+            f_best = f_start.copy()
+            base_hv = hypervolume_3d(nd_F, ref)
+            base_nd = nd_F.copy()
+
+            for step in range(n_steps):
+                if not time_ok() or eval_count >= max_budget:
+                    break
+                # Adaptive step size
+                scale = 0.15 * (1.0 - step / float(max(1, n_steps))) ** 0.5
+                x_new = x_best + scale * np.random.standard_normal(dim)
+                x_new = np.clip(x_new, lo, hi)
+                f_new = evaluate(x_new)
+                if f_new is None:
+                    break
+                all_X.append(x_new)
+                all_F.append(f_new)
+                # Check if f_new is non-dominated w.r.t. current nd_F
+                cand = np.vstack([base_nd, f_new])
+                hv = hypervolume_3d(cand, ref)
+                if hv > base_hv + 1e-12:
+                    x_best = x_new
+                    f_best = f_new
+                    nd_idx2 = non_dominated_indices(cand)
+                    base_nd = cand[nd_idx2]
+                    base_hv = hv
+            return x_best, f_best, base_nd, base_hv
+
+        # Phase 2a: Refine each non-dominated point
+        remaining = max_budget - eval_count
+        if len(nd_F) > 0 and remaining > 0:
+            steps_per_point = max(4, remaining // (len(nd_F) + 2))
+            for i in range(len(nd_F)):
+                if not time_ok() or eval_count >= max_budget:
+                    break
+                # Find the decision-space point corresponding to nd_F[i]
+                # nd_F[i] is an objective vector; find its source in X
+                # Since we may have duplicates, just use the first match
+                x_start = None
+                for k in range(len(all_X)):
+                    if np.allclose(all_F[k], nd_F[i], atol=1e-10):
+                        x_start = all_X[k]
+                        break
+                if x_start is None:
+                    x_start = lo + np.random.random(dim) * (hi - lo)
+                f_start = nd_F[i]
+                x_ref, f_ref, nd_F, base_hv = local_refine(x_start, f_start, nd_F, steps_per_point)
+
+        # Phase 2b: Interpolation-based sampling
+        remaining = max_budget - eval_count
+        if len(nd_F) >= 2 and remaining > 0:
+            n_interp = min(remaining // 8, 20)
+            for _ in range(n_interp):
+                if not time_ok() or eval_count >= max_budget:
+                    break
+                # Pick two random non-dominated points and interpolate
+                i, j = np.random.choice(len(nd_F), 2, replace=False)
+                t = np.random.random()
+                # Interpolate in objective space to get a target
+                target_obj = t * nd_F[i] + (1 - t) * nd_F[j]
+                # Now sample in decision space near the source points
+                # Find sources
+                x_i = None
+                x_j = None
+                for k in range(len(all_X)):
+                    if np.allclose(all_F[k], nd_F[i], atol=1e-10):
+                        x_i = all_X[k]
+                        break
+                for k in range(len(all_X)):
+                    if np.allclose(all_F[k], nd_F[j], atol=1e-10):
+                        x_j = all_X[k]
+                        break
+                if x_i is not None and x_j is not None:
+                    x_new = t * x_i + (1 - t) * x_j + 0.05 * np.random.standard_normal(dim)
+                else:
+                    x_new = lo + np.random.random(dim) * (hi - lo)
+                x_new = np.clip(x_new, lo, hi)
+                f_new = evaluate(x_new)
+                if f_new is None:
+                    break
+                all_X.append(x_new)
+                all_F.append(f_new)
+                # Update non-dominated set
+                cand = np.vstack([nd_F, f_new])
+                hv = hypervolume_3d(cand, ref)
+                nd_idx2 = non_dominated_indices(cand)
+                nd_F = cand[nd_idx2]
+
+        # Phase 2c: Random restarts with local refinement
+        remaining = max_budget - eval_count
+        n_restarts = min(remaining // 10, 15)
+        for _ in range(n_restarts):
+            if not time_ok() or eval_count >= max_budget:
+                break
+            x_rand = lo + np.random.random(dim) * (hi - lo)
+            f_rand = evaluate(x_rand)
+            if f_rand is None:
+                break
+            all_X.append(x_rand)
+            all_F.append(f_rand)
+            # Check if it improves hypervolume
+            cand = np.vstack([nd_F, f_rand])
+            hv = hypervolume_3d(cand, ref)
+            nd_idx2 = non_dominated_indices(cand)
+            nd_F = cand[nd_idx2]
+            # If it's non-dominated, refine it
+            if any(np.allclose(f_rand, nd_F[k], atol=1e-10) for k in range(len(nd_F))):
+                x_ref, f_ref, nd_F, _ = local_refine(x_rand, f_rand, nd_F, 6)
+
+        # Final: return the best point (first non-dominated point)
+        if len(all_X) > 0:
+            final_nd = non_dominated_indices(np.array(all_F))
+            if len(final_nd) > 0:
+                return all_X[final_nd[0]]
+            return all_X[0]
+        return lo + 0.5 * (hi - lo)
