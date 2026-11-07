@@ -1,0 +1,158 @@
+import time
+
+def construct():
+    n = 10
+    # L1 is the standard cyclic Latin square
+    L1 = [[(i + j) % n for j in range(n)] for i in range(n)]
+    
+    start_time = time.time()
+    # Keep a safety margin from the 90s wall-clock limit
+    deadline = 85.0 
+
+    def find_next_square(existing_squares, time_limit):
+        """
+        Finds a new Latin square orthogonal to all squares in existing_squares.
+        Uses bitmasking for fast constraint checking.
+        """
+        if time.time() > deadline:
+            return None
+            
+        # State
+        L_new = [[-1 for _ in range(n)] for _ in range(n)]
+        
+        # Constraints for L_new
+        row_used = [0] * n  # Bitmask of symbols used in each row
+        col_used = [0] * n  # Bitmask of symbols used in each col
+        
+        # Constraints for orthogonality with existing squares
+        # pair_used[k] is a bitmask of used pairs (existing_squares[k][i][j], L_new[i][j])
+        # Each existing square has n*n possible pairs (0..99).
+        # Python integers can handle bitmasks of any size, so we can use a single int per square.
+        pair_used = [0] * len(existing_squares)
+        
+        def backtrack(remaining):
+            if time.time() > deadline:
+                return False
+            if remaining == 0:
+                return True
+            
+            # MRV Heuristic: Find the unassigned cell with the fewest candidates
+            min_count = n + 1
+            best_i, best_j = -1, -1
+            best_cands = []
+            
+            for i in range(n):
+                for j in range(n):
+                    if L_new[i][j] == -1:
+                        cands = []
+                        for v in range(n):
+                            bit = 1 << v
+                            if (row_used[i] & bit) or (col_used[j] & bit):
+                                continue
+                            
+                            valid = True
+                            for k, sq in enumerate(existing_squares):
+                                s_val = sq[i][j]
+                                pair_bit = 1 << (s_val * n + v)
+                                if pair_used[k] & pair_bit:
+                                    valid = False
+                                    break
+                            
+                            if valid:
+                                cands.append(v)
+                        
+                        if len(cands) < min_count:
+                            min_count = len(cands)
+                            best_i, best_j = i, j
+                            best_cands = cands
+                            if min_count == 0:
+                                return False
+                            if min_count == 1:
+                                break
+                if min_count == 1:
+                    break
+            
+            if best_i == -1:
+                return True
+            
+            i, j = best_i, best_j
+            
+            for v in best_cands:
+                L_new[i][j] = v
+                bit = 1 << v
+                row_used[i] |= bit
+                col_used[j] |= bit
+                
+                pair_bits = []
+                for k, sq in enumerate(existing_squares):
+                    s_val = sq[i][j]
+                    pair_bit = 1 << (s_val * n + v)
+                    pair_used[k] |= pair_bit
+                    pair_bits.append(pair_bit)
+                
+                if backtrack(remaining - 1):
+                    return True
+                
+                # Undo
+                L_new[i][j] = -1
+                row_used[i] &= ~bit
+                col_used[j] &= ~bit
+                for k in range(len(existing_squares)):
+                    pair_used[k] &= ~pair_bits[k]
+            
+            return False
+
+        # We have a total time budget. We allocate a portion of the remaining time to this search.
+        # If we have many squares, the search space is more constrained, but finding a solution might be harder.
+        # Let's just use the global deadline check inside the recursion.
+        # The caller should manage how long to let this run, but since it's a single call, 
+        # we rely on the global deadline.
+        
+        success = backtrack(n * n)
+        if success:
+            return L_new
+        else:
+            return None
+
+    squares = [L1]
+    
+    # Try to find L2, L3, ... up to 9 squares total
+    # We know L2 is easy to find. L3 is harder.
+    
+    # To be safe and ensure we at least get 2 squares (matching current score),
+    # we prioritize finding L2 first.
+    
+    # Find L2
+    if time.time() < deadline - 5: # Leave 5s buffer
+        L2 = find_next_square(squares, deadline - time.time())
+        if L2:
+            squares.append(L2)
+            
+    # Find L3
+    if len(squares) >= 2 and time.time() < deadline - 5:
+        L3 = find_next_square(squares, deadline - time.time())
+        if L3:
+            squares.append(L3)
+            
+    # Find L4
+    if len(squares) >= 3 and time.time() < deadline - 5:
+        L4 = find_next_square(squares, deadline - time.time())
+        if L4:
+            squares.append(L4)
+            
+    # Find L5
+    if len(squares) >= 4 and time.time() < deadline - 5:
+        L5 = find_next_square(squares, deadline - time.time())
+        if L5:
+            squares.append(L5)
+
+    # Ensure types are strictly Python int
+    final_result = []
+    for sq in squares:
+        final_sq = []
+        for row in sq:
+            final_row = [int(x) for x in row]
+            final_sq.append(final_row)
+        final_result.append(final_sq)
+        
+    return final_result

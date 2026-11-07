@@ -1,0 +1,142 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import time
+
+def construct():
+    from random import Random
+    import time as _time
+
+    deadline = _time.monotonic() + 140.0
+
+    def instance(splits, seed, palette=5):
+        rng = Random(seed)
+        faces = [[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
+        edges = {(min(a, b), max(a, b)) for f in faces for a, b in zip(f, f[1:] + f[:1])}
+        n = 8
+        for _ in range(splits):
+            face = faces.pop(rng.randrange(len(faces)))
+            inner = list(range(n, n + 4))
+            n += 4
+            for i in range(4):
+                a, b = face[i], face[(i + 1) % 4]
+                edges.add((min(a, inner[i]), max(a, inner[i])))
+                edges.add((min(inner[i], inner[(i + 1) % 4]), max(inner[i], inner[(i + 1) % 4])))
+                faces.append([a, b, inner[(i + 1) % 4], inner[i]])
+            faces.append(inner)
+        lists = [sorted(rng.sample(range(palette), 3)) for _ in range(n)]
+        return n, sorted(edges), lists
+
+    def solve_csp(n, edges, color_lists):
+        """Backtracking CSP solver with forward checking and MRV heuristic."""
+        # Build adjacency
+        adj = [[] for _ in range(n)]
+        for u, v in edges:
+            adj[u].append(v)
+            adj[v].append(u)
+        # Convert to sets for fast lookup
+        adj_sets = [set(a) for a in adj]
+
+        # Domains: each vertex starts with its list of 3 colours
+        domains = [set(color_lists[v]) for v in range(n)]
+        assignment = [None] * n
+
+        def is_consistent():
+            """Check if current partial assignment is consistent."""
+            for v in range(n):
+                if assignment[v] is not None:
+                    for u in adj[v]:
+                        if assignment[u] is not None and assignment[u] == assignment[v]:
+                            return False
+            return True
+
+        def forward_check(v, c):
+            """Remove c from domains of unassigned neighbors. Return False if any domain becomes empty."""
+            for u in adj[v]:
+                if assignment[u] is None and c in domains[u]:
+                    domains[u].discard(c)
+                    if not domains[u]:
+                        return False
+            return True
+
+        def unforward_check(v):
+            """Restore domains of unassigned neighbors of v (re-add all possible colours from original list)."""
+            for u in adj[v]:
+                if assignment[u] is None:
+                    domains[u] = set(color_lists[u])
+                    # Re-apply constraints from already-assigned neighbors
+                    for w in adj[u]:
+                        if assignment[w] is not None:
+                            domains[u].discard(assignment[w])
+                            if not domains[u]:
+                                return False
+            return True
+
+        def get_mrv_vertex():
+            """Pick unassigned vertex with minimum remaining values."""
+            min_size = float('inf')
+            best = -1
+            for v in range(n):
+                if assignment[v] is None:
+                    sz = len(domains[v])
+                    if sz == 0:
+                        return v  # domain wipeout
+                    if sz < min_size:
+                        min_size = sz
+                        best = v
+            return best
+
+        def backtrack(depth):
+            if _time.monotonic() > deadline:
+                return None  # timeout
+
+            # Find unassigned vertex with MRV
+            v = get_mrv_vertex()
+            if v == -1:
+                # All assigned
+                return assignment[:]
+
+            # Try each colour in domain
+            for c in sorted(domains[v]):
+                assignment[v] = c
+                if forward_check(v, c):
+                    result = backtrack(depth + 1)
+                    if result is not None:
+                        return result
+                unforward_check(v)
+                assignment[v] = None
+
+            return None
+
+        # Try with MRV backtracking
+        result = backtrack(0)
+        if result is not None:
+            return result
+
+        # Fallback: simple greedy in case of timeout or failure
+        colour = [None] * n
+        for v in sorted(range(n), key=lambda u: -len(adj[u])):
+            taken = {colour[u] for u in adj[v] if colour[u] is not None}
+            free = [c for c in color_lists[v] if c not in taken]
+            colour[v] = free[0] if free else color_lists[v][0]
+        return colour
+
+    out = []
+    for splits, seed in ((20, 701), (40, 702), (60, 703), (100, 704)):
+        if _time.monotonic() > deadline:
+            # Not enough time; return greedy fallback for remaining
+            n, edges, lists = instance(splits, seed)
+            adj = [[] for _ in range(n)]
+            for u, v in edges:
+                adj[u].append(v)
+                adj[v].append(u)
+            colour = [None] * n
+            for v in sorted(range(n), key=lambda u: -len(adj[u])):
+                taken = {colour[u] for u in adj[v] if colour[u] is not None}
+                free = [c for c in lists[v] if c not in taken]
+                colour[v] = free[0] if free else lists[v][0]
+            out.append(colour)
+            continue
+        n, edges, lists = instance(splits, seed)
+        out.append(solve_csp(n, edges, lists))
+    return out
+# EVOLVE-BLOCK-END

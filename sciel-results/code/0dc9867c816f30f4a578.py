@@ -1,0 +1,34 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import numpy as np
+
+def heuristics(demands, capacity):
+    n = len(demands)
+    s = np.array(demands, dtype=np.float64)
+    
+    # Compute sum of all pairs
+    sums = s[:, None] + s[None, :]
+    
+    # Compute ideal complement for each i
+    # Ideal size for j given i is capacity - s_i
+    ideal = capacity - s[:, None] # Shape (n, 1)
+    
+    # Difference between actual j size and ideal size
+    # s[None, :] is shape (1, n)
+    diff = s[None, :] - ideal
+    
+    # Use a sharper Gaussian to focus on near-perfect complements
+    # Smaller sigma means the heuristic strongly prefers pairs that sum close to capacity
+    sigma = 5.0
+    exponent = - (diff ** 2) / (2 * sigma ** 2)
+    H = np.exp(exponent)
+    
+    # Mask infeasible pairs
+    # If sum > capacity, set to 0 (will be clamped to 1e-9 by evaluator)
+    H[sums > capacity] = 0.0
+    
+    # Ensure diagonal is 0 (can't place item after itself)
+    np.fill_diagonal(H, 0.0)
+    
+    return H
+# EVOLVE-BLOCK-END

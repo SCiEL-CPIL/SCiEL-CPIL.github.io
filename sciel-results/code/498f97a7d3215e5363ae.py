@@ -1,0 +1,448 @@
+# EVOLVE-BLOCK-START
+import time
+import numpy as np
+from scipy.optimize import differential_evolution, minimize
+from scipy.spatial.distance import cdist
+from scipy.stats import linregress
+
+_START_TIME = time.time()
+_DEADLINE = _START_TIME + 300  # safety margin before 330s kill
+
+
+def _time_left():
+    return _DEADLINE - time.time()
+
+
+def _build_basis(X, d):
+    """Build a rich set of candidate basis functions evaluated on X. Returns (N, p) array."""
+    N = X.shape[0]
+    cols = []
+
+    # Constant
+    cols.append(np.ones(N))
+
+    # Linear
+    for j in range(d):
+        cols.append(X[:, j])
+
+    # Powers up to 8
+    for j in range(d):
+        for k in range(2, 9):
+            cols.append(X[:, j] ** k)
+
+    # Pairwise products
+    for i in range(d):
+        for j in range(i, d):
+            cols.append(X[:, i] * X[:, j])
+
+    # Triple products
+    for i in range(d):
+        for j in range(i, d):
+            for k in range(j, d):
+                cols.append(X[:, i] * X[:, j] * X[:, k])
+
+    # Trig
+    for j in range(d):
+        xj = X[:, j]
+        cols.append(np.sin(xj))
+        cols.append(np.cos(xj))
+        cols.append(np.sin(2.0 * xj))
+        cols.append(np.cos(2.0 * xj))
+        cols.append(np.sin(3.0 * xj))
+        cols.append(np.cos(3.0 * xj))
+        cols.append(np.tan(xj))
+
+    # Exp, log, sqrt, sigmoid, tanh
+    for j in range(d):
+        xj = X[:, j]
+        cols.append(np.exp(xj))
+        cols.append(np.exp(-xj))
+        cols.append(np.exp(2.0 * xj))
+        cols.append(np.exp(-2.0 * xj))
+        cols.append(np.log1p(xj))
+        cols.append(np.log(xj + 1e-10))
+        cols.append(np.sqrt(xj + 1e-10))
+        cols.append(1.0 / (xj + 1e-10))
+        cols.append(np.tanh(xj))
+        cols.append(np.tanh(2.0 * xj))
+        cols.append(1.0 / (1.0 + np.exp(-xj)))
+
+    # Cross terms with trig and exp
+    if d >= 2:
+        for i in range(d):
+            for j in range(i + 1, d):
+                xi, xj = X[:, i], X[:, j]
+                cols.append(np.sin(xi) * xj)
+                cols.append(np.cos(xi) * xj)
+                cols.append(np.sin(xi) * np.sin(xj))
+                cols.append(np.cos(xi) * np.cos(xj))
+                cols.append(xi * np.exp(xj))
+                cols.append(np.exp(xi) * xj)
+                cols.append(xi * np.sqrt(xj + 1e-10))
+                cols.append(np.sqrt(xi + 1e-10) * xj)
+                cols.append(np.sin(xi) * np.exp(xj))
+                cols.append(np.cos(xi) * np.exp(xj))
+                cols.append(xi * xj * np.sin(xi))
+                cols.append(xi * xj * np.cos(xj))
+                cols.append(np.exp(xi + xj))
+                cols.append(np.exp(xi - xj))
+                cols.append(np.log1p(xi) * xj)
+                cols.append(xi * np.log1p(xj))
+
+    # Global features
+    cols.append(np.sum(X, axis=1))
+    cols.append(np.prod(X, axis=1))
+    cols.append(np.sum(X ** 2, axis=1))
+    cols.append(np.sum(X ** 3, axis=1))
+    cols.append(np.linalg.norm(X, axis=1))
+    cols.append(np.linalg.norm(X, axis=1) ** 2)
+    cols.append(np.min(X, axis=1))
+    cols.append(np.max(X, axis=1))
+    cols.append(np.sum(np.sin(X), axis=1))
+    cols.append(np.sum(np.cos(X), axis=1))
+    cols.append(np.sum(np.exp(X), axis=1))
+    cols.append(np.sum(1.0 / (X + 1e-10), axis=1))
+
+    # Differences
+    if d >= 2:
+        for i in range(d):
+            for j in range(i + 1, d):
+                cols.append(X[:, i] - X[:, j])
+                cols.append(X[:, i] * (X[:, i] - X[:, j]))
+                cols.append(np.sin(X[:, i] - X[:, j]))
+                cols.append(np.cos(X[:, i] - X[:, j]))
+
+    return np.column_stack(cols)
+
+
+def _fit_ridge(F, y, alpha=1e-8):
+    n, p = F.shape
+    A = F.T @ F + alpha * np.eye(p)
+    b = F.T @ y
+    try:
+        w = np.linalg.solve(A, w if False else b)
+    except np.linalg.LinAlgError:
+        w = np.linalg.lstsq(F, y, rcond=None)[0]
+    return w
+
+
+def _lasso_coord_descent(F, y, n_iter=200, lam=1e-4):
+    """
+    Lasso via coordinate descent with residual tracking.
+    Returns (w, active_indices).
+    """
+    n, p = F.shape
+    w = np.zeros(p)
+    if p == 0:
+        return w, []
+
+    # Precompute column norms squared
+    col_norm_sq = np.sum(F ** 2, axis=0)
+    col_norm_sq = np.maximum(col_norm_sq, 1e-15)
+
+    w = np.zeros(p)
+    residual = y.copy()  # y - F @ w
+
+    for _ in range(n_iter):
+        if _time_left() < 2.0:
+            break
+        for j in range(p):
+            rho_j = F[:, j] @ residual + col_norm_sq[j] * w[j]
+            if rho_j > lam:
+                w_j_new = (rho_j - lam) / col_norm_sq[j]
+            elif rho_j < -lam:
+                w_j_new = (rho_j + lam) / col_norm_sq[j]
+            else:
+                w_j_new = 0.0
+            if w_j_new != w[j]:
+                residual -= F[:, j] * (w_j_new - w[j])
+                w[j] = w_j_new
+
+    active = list(np.where(np.abs(w) > 1e-10)[0])
+    return w, active
+
+
+def _rbf_predict(X_train, y_train, X, gamma, alpha=1e-6):
+    Xa = X_train
+    Xb = X
+    sq_a = np.sum(Xa ** 2, axis=1)[:, None]
+    sq_b = np.sum(Xb ** 2, axis=1)[None, :]
+    K_train = np.exp(-gamma * (sq_a + sq_a.T - 2.0 * Xa @ Xa.T))
+    K_test = np.exp(-gamma * (sq_a + sq_b - 2.0 * Xa @ X.T))
+
+    n = X_train.shape[0]
+    A = K_train + alpha * np.eye(n)
+    try:
+        theta = np.linalg.solve(A, y_train)
+    except np.linalg.LinAlgError:
+        theta = np.linalg.lstsq(A, y_train, rcond=None)[0]
+    return K_test @ theta
+
+
+def _train_neural_net(X_train, y_train, X_test, hidden_sizes=(64, 64), lr=0.005,
+                       epochs=8000, batch_size=32, weight_decay=1e-5):
+    """
+    Train a small fully-connected neural network using Adam optimizer.
+    Returns the trained model parameters and a predict function.
+    """
+    N, d = X_train.shape
+    y_train = y_train.reshape(-1, 1)
+    
+    # Standardize inputs and outputs
+    X_mean = X_train.mean(axis=0)
+    X_std = X_train.std(axis=0)
+    X_std[X_std < 1e-12] = 1.0
+    y_mean = y_train.mean()
+    y_std = y_train.std()
+    if y_std < 1e-12:
+        y_std = 1.0
+    
+    X_norm = (X_train - X_mean) / X_std
+    y_norm = (y_train - y_mean) / y_std
+    
+    # Define architecture
+    layers = [d] + list(hidden_sizes) + [1]
+    
+    # Initialize weights with He initialization
+    rng = np.random.RandomState(42)
+    W = []
+    b = []
+    for i in range(len(layers) - 1):
+        fan_in = layers[i]
+        fan_out = layers[i + 1]
+        W.append(rng.randn(fan_in, fan_out) * np.sqrt(2.0 / fan_in))
+        b.append(np.zeros(fan_out))
+    
+    # Adam optimizer state
+    m_W = [np.zeros_like(w) for w in W]
+    v_W = [np.zeros_like(w) for w in W]
+    m_b = [np.zeros_like(bi) for bi in b]
+    v_b = [np.zeros_like(bi) for bi in b]
+    beta1, beta2, eps = 0.9, 0.999, 1e-8
+    t = 0
+    
+    def forward(X):
+        activations = [X]
+        z = X
+        for i in range(len(W)):
+            z = z @ W[i] + b[i]
+            if i < len(W) - 1:
+                z = np.tanh(z)
+            activations.append(z)
+        return activations
+    
+    def backward(activations, dL_dy):
+        dW = [None] * len(W)
+        db = [None] * len(b)
+        dz = dL_dy
+        for i in range(len(W) - 1, -1, -1):
+            dW[i] = activations[i].T @ dz
+            db[i] = dz.sum(axis=0)
+            if i > 0:
+                dz = (dz @ W[i].T) * (1 - activations[i + 1] ** 2)
+        return dW, db
+    
+    # Training loop
+    best_loss = np.inf
+    best_params = (W.copy(), b.copy())
+    
+    for epoch in range(epochs):
+        if _time_left() < 3.0:
+            break
+        
+        # Shuffle
+        idx = np.random.permutation(N)
+        
+        epoch_loss = 0
+        n_batches = 0
+        
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            batch_idx = idx[start:end]
+            X_batch = X_norm[batch_idx]
+            y_batch = y_norm[batch_idx]
+            
+            # Forward
+            activations = forward(X_batch)
+            y_pred = activations[-1]
+            
+            # Loss and gradient
+            loss = np.mean((y_pred - y_batch) ** 2)
+            epoch_loss += loss
+            n_batches += 1
+            
+            # Weight decay
+            dL_dy = 2.0 * (y_pred - y_batch) / len(batch_idx)
+            dW, db = backward(activations, dL_dy)
+            for i in range(len(W)):
+                dW[i] += weight_decay * W[i]
+            
+            # Adam update
+            t += 1
+            for i in range(len(W)):
+                m_W[i] = beta1 * m_W[i] + (1 - beta1) * dW[i]
+                v_W[i] = beta2 * v_W[i] + (1 - beta2) * dW[i] ** 2
+                m_hat = m_W[i] / (1 - beta1 ** t)
+                v_hat = v_W[i] / (1 - beta2 ** t)
+                W[i] -= lr * m_hat / (np.sqrt(v_hat) + eps)
+                
+                m_b[i] = beta1 * m_b[i] + (1 - beta1) * db[i]
+                v_b[i] = beta2 * v_b[i] + (1 - beta2) * db[i] ** 2
+                m_hat_b = m_b[i] / (1 - beta1 ** t)
+                v_hat_b = v_b[i] / (1 - beta2 ** t)
+                b[i] -= lr * m_hat_b / (np.sqrt(v_hat_b) + eps)
+        
+        avg_loss = epoch_loss / max(n_batches, 1)
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            best_params = (W.copy(), b.copy())
+        
+        # Early stopping if loss is very small
+        if avg_loss < 1e-10:
+            break
+    
+    # Use best parameters
+    W_best, b_best = best_params
+    
+    # Create predict function
+    def nn_predict(X):
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
+        X_norm = (X - X_mean) / X_std
+        z = X_norm
+        for i in range(len(W_best)):
+            z = z @ W_best[i] + b_best[i]
+            if i < len(W_best) - 1:
+                z = np.tanh(z)
+        return (z * y_std + y_mean).flatten()
+    
+    return nn_predict, avg_loss
+
+
+def fit(X_train, y_train):
+    X_train = np.asarray(X_train, dtype=np.float64)
+    y_train = np.asarray(y_train, dtype=np.float64)
+    N, d = X_train.shape
+
+    if N == 0:
+        return lambda X: np.zeros(np.asarray(X).shape[0])
+
+    # Build basis
+    F = _build_basis(X_train, d)
+    p = F.shape[1]
+
+    # Ensure finite
+    finite_cols = np.all(np.isfinite(F), axis=0)
+    F = F[:, finite_cols]
+    p = F.shape[1]
+    finite_mask = finite_cols
+
+    if p == 0:
+        return lambda X: np.zeros(np.asarray(X).shape[0])
+
+    # Standardize features (keep constant)
+    F_mean = np.mean(F, axis=0)
+    F_std = np.std(F, axis=0)
+    F_std[F_std < 1e-12] = 1.0
+    F_std[0] = 1.0
+    F_mean[0] = 0.0
+    F_norm = (F - F_mean) / F_std
+
+    # y stats
+    y_mean = np.mean(y_train)
+    y_std = np.std(y_train)
+    if y_std < 1e-12:
+        return lambda X: np.full(np.asarray(X).shape[0], y_mean)
+    y_norm = (y_train - y_mean) / y_std
+
+    # Lasso
+    w_norm, active = _lasso_coord_descent(F_norm, y_norm, n_iter=200, lam=1e-5)
+
+    if len(active) == 0:
+        active = [0]
+
+    F_active = F_norm[:, active]
+    w_active = _fit_ridge(F_active, y_norm, alpha=1e-8)
+
+    pred_train_norm = F_active @ w_active
+    train_mse_norm = np.mean((pred_train_norm - y_norm) ** 2)
+    train_mse = train_mse_norm * y_std ** 2
+
+    best_mse = train_mse
+    best_type = "basis"
+    best_gamma = None
+    best_nn_predict = None
+    best_nn_loss = np.inf
+
+    # RBF fallback
+    if train_mse_norm > 0.02 and _time_left() > 10.0:
+        X_scale = np.std(X_train, axis=0)
+        X_scale[X_scale < 1e-12] = 1.0
+        d_eff = np.sqrt(np.sum(X_scale ** 2))
+        gamma_candidates = [1.0 / (2.0 * d * d_eff ** 2),
+                            1.0 / (d_eff ** 2),
+                            1.0 / (d_eff ** 2) * 5.0,
+                            1.0 / (d_eff ** 2) * 0.2,
+                            1.0 / (d_eff ** 2) * 10.0,
+                            1.0 / (d_eff ** 2) * 0.1]
+        for gamma in gamma_candidates:
+            if _time_left() < 3.0:
+                break
+            try:
+                pred_rbf = _rbf_predict(X_train, y_train, X_train, gamma, alpha=1e-6)
+                mse_rbf = np.mean((pred_rbf - y_train) ** 2)
+                if mse_rbf < best_mse:
+                    best_mse = mse_rbf
+                    best_type = "rbf"
+                    best_gamma = gamma
+            except Exception:
+                continue
+
+    # Neural network fallback if other methods didn't fit well
+    if train_mse_norm > 0.005 and _time_left() > 20.0:
+        try:
+            nn_predict, nn_loss = _train_neural_net(X_train, y_train, X_train, 
+                                                     hidden_sizes=(64, 64), 
+                                                     lr=0.005, epochs=6000, 
+                                                     batch_size=32)
+            pred_nn = nn_predict(X_train)
+            mse_nn = np.mean((pred_nn - y_train) ** 2)
+            if mse_nn < best_mse:
+                best_mse = mse_nn
+                best_type = "nn"
+                best_nn_predict = nn_predict
+        except Exception:
+            pass
+
+    # Capture
+    sel_indices = active
+    F_mean_c = F_mean.copy()
+    F_std_c = F_std.copy()
+    w_c = w_active.copy()
+    y_mean_c = y_mean
+    y_std_c = y_std
+    best_type_c = best_type
+    best_gamma_c = best_gamma
+    X_train_c = X_train.copy()
+    y_train_c = y_train.copy()
+    finite_mask_c = finite_mask.copy()
+    best_nn_predict_c = best_nn_predict
+
+    def predict(X):
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X.reshape(1, -1)
+        if best_type_c == "nn" and best_nn_predict_c is not None:
+            return best_nn_predict_c(X)
+        elif best_type_c == "rbf" and best_gamma_c is not None:
+            return _rbf_predict(X_train_c, y_train_c, X, best_gamma_c, alpha=1e-6)
+        else:
+            F_pred = _build_basis(X, d)
+            F_pred = F_pred[:, finite_mask_c]
+            F_pred_norm = (F_pred - F_mean_c) / F_std_c
+            F_pred_sel = F_pred_norm[:, sel_indices]
+            return F_pred_sel @ w_c * y_std_c + y_mean_c
+
+    return predict
+# EVOLVE-BLOCK-END

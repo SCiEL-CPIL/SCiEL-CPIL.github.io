@@ -1,0 +1,159 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+P = {'n': 50, 'edges': [[0, 1], [0, 7], [0, 43], [0, 49], [1, 2], [1, 8], [1, 44], [2, 3], [2, 9], [2, 45], [3, 4], [3, 10], [3, 46], [4, 5], [4, 11], [4, 47], [5, 6], [5, 12], [5, 48], [6, 7], [6, 13], [6, 49], [7, 8], [7, 14], [8, 9], [8, 15], [9, 10], [9, 16], [10, 11], [10, 17], [11, 12], [11, 18], [12, 13], [12, 19], [13, 14], [13, 20], [14, 15], [14, 21], [15, 16], [15, 22], [16, 17], [16, 23], [17, 18], [17, 24], [18, 19], [18, 25], [19, 20], [19, 26], [20, 21], [20, 27], [21, 22], [21, 28], [22, 23], [22, 29], [23, 24], [23, 30], [24, 25], [24, 31], [25, 26], [25, 32], [26, 27], [26, 33], [27, 28], [27, 34], [28, 29], [28, 35], [29, 30], [29, 36], [30, 31], [30, 37], [31, 32], [31, 38], [32, 33], [32, 39], [33, 34], [33, 40], [34, 35], [34, 41], [35, 36], [35, 42], [36, 37], [36, 43], [37, 38], [37, 44], [38, 39], [38, 45], [39, 40], [39, 46], [40, 41], [40, 47], [41, 42], [41, 48], [42, 43], [42, 49], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49]]}
+
+def construct():
+    n = P['n']
+    edges = P['edges']
+    
+    # Build adjacency
+    adj = [[] for _ in range(n)]
+    for u, v in edges:
+        adj[u].append(v)
+        adj[v].append(u)
+    
+    # Try to find coloring with k colors for k = 3, 4, 5, ...
+    # Use backtracking with forest constraint checking
+    
+    def check_forest_constraint(coloring, k):
+        """Check that for every pair of colors, the induced subgraph is a forest."""
+        # For each pair of colors (i, j), collect vertices and edges
+        for i in range(k):
+            for j in range(i + 1, k):
+                # Union-find for this color pair
+                parent = list(range(n))
+                rank = [0] * n
+                
+                def find(x):
+                    while parent[x] != x:
+                        parent[x] = parent[parent[x]]
+                        x = parent[x]
+                    return x
+                
+                def union(x, y):
+                    rx, ry = find(x), find(y)
+                    if rx == ry:
+                        return False  # Cycle detected
+                    if rank[rx] < rank[ry]:
+                        rx, ry = ry, rx
+                    parent[ry] = rx
+                    if rank[rx] == rank[ry]:
+                        rank[rx] += 1
+                    return True
+                
+                # Check all edges between vertices of color i or j
+                for u, v in edges:
+                    cu, cv = coloring[u], coloring[v]
+                    if (cu == i and cv == j) or (cu == j and cv == i):
+                        if not union(u, v):
+                            return False  # Bicolored cycle found
+        return True
+    
+    def backtrack(vertex, coloring, k, color_count):
+        """Backtracking search for valid coloring with at most k colors."""
+        if vertex == n:
+            # Check if all colors used form a valid forest constraint
+            # Only need to check pairs of colors that are actually used
+            used_colors = set(coloring)
+            if len(used_colors) > color_count:
+                return None
+            # Check forest constraint for all pairs of used colors
+            for i in used_colors:
+                for j in used_colors:
+                    if i >= j:
+                        continue
+                    # Union-find for this pair
+                    parent = list(range(n))
+                    rank = [0] * n
+                    
+                    def find(x):
+                        while parent[x] != x:
+                            parent[x] = parent[parent[x]]
+                            x = parent[x]
+                        return x
+                    
+                    def union(x, y):
+                        rx, ry = find(x), find(y)
+                        if rx == ry:
+                            return False
+                        if rank[rx] < rank[ry]:
+                            rx, ry = ry, rx
+                        parent[ry] = rx
+                        if rank[rx] == rank[ry]:
+                            rank[rx] += 1
+                        return True
+                    
+                    for u, v in edges:
+                        cu, cv = coloring[u], coloring[v]
+                        if (cu == i and cv == j) or (cu == j and cv == i):
+                            if not union(u, v):
+                                return None
+            return coloring[:]
+        
+        # Try each color
+        for c in range(k):
+            # Check if color c conflicts with neighbors
+            valid = True
+            for nb in adj[vertex]:
+                if coloring[nb] == c:
+                    valid = False
+                    break
+            if not valid:
+                continue
+            
+            coloring[vertex] = c
+            result = backtrack(vertex + 1, coloring, k, color_count)
+            if result is not None:
+                return result
+            coloring[vertex] = -1
+        
+        return None
+    
+    # Try increasing number of colors
+    for k in range(3, n + 1):
+        coloring = [-1] * n
+        result = backtrack(0, coloring, k, k)
+        if result is not None:
+            # Verify the solution
+            used = set(result)
+            # Double check forest constraint
+            for i in used:
+                for j in used:
+                    if i >= j:
+                        continue
+                    parent = list(range(n))
+                    rank = [0] * n
+                    
+                    def find(x):
+                        while parent[x] != x:
+                            parent[x] = parent[parent[x]]
+                            x = parent[x]
+                        return x
+                    
+                    def union(x, y):
+                        rx, ry = find(x), find(y)
+                        if rx == ry:
+                            return False
+                        if rank[rx] < rank[ry]:
+                            rx, ry = ry, rx
+                        parent[ry] = rx
+                        if rank[rx] == rank[ry]:
+                            rank[rx] += 1
+                        return True
+                    
+                    ok = True
+                    for u, v in edges:
+                        cu, cv = result[u], result[v]
+                        if (cu == i and cv == j) or (cu == j and cv == i):
+                            if not union(u, v):
+                                ok = False
+                                break
+                    if not ok:
+                        break
+            else:
+                # Valid solution
+                return [int(x) for x in result]
+    
+    # Fallback: use all distinct colors (always valid)
+    return [int(i) for i in range(n)]
+# EVOLVE-BLOCK-END

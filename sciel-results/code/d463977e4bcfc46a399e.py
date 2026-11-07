@@ -1,0 +1,144 @@
+import time
+import sys
+import random
+
+def _can_match(m, L, n=12):
+    # Check if (m, m+L] contains distinct b_1..b_n with i | b_i
+    # Use iterative DFS augmenting paths for speed and safety
+    adj = [[] for _ in range(n)]
+    for i in range(1, n + 1):
+        # smallest multiple of i > m
+        r = ((m // i) + 1) * i
+        end = m + L
+        if r > end:
+            return False
+        v = r
+        while v <= end:
+            adj[i - 1].append(v)
+            v += i
+    
+    # match_r: value -> left index (0-based), or None
+    match_r = {}
+    
+    def dfs_iter(u, visited):
+        # Iterative DFS to avoid recursion overhead
+        stack = [(u, 0)]
+        while stack:
+            node, idx = stack[-1]
+            if idx < len(adj[node]):
+                v = adj[node][idx]
+                stack[-1] = (node, idx + 1)
+                if v in visited:
+                    continue
+                visited.add(v)
+                if v not in match_r:
+                    # Found augmenting path
+                    while stack:
+                        u2, _ = stack.pop()
+                        if stack:
+                            prev_u, prev_idx = stack[-1]
+                            v2 = adj[prev_u][prev_idx]
+                            match_r[v2] = u2
+                        else:
+                            match_r[v] = u2
+                    return True
+                else:
+                    # Recurse into match_r[v]
+                    stack.append((match_r[v], 0))
+            else:
+                stack.pop()
+        return False
+    
+    count = 0
+    for u in range(n):
+        visited = set()
+        if dfs_iter(u, visited):
+            count += 1
+        else:
+            return False
+    return count == n
+
+def _f(m, n=12):
+    # Binary search smallest L in [1, 144]
+    lo, hi = 1, 144
+    if not _can_match(m, hi, n):
+        return hi
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _can_match(m, mid, n):
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+def construct():
+    deadline = time.time() + 80  # 80s budget, 10s safety margin
+    
+    best_m = 12
+    best_f = _f(12)
+    
+    # Strategy: 
+    # 1. Coarse scan with step 7 to find good regions
+    # 2. Refine around best found
+    
+    step = 7
+    m = 0
+    while m <= 1000000:
+        if time.time() > deadline:
+            break
+        f = _f(m)
+        if f > best_f:
+            best_f = f
+            best_m = m
+        m += step
+    
+    # Refine around best_m with smaller step
+    if time.time() < deadline:
+        # First refine with step 1 in a wider range
+        for dm in range(-500, 501):
+            if time.time() > deadline:
+                break
+            mm = best_m + dm
+            if mm < 0 or mm > 1000000:
+                continue
+            f = _f(mm)
+            if f > best_f:
+                best_f = f
+                best_m = mm
+    
+    # Further refine with step 1 in a tighter range
+    if time.time() < deadline:
+        for dm in range(-50, 51):
+            if time.time() > deadline:
+                break
+            mm = best_m + dm
+            if mm < 0 or mm > 1000000:
+                continue
+            f = _f(mm)
+            if f > best_f:
+                best_f = f
+                best_m = mm
+    
+    # Additional random sampling to explore other regions
+    if time.time() < deadline:
+        for _ in range(500):
+            if time.time() > deadline:
+                break
+            mm = random.randint(0, 1000000)
+            f = _f(mm)
+            if f > best_f:
+                best_f = f
+                best_m = mm
+                # If we found a new best, do a local refine
+                for dm in range(-20, 21):
+                    if time.time() > deadline:
+                        break
+                    mm2 = best_m + dm
+                    if mm2 < 0 or mm2 > 1000000:
+                        continue
+                    f2 = _f(mm2)
+                    if f2 > best_f:
+                        best_f = f2
+                        best_m = mm2
+    
+    return int(best_m)

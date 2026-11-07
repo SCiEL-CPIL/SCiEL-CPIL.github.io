@@ -1,0 +1,150 @@
+import time
+import sys
+from random import Random
+
+sys.setrecursionlimit(10000)
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 145.0  # 5 second margin before 150s kill
+
+    def instance(splits, seed, palette=5):
+        rng = Random(seed)
+        faces = [[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
+        edges = {(min(a, b), max(a, b)) for f in faces for a, b in zip(f, f[1:] + f[:1])}
+        n = 8
+        for _ in range(splits):
+            face = faces.pop(rng.randrange(len(faces)))
+            inner = list(range(n, n + 4))
+            n += 4
+            for i in range(4):
+                a, b = face[i], face[(i + 1) % 4]
+                edges.add((min(a, inner[i]), max(a, inner[i])))
+                edges.add((min(inner[i], inner[(i + 1) % 4]), max(inner[i], inner[(i + 1) % 4])))
+                faces.append([a, b, inner[(i + 1) % 4], inner[i]])
+            faces.append(inner)
+        lists = [sorted(rng.sample(range(palette), 3)) for _ in range(n)]
+        return n, sorted(edges), lists
+
+    def solve_instance(n, edges, lists):
+        # Build adjacency list
+        adj = [[] for _ in range(n)]
+        for u, v in edges:
+            adj[u].append(v)
+            adj[v].append(u)
+        
+        # Pre-compute color masks
+        list_mask = [0] * n
+        for v in range(n):
+            mask = 0
+            for c in lists[v]:
+                mask |= (1 << c)
+            list_mask[v] = mask
+        
+        # color[v] = -1 if uncolored, else color
+        color = [-1] * n
+        # used_mask[v] has bits set for colors used by neighbors of v
+        used_mask = [0] * n
+        uncolored_count = n
+        
+        # List of uncolored vertices for faster MRV selection
+        uncolored_verts = list(range(n))
+        
+        def backtrack():
+            nonlocal uncolored_count
+            
+            if uncolored_count == 0:
+                return True
+            
+            # Deadline check
+            if time.time() > deadline:
+                return False
+            
+            # Find uncolored vertex with Minimum Remaining Values (MRV)
+            # Tie-break by maximum degree (more constrained)
+            min_count = 4
+            best_v = -1
+            best_avail = 0
+            best_degree = -1
+            best_idx_in_list = -1
+            
+            for i, v in enumerate(uncolored_verts):
+                avail = list_mask[v] & ~used_mask[v]
+                if avail == 0:
+                    return False
+                
+                cnt = bin(avail).count('1')
+                deg = len(adj[v])
+                
+                if cnt < min_count or (cnt == min_count and deg > best_degree):
+                    min_count = cnt
+                    best_v = v
+                    best_avail = avail
+                    best_degree = deg
+                    best_idx_in_list = i
+                    if min_count == 1:
+                        break
+            
+            if best_v == -1:
+                return False
+            
+            # Remove best_v from uncolored_verts
+            uncolored_verts.pop(best_idx_in_list)
+            uncolored_count -= 1
+            
+            # Try each available color
+            avail = best_avail
+            while avail:
+                lsb = avail & -avail
+                c = lsb.bit_length() - 1
+                avail -= lsb
+                
+                color[best_v] = c
+                bit = 1 << c
+                
+                # Update used_mask for neighbors
+                for u in adj[best_v]:
+                    used_mask[u] |= bit
+                
+                # Forward checking: verify no uncolored neighbor has 0 options
+                conflict = False
+                for u in adj[best_v]:
+                    if color[u] == -1:
+                        if (list_mask[u] & ~used_mask[u]) == 0:
+                            conflict = True
+                            break
+                
+                if not conflict and backtrack():
+                    return True
+                
+                # Undo
+                for u in adj[best_v]:
+                    used_mask[u] ^= bit
+                color[best_v] = -1
+            
+            # Re-add best_v to uncolored_verts
+            uncolored_verts.append(best_v)
+            uncolored_count += 1
+            return False
+        
+        if backtrack():
+            return [int(c) for c in color]
+        else:
+            return None
+
+    out = []
+    for splits, seed in ((20, 701), (40, 702), (60, 703), (100, 704)):
+        if time.time() > deadline:
+            n, _, _ = instance(splits, seed)
+            out.append([0] * n)
+            continue
+        
+        n, edges, lists = instance(splits, seed)
+        res = solve_instance(n, edges, lists)
+        
+        if res is None:
+            out.append([0] * n)
+        else:
+            out.append(res)
+            
+    return out

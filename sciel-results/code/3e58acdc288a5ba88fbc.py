@@ -1,0 +1,27 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+
+def heuristics(prizes, distance_matrix, max_len):
+    prizes = np.asarray(prizes, dtype=float)
+    distance_matrix = np.asarray(distance_matrix, dtype=float)
+    n = len(prizes)
+    
+    # Direct heuristic: amplify prize value, penalize distance
+    # Use higher alpha and beta to strengthen preference for high-prize, close nodes
+    eps = 1e-3
+    alpha = 3.0
+    beta = 1.5
+    
+    prize_factor = np.power(prizes + 1e-9, alpha)
+    dist_factor = np.power(distance_matrix + eps, beta)
+    
+    heuristic = prize_factor[None, :] / dist_factor
+    
+    # Ensure positive finite values
+    heuristic = np.where(np.isfinite(heuristic) & (heuristic > 0), heuristic, 1e-9)
+    
+    return heuristic
+# EVOLVE-BLOCK-END

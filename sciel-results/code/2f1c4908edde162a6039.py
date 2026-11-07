@@ -1,0 +1,79 @@
+import math
+
+def construct():
+    divisors = [6, 10, 14, 15, 21, 22, 26, 33, 35, 39]
+    n = len(divisors)
+    
+    # We search for the minimum range R
+    # Start with R=1 and increase
+    # For each R, we search for a starting value M
+    # We limit M to a reasonable range to ensure speed.
+    # Given the small divisors, a tight cluster should appear early.
+    
+    max_R = 200
+    max_M = 5000
+    
+    for R in range(1, max_R + 1):
+        for M in range(1, max_M + 1):
+            # Check if each divisor has at least one multiple in [M, M+R]
+            # And collect them
+            candidates = []
+            valid = True
+            for d in divisors:
+                # Find multiples of d in [M, M+R]
+                # First multiple >= M is ceil(M/d) * d
+                k_start = (M + d - 1) // d
+                k_end = (M + R) // d
+                
+                mults = []
+                for k in range(k_start, k_end + 1):
+                    val = k * d
+                    if M <= val <= M + R:
+                        mults.append(val)
+                
+                if not mults:
+                    valid = False
+                    break
+                candidates.append(mults)
+            
+            if not valid:
+                continue
+            
+            # Now we need to select one value from each candidates[i]
+            # such that all selected values are distinct.
+            # Use MRV heuristic: process variables with fewest candidates first.
+            
+            # Create list of (candidate_list, original_index)
+            indexed_candidates = [(c, i) for i, c in enumerate(candidates)]
+            # Sort by length of candidate list (smallest first)
+            indexed_candidates.sort(key=lambda x: len(x[0]))
+            
+            assignment = [None] * n
+            used = set()
+            
+            def backtrack(idx):
+                if idx == len(indexed_candidates):
+                    return True
+                
+                c_list, orig_idx = indexed_candidates[idx]
+                for val in c_list:
+                    if val not in used:
+                        used.add(val)
+                        assignment[orig_idx] = val
+                        if backtrack(idx + 1):
+                            return True
+                        used.remove(val)
+                        assignment[orig_idx] = None
+                return False
+            
+            if backtrack(0):
+                # Verify distinctness and constraints just in case
+                if len(set(assignment)) == n:
+                    # Check bounds
+                    if all(1 <= x <= 1000000 for x in assignment):
+                        return assignment[:]
+            
+    # Fallback if no small range found (should not happen)
+    # Just return the divisors themselves (which are distinct and valid, but range might be large)
+    # Or a simple greedy
+    return divisors[:]

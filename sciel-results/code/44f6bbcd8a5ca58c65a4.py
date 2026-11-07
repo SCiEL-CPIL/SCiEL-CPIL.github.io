@@ -1,0 +1,13 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+P = {'n': 10}
+
+def construct():
+    n = P['n']
+    # Return a single valid Latin square of order 10
+    # This is the cyclic group Z_10
+    squares = []
+    sq = [[(i + j) % n for j in range(n)] for i in range(n)]
+    squares.append(sq)
+    return squares
+# EVOLVE-BLOCK-END

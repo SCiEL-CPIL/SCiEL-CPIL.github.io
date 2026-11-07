@@ -1,0 +1,427 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+def heuristics(prizes, distance_matrix, max_len):
+    start_time = time.time()
+    time_limit = 295.0  # Safety margin (evaluator kills at 330s)
+    
+    N = len(prizes)
+    
+    # Precompute d_j0 = distance from each node to node 0
+    d_j0 = distance_matrix[:, 0].copy()
+    
+    # Vectorized ACO simulation for speed
+    def run_aco(eta, seed):
+        np.random.seed(seed)
+        tau = np.ones((N, N))
+        
+        best_prize_global = 0.0
+        
+        for it in range(30):
+            best_prize_iter = 0.0
+            
+            for ant in range(20):
+                current = 0
+                path_len = 0.0
+                prize_total = 0.0
+                visited = np.zeros(N, dtype=bool)
+                visited[0] = True
+                
+                while True:
+                    # Find eligible nodes: unvisited and within budget
+                    remaining = max_len - path_len
+                    # d[i,j] + d[j,0] <= remaining
+                    costs = distance_matrix[current, :] + d_j0
+                    eligible_mask = (~visited) & (costs <= remaining)
+                    
+                    if not np.any(eligible_mask):
+                        break
+                    
+                    eligible_idx = np.where(eligible_mask)[0]
+                    weights = tau[current, eligible_idx] * eta[current, eligible_idx]
+                    total_w = weights.sum()
+                    if total_w <= 0:
+                        break
+                    
+                    probs = weights / total_w
+                    r = np.random.rand()
+                    cumsum = np.cumsum(probs)
+                    idx = np.searchsorted(cumsum, r)
+                    if idx >= len(eligible_idx):
+                        idx = len(eligible_idx) - 1
+                    
+                    next_node = eligible_idx[idx]
+                    path_len += distance_matrix[current, next_node]
+                    prize_total += prizes[next_node]
+                    visited[next_node] = True
+                    current = next_node
+                
+                if prize_total > best_prize_iter:
+                    best_prize_iter = prize_total
+            
+            if best_prize_iter > best_prize_global:
+                best_prize_global = best_prize_iter
+            
+            tau = tau * 0.9
+            tau += best_prize_iter / 10.0
+        
+        return best_prize_global
+
+    # Heuristic generators
+    def gen_heuristic_A(lam):
+        denom = distance_matrix + lam * d_j0[None, :]
+        denom = np.maximum(denom, 1e-9)
+        eta = prizes[None, :] / denom
+        eta = np.where(eta > 0, eta, 1e-9)
+        return eta
+
+    def gen_heuristic_B(lam):
+        denom = distance_matrix * (1.0 + lam * d_j0[None, :])
+        denom = np.maximum(denom, 1e-9)
+        eta = prizes[None, :] / denom
+        eta = np.where(eta > 0, eta, 1e-9)
+        return eta
+
+    def gen_heuristic_C(lam):
+        # (Prize_j)^lam / (d_ij + d_j0)
+        denom = distance_matrix + d_j0[None, :]
+        denom = np.maximum(denom, 1e-9)
+        prize_pow = np.power(np.maximum(prizes, 1e-9), lam)[None, :]
+        eta = prize_pow / denom
+        eta = np.where(eta > 0, eta, 1e-9)
+        return eta
+
+    def gen_heuristic_D(lam):
+        # Prize_j / (d_ij^lam)
+        denom = np.power(np.maximum(distance_matrix, 1e-9), lam)
+        denom = np.maximum(denom, 1e-9)
+        eta = prizes[None, :] / denom
+        eta = np.where(eta > 0, eta, 1e-9)
+        return eta
+
+    def gen_heuristic_E(lam):
+        # (Prize_j) / (d_ij * d_j0^lam)
+        denom = distance_matrix * np.power(np.maximum(d_j0, 1e-9)[None, :], lam)
+        denom = np.maximum(denom, 1e-9)
+        eta = prizes[None, :] / denom
+        eta = np.where(eta > 0, eta, 1e-9)
+        return eta
+
+    def gen_heuristic_F(a, b):
+        # Prize_j^a / (d_ij^b)
+        prize_pow = np.power(np.maximum(prizes, 1e-9), a)[None, :]
+        denom = np.power(np.maximum(distance_matrix, 1e-9), b)
+        denom = np.maximum(denom, 1e-9)
+        eta = prize_pow / denom
+        eta = np.where(eta > 0, eta, 1e-9)
+        return eta
+
+    def gen_heuristic_G2(a, b):
+        # Prize_j^a / (d_ij^b * d_j0^b)
+        prize_pow = np.power(np.maximum(prizes, 1e-9), a)[None, :]
+        denom = np.power(np.maximum(distance_matrix, 1e-9), b) * np.power(np.maximum(d_j0, 1e-9)[None, :], b)
+        denom = np.maximum(denom, 1e-9)
+        eta = prize_pow / denom
+        eta = np.where(eta > 0, eta, 1e-9)
+        return eta
+
+    def gen_heuristic_H(a, b, c):
+        # Prize_j^a / (d_ij^b + c*d_j0)
+        prize_pow = np.power(np.maximum(prizes, 1e-9), a)[None, :]
+        denom = np.power(np.maximum(distance_matrix, 1e-9), b) + c * d_j0[None, :]
+        denom = np.maximum(denom, 1e-9)
+        eta = prize_pow / denom
+        eta = np.where(eta > 0, eta, 1e-9)
+        return eta
+
+    def gen_heuristic_I(a, b):
+        # Prize_j^a / (d_ij + b*d_j0)
+        prize_pow = np.power(np.maximum(prizes, 1e-9), a)[None, :]
+        denom = distance_matrix + b * d_j0[None, :]
+        denom = np.maximum(denom, 1e-9)
+        eta = prize_pow / denom
+        eta = np.where(eta > 0, eta, 1e-9)
+        return eta
+
+    def gen_heuristic_J(a, b, c):
+        # Prize_j^a * (1/(d_ij)^b) * (1/(d_j0)^c)
+        prize_pow = np.power(np.maximum(prizes, 1e-9), a)[None, :]
+        dij_pow = np.power(np.maximum(distance_matrix, 1e-9), b)
+        dj0_pow = np.power(np.maximum(d_j0, 1e-9)[None, :], c)
+        eta = prize_pow / (dij_pow * dj0_pow)
+        eta = np.where(eta > 0, eta, 1e-9)
+        return eta
+
+    def gen_heuristic_K(a, b, c):
+        # Prize_j^a / (d_ij^b * d_j0^c)
+        prize_pow = np.power(np.maximum(prizes, 1e-9), a)[None, :]
+        dij_pow = np.power(np.maximum(distance_matrix, 1e-9), b)
+        dj0_pow = np.power(np.maximum(d_j0, 1e-9)[None, :], c)
+        eta = prize_pow / (dij_pow * dj0_pow)
+        eta = np.where(eta > 0, eta, 1e-9)
+        return eta
+
+    def gen_heuristic_L(a, b):
+        # Prize_j^a / (d_ij^b + d_j0^b)
+        prize_pow = np.power(np.maximum(prizes, 1e-9), a)[None, :]
+        denom = np.power(np.maximum(distance_matrix, 1e-9), b) + np.power(np.maximum(d_j0, 1e-9)[None, :], b)
+        denom = np.maximum(denom, 1e-9)
+        eta = prize_pow / denom
+        eta = np.where(eta > 0, eta, 1e-9)
+        return eta
+
+    # Build candidate list: (type, param1, param2, param3)
+    candidates = []
+    
+    # Type A: Prize_j / (d_ij + lam*d_j0)
+    for lam in [0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0, 8.0, 12.0]:
+        candidates.append(('A', lam, 0, 0))
+    
+    # Type B: Prize_j / (d_ij * (1 + lam*d_j0))
+    for lam in [0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0]:
+        candidates.append(('B', lam, 0, 0))
+    
+    # Type C: Prize_j^lam / (d_ij + d_j0)
+    for lam in [0.5, 1.0, 1.5, 2.0, 3.0]:
+        candidates.append(('C', lam, 0, 0))
+    
+    # Type D: Prize_j / d_ij^lam
+    for lam in [0.5, 1.0, 1.5, 2.0, 3.0, 5.0]:
+        candidates.append(('D', lam, 0, 0))
+    
+    # Type E: Prize_j / (d_ij * d_j0^lam)
+    for lam in [0.5, 1.0, 1.5, 2.0, 3.0]:
+        candidates.append(('E', lam, 0, 0))
+    
+    # Type F: Prize_j^a / d_ij^b
+    for a in [0.5, 1.0, 1.5, 2.0, 3.0]:
+        for b in [0.5, 1.0, 1.5, 2.0, 3.0]:
+            candidates.append(('F', a, b, 0))
+    
+    # Type G2: Prize_j^a / (d_ij^b * d_j0^b)
+    for a in [0.5, 1.0, 1.5, 2.0, 3.0]:
+        for b in [0.5, 1.0, 1.5, 2.0, 3.0]:
+            candidates.append(('G2', a, b, 0))
+    
+    # Type H: Prize_j^a / (d_ij^b + c*d_j0)
+    for a in [1.0, 1.5, 2.0]:
+        for b in [1.0, 1.5, 2.0]:
+            for c in [0.5, 1.0, 2.0]:
+                candidates.append(('H', a, b, c))
+    
+    # Type I: Prize_j^a / (d_ij + b*d_j0)
+    for a in [1.0, 1.5, 2.0]:
+        for b in [0.5, 1.0, 1.5, 2.0, 3.0]:
+            candidates.append(('I', a, b, 0))
+    
+    # Type J: Prize_j^a / (d_ij^b * d_j0^c)
+    for a in [1.0, 1.5, 2.0]:
+        for b in [0.5, 1.0, 1.5]:
+            for c in [0.5, 1.0, 1.5]:
+                candidates.append(('J', a, b, c))
+    
+    # Type K: Prize_j^a / (d_ij^b * d_j0^c) - different ranges
+    for a in [0.5, 1.0, 1.5, 2.0]:
+        for b in [0.5, 1.0, 1.5, 2.0]:
+            for c in [0.5, 1.0, 1.5, 2.0]:
+                candidates.append(('K', a, b, c))
+    
+    # Type L: Prize_j^a / (d_ij^b + d_j0^b)
+    for a in [0.5, 1.0, 1.5, 2.0]:
+        for b in [0.5, 1.0, 1.5, 2.0]:
+            candidates.append(('L', a, b, 0))
+
+    def get_eta(c_type, p1, p2, p3):
+        if c_type == 'A':
+            return gen_heuristic_A(p1)
+        elif c_type == 'B':
+            return gen_heuristic_B(p1)
+        elif c_type == 'C':
+            return gen_heuristic_C(p1)
+        elif c_type == 'D':
+            return gen_heuristic_D(p1)
+        elif c_type == 'E':
+            return gen_heuristic_E(p1)
+        elif c_type == 'F':
+            return gen_heuristic_F(p1, p2)
+        elif c_type == 'G2':
+            return gen_heuristic_G2(p1, p2)
+        elif c_type == 'H':
+            return gen_heuristic_H(p1, p2, p3)
+        elif c_type == 'I':
+            return gen_heuristic_I(p1, p2)
+        elif c_type == 'J':
+            return gen_heuristic_J(p1, p2, p3)
+        elif c_type == 'K':
+            return gen_heuristic_K(p1, p2, p3)
+        elif c_type == 'L':
+            return gen_heuristic_L(p1, p2)
+        else:
+            return gen_heuristic_A(0.0)
+
+    # Phase 1: Quick screen with seed 0
+    quick_results = []
+    for c_type, p1, p2, p3 in candidates:
+        if time.time() - start_time > time_limit - 90:
+            break
+        eta = get_eta(c_type, p1, p2, p3)
+        s = run_aco(eta, 0)
+        quick_results.append((s, c_type, p1, p2, p3, eta))
+
+    # Sort by quick score descending
+    quick_results.sort(key=lambda x: x[0], reverse=True)
+
+    # Phase 2: Evaluate top candidates with multiple seeds
+    top_k = min(15, len(quick_results))
+    best_score = -1
+    best_eta = quick_results[0][5] if quick_results else gen_heuristic_A(0.0)
+
+    for s_quick, c_type, p1, p2, p3, eta in quick_results[:top_k]:
+        if time.time() - start_time > time_limit - 30:
+            break
+        scores = [s_quick]  # seed 0 already computed
+        for seed in [1, 2, 3]:
+            if time.time() - start_time > time_limit - 25:
+                break
+            s = run_aco(eta, seed)
+            scores.append(s)
+        avg_score = np.mean(scores)
+        if avg_score > best_score:
+            best_score = avg_score
+            best_eta = eta
+
+    # Phase 3: Local refinement around best candidate
+    if time.time() - start_time < time_limit - 40:
+        best_entry = quick_results[0]
+        best_type = best_entry[1]
+        best_p1 = best_entry[2]
+        best_p2 = best_entry[3]
+        best_p3 = best_entry[4]
+        
+        refinement_candidates = []
+        
+        # Neighbors in parameter space
+        param_ranges = {
+            'A': [(0, 20), (0, 0), (0, 0)],
+            'B': [(0, 10), (0, 0), (0, 0)],
+            'C': [(0.25, 5), (0, 0), (0, 0)],
+            'D': [(0.25, 5), (0, 0), (0, 0)],
+            'E': [(0.25, 5), (0, 0), (0, 0)],
+            'F': [(0.25, 5), (0.25, 5), (0, 0)],
+            'G2': [(0.25, 5), (0.25, 5), (0, 0)],
+            'H': [(0.5, 3), (0.5, 3), (0.25, 3)],
+            'I': [(0.5, 3), (0.25, 5), (0, 0)],
+            'J': [(0.5, 3), (0.25, 3), (0.25, 3)],
+            'K': [(0.5, 3), (0.25, 3), (0.25, 3)],
+            'L': [(0.5, 3), (0.25, 3), (0, 0)],
+        }
+        
+        ranges = param_ranges.get(best_type, [(0, 10), (0, 10), (0, 10)])
+        
+        # Finer local search
+        for dp1 in [-0.3, -0.15, -0.05, 0.05, 0.15, 0.3, 0.5, 0.8]:
+            for dp2 in [-0.3, -0.15, -0.05, 0.05, 0.15, 0.3, 0.5, 0.8]:
+                for dp3 in [-0.3, -0.15, -0.05, 0.05, 0.15, 0.3, 0.5, 0.8]:
+                    np1 = best_p1 + dp1
+                    np2 = best_p2 + dp2
+                    np3 = best_p3 + dp3
+                    if (np1 >= ranges[0][0] and np1 <= ranges[0][1] and
+                        np2 >= ranges[1][0] and np2 <= ranges[1][1] and
+                        np3 >= ranges[2][0] and np3 <= ranges[2][1]):
+                        if (dp1 != 0 or dp2 != 0 or dp3 != 0):
+                            refinement_candidates.append((best_type, np1, np2, np3))
+        
+        # Also try other types at best params (where applicable)
+        other_types = ['A', 'B', 'C', 'D', 'E', 'F', 'G2', 'H', 'I', 'J', 'K', 'L']
+        for ot in other_types:
+            if ot != best_type:
+                # Map params appropriately
+                if ot in ['A', 'B', 'C', 'D', 'E']:
+                    refinement_candidates.append((ot, best_p1, 0, 0))
+                elif ot in ['F', 'G2', 'I', 'L']:
+                    refinement_candidates.append((ot, best_p1, best_p2, 0))
+                elif ot in ['H', 'J', 'K']:
+                    refinement_candidates.append((ot, best_p1, best_p2, best_p3))
+        
+        # Deduplicate
+        seen = set()
+        unique_refinement = []
+        for rc in refinement_candidates:
+            key = (rc[0], round(rc[1], 3), round(rc[2], 3), round(rc[3], 3))
+            if key not in seen:
+                seen.add(key)
+                unique_refinement.append(rc)
+        
+        # Quick screen refinement candidates
+        refinement_scores = []
+        for c_type, p1, p2, p3 in unique_refinement:
+            if time.time() - start_time > time_limit - 25:
+                break
+            eta = get_eta(c_type, p1, p2, p3)
+            s = run_aco(eta, 0)
+            refinement_scores.append((s, c_type, p1, p2, p3, eta))
+        
+        refinement_scores.sort(key=lambda x: x[0], reverse=True)
+        
+        # Evaluate top refinement candidates with more seeds
+        top_ref = min(10, len(refinement_scores))
+        for s_quick, c_type, p1, p2, p3, eta in refinement_scores[:top_ref]:
+            if time.time() - start_time > time_limit - 15:
+                break
+            if s_quick <= best_score * 0.95:
+                continue
+            scores = [s_quick]
+            for seed in [1, 2, 3]:
+                if time.time() - start_time > time_limit - 10:
+                    break
+                s2 = run_aco(eta, seed)
+                scores.append(s2)
+            avg = np.mean(scores)
+            if avg > best_score:
+                best_score = avg
+                best_eta = eta
+
+    # Phase 4: Final polish - try blending with a few other top candidates
+    if time.time() - start_time < time_limit - 20:
+        # Get top 3 candidates from quick results
+        top_candidates = quick_results[:3]
+        
+        for i in range(min(3, len(top_candidates))):
+            for j in range(i+1, min(3, len(top_candidates))):
+                if time.time() - start_time > time_limit - 10:
+                    break
+                
+                eta1 = top_candidates[i][5]
+                eta2 = top_candidates[j][5]
+                
+                # Try geometric mean blend
+                for blend_w in [0.3, 0.5, 0.7]:
+                    if time.time() - start_time > time_limit - 8:
+                        break
+                    # Geometric mean: (eta1 * eta2)^(1/2)
+                    eta_blend = np.sqrt(eta1 * eta2)
+                    eta_blend = np.where(eta_blend > 0, eta_blend, 1e-9)
+                    
+                    s = run_aco(eta_blend, 0)
+                    if s > best_score * 0.97:
+                        scores = [s]
+                        for seed in [1, 2]:
+                            if time.time() - start_time > time_limit - 5:
+                                break
+                            s2 = run_aco(eta_blend, seed)
+                            scores.append(s2)
+                        avg = np.mean(scores)
+                        if avg > best_score:
+                            best_score = avg
+                            best_eta = eta_blend
+
+    # Final safety check
+    if not np.all(np.isfinite(best_eta)) or best_eta.shape != distance_matrix.shape:
+        best_eta = (prizes[None, :] + 1e-9) / (distance_matrix + 1e-9)
+        best_eta = np.where(best_eta > 0, best_eta, 1e-9)
+
+    return best_eta
+
+# EVOLVE-BLOCK-END

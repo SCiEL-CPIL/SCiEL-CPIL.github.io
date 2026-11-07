@@ -1,0 +1,72 @@
+"""Symbolic regression with 2 inputs using a Fourier basis + BFGS."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+
+def equation(x: np.ndarray, y: np.ndarray, params: np.ndarray) -> np.ndarray:
+    # Deadline guard
+    t0 = time.time()
+    deadline = t0 + 110.0  # 10s safety margin before 120s limit
+
+    # Ensure inputs are arrays
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    
+    # Construct a Fourier basis with 10 terms.
+    # We use a mix of individual and interaction terms.
+    # The domain is [-1, 1], so frequencies of pi, 2*pi etc are reasonable.
+    # Let's use standard frequencies (1, 2) scaled to the domain.
+    
+    # Term 0: Constant (1) - often important as a bias term
+    term_0 = np.ones_like(x)
+    
+    # Term 1: cos(x)
+    term_1 = np.cos(x)
+    
+    # Term 2: sin(x)
+    term_2 = np.sin(x)
+    
+    # Term 3: cos(y)
+    term_3 = np.cos(y)
+    
+    # Term 4: sin(y)
+    term_4 = np.sin(y)
+    
+    # Term 5: cos(x + y) - interaction
+    term_5 = np.cos(x + y)
+    
+    # Term 6: sin(x + y) - interaction
+    term_6 = np.sin(x + y)
+    
+    # Term 7: cos(x - y) - interaction
+    term_7 = np.cos(x - y)
+    
+    # Term 8: sin(x - y) - interaction
+    term_8 = np.sin(x - y)
+    
+    # Term 9: cos(2*x) - second harmonic in x
+    term_9 = np.cos(2 * x)
+    
+    # Stack terms into a matrix of shape (n_points, 10)
+    basis = np.column_stack([
+        term_0, term_1, term_2, term_3, term_4,
+        term_5, term_6, term_7, term_8, term_9
+    ])
+    
+    # The model is linear in params: pred = basis @ params
+    # BFGS will optimize params to minimize MSE.
+    # Since it's linear, this is effectively a least squares problem,
+    # but BFGS is robust enough to find it quickly from any start.
+    
+    predictions = basis @ params
+    
+    # Ensure output is finite and correct shape
+    if not np.all(np.isfinite(predictions)):
+         # Fallback to zero if something went wrong (should not happen)
+         return np.zeros_like(x)
+        
+    return predictions
+
+
+# EVOLVE-BLOCK-END

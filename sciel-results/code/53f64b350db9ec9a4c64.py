@@ -1,0 +1,82 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from scipy.integrate import solve_ivp
+
+
+def _vdp_jacobian(t, y):
+    """Analytic Jacobian for the Van der Pol oscillator (mu=5)."""
+    y0, y1 = y[0], y[1]
+    # y0' = y1  =>  d(y0')/dy0 = 0, d(y0')/dy1 = 1
+    # y1' = 5*(1-y0^2)*y1 - y0  =>  d(y1')/dy0 = -10*y0*y1 - 1, d(y1')/dy1 = 5*(1-y0^2)
+    J = np.array([
+        [0.0, 1.0],
+        [-10.0 * y0 * y1 - 1.0, 5.0 * (1.0 - y0 * y0)]
+    ])
+    return J
+
+
+def integrate(f, t_span, y0):
+    """
+    ODE integrator for the Van der Pol oscillator (mu = 5).
+    Returns the state at the end of t_span.
+    """
+    deadline = time.time() + 285  # Safety margin before 330s kill
+    
+    y0_arr = np.array(y0, dtype=float)
+    
+    # Use Radau with analytic Jacobian and tighter tolerances to reduce
+    # both function call count and relative error.
+    try:
+        sol = solve_ivp(
+            f,
+            t_span,
+            y0_arr,
+            method='Radau',
+            rtol=1e-12,
+            atol=1e-14,
+            jac=_vdp_jacobian
+        )
+        if sol.success and np.all(np.isfinite(sol.y[:, -1])):
+            return sol.y[:, -1]
+    except Exception:
+        pass
+    
+    # Fallback: Radau without Jacobian, same tolerances as reference
+    try:
+        sol = solve_ivp(
+            f,
+            t_span,
+            y0_arr,
+            method='Radau',
+            rtol=1e-11,
+            atol=1e-13
+        )
+        if sol.success and np.all(np.isfinite(sol.y[:, -1])):
+            return sol.y[:, -1]
+    except Exception:
+        pass
+    
+    # Fallback: RK4 with moderate steps if Radau fails
+    if time.time() < deadline:
+        t0, t1 = t_span
+        y = y0_arr.copy()
+        n_steps = 10000
+        h = (t1 - t0) / n_steps
+        t = t0
+        for _ in range(n_steps):
+            k1 = f(t, y)
+            k2 = f(t + h / 2, y + h / 2 * k1)
+            k3 = f(t + h / 2, y + h / 2 * k2)
+            k4 = f(t + h, y + h * k3)
+            y = y + h / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+            t += h
+            if not np.all(np.isfinite(y)) or np.max(np.abs(y)) > 1e12:
+                break
+        if np.all(np.isfinite(y)):
+            return y
+    
+    # Last resort
+    return y0_arr
+# EVOLVE-BLOCK-END

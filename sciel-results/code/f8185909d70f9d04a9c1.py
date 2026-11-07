@@ -1,0 +1,9 @@
+        for v in I_verts:
+            if d_v[v] < 2:
+                continue
+            for w in I_verts:
+                if v >= w:
+                    continue
+                # ...
+                conflict[v][w] = ...
+                conflict[w][v] = ...

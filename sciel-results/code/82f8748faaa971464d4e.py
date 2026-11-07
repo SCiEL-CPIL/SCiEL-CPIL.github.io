@@ -1,0 +1,6 @@
+    for mask in range(1, size):
+        sub = mask
+        # ...
+        while sub:
+            # ...
+            sub = (sub - 1) & mask

@@ -1,0 +1,321 @@
+"""Root finder for 3 fixed oscillatory equations; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import math
+import time
+from scipy.optimize import brentq, minimize_scalar
+
+# Safety margin before the 120 s wall-clock limit.
+_DEADLINE = time.time() + 110.0
+
+
+def _ok(v):
+    try:
+        return math.isfinite(v)
+    except (TypeError, ValueError):
+        return False
+
+
+def _illinois(f, a, b, fa, fb, max_iter=80):
+    """Illinois (regula falsi with under-relaxation). Requires fa, fb finite, fa*fb<0."""
+    if not _ok(fa) or not _ok(fb):
+        return None
+    for _ in range(max_iter):
+        if time.time() > _DEADLINE:
+            break
+        # secant estimate
+        denom = fb - fa
+        if denom == 0.0:
+            break
+        c = (a * fb - b * fa) / denom
+        if not _ok(c):
+            break
+        fc = f(c)
+        if not _ok(fc):
+            # nudge c toward the interior
+            c = 0.5 * (a + b)
+            fc = f(c)
+            if not _ok(fc):
+                break
+        if abs(fc) <= 1e-12:
+            return c
+        if fa * fc < 0.0:
+            b, fb = c, fc
+        else:
+            a, fa = c, fc
+        # Illinois damping: keep the bracket, shrink the side that changed less
+        if abs(fb) < abs(fa):
+            fa = 0.5 * fa
+        else:
+            fb = 0.5 * fb
+        if abs(b - a) <= 1e-15 * max(1.0, abs(a), abs(b)):
+            break
+    # return the endpoint with the smaller |f|
+    if abs(fa) <= abs(fb):
+        return a
+    return b
+
+
+def _local(f, x0):
+    """Fast local Illinois/secant from x0. Returns (x, fx) or None."""
+    x = float(x0)
+    fx = f(x)
+    if not _ok(fx):
+        return None
+    if abs(fx) <= 1e-8:
+        return x, fx
+    x_prev = x
+    fx_prev = fx
+    for _ in range(12):
+        if time.time() > _DEADLINE:
+            return None
+        # secant step
+        denom = fx - fx_prev
+        if denom == 0.0 or not _ok(denom):
+            break
+        x_new = x - fx * (x - x_prev) / denom
+        if not _ok(x_new):
+            break
+        fx_new = f(x_new)
+        if not _ok(fx_new):
+            break
+        if abs(fx_new) <= 1e-8:
+            return x_new, fx_new
+        # divergence guard
+        if abs(x_new - x) > 1000.0 * (1.0 + abs(x)):
+            break
+        x_prev, fx_prev = x, fx
+        x, fx = x_new, fx_new
+    return None
+
+
+def _golden_bracket(f, a, b, fa, fb, tol=1e-12, max_iter=60):
+    """Golden section search for minimum of |f(x)| on [a,b] where a and b are fixed."""
+    if not _ok(fa) or not _ok(fb):
+        return a, fa
+    phi = (1.0 + math.sqrt(5.0)) / 2.0
+    invphi = 1.0 / phi
+    invphi2 = 1.0 / (phi * phi)
+    
+    # Ensure a < b
+    if a > b:
+        a, b = b, a
+        fa, fb = fb, fa
+    
+    c = b - invphi * (b - a)
+    d = a + invphi * (b - a)
+    fc = f(c)
+    fd = f(d)
+    
+    best_x, best_f = a, fa
+    if abs(fa) < abs(fc) and abs(fa) < abs(fd) and abs(fa) < abs(fb):
+        best_x, best_f = a, fa
+    elif abs(fb) < abs(fc) and abs(fb) < abs(fd) and abs(fb) < abs(fa):
+        best_x, best_f = b, fb
+    
+    for _ in range(max_iter):
+        if time.time() > _DEADLINE:
+            break
+        if not _ok(fc):
+            fc = 1e100
+        if not _ok(fd):
+            fd = 1e100
+        
+        if abs(fc) < abs(fd):
+            b, fb = d, fd
+            d, fd = c, fc
+            c = b - invphi * (b - a)
+            fc = f(c)
+        else:
+            a, fa = c, fc
+            c, fc = d, fd
+            d = a + invphi * (b - a)
+            fd = f(d)
+        
+        # Update best
+        if abs(fc) < abs(best_f):
+            best_x, best_f = c, fc
+        if abs(fd) < abs(best_f):
+            best_x, best_f = d, fd
+            
+        if abs(b - a) <= tol * max(1.0, abs(a), abs(b)):
+            break
+    
+    return best_x, best_f
+
+
+def find_root(f, x0):
+    x0 = float(x0)
+    best_x = x0
+    best_fx = f(x0)
+    best_abs = abs(best_fx) if _ok(best_fx) else math.inf
+
+    # Phase 1: fast local method (few calls, high payoff when it works).
+    loc = _local(f, x0)
+    if loc is not None:
+        return loc[0]
+
+    # Phase 2: build a bracket around x0.
+    # Try expanding a bracket to find a sign change or a local |f| minimum.
+    scale = max(1.0, abs(x0))
+    # scan outward with a modest geometric factor; keep the best |f| point.
+    a = x0
+    fa = best_fx
+    b = x0
+    fb = best_fx
+
+    # Expand right and left to find a sign change (guaranteed root) or local min.
+    step = scale
+    found_sign = False
+    ca = None
+    cb = None
+    for _ in range(30):
+        if time.time() > _DEADLINE:
+            break
+        step *= 2.5
+        r = x0 + step
+        fr = f(r)
+        if _ok(fr):
+            if abs(fr) < best_abs:
+                best_abs, best_x, best_fx = abs(fr), r, fr
+            if _ok(fa) and fa * fr < 0.0:
+                ca, cb = x0, r
+                found_sign = True
+                break
+        l = x0 - step
+        fl = f(l)
+        if _ok(fl):
+            if abs(fl) < best_abs:
+                best_abs, best_x, best_fx = abs(fl), l, fl
+            if _ok(fa) and fa * fl < 0.0:
+                ca, cb = l, x0
+                found_sign = True
+                break
+        if step > 1e12:
+            break
+
+    if found_sign:
+        try:
+            root = brentq(f, ca, cb, xtol=1e-12, rtol=1e-14, maxiter=100)
+            if _ok(root):
+                return root
+        except Exception:
+            pass
+        # fallback to Illinois on the same bracket
+        fa2 = f(ca)
+        fb2 = f(cb)
+        r = _illinois(f, ca, cb, fa2, fb2)
+        if r is not None and _ok(r):
+            return r
+
+    # No sign change found: try to refine around the best |f| point (touching root).
+    # Build a small bracket around best_x and look for a local minimum / sign change.
+    cx = best_x
+    cfx = best_fx
+    if _ok(cfx):
+        h = max(1e-4, 1e-4 * abs(cx))
+        # sample a few offsets to find a sign change or a lower point
+        for k in range(1, 12):
+            if time.time() > _DEADLINE:
+                break
+            off = h * (2.0 ** k)
+            for sgn in (1.0, -1.0):
+                p = cx + sgn * off
+                fp = f(p)
+                if not _ok(fp):
+                    continue
+                if abs(fp) < best_abs:
+                    best_abs, best_x, best_fx = abs(fp), p, fp
+                if _ok(cfx) and cfx * fp < 0.0:
+                    lo, hi = (cx, p) if sgn > 0 else (p, cx)
+                    try:
+                        root = brentq(f, lo, hi, xtol=1e-12, rtol=1e-14, maxiter=100)
+                        if _ok(root):
+                            return root
+                    except Exception:
+                        pass
+                    r = _illinois(f, lo, hi, f(lo), f(hi))
+                    if r is not None and _ok(r):
+                        return r
+                    break
+        # If we found a local minimum in the scanning phase, refine it with golden section
+        # We use the neighborhood found by the scan (roughly best_x +/- h*1024)
+        # Let's define a bracket around best_x for golden section
+        # We need to ensure we are bracketing the minimum
+        # Re-evaluate best_x to get current fx
+        # The scan might have updated best_x, but cfx is old.
+        # Let's just use the best_x found in the scan and a reasonable width.
+        # The scan expanded up to step ~ scale * 2.5^12 which is huge.
+        # But the local min is likely close.
+        # Let's try a bracket of size max(1e-2, 1e-2*abs(best_x))
+        w = max(1e-2, 1e-2 * abs(best_x))
+        lo = best_x - w
+        hi = best_x + w
+        f_lo = f(lo)
+        f_hi = f(hi)
+        
+        # Check if we have a valid bracket for the minimum (i.e. f(best_x) < f(lo) and f(best_x) < f_hi)
+        # We already have best_fx from the scan loop, but it might be stale if best_x moved.
+        # Let's just run golden section on [lo, hi] minimizing |f|
+        # This is robust if the minimum is inside.
+        if time.time() < _DEADLINE - 5.0:
+            gx, gf = _golden_bracket(f, lo, hi, f_lo, f_hi, tol=1e-12, max_iter=50)
+            if _ok(gf) and abs(gf) < best_abs:
+                best_x = gx
+                best_fx = gf
+                best_abs = abs(gf)
+                if best_abs <= 1e-8:
+                    return best_x
+
+    # Phase 3: Global minimization of squared residual as fallback
+    # This handles cases where no sign change was found but a root exists
+    # (e.g., touching roots or roots with very small |f| values)
+    if time.time() < _DEADLINE - 5.0:
+        try:
+            # Define the objective function
+            def obj(x):
+                try:
+                    fx = f(x)
+                    if not _ok(fx):
+                        return 1e100
+                    val = fx * fx
+                    return val if val < 1e100 else 1e100
+                except:
+                    return 1e100
+            
+            # Use expanding bounded intervals
+            base_scale = max(1.0, abs(x0))
+            for expand_factor in [1, 10, 100, 1000]:
+                if time.time() > _DEADLINE - 5.0:
+                    break
+                half_width = base_scale * expand_factor
+                if half_width < 1e-6:
+                    half_width = 1e-6
+                if half_width > 1e6:
+                    half_width = 1e6
+                
+                try:
+                    result = minimize_scalar(
+                        obj, 
+                        bounds=(x0 - half_width, x0 + half_width),
+                        method='bounded',
+                        options={'xatol': 1e-10, 'maxiter': 50}
+                    )
+                    if result.success and _ok(result.x):
+                        fx_check = f(result.x)
+                        if _ok(fx_check) and abs(fx_check) < best_abs:
+                            best_x = result.x
+                            best_fx = fx_check
+                            best_abs = abs(fx_check)
+                            if best_abs <= 1e-8:
+                                return best_x
+                except Exception:
+                    pass
+        
+        except Exception:
+            pass
+
+    # Return the best finite candidate found.
+    if _ok(best_x):
+        return best_x
+    return x0
+# EVOLVE-BLOCK-END

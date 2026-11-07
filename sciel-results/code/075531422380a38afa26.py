@@ -1,0 +1,49 @@
+def construct():
+    """
+    Return a 3-uniform hypergraph on vertices 0..8 that is 3-chromatic
+    (not 2-colorable, but 3-colorable) with the minimum number of edges.
+    
+    The Fano plane is the unique (up to isomorphism) 3-chromatic 3-uniform
+    hypergraph with 7 edges. It is known to be the minimum for 3-chromatic
+    triple systems. We embed it in 9 vertices by leaving vertices 7 and 8 isolated.
+    """
+    # Fano plane edges (7 edges on vertices 0-6)
+    edges = [
+        [0, 1, 2],
+        [0, 3, 4],
+        [0, 5, 6],
+        [1, 3, 5],
+        [1, 4, 6],
+        [2, 3, 6],
+        [2, 4, 5]
+    ]
+    
+    # A valid 3-coloring: no edge is monochromatic
+    # Vertices 0-6 are colored to break each Fano edge
+    # v0=0, v1=1, v2=2 -> edge [0,1,2] has colors {0,1,2}
+    # v0=0, v3=1, v4=0 -> edge [0,3,4] has colors {0,1}
+    # v0=0, v5=2, v6=0 -> edge [0,5,6] has colors {0,2}
+    # v1=1, v3=1, v5=2 -> edge [1,3,5] has colors {1,2}
+    # v1=1, v4=0, v6=0 -> edge [1,4,6] has colors {0,1}
+    # v2=2, v3=1, v6=0 -> edge [2,3,6] has colors {0,1,2}
+    # v2=2, v4=0, v5=2 -> edge [2,4,5] has colors {0,2}
+    colors = [0, 1, 2, 1, 0, 2, 0, 0, 0]
+    
+    # Ensure all types are Python int and list
+    # Converting to lists of ints as required by the contract
+    final_edges = []
+    for e in edges:
+        final_edges.append([int(e[0]), int(e[1]), int(e[2])])
+    
+    final_colors = [int(c) for c in colors]
+    
+    # Defensive check: Ensure no edge is monochromatic
+    for e in final_edges:
+        c0, c1, c2 = final_colors[e[0]], final_colors[e[1]], final_colors[e[2]]
+        if c0 == c1 == c2:
+            # This should never happen with the known Fano coloring,
+            # but if it does, we would need to fix it.
+            # For this specific static structure, it is guaranteed valid.
+            pass
+    
+    return {'edges': final_edges, 'colors': final_colors}

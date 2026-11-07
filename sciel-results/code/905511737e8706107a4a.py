@@ -1,0 +1,33 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+
+def construct():
+    # Construct two disjoint K_{3,3} components.
+    # Each K_{3,3} is bipartite with parts of size 3, so it's triangle-free.
+    # The cycle lengths in K_{3,3} are exactly 4 and 6.
+    # Since the graph is disconnected, the set of distinct cycle lengths
+    # is the union of cycle lengths from each component, which is {4, 6}.
+    # This gives a raw value of 2, which is the minimum possible for
+    # a triangle-free graph with minimum degree 3.
+    
+    edges = []
+    
+    # Component 1: K_{3,3} on vertices 0..5
+    # Partition: A = {0, 1, 2}, B = {3, 4, 5}
+    part1_a = [0, 1, 2]
+    part1_b = [3, 4, 5]
+    for u in part1_a:
+        for v in part1_b:
+            edges.append([int(u), int(v)])
+    
+    # Component 2: K_{3,3} on vertices 6..11
+    # Partition: A = {6, 7, 8}, B = {9, 10, 11}
+    part2_a = [6, 7, 8]
+    part2_b = [9, 10, 11]
+    for u in part2_a:
+        for v in part2_b:
+            edges.append([int(u), int(v)])
+    
+    return edges
+
+# EVOLVE-BLOCK-END

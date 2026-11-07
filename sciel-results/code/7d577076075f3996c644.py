@@ -1,0 +1,335 @@
+"""Solver for few-color graph coloring with no bicolored cycles."""
+import time
+from collections import defaultdict
+
+P = {'n': 50, 'edges': [[0, 1], [0, 7], [0, 43], [0, 49], [1, 2], [1, 8], [1, 44], [2, 3], [2, 9], [2, 45], [3, 4], [3, 10], [3, 46], [4, 5], [4, 11], [4, 47], [5, 6], [5, 12], [5, 48], [6, 7], [6, 13], [6, 49], [7, 8], [7, 14], [8, 9], [8, 15], [9, 10], [9, 16], [10, 11], [10, 17], [11, 12], [11, 18], [12, 13], [12, 19], [13, 14], [13, 20], [14, 15], [14, 21], [15, 16], [15, 22], [16, 17], [16, 23], [17, 18], [17, 24], [18, 19], [18, 25], [19, 20], [19, 26], [20, 21], [20, 27], [21, 22], [21, 28], [22, 23], [22, 29], [23, 24], [23, 30], [24, 25], [24, 31], [25, 26], [25, 32], [26, 27], [26, 33], [27, 28], [27, 34], [28, 29], [28, 35], [29, 30], [29, 36], [30, 31], [30, 37], [31, 32], [31, 38], [32, 33], [32, 39], [33, 34], [33, 40], [34, 35], [34, 41], [35, 36], [35, 42], [36, 37], [36, 43], [37, 38], [37, 44], [38, 39], [38, 45], [39, 40], [39, 46], [40, 41], [40, 47], [41, 42], [41, 48], [42, 43], [42, 49], [43, 44], [44, 45], [45, 46], [46, 47], [47, 48], [48, 49]]}
+
+def _build_adj():
+    n = P['n']
+    adj = [[] for _ in range(n)]
+    for u, v in P['edges']:
+        adj[u].append(v)
+        adj[v].append(u)
+    return adj
+
+def _check_bicolored_cycles_full(coloring, adj):
+    """Full check: verify no bicolored cycles using union-find per color pair."""
+    n = P['n']
+    for u, v in P['edges']:
+        if coloring[u] == coloring[v]:
+            return False
+    
+    pair_edges = defaultdict(list)
+    for u, v in P['edges']:
+        cu, cv = coloring[u], coloring[v]
+        if cu < cv:
+            pair_edges[(cu, cv)].append((u, v))
+        elif cv < cu:
+            pair_edges[(cv, cu)].append((u, v))
+    
+    for (c1, c2), edges in pair_edges.items():
+        parent = {}
+        rank = {}
+        def find(x):
+            if x not in parent:
+                parent[x] = x
+                rank[x] = 0
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra == rb:
+                return False
+            if rank[ra] < rank[rb]:
+                ra, rb = rb, ra
+            parent[rb] = ra
+            if rank[ra] == rank[rb]:
+                rank[ra] += 1
+            return True
+        
+        for u, v in edges:
+            if not union(u, v):
+                return False
+    return True
+
+def _milp_coloring(adj, num_colors, deadline):
+    """
+    Try to find a valid coloring using MILP via scipy.optimize.milp.
+    Returns a coloring list or None.
+    """
+    try:
+        from scipy.optimize import milp, LinearConstraint, Bounds
+        import numpy as np
+    except ImportError:
+        return None
+    
+    n = P['n']
+    edges = P['edges']
+    m = len(edges)
+    
+    # Decision variables: x[v][c] = 1 if vertex v gets color c
+    # Total variables: n * num_colors
+    # Constraints:
+    # 1. Each vertex gets exactly one color: sum_c x[v][c] = 1 for each v
+    # 2. Adjacent vertices differ: x[u][c] + x[v][c] <= 1 for each edge (u,v) and color c
+    # 3. No bicolored cycles: this is hard to express linearly directly.
+    #    Instead, we rely on the fact that for small k, the cycle constraints are tight.
+    #    We will use a heuristic approach: solve the LP relaxation, then round.
+    #    Actually, let's just try to solve a standard graph coloring MILP first,
+    #    and then check for bicolored cycles. If it fails, we backtrack.
+    #    But the key insight is: for 3 colors, the bicolored cycle constraint is very strong.
+    
+    # Let's build the MILP:
+    # Variables: x[v][c] for v in 0..n-1, c in 0..num_colors-1
+    # Objective: minimize sum of "color used" indicators.
+    # Let y[c] = 1 if color c is used. y[c] >= x[v][c] for all v.
+    # Minimize sum_c y[c].
+    
+    # Total vars: n*num_colors + num_colors
+    # Index: var_idx(v, c) = v * num_colors + c
+    #        y_idx(c) = n * num_colors + c
+    
+    nvar = n * num_colors + num_colors
+    
+    # Objective: minimize sum y[c]
+    c_obj = np.zeros(nvar)
+    for c in range(num_colors):
+        c_obj[n * num_colors + c] = 1.0
+    
+    # Constraints:
+    # 1. Sum_c x[v][c] = 1 for each v
+    # 2. x[u][c] + x[v][c] <= 1 for each edge, color c
+    # 3. y[c] >= x[v][c] for each v, c
+    
+    # We'll build A_ub, b_ub for inequalities and A_eq, b_eq for equalities
+    # scipy.optimize.milp takes:
+    # c: objective
+    # constraints: LinearConstraint(A, lb, ub)
+    # integrality: array of 0/1
+    # bounds: Bounds
+    
+    # Let's collect all inequality constraints: x[u][c] + x[v][c] <= 1
+    # and y[c] - x[v][c] >= 0  =>  -y[c] + x[v][c] <= 0
+    
+    ineq_rows = []
+    ineq_ubs = []
+    
+    # Edge constraints: x[u][c] + x[v][c] <= 1
+    for u, v in edges:
+        for c in range(num_colors):
+            row = np.zeros(nvar)
+            row[u * num_colors + c] = 1.0
+            row[v * num_colors + c] = 1.0
+            ineq_rows.append(row)
+            ineq_ubs.append(1.0)
+    
+    # y[c] >= x[v][c]  =>  x[v][c] - y[c] <= 0
+    for v in range(n):
+        for c in range(num_colors):
+            row = np.zeros(nvar)
+            row[v * num_colors + c] = 1.0
+            row[n * num_colors + c] = -1.0
+            ineq_rows.append(row)
+            ineq_ubs.append(0.0)
+    
+    # Equality constraints: sum_c x[v][c] = 1
+    eq_rows = []
+    eq_rhs = []
+    for v in range(n):
+        row = np.zeros(nvar)
+        for c in range(num_colors):
+            row[v * num_colors + c] = 1.0
+        eq_rows.append(row)
+        eq_rhs.append(1.0)
+    
+    if ineq_rows:
+        A_ub = np.array(ineq_rows)
+        b_ub = np.array(ineq_ubs)
+    else:
+        A_ub = np.array([[]]).reshape(0, nvar)
+        b_ub = np.array([])
+    
+    if eq_rows:
+        A_eq = np.array(eq_rows)
+        b_eq = np.array(eq_rhs)
+    else:
+        A_eq = np.array([[]]).reshape(0, nvar)
+        b_eq = np.array([])
+    
+    # Integrality: all x[v][c] and y[c] are binary
+    integrality = np.ones(nvar)
+    
+    # Bounds: 0 <= x[v][c] <= 1, 0 <= y[c] <= 1
+    lb = np.zeros(nvar)
+    ub = np.ones(nvar)
+    
+    constraints = LinearConstraint(
+        np.vstack([A_ub, A_eq]) if A_ub.size > 0 or A_eq.size > 0 else np.array([[]]).reshape(0, nvar),
+        np.concatenate([b_ub, b_eq]) if b_ub.size > 0 or b_eq.size > 0 else np.array([]),
+        np.concatenate([-np.inf * np.ones(len(b_ub) if b_ub.size > 0 else 0), b_eq]) if b_ub.size > 0 or b_eq.size > 0 else np.array([])
+    )
+    
+    # Actually, LinearConstraint takes A, lb, ub where lb <= A @ x <= ub
+    # Let's redo this properly.
+    
+    # Inequalities: A_ub @ x <= b_ub
+    # Equalities: A_eq @ x = b_eq  =>  A_eq @ x >= b_eq and A_eq @ x <= b_eq
+    
+    all_A = []
+    all_lb = []
+    all_ub = []
+    
+    if A_ub.size > 0:
+        all_A.append(A_ub)
+        all_lb.extend([-np.inf] * len(b_ub))
+        all_ub.extend(list(b_ub))
+    
+    if A_eq.size > 0:
+        all_A.append(A_eq)
+        all_lb.extend(list(b_eq))
+        all_ub.extend(list(b_eq))
+    
+    if all_A:
+        A_all = np.vstack(all_A)
+        lb_all = np.array(all_lb)
+        ub_all = np.array(all_ub)
+    else:
+        A_all = np.array([[]]).reshape(0, nvar)
+        lb_all = np.array([])
+        ub_all = np.array([])
+    
+    constraints = LinearConstraint(A_all, lb_all, ub_all)
+    bounds = Bounds(lb, ub)
+    
+    start_time = time.time()
+    
+    try:
+        result = milp(c=c_obj, constraints=constraints, integrality=integrality, bounds=bounds,
+                      options={"time_limit": max(1, int(deadline - time.time()))})
+    except Exception:
+        return None
+    
+    if time.time() > deadline:
+        return None
+    
+    if not result.success:
+        return None
+    
+    x = result.x
+    if x is None:
+        return None
+    
+    # Extract coloring
+    coloring = [-1] * n
+    for v in range(n):
+        for c in range(num_colors):
+            if x[v * num_colors + c] > 0.5:
+                coloring[v] = c
+                break
+    
+    if -1 in coloring:
+        return None
+    
+    # Verify
+    if _check_bicolored_cycles_full(coloring, adj):
+        return [int(c) for c in coloring]
+    
+    return None
+
+def _backtrack_coloring(adj, num_colors, deadline, order=None):
+    """Backtracking with incremental bicolored cycle checking."""
+    n = P['n']
+    coloring = [-1] * n
+    
+    if order is None:
+        order = sorted(range(n), key=lambda x: (-len(adj[x]), x))
+    
+    def would_create_cycle(v, c, adj, coloring):
+        neighbor_colors = set()
+        for nb in adj[v]:
+            if coloring[nb] != -1 and coloring[nb] != c:
+                neighbor_colors.add(coloring[nb])
+        
+        for cn in neighbor_colors:
+            target_neighbors = [nb for nb in adj[v] if coloring[nb] == cn]
+            if not target_neighbors:
+                continue
+            
+            visited = set([v])
+            stack = [(v, -1)]
+            found_cycle = False
+            
+            while stack and not found_cycle:
+                cur, par = stack.pop()
+                for nb in adj[cur]:
+                    if nb == par:
+                        continue
+                    if coloring[nb] not in (c, cn):
+                        continue
+                    if nb == v:
+                        found_cycle = True
+                        break
+                    if nb in visited:
+                        if coloring[nb] == cn and nb in target_neighbors:
+                            found_cycle = True
+                            break
+                        continue
+                    visited.add(nb)
+                    stack.append((nb, cur))
+            
+            if found_cycle:
+                return False
+        
+        return True
+    
+    def dfs(idx):
+        if time.time() > deadline:
+            return None
+        if idx == n:
+            return coloring[:]
+        
+        v = order[idx]
+        used_by_neighbors = set()
+        for nb in adj[v]:
+            if coloring[nb] != -1:
+                used_by_neighbors.add(coloring[nb])
+        
+        for c in range(num_colors):
+            if c in used_by_neighbors:
+                continue
+            
+            coloring[v] = c
+            if would_create_cycle(v, c, adj, coloring):
+                result = dfs(idx + 1)
+                if result is not None:
+                    return result
+            coloring[v] = -1
+        
+        return None
+    
+    return dfs(0)
+
+def construct():
+    deadline = time.time() + 85
+    adj = _build_adj()
+    
+    for nc in [3, 4, 5, 6]:
+        if time.time() > deadline:
+            break
+        
+        # Try MILP first for small num_colors
+        if nc <= 4 and time.time() < deadline - 20:
+            result = _milp_coloring(adj, nc, deadline)
+            if result is not None:
+                if _check_bicolored_cycles_full(result, adj):
+                    return [int(x) for x in result]
+        
+        # Fall back to backtracking
+        result = _backtrack_coloring(adj, nc, deadline)
+        if result is not None:
+            if _check_bicolored_cycles_full(result, adj):
+                return [int(x) for x in result]
+    
+    return [int(i) for i in range(P['n'])]

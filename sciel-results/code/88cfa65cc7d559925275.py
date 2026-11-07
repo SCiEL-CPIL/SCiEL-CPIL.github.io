@@ -1,0 +1,305 @@
+"""Root finder for 3 fixed 2D systems using Broyden's method with Newton polish and multi-start."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+def find_root_system(F, x0):
+    """
+    Finds x in R^2 such that ||F(x)|| <= 1e-8 using Broyden's method
+    with merit function line search, Newton polish, and multi-start continuation.
+    
+    Broyden reduces F-call count: ~3 calls for initial Jacobian,
+    then 1 call per line search step (vs 3 for finite-diff Newton).
+    Newton polish with fresh Jacobians provides high-precision convergence.
+    """
+    x = np.array(x0, dtype=float)
+    if not np.all(np.isfinite(x)):
+        x = np.zeros(2)
+    
+    tol = 1e-8
+    tol_sq = tol * tol
+    start_time = time.time()
+    time_limit = 140.0
+    
+    def time_left():
+        return time_limit - (time.time() - start_time)
+    
+    def compute_jacobian(x_pt, Fx_pt):
+        """Compute Jacobian via forward differences."""
+        h = 1e-7
+        scale = np.max(np.abs(x_pt))
+        if scale > 1.0:
+            h = 1e-7 * scale
+        J = np.zeros((2, 2))
+        for j in range(2):
+            e = np.zeros(2)
+            e[j] = h
+            Fx_e = F(x_pt + e)
+            J[:, j] = (Fx_e - Fx_pt) / h
+        return J
+    
+    # Track best solution
+    best_x = x.copy()
+    best_norm_sq = float('inf')
+    
+    # Initial evaluation
+    try:
+        Fx0 = F(x)
+        best_norm_sq = float(np.dot(Fx0, Fx0))
+    except:
+        return np.zeros(2)
+    
+    if best_norm_sq <= tol_sq:
+        return best_x
+    
+    # Newton polish: use fresh Jacobians for high-precision convergence
+    def newton_polish(x_start, Fx_start, max_iters=10):
+        """
+        Newton's method with fresh Jacobian each step for high-precision convergence.
+        Returns (x, Fx, converged, iters_used).
+        """
+        x_cur = x_start.copy()
+        Fx_cur = Fx_start.copy()
+        norm_sq_cur = float(np.dot(Fx_cur, Fx_cur))
+        
+        if norm_sq_cur <= tol_sq:
+            return x_cur, Fx_cur, True, 0
+        
+        iters = 0
+        for it in range(max_iters):
+            iters = it + 1
+            if time_left() < 1.0:
+                break
+            
+            J = compute_jacobian(x_cur, Fx_cur)
+            det = J[0, 0] * J[1, 1] - J[0, 1] * J[1, 0]
+            if abs(det) < 1e-12:
+                break
+            
+            try:
+                s = np.linalg.solve(J, -Fx_cur)
+            except np.linalg.LinAlgError:
+                break
+            
+            s_norm = np.linalg.norm(s)
+            if s_norm < 1e-15:
+                break
+            
+            x_try = x_cur + s
+            Fx_try = F(x_try)
+            norm_sq_try = float(np.dot(Fx_try, Fx_try))
+            
+            if norm_sq_try <= tol_sq:
+                return x_try, Fx_try, True, iters
+            
+            if norm_sq_try < norm_sq_cur:
+                x_cur = x_try
+                Fx_cur = Fx_try
+                norm_sq_cur = norm_sq_try
+            else:
+                # Damped Newton step
+                alpha = 0.5
+                for _ in range(5):
+                    x_try = x_cur + alpha * s
+                    Fx_try = F(x_try)
+                    norm_sq_try = float(np.dot(Fx_try, Fx_try))
+                    if norm_sq_try < norm_sq_cur:
+                        x_cur = x_try
+                        Fx_cur = Fx_try
+                        norm_sq_cur = norm_sq_try
+                        break
+                    alpha *= 0.5
+                else:
+                    break
+        
+        return x_cur, Fx_cur, False, iters
+    
+    # Broyden solver from a given starting point
+    def broyden_solve(x_start, Fx_start, max_iters=40):
+        """
+        Broyden's good method with merit function line search.
+        Returns (x, Fx, converged, iters_used).
+        """
+        x_cur = x_start.copy()
+        Fx_cur = Fx_start.copy()
+        norm_sq_cur = float(np.dot(Fx_cur, Fx_cur))
+        
+        if norm_sq_cur <= tol_sq:
+            return x_cur, Fx_cur, True, 0
+        
+        # Compute initial Jacobian via forward differences
+        J = compute_jacobian(x_cur, Fx_cur)
+        
+        # Check if Jacobian is well-conditioned
+        det = J[0, 0] * J[1, 1] - J[0, 1] * J[1, 0]
+        if abs(det) < 1e-12:
+            return x_cur, Fx_cur, False, 0
+        
+        iters = 0
+        max_step = 50.0
+        
+        for it in range(max_iters):
+            iters = it + 1
+            if time_left() < 1.0:
+                break
+            
+            # Solve J * s = -Fx
+            try:
+                s = np.linalg.solve(J, -Fx_cur)
+            except np.linalg.LinAlgError:
+                break
+            
+            s_norm = np.linalg.norm(s)
+            if s_norm < 1e-15:
+                break
+            
+            # Limit step size
+            if s_norm > max_step:
+                s = s * (max_step / s_norm)
+                s_norm = max_step
+            
+            # Line search on merit function phi(x) = 0.5 * ||F(x)||^2
+            alpha = 1.0
+            phi_prev = 0.5 * norm_sq_cur
+            slope = float(np.dot(Fx_cur, J @ s))  # directional derivative of phi
+            
+            # If slope is not negative, use steepest descent direction
+            if slope >= 0:
+                s = -J.T @ Fx_cur
+                s_norm = np.linalg.norm(s)
+                if s_norm < 1e-15:
+                    break
+                if s_norm > max_step:
+                    s = s * (max_step / s_norm)
+                slope = -float(np.dot(s, J.T @ Fx_cur))
+                if slope >= 0:
+                    break
+            
+            accepted = False
+            c1 = 1e-4  # Armijo parameter
+            
+            for _ls in range(25):
+                x_try = x_cur + alpha * s
+                Fx_try = F(x_try)
+                norm_sq_try = float(np.dot(Fx_try, Fx_try))
+                phi_try = 0.5 * norm_sq_try
+                
+                if norm_sq_try <= tol_sq:
+                    return x_try, Fx_try, True, iters
+                
+                if phi_try <= phi_prev + c1 * alpha * slope:
+                    accepted = True
+                    break
+                
+                alpha *= 0.5
+            
+            if not accepted:
+                break
+            
+            # Update Broyden: J <- J + (Fx_new - Fx - J*s)/||s||^2 * s^T
+            delta_F = Fx_try - Fx_cur - J @ s
+            s_norm_sq = np.dot(s, s)
+            if s_norm_sq > 1e-16:
+                J = J + np.outer(delta_F, s) / s_norm_sq
+            
+            # Update state
+            x_cur = x_try
+            Fx_cur = Fx_try
+            norm_sq_cur = norm_sq_try
+        
+        return x_cur, Fx_cur, False, iters
+    
+    # Multi-start strategy with Broyden + Newton polish
+    max_restarts = 25
+    
+    # First, try from x0 with Broyden
+    x_sol, Fx_sol, converged, _ = broyden_solve(x, Fx0, max_iters=40)
+    if converged:
+        return x_sol
+    
+    # If Broyden got close but not exact, try Newton polish
+    norm_sq_sol = float(np.dot(Fx_sol, Fx_sol))
+    if norm_sq_sol < 1e-4:
+        x_pol, Fx_pol, conv_pol, _ = newton_polish(x_sol, Fx_sol, max_iters=10)
+        if conv_pol:
+            return x_pol
+        norm_sq_pol = float(np.dot(Fx_pol, Fx_pol))
+        if norm_sq_pol < norm_sq_sol:
+            x_sol, Fx_sol, norm_sq_sol = x_pol, Fx_pol, norm_sq_pol
+    
+    if norm_sq_sol < best_norm_sq:
+        best_norm_sq = norm_sq_sol
+        best_x = x_sol.copy()
+    
+    # If not converged, try from multiple starting points
+    np.random.seed(42)
+    
+    for restart in range(max_restarts):
+        if time_left() < 3.0:
+            break
+        if best_norm_sq <= tol_sq:
+            return best_x
+        
+        # Generate starting point
+        if restart % 3 == 0:
+            # Random in box around x0
+            x_start = x + np.random.uniform(-10, 10, size=2)
+        elif restart % 3 == 1:
+            # Ring around best_x with growing radius
+            radius = 1.0 + 2.0 * (restart // 3)
+            angle = np.random.uniform(0, 2 * np.pi)
+            x_start = best_x + radius * np.array([np.cos(angle), np.sin(angle)])
+        else:
+            # Small perturbation around best_x
+            x_start = best_x + np.random.randn(2) * 0.5
+        
+        if not np.all(np.isfinite(x_start)):
+            continue
+        
+        try:
+            Fx_start = F(x_start)
+        except:
+            continue
+        
+        norm_sq_start = float(np.dot(Fx_start, Fx_start))
+        if norm_sq_start < best_norm_sq:
+            best_norm_sq = norm_sq_start
+            best_x = x_start.copy()
+        
+        if norm_sq_start <= tol_sq:
+            return x_start
+        
+        # Broyden from this start
+        x_sol, Fx_sol, converged, _ = broyden_solve(x_start, Fx_start, max_iters=35)
+        if converged:
+            return x_sol
+        
+        # Newton polish if close
+        norm_sq_sol = float(np.dot(Fx_sol, Fx_sol))
+        if norm_sq_sol < 1e-4:
+            x_pol, Fx_pol, conv_pol, _ = newton_polish(x_sol, Fx_sol, max_iters=10)
+            if conv_pol:
+                return x_pol
+            norm_sq_pol = float(np.dot(Fx_pol, Fx_pol))
+            if norm_sq_pol < norm_sq_sol:
+                x_sol, Fx_sol, norm_sq_sol = x_pol, Fx_pol, norm_sq_pol
+        
+        if norm_sq_sol < best_norm_sq:
+            best_norm_sq = norm_sq_sol
+            best_x = x_sol.copy()
+    
+    # Final Newton polish on best_x if close
+    if best_norm_sq < 1e-4:
+        try:
+            Fx_best = F(best_x)
+            x_pol, Fx_pol, conv_pol, _ = newton_polish(best_x, Fx_best, max_iters=10)
+            if conv_pol:
+                return x_pol
+            norm_sq_pol = float(np.dot(Fx_pol, Fx_pol))
+            if norm_sq_pol < best_norm_sq:
+                best_x = x_pol.copy()
+        except:
+            pass
+    
+    return best_x
+# EVOLVE-BLOCK-END

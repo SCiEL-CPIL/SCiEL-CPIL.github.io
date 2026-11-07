@@ -1,0 +1,34 @@
+"""Constructs a graph with minimum degree 3, girth 4, and minimal distinct cycle lengths."""
+
+def construct():
+    # The goal is to minimize the number of distinct simple cycle lengths.
+    # A graph formed by the disjoint union of two K_{3,3} graphs satisfies all constraints:
+    # 1. Vertices 0-11 are used.
+    # 2. K_{3,3} is 3-regular, so every vertex has degree 3 (>= 3).
+    # 3. K_{3,3} is bipartite, so it is triangle-free (girth >= 4).
+    # 4. K_{3,3} contains cycles (4-cycles and 6-cycles).
+    # 5. The distinct cycle lengths in K_{3,3} are exactly {4, 6}.
+    #    - 4-cycles exist (e.g., 0-3-1-4-0).
+    #    - 6-cycles exist (e.g., 0-3-1-4-2-5-0).
+    #    - No cycles of length > 6 exist because the partition size is 3.
+    #    - No odd cycles exist because it is bipartite.
+    # Thus, the set of distinct cycle lengths is {4, 6}, which has size 2.
+    # This is likely the minimum possible for n=12 and min_degree>=3.
+    
+    edges = []
+    
+    # First component: K_{3,3} on vertices 0, 1, 2 and 3, 4, 5
+    part_a1 = [0, 1, 2]
+    part_b1 = [3, 4, 5]
+    for u in part_a1:
+        for v in part_b1:
+            edges.append([u, v])
+            
+    # Second component: K_{3,3} on vertices 6, 7, 8 and 9, 10, 11
+    part_a2 = [6, 7, 8]
+    part_b2 = [9, 10, 11]
+    for u in part_a2:
+        for v in part_b2:
+            edges.append([u, v])
+            
+    return edges

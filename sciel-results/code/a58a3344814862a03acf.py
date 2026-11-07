@@ -1,0 +1,481 @@
+import time
+import random
+from itertools import combinations
+from collections import deque
+import networkx as nx
+
+P = {'n': 24, 'edges': [[0, 1], [0, 3], [0, 5], [0, 9], [0, 10], [0, 12], [0, 20], [0, 22], [1, 4], [1, 5], [1, 6], [1, 14], [1, 15], [1, 17], [1, 19], [1, 20], [1, 22], [2, 3], [2, 5], [2, 7], [2, 8], [3, 7], [3, 9], [3, 10], [3, 11], [3, 13], [3, 14], [3, 16], [3, 19], [3, 20], [4, 6], [4, 9], [4, 11], [4, 12], [4, 13], [4, 14], [4, 15], [4, 18], [4, 19], [4, 20], [4, 21], [4, 23], [5, 7], [5, 8], [5, 9], [5, 12], [5, 14], [5, 15], [5, 17], [5, 18], [5, 19], [5, 20], [5, 21], [6, 10], [6, 13], [6, 16], [6, 20], [6, 21], [6, 22], [7, 15], [7, 16], [7, 19], [7, 22], [8, 9], [8, 15], [8, 18], [8, 20], [8, 22], [9, 11], [9, 12], [9, 15], [9, 17], [9, 21], [9, 23], [10, 12], [11, 13], [11, 14], [11, 17], [11, 18], [11, 20], [11, 22], [12, 13], [12, 15], [12, 16], [12, 22], [12, 23], [13, 16], [14, 16], [14, 17], [14, 18], [14, 19], [15, 16], [15, 19], [15, 20], [15, 22], [16, 18], [16, 21], [17, 22], [18, 19], [18, 20], [19, 21], [20, 22], [20, 23], [21, 22], [21, 23], [22, 23]]}
+
+def construct():
+    t_start = time.time()
+    DEADLINE = 85.0
+    n = P['n']
+    edges = P['edges']
+    adj = [set() for _ in range(n)]
+    for u, v in edges:
+        adj[u].add(v)
+        adj[v].add(u)
+    degrees = [len(adj[v]) for v in range(n)]
+    sorted_verts = sorted(range(n), key=lambda x: degrees[x], reverse=True)
+
+    def time_up():
+        return time.time() - t_start > DEADLINE
+
+    def find_shortest_path(u, v, banned):
+        """BFS level-by-level to guarantee shortest path (fewest interior vertices)."""
+        if u == v:
+            return None
+        if v in adj[u]:
+            return [u, v]
+        parent = {u: None}
+        q = deque([u])
+        while q:
+            level_size = len(q)
+            for _ in range(level_size):
+                cur = q.popleft()
+                for nxt in adj[cur]:
+                    if nxt == v:
+                        path = [v]
+                        node = cur
+                        while node is not None:
+                            path.append(node)
+                            node = parent[node]
+                        path.reverse()
+                        return path
+                    if nxt in parent or nxt in banned:
+                        continue
+                    parent[nxt] = cur
+                    q.append(nxt)
+        return None
+
+    def find_shortest_path_ordered(u, v, banned, neighbor_order):
+        """BFS with specific neighbor ordering to find shorter paths."""
+        if u == v:
+            return None
+        if v in adj[u]:
+            return [u, v]
+        parent = {u: None}
+        q = deque([u])
+        while q:
+            level_size = len(q)
+            for _ in range(level_size):
+                cur = q.popleft()
+                neighbors = [nxt for nxt in adj[cur] if nxt != v and nxt not in parent and nxt not in banned]
+                neighbors.sort(key=lambda x: neighbor_order(x))
+                for nxt in neighbors:
+                    parent[nxt] = cur
+                    q.append(nxt)
+                if v in parent:
+                    path = [v]
+                    node = parent[v]
+                    while node is not None:
+                        path.append(node)
+                        node = parent[node]
+                    path.reverse()
+                    return path
+        return None
+
+    def find_path_any(u, v, banned):
+        """Standard BFS that returns any valid path."""
+        if u == v:
+            return None
+        if v in adj[u]:
+            return [u, v]
+        parent = {u: None}
+        q = deque([u])
+        while q:
+            cur = q.popleft()
+            for nxt in adj[cur]:
+                if nxt == v:
+                    path = [v]
+                    node = cur
+                    while node is not None:
+                        path.append(node)
+                        node = parent[node]
+                    path.reverse()
+                    return path
+                if nxt in parent or nxt in banned:
+                    continue
+                parent[nxt] = cur
+                q.append(nxt)
+        return None
+
+    def try_find(branches, rng, attempts=60):
+        bset = set(branches)
+        pairs = list(combinations(branches, 2))
+        # Sort pairs by "difficulty": prefer pairs that are NOT directly adjacent
+        def pair_key(p):
+            a, b = p
+            if b in adj[a]:
+                return (0, degrees[a] + degrees[b])
+            else:
+                return (1, -(degrees[a] + degrees[b]))
+        deg_order = sorted(pairs, key=pair_key)
+
+        # Different neighbor ordering strategies
+        order_strategies = [
+            lambda x: degrees[x],  # low degree first
+            lambda x: -degrees[x],  # high degree first
+            lambda x: rng.random(),  # random
+            lambda x: len([y for y in adj[x] if y not in bset]),  # low non-branch degree
+        ]
+
+        for attempt in range(attempts):
+            if time_up():
+                break
+            if attempt == 0:
+                order = list(deg_order)
+            elif attempt % 4 == 1:
+                order = list(deg_order)
+                order.reverse()
+            elif attempt % 4 == 2:
+                order = sorted(pairs, key=lambda p: degrees[p[0]] + degrees[p[1]])
+            else:
+                order = list(pairs)
+                rng.shuffle(order)
+
+            # Choose neighbor ordering strategy based on attempt
+            norder = order_strategies[attempt % len(order_strategies)]
+
+            used = set()
+            paths = {}
+            ok = True
+            for a, b in order:
+                banned = used | bset
+                banned.discard(a)
+                banned.discard(b)
+                # Try standard BFS first
+                p = find_shortest_path(a, b, banned)
+                if p is None:
+                    # Try with different neighbor ordering
+                    p = find_shortest_path_ordered(a, b, banned, norder)
+                if p is None:
+                    ok = False
+                    break
+                interior = set(p[1:-1])
+                if interior & bset or interior & used:
+                    ok = False
+                    break
+                used |= interior
+                paths[frozenset((a, b))] = p
+            if ok:
+                return paths
+        return None
+
+    def try_find_flow(branches, rng, attempts=30):
+        """Use max-flow to verify and extract paths for a candidate branch set."""
+        bset = set(branches)
+        pairs = list(combinations(branches, 2))
+        num_pairs = len(pairs)
+        if num_pairs == 0:
+            return None
+        
+        # Build flow network
+        # Nodes: original vertices + source + sink
+        # For each branch vertex v, split into v_in and v_out with infinite capacity edge
+        # For non-branch vertices, capacity is 1
+        # For each pair (a,b), we need a path from a_out to b_in
+        
+        # Simpler approach: Use edge-disjoint paths via flow
+        # Create a directed version of the graph
+        # Each undirected edge (u,v) becomes two directed edges (u->v) and (v->u)
+        # Each vertex (except branches) has capacity 1 (split into in/out with capacity 1 edge)
+        # Branch vertices have infinite capacity
+        
+        # Actually, let's use a simpler max-flow formulation:
+        # We want to find vertex-disjoint paths between all pairs of branch vertices
+        # This is equivalent to checking if there are k-1 edge-disjoint paths from one branch to others
+        # But that's not quite right either.
+        
+        # Let's use the standard approach: for each pair, check if there's a path
+        # using the remaining vertices. But that's what we're already doing.
+        
+        # Alternative: Use NetworkX's disjoint paths algorithm
+        try:
+            G = nx.Graph()
+            G.add_nodes_from(range(n))
+            for u, v in edges:
+                G.add_edge(u, v)
+            
+            # For each pair, find a path avoiding other branches and used vertices
+            paths = {}
+            used = set()
+            ok = True
+            
+            # Try multiple orderings
+            for attempt in range(attempts):
+                if time_up():
+                    break
+                if attempt == 0:
+                    order = list(pairs)
+                else:
+                    order = list(pairs)
+                    rng.shuffle(order)
+                
+                used = set()
+                paths = {}
+                ok = True
+                for a, b in order:
+                    banned = used | bset
+                    banned.discard(a)
+                    banned.discard(b)
+                    # Try to find a path in the subgraph induced by vertices not in banned
+                    subgraph = G.subgraph([v for v in G.nodes() if v not in banned])
+                    if a not in subgraph.nodes() or b not in subgraph.nodes():
+                        ok = False
+                        break
+                    try:
+                        p = nx.shortest_path(subgraph, a, b)
+                    except nx.NetworkXNoPath:
+                        ok = False
+                        break
+                    if p is None or len(p) < 2:
+                        ok = False
+                        break
+                    interior = set(p[1:-1])
+                    if interior & bset or interior & used:
+                        ok = False
+                        break
+                    used |= interior
+                    paths[frozenset((a, b))] = p
+                if ok:
+                    return paths
+        except Exception:
+            pass
+        return None
+
+    def try_find_mixed(branches, rng, attempts=60):
+        """Mix shortest-path and any-path strategies with varied neighbor orderings."""
+        bset = set(branches)
+        pairs = list(combinations(branches, 2))
+        def pair_key(p):
+            a, b = p
+            if b in adj[a]:
+                return (0, degrees[a] + degrees[b])
+            else:
+                return (1, -(degrees[a] + degrees[b]))
+        deg_order = sorted(pairs, key=pair_key)
+
+        order_strategies = [
+            lambda x: degrees[x],
+            lambda x: -degrees[x],
+            lambda x: rng.random(),
+            lambda x: len([y for y in adj[x] if y not in bset]),
+        ]
+
+        for attempt in range(attempts):
+            if time_up():
+                break
+            if attempt % 3 == 0:
+                order = list(deg_order)
+            elif attempt % 3 == 1:
+                order = list(pairs)
+                rng.shuffle(order)
+            else:
+                order = sorted(pairs, key=lambda p: degrees[p[0]] + degrees[p[1]])
+
+            norder = order_strategies[attempt % len(order_strategies)]
+
+            used = set()
+            paths = {}
+            ok = True
+            for a, b in order:
+                banned = used | bset
+                banned.discard(a)
+                banned.discard(b)
+                # Alternate between strategies
+                if attempt % 2 == 0:
+                    p = find_shortest_path(a, b, banned)
+                    if p is None:
+                        p = find_shortest_path_ordered(a, b, banned, norder)
+                else:
+                    p = find_path_any(a, b, banned)
+                    if p is None:
+                        p = find_shortest_path_ordered(a, b, banned, norder)
+                if p is None:
+                    ok = False
+                    break
+                interior = set(p[1:-1])
+                if interior & bset or interior & used:
+                    ok = False
+                    break
+                used |= interior
+                paths[frozenset((a, b))] = p
+            if ok:
+                return paths
+        return None
+
+    def validate(branches, paths):
+        if not branches or len(branches) < 2:
+            return 0
+        bset = set(branches)
+        if len(bset) != len(branches):
+            return 0
+        expected = set(frozenset((a, b)) for a, b in combinations(branches, 2))
+        if len(paths) != len(expected):
+            return 0
+        used = set()
+        for fkey, p in paths.items():
+            if len(p) < 2:
+                return 0
+            a, b = p[0], p[-1]
+            if a not in bset or b not in bset or a == b:
+                return 0
+            if fkey not in expected:
+                return 0
+            interior = set(p[1:-1])
+            if interior & bset or interior & used:
+                return 0
+            for i in range(len(p) - 1):
+                if p[i+1] not in adj[p[i]]:
+                    return 0
+            used |= interior
+        return len(branches)
+
+    def final_result(branches, paths):
+        branch_list = [int(b) for b in sorted(branches)]
+        path_list = []
+        for a, b in combinations(sorted(branches), 2):
+            fkey = frozenset((a, b))
+            p = paths.get(fkey)
+            if p is None:
+                p = [a, b]
+            path_list.append([int(x) for x in p])
+        return {'branches': branch_list, 'paths': path_list}
+
+    rng = random.Random(42)
+    best_count = 0
+    best_result = None
+
+    # Phase 1: Top-down k search with multiple strategies
+    for k in range(12, 1, -1):
+        if time_up():
+            break
+        candidates = []
+        seen_sets = set()
+
+        # Top k by degree
+        c = tuple(sorted(sorted_verts[:k]))
+        candidates.append(sorted_verts[:k])
+        seen_sets.add(frozenset(c))
+
+        # Top k-1 + random (more samples)
+        for _ in range(12):
+            top_k1 = sorted_verts[:k-1]
+            rest = [v for v in range(n) if v not in top_k1]
+            if rest:
+                c = sorted(top_k1 + [rng.choice(rest)])
+                fs = frozenset(c)
+                if fs not in seen_sets:
+                    candidates.append(c)
+                    seen_sets.add(fs)
+
+        # Random (more samples)
+        for _ in range(40):
+            c = sorted(rng.sample(range(n), k))
+            fs = frozenset(c)
+            if fs not in seen_sets:
+                candidates.append(c)
+                seen_sets.add(fs)
+
+        # Medium-degree mix
+        for _ in range(6):
+            half = k // 2
+            c1 = sorted_verts[:half]
+            c2 = sorted_verts[n//2:n//2 + (k - half)]
+            c = sorted(c1 + c2)
+            fs = frozenset(c)
+            if fs not in seen_sets:
+                candidates.append(c)
+                seen_sets.add(fs)
+
+        # Degree-spread: pick vertices with varying degrees
+        for _ in range(6):
+            c = []
+            for i in range(k):
+                # Pick from different degree ranges
+                idx = int(i * n / k)
+                idx = min(idx, n - 1)
+                c.append(sorted_verts[idx])
+            c = sorted(set(c))
+            if len(c) == k:
+                fs = frozenset(c)
+                if fs not in seen_sets:
+                    candidates.append(c)
+                    seen_sets.add(fs)
+
+        for cand in candidates:
+            if time_up():
+                break
+            # Try both strategies
+            paths = try_find(cand, rng, attempts=80)
+            if paths is None:
+                paths = try_find_mixed(cand, rng, attempts=40)
+            if paths is None:
+                paths = try_find_flow(cand, rng, attempts=20)
+            if paths is not None:
+                cnt = validate(cand, paths)
+                if cnt > best_count:
+                    best_count = cnt
+                    best_result = (cand, paths)
+                    break
+        if best_result is not None:
+            break
+
+    # Phase 2: Greedy growth
+    if not time_up():
+        if best_result is not None:
+            current = list(best_result[0])
+        else:
+            current = sorted_verts[:2]
+        current_paths = try_find(current, rng, attempts=80)
+        for _ in range(12):
+            if time_up():
+                break
+            if current_paths is None:
+                break
+            cset = set(current)
+            cands = [v for v in range(n) if v not in cset]
+            # Score candidates by degree and connectivity to existing branches
+            def cand_score(v):
+                conn = sum(1 for b in current if b in adj[v])
+                return (degrees[v], conn)
+            cands.sort(key=cand_score, reverse=True)
+            added = False
+            for v in cands[:20]:  # Limit candidates to speed up
+                if time_up():
+                    break
+                new_br = current + [v]
+                new_paths = try_find(new_br, rng, attempts=50)
+                if new_paths is None:
+                    new_paths = try_find_mixed(new_br, rng, attempts=35)
+                if new_paths is None:
+                    new_paths = try_find_flow(new_br, rng, attempts=15)
+                if new_paths is not None:
+                    cnt = validate(new_br, new_paths)
+                    if cnt > best_count:
+                        best_count = cnt
+                        best_result = (new_br, new_paths)
+                        current = new_br
+                        current_paths = new_paths
+                        added = True
+                        break
+            if not added:
+                break
+
+    # Fallback
+    if best_result is None:
+        # Try to find at least 2 branches
+        found = False
+        for u, v in edges:
+            paths = {frozenset((u, v)): [u, v]}
+            if validate([u, v], paths) > 0:
+                best_result = ([u, v], paths)
+                found = True
+                break
+        if not found:
+            u, v = edges[0]
+            best_result = ([u, v], {frozenset((u, v)): [u, v]})
+
+    branches, paths = best_result
+    return final_result(branches, paths)
