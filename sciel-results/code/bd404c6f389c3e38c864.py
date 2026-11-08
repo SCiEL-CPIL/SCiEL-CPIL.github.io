@@ -1,0 +1,174 @@
+import numpy as np
+import time
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 110.0
+
+    n, m, p = 4, 4, 8
+    rank = 98
+
+    U = np.zeros((n * m, rank))
+    V = np.zeros((m * p, rank))
+    W = np.zeros((p * n, rank))
+
+    # Strassen 2x2x2 decomposition
+    U_2 = np.zeros((4, 7))
+    V_2 = np.zeros((4, 7))
+    W_2 = np.zeros((4, 7))
+
+    # c=0
+    U_2[0, 0] = 1; U_2[3, 0] = 1
+    V_2[0, 0] = 1; V_2[3, 0] = 1
+    W_2[0, 0] = 1; W_2[3, 0] = 1
+
+    # c=1
+    U_2[2, 1] = 1; U_2[3, 1] = 1
+    V_2[0, 1] = 1
+    W_2[2, 1] = 1; W_2[3, 1] = -1
+
+    # c=2
+    U_2[0, 2] = 1
+    V_2[1, 2] = 1; V_2[3, 2] = -1
+    W_2[1, 2] = 1; W_2[3, 2] = 1
+
+    # c=3
+    U_2[3, 3] = 1
+    V_2[2, 3] = 1; V_2[0, 3] = -1
+    W_2[0, 3] = 1; W_2[2, 3] = 1
+
+    # c=4
+    U_2[0, 4] = 1; U_2[1, 4] = 1
+    V_2[3, 4] = 1
+    W_2[0, 4] = -1; W_2[1, 4] = 1
+
+    # c=5
+    U_2[2, 5] = 1; U_2[0, 5] = -1
+    V_2[0, 5] = 1; V_2[1, 5] = 1
+    W_2[3, 5] = 1
+
+    # c=6
+    U_2[1, 6] = 1; U_2[3, 6] = -1
+    V_2[2, 6] = 1; V_2[3, 6] = 1
+    W_2[0, 6] = 1
+
+    # Specs for 4x4x4 Strassen
+    A_specs = [
+        [(1, 0), (1, 3)],
+        [(1, 2), (1, 3)],
+        [(1, 0)],
+        [(1, 3)],
+        [(1, 0), (1, 1)],
+        [(1, 2), (-1, 0)],
+        [(1, 1), (-1, 3)],
+    ]
+
+    B_specs = [
+        [(1, 0), (1, 3)],
+        [(1, 0)],
+        [(1, 1), (-1, 3)],
+        [(1, 2), (-1, 0)],
+        [(1, 3)],
+        [(1, 0), (1, 1)],
+        [(1, 2), (1, 3)],
+    ]
+
+    C_specs = [
+        [(1, 0), (1, 3)],
+        [(1, 2), (-1, 3)],
+        [(1, 1), (1, 3)],
+        [(1, 0), (1, 2)],
+        [(-1, 0), (1, 1)],
+        [(1, 3)],
+        [(1, 0)],
+    ]
+
+    # Pre-compute all index mappings to avoid repeated divmod and arithmetic in inner loops
+    # For each Strassen term k_p and sub-term m_s, pre-compute the (global_idx, coeff) tuples
+    # for U, V, W
+
+    # U pre-computation: for each (k_p, m_s), list of (global_a_idx, value)
+    U_entries = {}
+    for k_p in range(7):
+        for m_s in range(7):
+            entries = []
+            for coeff_a, block_idx in A_specs[k_p]:
+                bi, bj = divmod(block_idx, 2)
+                for r in range(2):
+                    for c in range(2):
+                        global_r = bi * 2 + r
+                        global_c = bj * 2 + c
+                        global_a_idx = global_r * 4 + global_c
+                        a_eff_idx = r * 2 + c
+                        val = coeff_a * U_2[a_eff_idx, m_s]
+                        if val != 0:
+                            entries.append((global_a_idx, val))
+            if entries:
+                U_entries[(k_p, m_s)] = entries
+
+    # V pre-computation: for each (half, k_p, m_s), list of (global_b_idx, value)
+    V_entries = {}
+    for half in range(2):
+        for k_p in range(7):
+            for m_s in range(7):
+                entries = []
+                for coeff_b, block_idx in B_specs[k_p]:
+                    bi, bj = divmod(block_idx, 2)
+                    for r in range(2):
+                        for c in range(2):
+                            global_r = bi * 2 + r
+                            global_c = bj * 2 + c
+                            global_k = global_c + half * 4
+                            global_b_idx = global_r * 8 + global_k
+                            b_eff_idx = r * 2 + c
+                            val = coeff_b * V_2[b_eff_idx, m_s]
+                            if val != 0:
+                                entries.append((global_b_idx, val))
+                if entries:
+                    V_entries[(half, k_p, m_s)] = entries
+
+    # W pre-computation: for each (half, k_p, m_s), list of (global_w_idx, value)
+    W_entries = {}
+    for half in range(2):
+        for k_p in range(7):
+            for m_s in range(7):
+                entries = []
+                for coeff_c, c_block_idx in C_specs[k_p]:
+                    bi, bj = divmod(c_block_idx, 2)
+                    for r in range(2):
+                        for c in range(2):
+                            global_i = bi * 2 + r
+                            global_k = bj * 2 + c + half * 4
+                            global_w_idx = global_k * 4 + global_i
+                            p_eff_idx = r * 2 + c
+                            val = coeff_c * W_2[p_eff_idx, m_s]
+                            if val != 0:
+                                entries.append((global_w_idx, val))
+                if entries:
+                    W_entries[(half, k_p, m_s)] = entries
+
+    # Fill the matrices using pre-computed entries
+    for half in range(2):
+        for k_p in range(7):
+            for m_s in range(7):
+                col = half * 49 + k_p * 7 + m_s
+
+                if time.time() > deadline:
+                    return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}
+
+                # U
+                if (k_p, m_s) in U_entries:
+                    for idx, val in U_entries[(k_p, m_s)]:
+                        U[idx, col] += val
+
+                # V
+                if (half, k_p, m_s) in V_entries:
+                    for idx, val in V_entries[(half, k_p, m_s)]:
+                        V[idx, col] += val
+
+                # W
+                if (half, k_p, m_s) in W_entries:
+                    for idx, val in W_entries[(half, k_p, m_s)]:
+                        W[idx, col] += val
+
+    return {"U": U.tolist(), "V": V.tolist(), "W": W.tolist()}

@@ -1,0 +1,249 @@
+import numpy as np
+from datetime import datetime, timedelta
+import random
+
+DIMENSIONS = [2, 3, 9]
+
+def construct():
+    n, m, p = DIMENSIONS
+    
+    # Start with the known rank-50 decomposition
+    U0, V0, W0 = _rank50_baseline(n, m, p)
+    best_rank = 50
+    best_U, best_V, best_W = U0, V0, W0
+    
+    start_time = datetime.now()
+    timeout = timedelta(seconds=100)  # Safety margin before 120s limit
+    
+    # Try to reduce rank by merging columns
+    improved = _merge_columns_search(best_U, best_V, best_W, n, m, p, start_time, timeout)
+    if improved is not None:
+        U, V, W = improved
+        if _verify_decomposition(U, V, W, n, m, p):
+            new_rank = len(U[0])
+            if new_rank < best_rank:
+                best_rank = new_rank
+                best_U, best_V, best_W = U, V, W
+    
+    return {"U": best_U, "V": best_V, "W": best_W}
+
+def _merge_columns_search(U, V, W, n, m, p, start_time, timeout):
+    """Try to reduce rank by merging pairs of columns that form a rank-1 sum."""
+    U_np = np.array(U, dtype=float)
+    V_np = np.array(V, dtype=float)
+    W_np = np.array(W, dtype=float)
+    
+    current_rank = U_np.shape[1]
+    improved = False
+    
+    # Use a more efficient rank-1 check: 
+    # A 3D tensor T[a,b,c] is rank 1 iff for any fixed a, T[a,:,:] is rank 1
+    # (assuming T is not zero). More precisely, T is rank 1 iff all its 
+    # 2D slices are rank 1 and consistent.
+    
+    for iteration in range(100):
+        if datetime.now() - start_time > timeout:
+            break
+        
+        merged = False
+        for r1 in range(current_rank):
+            if datetime.now() - start_time > timeout:
+                break
+            for r2 in range(r1 + 1, current_rank):
+                # Check if u_r1⊗v_r1⊗w_r1 + u_r2⊗v_r2⊗w_r2 is rank 1
+                # Efficient check: the sum is rank 1 iff the "cross terms" vanish
+                # in a specific way. Use the following criterion:
+                # T_sum is rank 1 iff for the 2D matrix M[a, (b,c)], rank(M) = 1.
+                # But building the full matrix is expensive. Instead, use:
+                # T_sum is rank 1 iff T_sum[a1,b1,c1]*T_sum[a2,b2,c2] = T_sum[a1,b2,c1]*T_sum[a2,b1,c2]
+                # for all a1,a2,b1,b2,c1,c2. This is expensive too.
+                
+                # Faster approach: check if the sum can be factored.
+                # T_sum = u⊗v⊗w iff there exist u,v,w such that
+                # T_sum[a,b,c] = u[a]*v[b]*w[c]
+                # This means T_sum[a,:,:] = u[a] * (v⊗w) for all a.
+                # So all slices T_sum[a,:,:] must be scalar multiples of each other.
+                
+                # Build T_sum as a 3D array of shape (n*m, m*p, p*n)
+                # But this is 6*27*18 = 2916 elements. Manageable.
+                
+                # Actually, let's use a simpler numerical check.
+                # Form the 2D matrix by flattening the last two dimensions:
+                # M[a, bc] = T_sum[a, b, c]
+                # T_sum is rank 1 iff M has rank 1.
+                
+                # Build T_sum efficiently
+                # T_sum[a, b, c] = U_np[a,r1]*V_np[b,r1]*W_np[c,r1] + U_np[a,r2]*V_np[b,r2]*W_np[c,r2]
+                
+                # Reshape to 2D: (n*m, m*p*p*n)
+                # Use outer products
+                term1 = np.outer(U_np[:, r1], np.outer(V_np[:, r1], W_np[:, r1]).flatten())
+                term2 = np.outer(U_np[:, r2], np.outer(V_np[:, r2], W_np[:, r2]).flatten())
+                T_mat = term1 + term2
+                
+                # Check if T_mat has rank 1
+                # Use SVD
+                try:
+                    s = np.linalg.svd(T_mat, full_matrices=False, compute_uv=False)
+                    if len(s) > 1 and s[1] < 1e-9:
+                        # Rank 1! Extract u, v, w
+                        U_r, s_r, Vt_r = np.linalg.svd(T_mat, full_matrices=False)
+                        if s_r[0] > 1e-10:
+                            u = U_r[:, 0] / np.sqrt(s_r[0])
+                            vw_flat = Vt_r[0, :] / np.sqrt(s_r[0])
+                            vw_2d = vw_flat.reshape(m * p, p * n)
+                            
+                            # Check if vw_2d is rank 1
+                            s2 = np.linalg.svd(vw_2d, full_matrices=False, compute_uv=False)
+                            if len(s2) > 1 and s2[1] < 1e-9:
+                                U_r2, s_r2, Vt_r2 = np.linalg.svd(vw_2d, full_matrices=False)
+                                if s_r2[0] > 1e-10:
+                                    v = U_r2[:, 0] / np.sqrt(s_r2[0])
+                                    w = Vt_r2[0, :] / np.sqrt(s_r2[0])
+                                    
+                                    # Replace columns r1 and r2 with the new column
+                                    U_np = np.delete(U_np, [r1, r2], axis=1)
+                                    V_np = np.delete(V_np, [r1, r2], axis=1)
+                                    W_np = np.delete(W_np, [r1, r2], axis=1)
+                                    U_np = np.column_stack([U_np, u])
+                                    V_np = np.column_stack([V_np, v])
+                                    W_np = np.column_stack([W_np, w])
+                                    current_rank -= 1
+                                    improved = True
+                                    merged = True
+                                    break
+                except:
+                    pass
+            
+            if merged:
+                break
+        
+        if not merged:
+            break
+    
+    if improved:
+        return U_np.tolist(), V_np.tolist(), W_np.tolist()
+    
+    return None
+
+def _rank50_baseline(n, m, p):
+    """Construct the known rank-50 decomposition using Strassen's algorithm."""
+    rank = 50
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    
+    col = 0
+    for b in range(4):
+        k0 = 2 * b
+        k1 = 2 * b + 1
+        
+        v_e = 0 * p + k0
+        v_f = 0 * p + k1
+        v_g = 1 * p + k0
+        v_h = 1 * p + k1
+        
+        u_a = 0 * m + 0
+        u_b = 0 * m + 1
+        u_c = 1 * m + 0
+        u_d = 1 * m + 1
+        
+        U[u_a][col] += 1; U[u_d][col] += 1
+        V[v_e][col] += 1; V[v_h][col] += 1
+        
+        U[u_c][col+1] += 1; U[u_d][col+1] += 1
+        V[v_e][col+1] += 1
+        
+        U[u_a][col+2] += 1
+        V[v_f][col+2] += 1; V[v_h][col+2] -= 1
+        
+        U[u_d][col+3] += 1
+        V[v_g][col+3] += 1; V[v_e][col+3] -= 1
+        
+        U[u_a][col+4] += 1; U[u_b][col+4] += 1
+        V[v_h][col+4] += 1
+        
+        U[u_c][col+5] += 1; U[u_a][col+5] -= 1
+        V[v_e][col+5] += 1; V[v_f][col+5] += 1
+        
+        U[u_b][col+6] += 1; U[u_d][col+6] -= 1
+        V[v_g][col+6] += 1; V[v_h][col+6] += 1
+        
+        w_00 = k0 * n + 0; w_01 = k1 * n + 0
+        w_10 = k0 * n + 1; w_11 = k1 * n + 1
+        
+        W[w_00][col] += 1; W[w_00][col+3] += 1
+        W[w_00][col+4] -= 1; W[w_00][col+6] += 1
+        
+        W[w_01][col+2] += 1; W[w_01][col+4] += 1
+        
+        W[w_10][col+1] += 1; W[w_10][col+3] += 1
+        
+        W[w_11][col] += 1; W[w_11][col+1] -= 1
+        W[w_11][col+2] += 1; W[w_11][col+5] += 1
+        
+        col += 7
+    
+    k8 = 8
+    v_e = 0 * p + k8; v_g = 1 * p + k8
+    u_a = 0 * m + 0; u_b = 0 * m + 1
+    u_c = 1 * m + 0; u_d = 1 * m + 1
+    
+    U[u_a][col] += 1; V[v_e][col] += 1
+    U[u_b][col+1] += 1; V[v_g][col+1] += 1
+    U[u_c][col+2] += 1; V[v_e][col+2] += 1
+    U[u_d][col+3] += 1; V[v_g][col+3] += 1
+    
+    w_08 = k8 * n + 0; w_18 = k8 * n + 1
+    W[w_08][col] += 1; W[w_08][col+1] += 1
+    W[w_18][col+2] += 1; W[w_18][col+3] += 1
+    col += 4
+    
+    u_ar0 = 0 * m + 2; u_ar1 = 1 * m + 2
+    for k in range(9):
+        v_b = 2 * p + k
+        U[u_ar0][col] += 1; V[v_b][col] += 1; W[k * n + 0][col] += 1
+        U[u_ar1][col+1] += 1; V[v_b][col+1] += 1; W[k * n + 1][col+1] += 1
+        col += 2
+    
+    return U, V, W
+
+def _verify_decomposition(U, V, W, n, m, p):
+    """Verify that the decomposition correctly computes matrix multiplication."""
+    if not U or not V or not W:
+        return False
+    
+    U_np = np.array(U, dtype=float)
+    V_np = np.array(V, dtype=float)
+    W_np = np.array(W, dtype=float)
+    
+    rank = U_np.shape[1]
+    
+    if U_np.shape[0] != n * m:
+        return False
+    if V_np.shape[0] != m * p:
+        return False
+    if W_np.shape[0] != p * n:
+        return False
+    if U_np.shape[1] != rank or V_np.shape[1] != rank or W_np.shape[1] != rank:
+        return False
+    
+    np.random.seed(42)
+    for trial in range(3):
+        A = np.random.randn(n, m)
+        B = np.random.randn(m, p)
+        C_expected = A @ B
+        
+        C_computed = np.zeros((n, p))
+        for i in range(n):
+            for k in range(p):
+                s = 0.0
+                for j in range(m):
+                    for r in range(rank):
+                        s += A[i, j] * V_np[j * p + k, r] * W_np[k * n + i, r]
+                C_computed[i, k] = s
+        
+        if not np.allclose(C_computed, C_expected, atol=1e-10):
+            return False
+    
+    return True

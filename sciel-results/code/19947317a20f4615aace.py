@@ -1,0 +1,3 @@
+U = [[0] * rank for _ in range(n * m)]
+# ...
+return {"U": U, "V": V, "W": W}

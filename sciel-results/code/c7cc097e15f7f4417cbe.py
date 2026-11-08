@@ -1,0 +1,175 @@
+import time
+import numpy as np
+
+DIMENSIONS = [4, 4, 8]
+
+def _strassen_2x2_terms():
+    """
+    Returns the 7 Strassen terms for 2x2x2 matrix multiplication.
+    """
+    terms = []
+    terms.append({
+        'U': {(0,0): 1, (1,1): 1},
+        'V': {(0,0): 1, (1,1): 1},
+        'W': {(0,0): 1, (1,1): 1}
+    })
+    terms.append({
+        'U': {(1,0): 1, (1,1): 1},
+        'V': {(0,0): 1},
+        'W': {(1,0): 1, (1,1): -1}
+    })
+    terms.append({
+        'U': {(0,0): 1},
+        'V': {(0,1): 1, (1,1): -1},
+        'W': {(0,1): 1, (1,1): 1}
+    })
+    terms.append({
+        'U': {(1,1): 1},
+        'V': {(1,0): 1, (0,0): -1},
+        'W': {(0,0): 1, (1,0): 1}
+    })
+    terms.append({
+        'U': {(0,0): 1, (0,1): 1},
+        'V': {(1,1): 1},
+        'W': {(0,0): -1, (0,1): 1}
+    })
+    terms.append({
+        'U': {(1,0): 1, (0,0): -1},
+        'V': {(0,0): 1, (0,1): 1},
+        'W': {(1,1): 1}
+    })
+    terms.append({
+        'U': {(0,1): 1, (1,1): -1},
+        'V': {(1,0): 1, (1,1): 1},
+        'W': {(0,0): 1}
+    })
+    return terms
+
+def _build_4x4x4_decomposition():
+    """
+    Builds a rank-49 decomposition for 4x4x4.
+    """
+    strassen_terms = _strassen_2x2_terms()
+    U = [[0] * 49 for _ in range(16)]
+    V = [[0] * 49 for _ in range(16)]
+    W = [[0] * 49 for _ in range(16)]
+    
+    col = 0
+    for meta_term in strassen_terms:
+        for inner_term in strassen_terms:
+            for (bi, bj), cu in meta_term['U'].items():
+                for (ii, jj), cu_inner in inner_term['U'].items():
+                    row_a = bi * 2 + ii
+                    col_a = bj * 2 + jj
+                    U[row_a * 4 + col_a][col] += cu * cu_inner
+            
+            for (bj, bk), cv in meta_term['V'].items():
+                for (jj, kk), cv_inner in inner_term['V'].items():
+                    row_b = bj * 2 + jj
+                    col_b = bk * 2 + kk
+                    V[row_b * 4 + col_b][col] += cv * cv_inner
+            
+            for (bi, bk), cw in meta_term['W'].items():
+                for (ii, kk), cw_inner in inner_term['W'].items():
+                    row_c = bk * 2 + kk
+                    col_c = bi * 2 + ii
+                    W[row_c * 4 + col_c][col] += cw * cw_inner
+            
+            col += 1
+    return U, V, W
+
+def _verify_decomposition(U, V, W, n, m, p, tol=1e-9):
+    """Verify decomposition."""
+    rank = len(U[0])
+    U_mat = np.array(U, dtype=float)
+    V_mat = np.array(V, dtype=float)
+    W_mat = np.array(W, dtype=float)
+    
+    np.random.seed(42)
+    A_test = np.random.randn(n, m)
+    B_test = np.random.randn(m, p)
+    C_expected = A_test @ B_test
+    
+    C_computed = np.zeros((n, p))
+    for r in range(rank):
+        U_r = U_mat[:, r].reshape(n, m)
+        V_r = V_mat[:, r].reshape(m, p)
+        W_r = W_mat[:, r].reshape(p, n)
+        
+        a_part = np.sum(U_r * A_test, axis=1)
+        b_part = np.sum(V_r * B_test, axis=0)
+        
+        C_computed += np.outer(a_part, b_part) * W_r.T
+        
+    if not np.allclose(C_computed, C_expected, atol=tol):
+        return False
+    return True
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 110
+    
+    n, m, p = DIMENSIONS
+    
+    if time.time() > deadline - 5:
+        rank_schoolbook = n * m * p
+        U_sb = [[0] * rank_schoolbook for _ in range(n * m)]
+        V_sb = [[0] * rank_schoolbook for _ in range(m * p)]
+        W_sb = [[0] * rank_schoolbook for _ in range(p * n)]
+        col = 0
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    U_sb[i * m + j][col] = 1
+                    V_sb[j * p + k][col] = 1
+                    W_sb[k * n + i][col] = 1
+                    col += 1
+        return {"U": U_sb, "V": V_sb, "W": W_sb}
+    
+    U_444, V_444, W_444 = _build_4x4x4_decomposition()
+    
+    rank_total = 49
+    U = [[0] * rank_total for _ in range(n * m)]
+    V = [[0] * rank_total for _ in range(m * p)]
+    W = [[0] * rank_total for _ in range(p * n)]
+    
+    # U is the same as U_444
+    for idx in range(n * m):
+        for r in range(rank_total):
+            U[idx][r] = U_444[idx][r]
+            
+    # V: Map 4x4 V_444 to 4x8 V
+    # V_444 index: j*4 + k (k in 0..3)
+    # V index: j*8 + k (k in 0..7)
+    for r in range(rank_total):
+        for j in range(m):
+            for k in range(4):
+                V[j * p + k][r] = V_444[j * 4 + k][r]
+                V[j * p + (k + 4)][r] = V_444[j * 4 + k][r]
+                
+    # W: Map 4x4 W_444 to 8x4 W (p*n)
+    # W_444 index: k*4 + i (k in 0..3)
+    # W index: k*4 + i (k in 0..7)
+    for r in range(rank_total):
+        for k in range(4):
+            for i in range(n):
+                W[k * n + i][r] = W_444[k * 4 + i][r]
+                W[(k + 4) * n + i][r] = W_444[k * 4 + i][r]
+    
+    if _verify_decomposition(U, V, W, n, m, p):
+        return {"U": U, "V": V, "W": W}
+    
+    # Fallback
+    rank_schoolbook = n * m * p
+    U_sb = [[0] * rank_schoolbook for _ in range(n * m)]
+    V_sb = [[0] * rank_schoolbook for _ in range(m * p)]
+    W_sb = [[0] * rank_schoolbook for _ in range(p * n)]
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U_sb[i * m + j][col] = 1
+                V_sb[j * p + k][col] = 1
+                W_sb[k * n + i][col] = 1
+                col += 1
+    return {"U": U_sb, "V": V_sb, "W": W_sb}

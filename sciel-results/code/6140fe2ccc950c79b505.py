@@ -1,0 +1,181 @@
+import numpy as np
+import time
+
+def construct():
+    n, m, p = 4, 5, 5  # A is n×m, B is m×p, C is n×p
+    
+    # Decomposition using 4+1 split:
+    # A (4×5) = [A_L (4×4) | A_R (4×1)]
+    # B (5×5) = [[B_TL (4×4) B_TR (4×1)]; [B_BL (1×4) B_BR (1×1)]]
+    # C (4×5) = [C_L (4×4) C_R (4×1)]
+    #
+    # C_L = A_L * B_TL + A_R * B_BL  (4×4)
+    # C_R = A_L * B_TR + A_R * B_BR  (4×1)
+    #
+    # Ranks:
+    # A_L * B_TL: [4,4,4] -> 49 (Strassen)
+    # A_R * B_BL: [4,1,4] -> 16 (naive, optimal)
+    # A_L * B_TR: [4,4,1] -> 16 (naive, optimal)
+    # A_R * B_BR: [4,1,1] -> 4  (naive, optimal)
+    # Total: 49 + 16 + 16 + 4 = 85
+    
+    rank = 85
+    U = [[0] * rank for _ in range(n * m)]  # 20 rows
+    V = [[0] * rank for _ in range(m * p)]  # 25 rows
+    W = [[0] * rank for _ in range(p * n)]  # 20 rows
+    
+    # Strassen 2x2x2 factors
+    # U indices: 0:(0,0), 1:(0,1), 2:(1,0), 3:(1,1)
+    # V indices: same
+    # W indices: same (using k*n+i convention for 2x2, so idx = c*2+r)
+    
+    def get_strassen_2x2():
+        u = [[0]*7 for _ in range(4)]
+        v = [[0]*7 for _ in range(4)]
+        w = [[0]*7 for _ in range(4)]
+        
+        # M0 = (a00+a11)(b00+b11)
+        u[0][0]=1; u[3][0]=1
+        v[0][0]=1; v[3][0]=1
+        w[0][0]=1; w[3][0]=1
+        
+        # M1 = (a10+a11)b00
+        u[2][1]=1; u[3][1]=1
+        v[0][1]=1
+        w[2][1]=1; w[3][1]=-1
+        
+        # M2 = a00(b01-b11)
+        u[0][2]=1
+        v[1][2]=1; v[3][2]=-1
+        w[1][2]=1; w[3][2]=1
+        
+        # M3 = a11(b10-b00)
+        u[3][3]=1
+        v[2][3]=1; v[0][3]=-1
+        w[0][3]=1; w[2][3]=1
+        
+        # M4 = (a00+a01)b11
+        u[0][4]=1; u[1][4]=1
+        v[3][4]=1
+        w[0][4]=-1; w[1][4]=1
+        
+        # M5 = (a10-a00)(b00+b01)
+        u[0][5]=-1; u[2][5]=1
+        v[0][5]=1; v[1][5]=1
+        w[3][5]=1
+        
+        # M6 = (a01-a11)(b10+b11)
+        u[1][6]=1; u[3][6]=-1
+        v[2][6]=1; v[3][6]=1
+        w[0][6]=1
+        
+        return u, v, w
+    
+    su, sv, sw = get_strassen_2x2()
+    
+    # 4x4x4 Strassen terms (7 outer terms, each using 7 inner 2x2 terms)
+    # Each outer term: (sum of A blocks) * (sum of B blocks) -> sum of C blocks
+    # A blocks: (0,0)=TL, (0,1)=TR, (1,0)=BL, (1,1)=BR
+    # Same for B and C
+    
+    terms_4x4 = [
+        # (A_coeffs, B_coeffs, C_coeffs)
+        ({(0,0):1, (1,1):1}, {(0,0):1, (1,1):1}, {(0,0):1, (1,1):1}),      # M1
+        ({(1,0):1, (1,1):1}, {(0,0):1}, {(1,0):1, (1,1):-1}),                  # M2
+        ({(0,0):1}, {(0,1):1, (1,1):-1}, {(0,1):1, (1,1):1}),                  # M3
+        ({(1,1):1}, {(1,0):1, (0,0):-1}, {(0,0):1, (1,0):1}),                  # M4
+        ({(0,0):1, (0,1):1}, {(1,1):1}, {(0,0):-1, (0,1):1}),                  # M5
+        ({(1,0):1, (0,0):-1}, {(0,0):1, (0,1):1}, {(1,1):1}),                  # M6
+        ({(0,1):1, (1,1):-1}, {(1,0):1, (1,1):1}, {(0,0):1}),                  # M7
+    ]
+    
+    col = 0
+    for a_coeffs, b_coeffs, c_coeffs in terms_4x4:
+        for k in range(7):
+            col_idx = col + k
+            # For this inner term k of the 2x2 Strassen:
+            # u_vec = su[:, k], v_vec = sv[:, k], w_vec = sw[:, k]
+            
+            # U: for each A block with nonzero coeff
+            for (br, bc), coeff_a in a_coeffs.items():
+                for lr in range(2):
+                    for lc in range(2):
+                        local_idx = lr * 2 + lc  # 0:00, 1:01, 2:10, 3:11
+                        u_val = su[local_idx][k]
+                        if u_val != 0:
+                            # Global A index: row = 2*br+lr, col = 2*bc+lc (within 4x4 part)
+                            # In full A (4x5), this is row=2*br+lr, col=2*bc+lc (cols 0-3)
+                            gi = 2 * br + lr
+                            gj = 2 * bc + lc
+                            U[gi * 5 + gj][col_idx] += coeff_a * u_val
+            
+            # V: for each B block with nonzero coeff
+            for (br, bc), coeff_b in b_coeffs.items():
+                for lr in range(2):
+                    for lc in range(2):
+                        local_idx = lr * 2 + lc
+                        v_val = sv[local_idx][k]
+                        if v_val != 0:
+                            # Global B index: row = 2*br+lr, col = 2*bc+lc (within 4x4 part)
+                            # In full B (5x5), this is row=2*br+lr, col=2*bc+lc (rows/cols 0-3)
+                            gj = 2 * br + lr
+                            gk = 2 * bc + lc
+                            V[gj * 5 + gk][col_idx] += coeff_b * v_val
+            
+            # W: for each C block with nonzero coeff
+            for (br, bc), coeff_c in c_coeffs.items():
+                for lr in range(2):
+                    for lc in range(2):
+                        local_idx = lr * 2 + lc
+                        w_val = sw[local_idx][k]
+                        if w_val != 0:
+                            # Global C index: row = 2*br+lr, col = 2*bc+lc (within 4x4 part)
+                            # In full C (4x5), this is row=2*br+lr, col=2*bc+lc (cols 0-3)
+                            # W index: k*n+i = col*4+row
+                            gi = 2 * br + lr
+                            gk = 2 * bc + lc
+                            W[gk * 4 + gi][col_idx] += coeff_c * w_val
+        
+        col += 7
+    
+    # col is now 49
+    
+    # Part 2: A_R * B_BL -> [4,1,4], rank 16
+    # A_R: A[i][4] for i=0..3
+    # B_BL: B[4][k] for k=0..3
+    # C_L: C[i][k] for i=0..3, k=0..3 -> W[k*4+i]
+    for i in range(4):
+        for k in range(4):
+            U[i * 5 + 4][col] = 1
+            V[4 * 5 + k][col] = 1
+            W[k * 4 + i][col] = 1
+            col += 1
+    
+    # col is now 65
+    
+    # Part 3: A_L * B_TR -> [4,4,1], rank 16
+    # A_L: A[i][j] for i=0..3, j=0..3
+    # B_TR: B[j][4] for j=0..3
+    # C_R: C[i][4] for i=0..3 -> W[4*4+i] = W[16+i]
+    for i in range(4):
+        for j in range(4):
+            U[i * 5 + j][col] = 1
+            V[j * 5 + 4][col] = 1
+            W[4 * 4 + i][col] = 1
+            col += 1
+    
+    # col is now 81
+    
+    # Part 4: A_R * B_BR -> [4,1,1], rank 4
+    # A_R: A[i][4] for i=0..3
+    # B_BR: B[4][4]
+    # C_R: C[i][4] for i=0..3 -> W[16+i]
+    for i in range(4):
+        U[i * 5 + 4][col] = 1
+        V[4 * 5 + 4][col] = 1
+        W[4 * 4 + i][col] = 1
+        col += 1
+    
+    # col should be 85
+    
+    return {"U": U, "V": V, "W": W}

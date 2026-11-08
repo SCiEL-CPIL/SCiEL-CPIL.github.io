@@ -1,0 +1,1 @@
+BET: {mechanism: "Implementing a numerical search for rank-33 decomposition via tensor equation solving, which if successful drops rank from 34 to 33, improving score from 36/34≈1.0588 to 36/33≈1.0909", q: 0.35, delta: [0.03, 0.035]}

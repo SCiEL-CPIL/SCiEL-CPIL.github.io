@@ -1,0 +1,288 @@
+import numpy as np
+import time
+from itertools import combinations
+
+N = 11
+SQRT3 = np.sqrt(3.0)
+H = SQRT3 / 2.0  # height of the equilateral triangle with side 1
+
+# Triangle vertices
+V0 = np.array([0.0, 0.0])
+V1 = np.array([1.0, 0.0])
+V2 = np.array([0.5, H])
+
+# Precompute triangle indices
+TRI_IDX = np.array(list(combinations(range(N), 3)))
+M = len(TRI_IDX)  # C(11,3) = 165
+
+# Precompute for fast area: for each triple (i,j,k), area = 0.5*|det([pj-pi, pk-pi])|
+# = 0.5*|x_i(y_j - y_k) + x_j(y_k - y_i) + x_k(y_i - y_j)|
+# Precompute coefficients: area = 0.5*|sum over vertices of coeff * x| + ... 
+# Actually: area = 0.5 * |x_i*y_j - x_i*y_k - x_j*y_i + x_j*y_k + x_k*y_i - x_k*y_j|
+# = 0.5 * |(x_i)(y_j - y_k) + (x_j)(y_k - y_i) + (x_k)(y_i - y_j)|
+# This is bilinear in (x,y) pairs. Let's just use the direct vectorized form but optimized.
+
+def min_triangle_area(points):
+    """Compute the minimum area over all C(n,3) triangles using vectorization."""
+    pi = points[TRI_IDX[:, 0]]  # (M, 2)
+    pj = points[TRI_IDX[:, 1]]  # (M, 2)
+    pk = points[TRI_IDX[:, 2]]  # (M, 2)
+    
+    # Area = 0.5 * |cross(pj - pi, pk - pi)|
+    # cross = (pj_x - pi_x)*(pk_y - pi_y) - (pj_y - pi_y)*(pk_x - pi_x)
+    dx1 = pj[:, 0] - pi[:, 0]
+    dy1 = pj[:, 1] - pi[:, 1]
+    dx2 = pk[:, 0] - pi[:, 0]
+    dy2 = pk[:, 1] - pi[:, 1]
+    cross = dx1 * dy2 - dy1 * dx2
+    return float(np.min(np.abs(cross)) * 0.5)
+
+def is_inside_triangle(p, eps=1e-9):
+    """Check if point p is inside the equilateral triangle."""
+    x, y = p
+    return (y >= -eps) and (y <= H + eps) and (x >= y/SQRT3 - eps) and (x <= 1 - y/SQRT3 + eps)
+
+def project_to_triangle(p):
+    """Project a point onto the triangle if it's outside."""
+    x, y = p
+    # Clip y
+    if y < 0:
+        y = 0
+    if y > H:
+        y = H
+    # Clip x based on y
+    x_min = y / SQRT3
+    x_max = 1 - y / SQRT3
+    if x < x_min:
+        x = x_min
+    if x > x_max:
+        x = x_max
+    return np.array([x, y])
+
+def generate_structured_initial():
+    """Generate a structured initial guess with good symmetry."""
+    points = []
+    # Vertices
+    points.append([0.0, 0.0])
+    points.append([1.0, 0.0])
+    points.append([0.5, H])
+    
+    # Edge midpoints
+    points.append([0.5, 0.0])
+    points.append([0.25, H/2])
+    points.append([0.75, H/2])
+    
+    # Center
+    points.append([0.5, H/3])
+    
+    # Additional points
+    points.append([0.25, 0.0])
+    points.append([0.75, 0.0])
+    points.append([0.35, H/4])
+    points.append([0.65, H/4])
+    
+    return np.array(points[:N])
+
+def generate_maxmin_initial(seed=42, n_iter=2000):
+    """Generate initial points using a max-min distance heuristic to spread points out."""
+    rng = np.random.RandomState(seed)
+    points = [generate_structured_initial()[0].copy()]  # Start with one vertex
+    
+    for _ in range(N - 1):
+        # Generate many candidates
+        candidates = []
+        for _ in range(500):
+            u, v = rng.random(2)
+            if u + v < 1:
+                x = u * 1.0 + v * 0.5
+                y = v * H
+                candidates.append([x, y])
+        candidates = np.array(candidates)
+        
+        # For each candidate, compute min distance to existing points
+        best_candidate = None
+        best_min_dist = -1
+        for cand in candidates:
+            dists = np.linalg.norm(points - cand, axis=1)
+            min_dist = np.min(dists)
+            if min_dist > best_min_dist:
+                best_min_dist = min_dist
+                best_candidate = cand
+        
+        points.append(best_candidate)
+    
+    return np.array(points)
+
+def generate_random_points(seed):
+    """Generate random points inside the triangle using rejection sampling."""
+    rng = np.random.RandomState(seed)
+    points = []
+    while len(points) < N:
+        u, v = rng.random(2)
+        if u + v < 1:
+            # Barycentric coordinates
+            a = 1 - u - v
+            b = u
+            c = v
+            x = b * 1.0 + c * 0.5
+            y = c * H
+            points.append([x, y])
+    return np.array(points)
+
+def local_optimize(points, max_iter=300, step_size=0.05, deadline=None):
+    """Local optimization using coordinate descent / hill climbing with Nelder-Mead-like refinement."""
+    points = points.copy()
+    best_val = min_triangle_area(points)
+    
+    # Try to improve each point using a simple hill-climbing with shrinking steps
+    for iteration in range(max_iter):
+        if deadline is not None and time.time() > deadline:
+            break
+            
+        improved = False
+        for i in range(N):
+            # Try moving point i in different directions
+            best_local = points[i].copy()
+            best_local_val = best_val
+            
+            # Try 8 directional moves + random perturbations
+            for _ in range(30):
+                if deadline is not None and time.time() > deadline:
+                    break
+                    
+                # Mix of directional and random moves
+                if _ < 8:
+                    # 8 compass directions
+                    angle = _ * np.pi / 4
+                    dx = step_size * np.array([np.cos(angle), np.sin(angle)])
+                else:
+                    dx = np.random.uniform(-step_size, step_size, 2)
+                
+                new_p = best_local + dx
+                new_p = project_to_triangle(new_p)
+                
+                # Check if it's still inside (with small tolerance)
+                if not is_inside_triangle(new_p, eps=1e-6):
+                    continue
+                    
+                new_points = points.copy()
+                new_points[i] = new_p
+                
+                val = min_triangle_area(new_points)
+                if val > best_local_val + 1e-12:
+                    best_local_val = val
+                    best_local = new_p
+                    improved = True
+            
+            points[i] = best_local
+        
+        # Update best value
+        current_val = min_triangle_area(points)
+        if current_val > best_val:
+            best_val = current_val
+        
+        # If no improvement in a full pass, reduce step size
+        if not improved:
+            step_size *= 0.7
+            if step_size < 1e-7:
+                break
+    
+    return points, best_val
+
+def simulated_annealing(points, deadline, initial_temp=0.05, cooling=0.9995, max_iter=5000):
+    """Simulated annealing to escape local optima."""
+    points = points.copy()
+    best_points = points.copy()
+    best_val = min_triangle_area(points)
+    current_val = best_val
+    temp = initial_temp
+    
+    for iteration in range(max_iter):
+        if time.time() > deadline:
+            break
+            
+        # Pick a random point to move
+        i = np.random.randint(N)
+        # Adaptive step size based on temperature
+        step = 0.03 + 0.02 * (temp / initial_temp)
+        dx = np.random.uniform(-step, step, 2)
+        new_p = points[i] + dx
+        new_p = project_to_triangle(new_p)
+        
+        if not is_inside_triangle(new_p, eps=1e-6):
+            continue
+        
+        new_points = points.copy()
+        new_points[i] = new_p
+        
+        new_val = min_triangle_area(new_points)
+        delta = new_val - current_val
+        
+        if delta > 0 or (temp > 1e-10 and np.random.random() < np.exp(delta / temp)):
+            points = new_points
+            current_val = new_val
+            if current_val > best_val:
+                best_val = current_val
+                best_points = points.copy()
+        
+        temp *= cooling
+    
+    return best_points, best_val
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 145.0  # 5s safety margin
+    
+    best_points = None
+    best_value = -1
+    
+    # Try multiple strategies: structured, max-min, and random
+    strategies = [
+        ("structured", generate_structured_initial()),
+    ]
+    
+    # Add max-min distance initializations (better spread)
+    for seed in [42, 123, 456]:
+        strategies.append((f"maxmin_{seed}", generate_maxmin_initial(seed)))
+    
+    # Add random initializations
+    for seed in range(5):
+        strategies.append((f"random_{seed}", generate_random_points(seed * 42 + 7)))
+    
+    for name, init_points in strategies:
+        if time.time() > deadline:
+            break
+        
+        # First, do local optimization
+        opt_points, opt_val = local_optimize(init_points, max_iter=200, step_size=0.05, deadline=deadline)
+        
+        if opt_val > best_value:
+            best_value = opt_val
+            best_points = opt_points.copy()
+        
+        # If we have time, try simulated annealing from the optimized point
+        if time.time() < deadline - 20:
+            sa_points, sa_val = simulated_annealing(opt_points, deadline, initial_temp=0.04, cooling=0.9995, max_iter=3000)
+            
+            if sa_val > best_value:
+                best_value = sa_val
+                best_points = sa_points.copy()
+    
+    # Final local optimization pass on the best found with finer steps
+    if best_points is not None and time.time() < deadline - 8:
+        final_points, final_val = local_optimize(best_points, max_iter=500, step_size=0.02, deadline=deadline)
+        if final_val > best_value:
+            best_value = final_val
+            best_points = final_points.copy()
+    
+    # Verify all points are inside the triangle
+    if best_points is not None:
+        for i, p in enumerate(best_points):
+            if not is_inside_triangle(p, eps=1e-6):
+                best_points[i] = project_to_triangle(p)
+    
+    if best_points is None:
+        # Fallback
+        best_points = generate_structured_initial()
+    
+    return best_points

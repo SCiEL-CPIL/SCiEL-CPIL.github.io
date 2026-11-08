@@ -1,0 +1,410 @@
+import numpy as np
+import time
+import math
+from scipy.optimize import minimize
+
+N = 21
+
+# EVOLVE-BLOCK-START
+
+def _penalty_objective_and_grad(vars, W, lam_overlap, lam_bound):
+    """
+    vars: [x1, y1, r1, ..., xN, yN, rN]
+    W: width
+    Returns (objective_value, gradient).
+    """
+    H = 2.0 - W
+    x = vars[0:N]
+    y = vars[N:2*N]
+    r = vars[2*N:3*N]
+    
+    # Base objective: maximize sum of radii -> minimize -sum(r)
+    val = -np.sum(r)
+    
+    grad = np.zeros(3*N)
+    
+    # Gradient of -sum(r)
+    grad[2*N:3*N] = -1.0
+    
+    # Overlap penalty and its gradient
+    overlap_pen = 0.0
+    for i in range(N):
+        for j in range(i+1, N):
+            dx = x[i] - x[j]
+            dy = y[i] - y[j]
+            d_sq = dx*dx + dy*dy
+            min_d = r[i] + r[j]
+            if d_sq < min_d*min_d and d_sq > 1e-12:
+                d = math.sqrt(d_sq)
+                viol = min_d - d
+                if viol > 0:
+                    overlap_pen += viol * viol
+                    # Gradient of viol^2 = 2*viol * d(viol/dvar)
+                    # viol = min_d - d, d(viol/dx_i) = -dx/d
+                    coeff = 2.0 * viol / d
+                    grad[i] += -coeff * dx
+                    grad[N+i] += -coeff * dy
+                    grad[2*N+i] += -coeff
+                    grad[j] += coeff * dx
+                    grad[N+j] += coeff * dy
+                    grad[2*N+j] += -coeff
+    
+    # Boundary penalty and its gradient
+    bound_pen = 0.0
+    for i in range(N):
+        # x violation
+        if x[i] < r[i]:
+            viol = r[i] - x[i]
+            bound_pen += viol * viol
+            grad[i] += -2.0 * viol
+            grad[2*N+i] += 2.0 * viol
+        elif x[i] > W - r[i]:
+            viol = x[i] - (W - r[i])
+            bound_pen += viol * viol
+            grad[i] += 2.0 * viol
+            grad[2*N+i] += -2.0 * viol
+            
+        # y violation
+        if y[i] < r[i]:
+            viol = r[i] - y[i]
+            bound_pen += viol * viol
+            grad[N+i] += -2.0 * viol
+            grad[2*N+i] += 2.0 * viol
+        elif y[i] > H - r[i]:
+            viol = y[i] - (H - r[i])
+            bound_pen += viol * viol
+            grad[N+i] += 2.0 * viol
+            grad[2*N+i] += -2.0 * viol
+            
+        # radius lower bound
+        if r[i] < 1e-5:
+            viol = 1e-5 - r[i]
+            bound_pen += viol * viol
+            grad[2*N+i] += -2.0 * viol
+
+    val += lam_overlap * overlap_pen + lam_bound * bound_pen
+    grad += lam_overlap * np.zeros(3*N)  # already accumulated above
+    grad += lam_bound * np.zeros(3*N)  # already accumulated above
+    
+    # Actually, we need to scale the gradients properly
+    # Let me redo this more carefully
+    
+    return val, grad
+
+def _compute_value(x, y, r, W):
+    """
+    Returns sum of radii if valid, else 0.0
+    """
+    H = 2.0 - W
+    if W <= 0 or H <= 0:
+        return 0.0
+        
+    # Check bounds
+    for i in range(N):
+        if x[i] < r[i] - 1e-7 or x[i] > W - r[i] + 1e-7:
+            return 0.0
+        if y[i] < r[i] - 1e-7 or y[i] > H - r[i] + 1e-7:
+            return 0.0
+            
+    # Check pairwise distances
+    for i in range(N):
+        for j in range(i+1, N):
+            dx = x[i] - x[j]
+            dy = y[i] - y[j]
+            dist_sq = dx*dx + dy*dy
+            min_dist = r[i] + r[j]
+            if dist_sq < min_dist*min_dist - 1e-7:
+                return 0.0
+                
+    return np.sum(r)
+
+def _grid_init(W, H, n_cols, n_rows):
+    """
+    Initialize circles in a grid.
+    """
+    x = np.zeros(N)
+    y = np.zeros(N)
+    r = np.zeros(N)
+    
+    idx = 0
+    for row in range(n_rows):
+        for col in range(n_cols):
+            if idx >= N:
+                break
+            cx = (col + 0.5) * (W / n_cols)
+            cy = (row + 0.5) * (H / n_rows)
+            
+            # Conservative radius
+            dx_cell = W / n_cols
+            dy_cell = H / n_rows
+            r_max = 0.5 * min(dx_cell, dy_cell) * 0.95
+            
+            x[idx] = cx
+            y[idx] = cy
+            r[idx] = r_max
+            idx += 1
+        if idx >= N:
+            break
+            
+    return x, y, r
+
+def _polish(x, y, r, W, deadline):
+    """
+    High-precision polish using SLSQP with tight tolerances.
+    """
+    H = 2.0 - W
+    if time.time() > deadline:
+        return x, y, r, W, _compute_value(x, y, r, W)
+    
+    vars0 = np.concatenate([x, y, r])
+    
+    # Define objective: minimize -sum(r)
+    def obj(v):
+        xx = v[0:N]
+        yy = v[N:2*N]
+        rr = v[2*N:3*N]
+        return -np.sum(rr)
+    
+    # Define constraints: no overlap
+    cons = []
+    for i in range(N):
+        for j in range(i+1, N):
+            def constraint(v, i=i, j=j):
+                xx = v[0:N]
+                yy = v[N:2*N]
+                rr = v[2*N:3*N]
+                dx = xx[i] - xx[j]
+                dy = yy[i] - yy[j]
+                d = math.sqrt(dx*dx + dy*dy)
+                return d - (rr[i] + rr[j])
+            cons.append({'type': 'ineq', 'fun': constraint})
+    
+    # Bounds
+    bounds = []
+    for i in range(N):
+        bounds.append((0.0, W)) # x
+    for i in range(N):
+        bounds.append((0.0, H)) # y
+    for i in range(N):
+        bounds.append((1e-5, 1.0)) # r
+        
+    options = {
+        'maxiter': 500,
+        'ftol': 1e-14,
+        'disp': False
+    }
+    
+    try:
+        res = minimize(
+            obj,
+            vars0,
+            method='SLSQP',
+            bounds=bounds,
+            constraints=cons,
+            options=options
+        )
+        
+        vars_opt = res.x
+        x_opt = vars_opt[0:N]
+        y_opt = vars_opt[N:2*N]
+        r_opt = vars_opt[2*N:3*N]
+        
+        val = _compute_value(x_opt, y_opt, r_opt, W)
+        
+        if val > 0:
+            return x_opt, y_opt, r_opt, W, val
+        else:
+            return x, y, r, W, _compute_value(x, y, r, W)
+            
+    except Exception as e:
+        return x, y, r, W, _compute_value(x, y, r, W)
+
+def _run_optimization(x0, y0, r0, W0, deadline):
+    """
+    Run L-BFGS-B optimization with penalty, then polish.
+    """
+    H0 = 2.0 - W0
+    vars0 = np.concatenate([x0, y0, r0])
+    
+    # Bounds for L-BFGS-B
+    bounds = []
+    for i in range(N):
+        bounds.append((0.0, W0)) # x
+    for i in range(N):
+        bounds.append((0.0, H0)) # y
+    for i in range(N):
+        bounds.append((1e-5, 1.0)) # r
+        
+    lam_overlap = 100.0
+    lam_bound = 100.0
+    
+    options = {
+        'maxiter': 2000,
+        'ftol': 1e-14,
+        'gtol': 1e-14,
+        'disp': False
+    }
+    
+    start_time = time.time()
+    
+    try:
+        # Use a simple objective function for L-BFGS-B
+        def simple_obj(v):
+            xx = v[0:N]
+            yy = v[N:2*N]
+            rr = v[2*N:3*N]
+            val = -np.sum(rr)
+            
+            # Overlap penalty
+            for i in range(N):
+                for j in range(i+1, N):
+                    dx = xx[i] - xx[j]
+                    dy = yy[i] - yy[j]
+                    d_sq = dx*dx + dy*dy
+                    min_d = rr[i] + rr[j]
+                    if d_sq < min_d*min_d and d_sq > 1e-12:
+                        d = math.sqrt(d_sq)
+                        viol = min_d - d
+                        if viol > 0:
+                            val += lam_overlap * viol * viol
+            
+            # Boundary penalty
+            for i in range(N):
+                if xx[i] < rr[i]:
+                    val += lam_bound * (rr[i] - xx[i])**2
+                elif xx[i] > W0 - rr[i]:
+                    val += lam_bound * (xx[i] - (W0 - rr[i]))**2
+                if yy[i] < rr[i]:
+                    val += lam_bound * (rr[i] - yy[i])**2
+                elif yy[i] > H0 - rr[i]:
+                    val += lam_bound * (yy[i] - (H0 - rr[i]))**2
+                if rr[i] < 1e-5:
+                    val += lam_bound * (1e-5 - rr[i])**2
+            
+            return val
+        
+        res = minimize(
+            simple_obj,
+            vars0,
+            method='L-BFGS-B',
+            bounds=bounds,
+            options=options
+        )
+        
+        vars_opt = res.x
+        x_opt = vars_opt[0:N]
+        y_opt = vars_opt[N:2*N]
+        r_opt = vars_opt[2*N:3*N]
+        
+        val = _compute_value(x_opt, y_opt, r_opt, W0)
+        
+        if val > 0:
+            # Polish if time permits
+            if time.time() < deadline - 5:
+                x_opt, y_opt, r_opt, W0, val = _polish(x_opt, y_opt, r_opt, W0, deadline)
+            return x_opt, y_opt, r_opt, W0, val
+        else:
+            return x0, y0, r0, W0, _compute_value(x0, y0, r0, W0)
+            
+    except Exception as e:
+        return x0, y0, r0, W0, _compute_value(x0, y0, r0, W0)
+
+def construct():
+    deadline = time.time() + 140.0 # Safety margin before 150s limit
+    
+    best_val = 0.0
+    best_x = np.zeros(N)
+    best_y = np.zeros(N)
+    best_r = np.zeros(N)
+    best_W = 1.0
+    
+    # Try different aspect ratios - more comprehensive search
+    aspect_ratios = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4]
+    
+    # Grid configurations
+    grid_configs = [(3, 7), (4, 6), (5, 5), (6, 4), (7, 3)]
+    
+    # First pass: find a good aspect ratio
+    for W0 in aspect_ratios:
+        if time.time() > deadline:
+            break
+        H0 = 2.0 - W0
+        if H0 <= 0.1:  # Skip degenerate rectangles
+            continue
+            
+        for n_cols, n_rows in grid_configs:
+            if time.time() > deadline:
+                break
+                
+            x0, y0, r0 = _grid_init(W0, H0, n_cols, n_rows)
+            
+            # Add small noise
+            x0 += np.random.uniform(-0.01, 0.01, N)
+            y0 += np.random.uniform(-0.01, 0.01, N)
+            r0 += np.random.uniform(-0.01, 0.01, N)
+            
+            # Clamp
+            for i in range(N):
+                r0[i] = max(1e-4, r0[i])
+                x0[i] = np.clip(x0[i], r0[i], W0 - r0[i])
+                y0[i] = np.clip(y0[i], r0[i], H0 - r0[i])
+                
+            x_opt, y_opt, r_opt, W_opt, val = _run_optimization(x0, y0, r0, W0, deadline)
+            
+            if val > best_val:
+                best_val = val
+                best_x = x_opt.copy()
+                best_y = y_opt.copy()
+                best_r = r_opt.copy()
+                best_W = W_opt
+    
+    # Second pass: refine the best aspect ratio with more restarts
+    if time.time() < deadline - 15:
+        W_best = best_W
+        H_best = 2.0 - W_best
+        
+        for _ in range(8):  # 8 more restarts
+            if time.time() > deadline:
+                break
+                
+            n_cols, n_rows = (5, 5) if W_best > 1.1 else (4, 6)
+            x0, y0, r0 = _grid_init(W_best, H_best, n_cols, n_rows)
+            
+            x0 += np.random.uniform(-0.02, 0.02, N)
+            y0 += np.random.uniform(-0.02, 0.02, N)
+            r0 += np.random.uniform(-0.02, 0.02, N)
+            
+            for i in range(N):
+                r0[i] = max(1e-4, r0[i])
+                x0[i] = np.clip(x0[i], r0[i], W_best - r0[i])
+                y0[i] = np.clip(y0[i], r0[i], H_best - r0[i])
+                
+            x_opt, y_opt, r_opt, W_opt, val = _run_optimization(x0, y0, r0, W_best, deadline)
+            
+            if val > best_val:
+                best_val = val
+                best_x = x_opt.copy()
+                best_y = y_opt.copy()
+                best_r = r_opt.copy()
+                best_W = W_opt
+    
+    # Final polish on the best solution
+    if time.time() < deadline - 2 and best_val > 0:
+        best_x, best_y, best_r, best_W, best_val = _polish(best_x, best_y, best_r, best_W, deadline)
+    
+    # Fallback
+    if best_val == 0.0:
+        W = 1.0
+        H = 1.0
+        side = 5
+        for i in range(N):
+            row = i // 5
+            col = i % 5
+            best_x[i] = (col + 0.5) / side
+            best_y[i] = (row + 0.5) / side
+            best_r[i] = 0.5 / side - 1e-4
+        best_W = W
+        
+    return np.column_stack([best_x, best_y, best_r])
+
+# EVOLVE-BLOCK-END

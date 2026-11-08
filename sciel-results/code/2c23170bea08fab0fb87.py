@@ -1,0 +1,6 @@
+    for k0, k1 in k_pairs:
+        for k in [k0, k1]:
+            # C_0,k = A_0,4 B_4,k
+            ...
+            # C_1,k = A_1,4 B_4,k
+            ...

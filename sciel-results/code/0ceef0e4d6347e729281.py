@@ -1,0 +1,3 @@
+            if not valid:
+                # Fall back to schoolbook
+                ...

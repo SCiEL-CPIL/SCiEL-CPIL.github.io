@@ -1,0 +1,149 @@
+import numpy as np
+import time
+
+DIMENSIONS = [2, 4, 7]
+
+def construct():
+    n, m, p = DIMENSIONS  # n=2 (rows of A), m=4 (inner), p=7 (cols of B)
+    
+    # We'll build the decomposition using a combination of Strassen and schoolbook
+    # Strategy: Split the 4x4 inner dimension into two 2x2 blocks
+    # For each 2x2 block of A and corresponding 2x7 block of B, use Strassen-like approach
+    
+    # For (2, 2, 7): We can pair up columns of B
+    # Use Strassen for (2,2,2) blocks: 7 mults per 2 output cols
+    # For the last column (odd), use schoolbook: 4 mults
+    # Total for (2,2,7): 3*7 + 4 = 25 mults
+    
+    # For two such blocks (j=0,1 and j=2,3): 2*25 = 50 mults
+    
+    # Let's build this carefully
+    rank = 50
+    U = [[0] * rank for _ in range(n * m)]   # shape (8, 50)
+    V = [[0] * rank for _ in range(m * p)]   # shape (28, 50)
+    W = [[0] * rank for _ in range(p * n)]   # shape (14, 50)
+    
+    col = 0
+    
+    def add_strassen_222(i0, j0, k0):
+        """Add Strassen decomposition for A[i0:i0+2, j0:j0+2] * B[j0:j0+2, k0:k0+2] -> C[i0:i0+2, k0:k0+2]"""
+        nonlocal col
+        # A indices: i*m + j
+        a_idx = i0 * m + j0
+        b_idx = i0 * m + (j0 + 1)
+        c_idx = (i0 + 1) * m + j0
+        d_idx = (i0 + 1) * m + (j0 + 1)
+        
+        # B indices: j*p + k
+        e_idx = j0 * p + k0
+        f_idx = j0 * p + (k0 + 1)
+        g_idx = (j0 + 1) * p + k0
+        h_idx = (j0 + 1) * p + (k0 + 1)
+        
+        # C indices: k*n + i (trace convention)
+        c00_idx = k0 * n + i0
+        c01_idx = (k0 + 1) * n + i0
+        c10_idx = k0 * n + (i0 + 1)
+        c11_idx = (k0 + 1) * n + (i0 + 1)
+        
+        # M1 = (a+d)(e+h) -> C00 += M1, C11 += M1
+        U[a_idx][col] += 1
+        U[d_idx][col] += 1
+        V[e_idx][col] += 1
+        V[h_idx][col] += 1
+        W[c00_idx][col] += 1
+        W[c11_idx][col] += 1
+        col += 1
+        
+        # M2 = (c+d)e -> C10 += M2, C11 -= M2
+        U[c_idx][col] += 1
+        U[d_idx][col] += 1
+        V[e_idx][col] += 1
+        W[c10_idx][col] += 1
+        W[c11_idx][col] -= 1
+        col += 1
+        
+        # M3 = a(f-h) -> C01 += M3, C11 += M3
+        U[a_idx][col] += 1
+        V[f_idx][col] += 1
+        V[h_idx][col] -= 1
+        W[c01_idx][col] += 1
+        W[c11_idx][col] += 1
+        col += 1
+        
+        # M4 = d(g-e) -> C00 += M4, C10 += M4
+        U[d_idx][col] += 1
+        V[g_idx][col] += 1
+        V[e_idx][col] -= 1
+        W[c00_idx][col] += 1
+        W[c10_idx][col] += 1
+        col += 1
+        
+        # M5 = (a+b)h -> C00 -= M5, C01 += M5
+        U[a_idx][col] += 1
+        U[b_idx][col] += 1
+        V[h_idx][col] += 1
+        W[c00_idx][col] -= 1
+        W[c01_idx][col] += 1
+        col += 1
+        
+        # M6 = (c-a)(e+f) -> C11 += M6
+        U[c_idx][col] += 1
+        U[a_idx][col] -= 1
+        V[e_idx][col] += 1
+        V[f_idx][col] += 1
+        W[c11_idx][col] += 1
+        col += 1
+        
+        # M7 = (b-d)(g+h) -> C00 += M7
+        U[b_idx][col] += 1
+        U[d_idx][col] -= 1
+        V[g_idx][col] += 1
+        V[h_idx][col] += 1
+        W[c00_idx][col] += 1
+        col += 1
+    
+    def add_schoolbook_221(i0, j0, k0):
+        """Add schoolbook for A[i0:i0+2, j0:j0+2] * B[j0:j0+2, k0:k0+1] -> C[i0:i0+2, k0:k0+1]"""
+        nonlocal col
+        a_idx = i0 * m + j0
+        b_idx = i0 * m + (j0 + 1)
+        c_idx = (i0 + 1) * m + j0
+        d_idx = (i0 + 1) * m + (j0 + 1)
+        
+        e_idx = j0 * p + k0
+        g_idx = (j0 + 1) * p + k0
+        
+        c00_idx = k0 * n + i0
+        c10_idx = k0 * n + (i0 + 1)
+        
+        # C00 = a*e + b*g
+        U[a_idx][col] += 1
+        V[e_idx][col] += 1
+        W[c00_idx][col] += 1
+        col += 1
+        
+        U[b_idx][col] += 1
+        V[g_idx][col] += 1
+        W[c00_idx][col] += 1
+        col += 1
+        
+        # C10 = c*e + d*g
+        U[c_idx][col] += 1
+        V[e_idx][col] += 1
+        W[c10_idx][col] += 1
+        col += 1
+        
+        U[d_idx][col] += 1
+        V[g_idx][col] += 1
+        W[c10_idx][col] += 1
+        col += 1
+    
+    # Process two j-blocks: {0,1} and {2,3}
+    for j_start in [0, 2]:
+        # Process 7 output columns as 3 pairs + 1 single
+        for k_start in [0, 2, 4]:
+            add_strassen_222(0, j_start, k_start)
+        add_schoolbook_221(0, j_start, 6)
+    
+    return {"U": U, "V": V, "W": W}

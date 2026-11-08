@@ -1,0 +1,256 @@
+import time
+import random
+import itertools
+
+DIMENSIONS = [3, 5, 7]
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 110.0
+
+    n, m, p = DIMENSIONS  # 3, 5, 7
+    U_rows = n * m  # 15
+    V_rows = m * p  # 35
+    W_rows = p * n  # 21
+
+    # Generate all possible 2x2x2 blocks
+    all_blocks = []
+    block_indices_list = []
+    
+    for i1 in range(n - 1):
+        for i2 in range(i1 + 1, n):
+            for j1 in range(m - 1):
+                for j2 in range(j1 + 1, m):
+                    for k1 in range(p - 1):
+                        for k2 in range(k1 + 1, p):
+                            indices = frozenset(
+                                (i, j, k)
+                                for i in (i1, i2)
+                                for j in (j1, j2)
+                                for k in (k1, k2)
+                            )
+                            all_blocks.append(((i1, i2, j1, j2, k1, k2), indices))
+                            block_indices_list.append(indices)
+
+    total_blocks = len(all_blocks)
+    
+    # Precompute conflicts as bitmasks for speed
+    # We need to check if a new block conflicts with the current set.
+    # Represent current set as a bitmask? Total blocks 630 is too big for a single int bitmask in Python efficiently for set ops?
+    # Actually, Python ints are arbitrary precision. 630 bits is small.
+    # Let's use bitmasks for the "current packing" and "conflict masks".
+    
+    conflict_masks = [0] * total_blocks
+    for i in range(total_blocks):
+        mask = 0
+        for j in range(total_blocks):
+            if i != j and (block_indices_list[i] & block_indices_list[j]):
+                mask |= (1 << j)
+        conflict_masks[i] = mask
+
+    best_packing = set()
+    best_size = 0
+    
+    random.seed(42)
+    
+    # Local Search with Random Restarts
+    # Max possible blocks is floor(105/8) = 13.
+    # We aim for 13.
+    
+    for trial in range(2000):
+        if time.time() > deadline - 5.0:
+            break
+            
+        # Initialize with greedy randomized
+        current_packing = set()
+        current_mask = 0
+        available = list(range(total_blocks))
+        random.shuffle(available)
+        
+        for idx in available:
+            # Check if idx conflicts with current_mask
+            # If (conflict_masks[idx] & current_mask) == 0, it's compatible
+            if (conflict_masks[idx] & current_mask) == 0:
+                current_packing.add(idx)
+                current_mask |= (1 << idx)
+        
+        current_size = len(current_packing)
+        
+        # Local Improvement
+        improved = True
+        # Limit inner loop to avoid getting stuck in one trial for too long
+        local_iterations = 0
+        while improved and local_iterations < 100 and time.time() < deadline - 5.0:
+            improved = False
+            local_iterations += 1
+            
+            # 1. Try to add a random block
+            # Find a block not in current_packing that doesn't conflict
+            # Randomly sample a few
+            for _ in range(20):
+                idx = random.randint(0, total_blocks - 1)
+                if idx in current_packing:
+                    continue
+                if (conflict_masks[idx] & current_mask) == 0:
+                    current_packing.add(idx)
+                    current_mask |= (1 << idx)
+                    current_size += 1
+                    improved = True
+                    break
+            
+            if improved:
+                continue
+
+            # 2. Try 2-for-1 swap (Remove 1, Add 2)
+            if current_size > 0:
+                remove_idx = random.choice(list(current_packing))
+                # Tentatively remove
+                current_packing.remove(remove_idx)
+                current_mask &= ~(1 << remove_idx)
+                current_size -= 1
+                
+                # Try to add 2 blocks
+                # We need to find 2 blocks that are compatible with each other and the new set
+                # Greedily add one, then another
+                added = 0
+                temp_mask = current_mask
+                temp_packing = set(current_packing)
+                
+                # Shuffle candidates to randomize order
+                candidates = [i for i in range(total_blocks) if i not in temp_packing and i != remove_idx]
+                random.shuffle(candidates)
+                
+                for idx in candidates:
+                    if added == 2:
+                        break
+                    if (conflict_masks[idx] & temp_mask) == 0:
+                        temp_packing.add(idx)
+                        temp_mask |= (1 << idx)
+                        added += 1
+                
+                if added == 2:
+                    current_packing = temp_packing
+                    current_mask = temp_mask
+                    current_size += 1 # Net gain 1
+                    improved = True
+                else:
+                    # Revert
+                    current_packing.add(remove_idx)
+                    current_mask |= (1 << remove_idx)
+                    current_size += 1
+
+            # 3. Try 3-for-2 swap (Remove 2, Add 3)
+            if current_size > 1 and not improved:
+                remove_indices = random.sample(list(current_packing), 2)
+                for r in remove_indices:
+                    current_packing.remove(r)
+                    current_mask &= ~(1 << r)
+                current_size -= 2
+                
+                temp_mask = current_mask
+                temp_packing = set(current_packing)
+                
+                candidates = [i for i in range(total_blocks) if i not in temp_packing and i not in remove_indices]
+                random.shuffle(candidates)
+                
+                added = 0
+                for idx in candidates:
+                    if added == 3:
+                        break
+                    if (conflict_masks[idx] & temp_mask) == 0:
+                        temp_packing.add(idx)
+                        temp_mask |= (1 << idx)
+                        added += 1
+                
+                if added == 3:
+                    current_packing = temp_packing
+                    current_mask = temp_mask
+                    current_size += 1 # Net gain 1
+                    improved = True
+                else:
+                    for r in remove_indices:
+                        current_packing.add(r)
+                        current_mask |= (1 << r)
+                    current_size += 2
+
+        if current_size > best_size:
+            best_size = current_size
+            best_packing = set(current_packing)
+            if best_size >= 13: # Theoretical max
+                break
+
+    num_blocks = best_size
+    
+    # Construct U, V, W
+    U_cols = []
+    V_cols = []
+    W_cols = []
+
+    def add_term(u_entries, v_entries, w_entries):
+        U_cols.append([0] * U_rows)
+        V_cols.append([0] * V_rows)
+        W_cols.append([0] * W_rows)
+        for idx, val in u_entries.items():
+            U_cols[-1][idx] = val
+        for idx, val in v_entries.items():
+            V_cols[-1][idx] = val
+        for idx, val in w_entries.items():
+            W_cols[-1][idx] = val
+
+    def add_strassen_block(i1, i2, j1, j2, k1, k2):
+        a11 = i1 * m + j1
+        a12 = i1 * m + j2
+        a21 = i2 * m + j1
+        a22 = i2 * m + j2
+        
+        b11 = j1 * p + k1
+        b12 = j1 * p + k2
+        b21 = j2 * p + k1
+        b22 = j2 * p + k2
+        
+        c11 = k1 * n + i1
+        c12 = k2 * n + i1
+        c21 = k1 * n + i2
+        c22 = k2 * n + i2
+        
+        add_term({a11: 1, a22: 1}, {b11: 1, b22: 1}, {c11: 1, c22: 1})
+        add_term({a21: 1, a22: 1}, {b11: 1}, {c21: 1, c22: -1})
+        add_term({a11: 1}, {b12: 1, b22: -1}, {c12: 1, c22: 1})
+        add_term({a22: 1}, {b21: 1, b11: -1}, {c11: 1, c21: 1})
+        add_term({a11: 1, a12: 1}, {b22: 1}, {c11: -1, c12: 1})
+        add_term({a21: 1, a11: -1}, {b11: 1, b12: 1}, {c22: 1})
+        add_term({a12: 1, a22: -1}, {b21: 1, b22: 1}, {c11: 1})
+
+    covered = set()
+    for idx in best_packing:
+        block_params, _ = all_blocks[idx]
+        i1, i2, j1, j2, k1, k2 = block_params
+        add_strassen_block(i1, i2, j1, j2, k1, k2)
+        for i in (i1, i2):
+            for j in (j1, j2):
+                for k in (k1, k2):
+                    covered.add((i, j, k))
+
+    # Add schoolbook terms for uncovered triples
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                if (i, j, k) not in covered:
+                    add_term({i * m + j: 1}, {j * p + k: 1}, {k * n + i: 1})
+
+    rank = len(U_cols)
+    
+    # Convert to matrix format
+    U = [[0] * rank for _ in range(U_rows)]
+    V = [[0] * rank for _ in range(V_rows)]
+    W = [[0] * rank for _ in range(W_rows)]
+    
+    for c in range(rank):
+        for r in range(U_rows):
+            U[r][c] = U_cols[c][r]
+        for r in range(V_rows):
+            V[r][c] = V_cols[c][r]
+        for r in range(W_rows):
+            W[r][c] = W_cols[c][r]
+
+    return {"U": U, "V": V, "W": W}
