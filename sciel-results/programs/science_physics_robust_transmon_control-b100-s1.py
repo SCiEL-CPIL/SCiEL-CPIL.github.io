@@ -1,347 +1,317 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-# EVOLVE-BLOCK-START
 import numpy as np
-import time
 from scipy.linalg import expm
 from scipy.optimize import minimize
+import time
 
 def pulse(target_gate, hardware_model):
-    """
-    Generate a robust pulse for X_pi gate using model-based optimization.
-    
-    Strategy:
-    1. Parametric DRAG-style pulse with Gaussian envelope.
-    2. Full Lindblad simulation for accurate infidelity calculation.
-    3. Optimization of sigma, alpha (DRAG), and area_scale.
-    4. Deadline guard to ensure completion within time limit.
-    """
-    if target_gate != 'X_pi':
-        raise ValueError("Only X_pi is supported")
-    
-    start_time = time.time()
-    deadline = 320.0  # seconds, with safety margin from 330s
-    
-    # Hardware parameters
-    anharmonicity = -2 * np.pi * 0.25  # rad/ns
+    start = time.time()
+    deadline = start + 325.0
+
+    # ---- constants ----
+    alpha = -2 * np.pi * 0.25
     amp_bound = 0.4
     slew_bound = 0.12
-    dt = 0.5  # ns
-    n_steps = 80
-    total_time = n_steps * dt  # 40 ns
-    T1 = 25000.0  # ns
-    Tphi = 40000.0  # ns
-    
-    # Time points
-    t = np.linspace(0, total_time, n_steps, endpoint=False) + dt/2
-    t_centered = t - total_time / 2.0
-    
-    # Pre-compute matrices
-    a = np.array([[0, 1, 0],
-                  [0, 0, np.sqrt(2)],
-                  [0, 0, 0]], dtype=complex)
-    adag = a.conj().T
-    n_op = adag @ a
-    eye3 = np.eye(3, dtype=complex)
-    
-    # Lindblad operators
-    L1 = a / np.sqrt(T1)
+    dt = 0.5
+    N = 80
+    T1 = 25000.0
+    Tphi = 40000.0
+    deltas = [-2 * np.pi * 0.002, 0.0, 2 * np.pi * 0.002]
+    scales = [0.97, 1.0, 1.03]
+
+    a_op = np.array([[0, 1, 0], [0, 0, np.sqrt(2)], [0, 0, 0]], dtype=complex)
+    a_dag = a_op.conj().T
+    n_op = a_dag @ a_op
+    n_nm1 = n_op @ (n_op - np.eye(3))
+
+    H0_nom = 0.5 * alpha * n_nm1
+    driveI = 0.5 * (a_op + a_dag)
+    driveQ = 0.5j * (a_op - a_dag)
+
+    # Lindblad terms
+    L1 = a_op / np.sqrt(T1)
     L2 = n_op * np.sqrt(2.0 / Tphi)
-    
-    # Anharmonicity part of Hamiltonian
-    H_anh = 0.5 * anharmonicity * n_op @ (n_op - eye3)
-    
-    # Test states (as density matrices)
-    psi_states = np.array([
-        [1, 0, 0],
-        [0, 1, 0],
-        [1, 1, 0] / np.sqrt(2),
-        [1, -1, 0] / np.sqrt(2),
-        [1, 1j, 0] / np.sqrt(2),
-        [1, -1j, 0] / np.sqrt(2)
-    ], dtype=complex)
-    
-    rho_initial = np.array([np.outer(p, p.conj()) for p in psi_states])
-    
-    # X gate
-    X = np.array([[0, 1, 0],
-                  [1, 0, 0],
-                  [0, 0, 0]], dtype=complex)
-    
-    # Target density matrices
-    psi_target = np.array([X @ p for p in psi_states], dtype=complex)
-    rho_target = np.array([np.outer(p, p.conj()) for p in psi_target])
-    
-    def get_lindbladian_superoperator(H, L1, L2):
-        """
-        Construct the 9x9 superoperator for the Lindblad equation.
-        d(rho)/dt = -i[H, rho] + L1 rho L1^dag - 0.5{L1^dag L1, rho} + ...
-        Vectorization: vec(rho) = (rho_00, rho_01, ..., rho_22)
-        Superoperator M: vec(d(rho)/dt) = M vec(rho)
-        """
-        dim = 3
-        # Commutator part: -i (H \otimes I - I \otimes H^T)
-        # Note: vec(AB C) = (A \otimes C^T) vec(B)
-        # vec(H rho) = (I \otimes H) vec(rho)
-        # vec(rho H) = (H^T \otimes I) vec(rho)
-        # vec([H, rho]) = (I \otimes H - H^T \otimes I) vec(rho)
-        # So -i[H, rho] -> -i (I \otimes H - H^T \otimes I)
-        
-        term_commutator = -1j * (np.kron(eye3, H) - np.kron(H.T, eye3))
-        
-        # Dissipation part
-        def lindblad_term(L):
-            # L rho L^dag -> (L^dag^T \otimes L) vec(rho)
-            # -0.5 {L^dag L, rho} -> -0.5 (I \otimes L^dag L - (L^dag L)^T \otimes I) vec(rho)
-            LdagL = L.conj().T @ L
-            term = np.kron(L.conj().T.T, L) - 0.5 * (np.kron(eye3, LdagL) - np.kron(LdagL.T, eye3))
-            return term
-        
-        term_diss = lindblad_term(L1) + lindblad_term(L2)
-        
-        return term_commutator + term_diss
-    
-    def simulate_full(pulse_data, delta, scale):
-        """
-        Full quantum simulation including dissipation using Lindblad superoperator.
-        Returns the final density matrices for the 6 test states.
-        """
-        # Pre-compute superoperators for each step
-        # Since H depends on I, Q, delta, scale, we compute them on the fly or pre-compute if pulse is fixed.
-        # For optimization, pulse changes, so we compute inside the loop.
-        
-        # We evolve all 6 states simultaneously by stacking their density matrices?
-        # No, the superoperator is linear, so we can apply it to a batch.
-        # Let's keep rho as a list of 6 matrices, or a (6, 3, 3) array.
-        
-        rho_current = rho_initial.copy()
-        
-        for i in range(n_steps):
-            I_i = pulse_data[i, 0]
-            Q_i = pulse_data[i, 1]
-            
-            H_int = 0.5 * scale * (I_i * (a + adag) + 1j * Q_i * (a - adag))
-            H_t = delta * n_op + H_anh + H_int
-            
-            # Compute superoperator
-            # This is the expensive part. 9x9 matrix construction.
-            # We can optimize this by noting that L1, L2 are constant.
-            # The commutator part changes with H_t.
-            
-            # Optimization: Pre-compute constant parts of Lindblad terms
-            # L1, L2 are constant.
-            # term_diss is constant!
-            # term_commutator depends on H_t.
-            
-            # Let's compute term_diss once outside the loop in the closure?
-            # It depends on L1, L2 which are constant.
-            
-            L1 = a / np.sqrt(T1)
-            L2 = n_op * np.sqrt(2.0 / Tphi)
-            
-            def lindblad_term_const(L):
-                LdagL = L.conj().T @ L
-                return np.kron(L.conj().T.T, L) - 0.5 * (np.kron(eye3, LdagL) - np.kron(LdagL.T, eye3))
-            
-            # This is still inside the loop. Let's move it out.
-            
-            # Actually, let's just compute the full superoperator.
-            # 9x9 is small.
-            
-            S = get_lindbladian_superoperator(H_t, L1, L2)
-            
-            # Exponentiate S * dt
-            S_step = expm(S * dt)
-            
-            # Apply to all 6 states
-            # rho_vec shape: (6, 9)
-            rho_vecs = np.array([rho.flatten() for rho in rho_current])
-            rho_vecs_new = S_step @ rho_vecs.T
-            rho_current = [rho_vecs_new[:, i].reshape(3, 3) for i in range(6)]
-            
-        return rho_current
-    
-    # Pre-compute constant Lindblad terms to speed up get_lindbladian_superoperator
-    L1_const = a / np.sqrt(T1)
-    L2_const = n_op * np.sqrt(2.0 / Tphi)
-    
-    def lindblad_term_precomp(L):
-        LdagL = L.conj().T @ L
-        return np.kron(L.conj().T.T, L) - 0.5 * (np.kron(eye3, LdagL) - np.kron(LdagL.T, eye3))
-    
-    term_diss_precomp = lindblad_term_precomp(L1_const) + lindblad_term_precomp(L2_const)
-    
-    def get_superoperator_fast(H_t):
-        term_commutator = -1j * (np.kron(eye3, H_t) - np.kron(H_t.T, eye3))
-        return term_commutator + term_diss_precomp
-    
-    def simulate_full_fast(pulse_data, delta, scale):
-        rho_current = rho_initial.copy()
-        
-        for i in range(n_steps):
-            I_i = pulse_data[i, 0]
-            Q_i = pulse_data[i, 1]
-            
-            H_int = 0.5 * scale * (I_i * (a + adag) + 1j * Q_i * (a - adag))
-            H_t = delta * n_op + H_anh + H_int
-            
-            S = get_superoperator_fast(H_t)
-            S_step = expm(S * dt)
-            
-            rho_vecs = np.array([rho.flatten() for rho in rho_current])
-            rho_vecs_new = S_step @ rho_vecs.T
-            rho_current = [rho_vecs_new[:, i].reshape(3, 3) for i in range(6)]
-            
-        return rho_current
-    
-    def compute_fidelity(rho_outs):
-        """
-        Compute mean fidelity over the 6 test states.
-        Fidelity F = <psi_target| rho_out |psi_target>
-        """
-        fidelities = []
-        for i in range(6):
-            rho_out = rho_outs[i]
-            psi_t = psi_target[i]
-            # F = psi_t^dag rho_out psi_t
-            fid = np.vdot(psi_t, rho_out @ psi_t).real
-            fidelities.append(fid)
-        
-        return np.mean(fidelities)
-    
-    def enforce_constraints(p):
-        """Enforce amplitude and slew rate constraints."""
-        p = p.copy()
-        
-        # Amplitude
-        amp = np.sqrt(p[:, 0]**2 + p[:, 1]**2)
-        max_amp = np.max(amp)
-        if max_amp > amp_bound:
-            p *= amp_bound / max_amp
-        
-        # Slew rate
-        max_slew = 0
-        for i in range(n_steps):
-            if i == 0:
-                dp = np.linalg.norm(p[0]) / dt
-            else:
-                dp = np.linalg.norm(p[i] - p[i-1]) / dt
-            if dp > max_slew:
-                max_slew = dp
-        
-        dp_last = np.linalg.norm(p[-1]) / dt
-        if dp_last > max_slew:
-            max_slew = dp_last
-            
-        if max_slew > slew_bound:
-            p *= slew_bound / max_slew
-            
-        return p
-    
-    def parametric_pulse(params):
-        """
-        Generate pulse from parameters: [sigma, alpha, area_scale]
-        """
-        sigma, alpha, area_scale = params
-        
-        # Gaussian envelope
-        I = np.exp(-t_centered**2 / (2 * sigma**2))
-        area = np.sum(I) * dt
-        I = I * (np.pi * area_scale / area)
-        
-        # DRAG: Q proportional to dI/dt
-        dI = np.gradient(I, dt)
-        Q = alpha * dI
-        
-        p = np.column_stack([I, Q])
-        return enforce_constraints(p)
-    
-    def compute_score(pulse_data):
-        """
-        Compute the scoring metric: mean + max infidelity over 9 cases.
-        """
-        deltas = [-2 * np.pi * 0.002, 0, 2 * np.pi * 0.002]
-        scales = [0.97, 1.0, 1.03]
-        
-        infidelities = []
+
+    d = 3
+    eye_d = np.eye(d)
+
+    # Precompute incoherent Liouvillian part (constant)
+    incoh_L = np.zeros((d * d, d * d), dtype=complex)
+    for Lk in [L1, L2]:
+        Lkd = Lk.conj().T
+        incoh_L += np.kron(Lk.conj(), Lk)
+        LkdLk = Lkd @ Lk
+        incoh_L += -0.5 * np.kron(eye_d, LkdLk)
+        incoh_L += -0.5 * np.kron(LkdLk.T, eye_d)
+
+    def get_H(I, Q, delta, scale):
+        return H0_nom + delta * n_op + scale * (I * driveI + Q * driveQ)
+
+    # Precompute coherent superoperator components
+    coh_base = -1j * (np.kron(H0_nom, eye_d) - np.kron(eye_d, H0_nom.T))
+    coh_delta = -1j * (np.kron(n_op, eye_d) - np.kron(eye_d, n_op.T))
+    coh_I = -1j * (np.kron(driveI, eye_d) - np.kron(eye_d, driveI.T))
+    coh_Q = -1j * (np.kron(driveQ, eye_d) - np.kron(eye_d, driveQ.T))
+
+    # For each (delta, scale) pair, precompute base Liouvillian and drive coefficients
+    L_bases = np.zeros((9, d * d, d * d), dtype=complex)
+    L_I_scales = np.zeros((9, d * d, d * d), dtype=complex)
+    L_Q_scales = np.zeros((9, d * d, d * d), dtype=complex)
+    case_idx = 0
+    for d_val in deltas:
+        for sc_val in scales:
+            L_bases[case_idx] = coh_base + d_val * coh_delta + incoh_L
+            L_I_scales[case_idx] = sc_val * coh_I
+            L_Q_scales[case_idx] = sc_val * coh_Q
+            case_idx += 1
+
+    def check_constraints(I_Q):
+        amps = np.sqrt(I_Q[:, 0] ** 2 + I_Q[:, 1] ** 2)
+        if np.max(amps) > amp_bound + 1e-9:
+            return False
+        p = np.vstack([np.zeros(2), I_Q, np.zeros(2)])
+        diffs = np.diff(p, axis=0)
+        if np.max(np.sqrt(np.sum(diffs ** 2, axis=1))) / dt > slew_bound + 1e-9:
+            return False
+        return True
+
+    states = [
+        np.array([1, 0, 0], dtype=complex),
+        np.array([0, 1, 0], dtype=complex),
+        np.array([1, 1, 0], dtype=complex) / np.sqrt(2),
+        np.array([1, -1, 0], dtype=complex) / np.sqrt(2),
+        np.array([1, 1j, 0], dtype=complex) / np.sqrt(2),
+        np.array([1, -1j, 0], dtype=complex) / np.sqrt(2),
+    ]
+    targets = [
+        np.array([0, 1, 0], dtype=complex),
+        np.array([1, 0, 0], dtype=complex),
+        np.array([1, 1, 0], dtype=complex) / np.sqrt(2),
+        np.array([-1, 1, 0], dtype=complex) / np.sqrt(2),
+        np.array([1j, 1, 0], dtype=complex) / np.sqrt(2),
+        np.array([-1j, 1, 0], dtype=complex) / np.sqrt(2),
+    ]
+
+    # Precompute fidelity measurement matrices
+    M_mats = []
+    for s in range(6):
+        M = np.outer(targets[s].conj(), targets[s])
+        M_mats.append(M.flatten())
+    M_mats = np.array(M_mats)  # shape (6, 9)
+
+    # Precompute initial density matrix vectors
+    rho_vecs_init = np.array([np.outer(states[s], states[s].conj()).flatten() for s in range(6)])
+    rho_vecs_init = rho_vecs_init.T  # shape (9, 6)
+
+    def propagate_all(I_Q, delta, scale):
+        case_idx = deltas.index(delta) * 3 + scales.index(scale)
+        rho_vecs = rho_vecs_init.copy()
+        for i in range(N):
+            L = L_bases[case_idx] + I_Q[i, 0] * L_I_scales[case_idx] + I_Q[i, 1] * L_Q_scales[case_idx]
+            U = expm(L * dt)
+            rho_vecs = U @ rho_vecs
+        fids = np.real(np.sum(M_mats * rho_vecs.T, axis=1))
+        return fids
+
+    def score_case(I_Q, delta, scale):
+        res = propagate_all(I_Q, delta, scale)
+        infs = 1.0 - res
+        return infs.mean() + infs.max()
+
+    def score(I_Q):
+        if not check_constraints(I_Q):
+            return 1e6
+        total = 0.0
         for d in deltas:
-            for s in scales:
-                rho_outs = simulate_full_fast(pulse_data, d, s)
-                fid = compute_fidelity(rho_outs)
-                infidelities.append(1 - fid)
-        
-        infidelities = np.array(infidelities)
-        return np.mean(infidelities) + np.max(infidelities)
-    
-    # Optimization using Nelder-Mead
-    def objective(params):
-        p = parametric_pulse(params)
-        return compute_score(p)
-    
-    # Initial guess: sigma=6, alpha=0.5, area_scale=1.0
-    x0 = np.array([6.0, 0.5, 1.0])
-    
-    best_params = x0.copy()
-    best_score = objective(x0)
-    
-    # Nelder-Mead optimization
+            for sc in scales:
+                total += score_case(I_Q, d, sc)
+        return total / 9.0
+
+    # ---- DRAG pulse generator with flexible shape ----
+    def gen_drag(p):
+        """p = [A, sI, eta, offset, width_q, amp_q, center_q]"""
+        A, sI, eta, offset, width_q, amp_q, center_q = p
+        t = np.linspace(0, 40, N)
+        tc = 20.0
+        I = A * np.exp(-(t - tc) ** 2 / (2 * sI ** 2))
+        dI = -(t - tc) / sI ** 2 * I
+        Q = eta * dI + amp_q * np.exp(-(t - center_q - offset) ** 2 / (2 * width_q ** 2))
+        return np.column_stack((I, Q))
+
+    def gen_drag2(p):
+        """Two-Gaussian Q for spectral nulling: p = [A, sI, eta, Aq1, wq1, cq1, Aq2, wq2, cq2]"""
+        A, sI, eta, Aq1, wq1, cq1, Aq2, wq2, cq2 = p
+        t = np.linspace(0, 40, N)
+        tc = 20.0
+        I = A * np.exp(-(t - tc) ** 2 / (2 * sI ** 2))
+        dI = -(t - tc) / sI ** 2 * I
+        Q = (eta * dI +
+             Aq1 * np.exp(-(t - tc - cq1) ** 2 / (2 * wq1 ** 2)) +
+             Aq2 * np.exp(-(t - tc - cq2) ** 2 / (2 * wq2 ** 2)))
+        return np.column_stack((I, Q))
+
+    def seed_pulse():
+        s = 40.0 / 6.0
+        t = np.linspace(0, 40, N)
+        I = (np.sqrt(np.pi / 2) / s) * np.exp(-(t - 20.0) ** 2 / (2 * s ** 2))
+        return np.column_stack((I, np.zeros(N)))
+
+    best = seed_pulse()
+    best_s = score(best)
+
+    # ---- Coarse grid: DRAG family ----
+    for A in [0.22, 0.26, 0.30, 0.34, 0.37]:
+        for sI in [4.5, 5.5, 6.5, 7.5, 9.0]:
+            for eta in [-3.0, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0]:
+                if time.time() > deadline - 100:
+                    break
+                I_Q = gen_drag([A, sI, eta, 0.0, 5.0, 0.0, 20.0])
+                if not check_constraints(I_Q):
+                    continue
+                s = score(I_Q)
+                if s < best_s:
+                    best_s, best = s, I_Q
+
+    # ---- Coarse grid: two-Gaussian Q (spectral nulling) ----
+    for A in [0.26, 0.30, 0.34]:
+        for sI in [5.0, 6.0, 7.0]:
+            for eta in [-2.0, -1.0, 0.0]:
+                for Aq in [0.03, 0.06, 0.10]:
+                    if time.time() > deadline - 80:
+                        break
+                    I_Q = gen_drag2([A, sI, eta, Aq, 3.0, 4.0, -Aq, 3.0, -4.0])
+                    if not check_constraints(I_Q):
+                        continue
+                    s = score(I_Q)
+                    if s < best_s:
+                        best_s, best = s, I_Q
+
+    # ---- Nelder-Mead refinement on DRAG family ----
+    def opt_drag(p):
+        if time.time() > deadline - 50:
+            return 1e6
+        I_Q = gen_drag(p)
+        if not check_constraints(I_Q):
+            return 1e6
+        return score(I_Q)
+
+    inits_drag = [
+        [0.28, 5.5, -1.5, 0.0, 5.0, 0.0, 20.0],
+        [0.30, 6.0, -1.0, 0.0, 5.0, 0.0, 20.0],
+        [0.26, 5.0, -2.0, 0.0, 5.0, 0.0, 20.0],
+        [0.32, 6.5, -1.0, 0.0, 5.0, 0.0, 20.0],
+        [0.30, 5.5, -1.5, 0.0, 4.0, 0.05, 24.0],
+        [0.30, 5.5, -1.5, 0.0, 4.0, -0.05, 16.0],
+    ]
+    for init in inits_drag:
+        if time.time() > deadline - 50:
+            break
+        try:
+            r = minimize(opt_drag, init, method='Nelder-Mead',
+                         options={'maxiter': 300, 'xatol': 0.005, 'fatol': 1e-8})
+            if r.fun < best_s:
+                I_Q = gen_drag(r.x)
+                if check_constraints(I_Q):
+                    best_s, best = r.fun, I_Q
+        except Exception:
+            pass
+
+    # ---- Nelder-Mead on two-Gaussian Q ----
+    def opt_drag2(p):
+        if time.time() > deadline - 30:
+            return 1e6
+        I_Q = gen_drag2(p)
+        if not check_constraints(I_Q):
+            return 1e6
+        return score(I_Q)
+
+    inits_drag2 = [
+        [0.30, 5.5, -1.5, 0.05, 3.0, 4.0, -0.05, 3.0, -4.0],
+        [0.30, 6.0, -1.0, 0.08, 3.5, 5.0, -0.08, 3.5, -5.0],
+        [0.28, 5.0, -2.0, 0.06, 2.5, 3.0, -0.06, 2.5, -3.0],
+        [0.32, 6.0, -1.0, 0.04, 4.0, 6.0, -0.04, 4.0, -6.0],
+    ]
+    for init in inits_drag2:
+        if time.time() > deadline - 30:
+            break
+        try:
+            r = minimize(opt_drag2, init, method='Nelder-Mead',
+                         options={'maxiter': 250, 'xatol': 0.005, 'fatol': 1e-8})
+            if r.fun < best_s:
+                I_Q = gen_drag2(r.x)
+                if check_constraints(I_Q):
+                    best_s, best = r.fun, I_Q
+        except Exception:
+            pass
+
+    # ---- Direct 80-step L-BFGS-B refinement ----
+    def opt_direct(x):
+        if time.time() > deadline - 10:
+            return 1e6
+        I_Q = x.reshape(N, 2)
+        if not check_constraints(I_Q):
+            return 1e6
+        return score(I_Q)
+
+    best_x = best.reshape(-1)
+    for k in range(6):
+        if time.time() > deadline - 10:
+            break
+        try:
+            r = minimize(opt_direct, best_x, method='L-BFGS-B',
+                         options={'maxiter': 150, 'ftol': 1e-10, 'gtol': 1e-7,
+                                  'maxfun': 1000, 'maxls': 50})
+            I_Q = r.x.reshape(N, 2)
+            if check_constraints(I_Q):
+                s = score(I_Q)
+                if s < best_s:
+                    best_s, best, best_x = s, I_Q, r.x
+            else:
+                break
+        except Exception:
+            break
+
+    # ---- Final polish ----
+    def opt_polish(x):
+        if time.time() > deadline - 5:
+            return 1e6
+        I_Q = x.reshape(N, 2)
+        if not check_constraints(I_Q):
+            return 1e6
+        return score(I_Q)
+
+    best_x = best.reshape(-1)
     try:
-        res = minimize(objective, x0, method='Nelder-Mead', 
-                      options={'maxiter': 500, 'xatol': 1e-5, 'fatol': 1e-7,
-                              'adaptive': True})
-        
-        if res.fun < best_score:
-            best_score = res.fun
-            best_params = res.x
+        r = minimize(opt_polish, best_x, method='L-BFGS-B',
+                     options={'maxiter': 80, 'ftol': 1e-12, 'gtol': 1e-9,
+                              'maxfun': 300, 'maxls': 40})
+        I_Q = r.x.reshape(N, 2)
+        if check_constraints(I_Q):
+            s = score(I_Q)
+            if s < best_s:
+                best_s, best = s, I_Q
     except Exception:
         pass
-    
-    # Check deadline
-    elapsed = time.time() - start_time
-    if elapsed > deadline - 30:
-        best_pulse = parametric_pulse(best_params)
-        return best_pulse
-    
-    # Try a few more local searches around the best point
-    best_params_copy = best_params.copy()
-    
-    for restart in range(20):
-        if time.time() - start_time > deadline - 20:
-            break
-        
-        # Perturb parameters
-        perturbation = np.random.normal(0, 0.3, size=3)
-        new_params = best_params_copy + perturbation
-        
-        # Ensure sigma is positive
-        new_params[0] = max(new_params[0], 2.0)
-        
-        new_score = objective(new_params)
-        
-        if new_score < best_score:
-            best_score = new_score
-            best_params_copy = new_params
-    
-    best_pulse = parametric_pulse(best_params_copy)
-    
-    # Final validity check
-    amp = np.sqrt(best_pulse[:, 0]**2 + best_pulse[:, 1]**2)
-    if np.max(amp) > amp_bound:
-        best_pulse *= amp_bound / np.max(amp)
-    
-    max_slew = 0
-    for i in range(n_steps):
-        if i == 0:
-            dp = np.linalg.norm(best_pulse[0]) / dt
+
+    # Final constrained cleanup
+    if not check_constraints(best):
+        I_Q = best.copy()
+        amps = np.sqrt(I_Q[:, 0] ** 2 + I_Q[:, 1] ** 2)
+        mask = amps > amp_bound
+        if np.any(mask):
+            scale = amp_bound / amps[mask]
+            I_Q[mask, 0] *= scale
+            I_Q[mask, 1] *= scale
+        p = np.vstack([np.zeros(2), I_Q, np.zeros(2)])
+        for i in range(len(p) - 1):
+            diff = p[i + 1] - p[i]
+            nd = np.sqrt(np.sum(diff ** 2))
+            max_step = slew_bound * dt
+            if nd > max_step:
+                scale = max_step / nd
+                p[i + 1] = p[i] + diff * scale
+        I_Q = p[1:-1]
+        if check_constraints(I_Q):
+            best = I_Q
         else:
-            dp = np.linalg.norm(best_pulse[i] - best_pulse[i-1]) / dt
-        if dp > max_slew:
-            max_slew = dp
-    dp_last = np.linalg.norm(best_pulse[-1]) / dt
-    if dp_last > max_slew:
-        max_slew = dp_last
-        
-    if max_slew > slew_bound:
-        best_pulse *= slew_bound / max_slew
-        
-    return best_pulse
-# EVOLVE-BLOCK-END
+            best = seed_pulse()
+    return best

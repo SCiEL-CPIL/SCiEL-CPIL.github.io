@@ -1,27 +1,28 @@
 """
 Strategy: Multi-start global optimization for Sutton-Chen transition-metal clusters.
-Uses FCC, HCP, icosahedral, BCC, and random templates.
-Adaptive basin-hopping with annealing, plus high-precision polish.
+Uses diverse structural templates (FCC, HCP, BCC, icosahedral, random, liquid).
+Adaptive basin-hopping with Metropolis acceptance, plus high-precision polish.
 """
 
 import time
 import numpy as np
 from autoresearch_suite.chem_clusters import relax, sutton_chen_energy_gradient
 
-_DEADLINE_SEC = 320.0
+_DEADLINE_SEC = 310.0
 _START_TIME = None
 
 def _time_left():
+    global _START_TIME
     if _START_TIME is None:
         return _DEADLINE_SEC
     return _DEADLINE_SEC - (time.time() - _START_TIME)
 
 def _liquid_start(n, rng, spacing=1.0):
     """Generate a liquid-like random start with minimum distance."""
-    radius = spacing * (n / 4.0) ** (1/3.0) * 2.8
+    radius = spacing * (n / 4.0) ** (1/3.0) * 3.0
     points = []
     min_dist = 0.55 * spacing
-    max_attempts = n * 100
+    max_attempts = n * 120
     
     for _ in range(max_attempts):
         if len(points) >= n:
@@ -51,7 +52,7 @@ def _fcc_cluster(n, spacing=1.0, rng=None):
         rng = np.random.default_rng()
     
     a = spacing * np.sqrt(2)
-    R = (3 * n * a**3 / (16 * np.pi)) ** (1/3) * 1.4
+    R = (3 * n * a**3 / (16 * np.pi)) ** (1/3) * 1.5
     n_side = int(np.ceil(R / a)) + 2
     
     points = []
@@ -69,7 +70,7 @@ def _fcc_cluster(n, spacing=1.0, rng=None):
     idx = np.argsort(dists)
     
     if len(idx) < n:
-        R2 = R * 1.5
+        R2 = R * 1.6
         n_side2 = int(np.ceil(R2 / a)) + 2
         points2 = []
         for i in range(-n_side2, n_side2 + 1):
@@ -97,9 +98,9 @@ def _hcp_cluster(n, spacing=1.0, rng=None):
     c = a * np.sqrt(8.0/3.0)
     
     points = []
-    n_layers = int(np.ceil(np.sqrt(n))) + 4
-    n_side = int(np.ceil(np.sqrt(n))) + 4
-    R2 = (n / 4.0) ** (2/3) * a**2 * 3.5
+    n_layers = int(np.ceil(np.sqrt(n))) + 5
+    n_side = int(np.ceil(np.sqrt(n))) + 5
+    R2 = (n / 4.0) ** (2/3) * a**2 * 4.0
     
     for layer in range(-n_layers, n_layers + 1):
         z = layer * c
@@ -122,7 +123,7 @@ def _hcp_cluster(n, spacing=1.0, rng=None):
     
     if len(idx) < n:
         while len(points) < n:
-            p = rng.uniform(-3*a, 3*a, 3)
+            p = rng.uniform(-4*a, 4*a, 3)
             points = np.vstack([points, p])
             dists = np.linalg.norm(points, axis=1)
             idx = np.argsort(dists)
@@ -136,10 +137,10 @@ def _random_compact(n, spacing=1.0, rng=None):
     if rng is None:
         rng = np.random.default_rng()
         
-    radius = spacing * (n / 4.0) ** (1/3.0) * 2.5
+    radius = spacing * (n / 4.0) ** (1/3.0) * 2.8
     points = []
     min_dist = 0.65 * spacing
-    max_attempts = n * 80
+    max_attempts = n * 100
     
     for _ in range(max_attempts):
         if len(points) >= n:
@@ -186,8 +187,8 @@ def _icosahedral_shell(n, spacing=1.0, rng=None):
     
     if n > 13:
         a = spacing * np.sqrt(2)
-        R2 = 2.2 * spacing
-        n_side = 5
+        R2 = 2.4 * spacing
+        n_side = 6
         second_shell = []
         for i in range(-n_side, n_side + 1):
             for j in range(-n_side, n_side + 1):
@@ -196,7 +197,7 @@ def _icosahedral_shell(n, spacing=1.0, rng=None):
                     for offset in [(0,0,0), (0.5,0.5,0), (0.5,0,0.5), (0,0.5,0.5)]:
                         p = base + np.array(offset) * a
                         r = np.linalg.norm(p)
-                        if 1.4 * spacing < r < 2.6 * spacing:
+                        if 1.3 * spacing < r < 2.8 * spacing:
                             second_shell.append(p / r * 2.0 * spacing)
         
         seen = set()
@@ -212,8 +213,8 @@ def _icosahedral_shell(n, spacing=1.0, rng=None):
                 points.append(p)
     
     while len(points) < n:
-        p = rng.uniform(-3.5*spacing, 3.5*spacing, 3)
-        if np.linalg.norm(p) < 4.0 * spacing:
+        p = rng.uniform(-4.0*spacing, 4.0*spacing, 3)
+        if np.linalg.norm(p) < 4.5 * spacing:
             points.append(p)
     
     points = np.array(points[:n])
@@ -226,7 +227,7 @@ def _bcc_cluster(n, spacing=1.0, rng=None):
         rng = np.random.default_rng()
     
     a = spacing * 2.0 / np.sqrt(3)
-    R = (3 * n * a**3 / (8 * np.pi)) ** (1/3) * 1.4
+    R = (3 * n * a**3 / (8 * np.pi)) ** (1/3) * 1.5
     n_side = int(np.ceil(R / a)) + 2
     
     points = []
@@ -244,7 +245,7 @@ def _bcc_cluster(n, spacing=1.0, rng=None):
     idx = np.argsort(dists)
     
     if len(idx) < n:
-        R2 = R * 1.5
+        R2 = R * 1.6
         n_side2 = int(np.ceil(R2 / a)) + 2
         points2 = []
         for i in range(-n_side2, n_side2 + 1):
@@ -320,14 +321,7 @@ def _high_precision_polish(positions, potential, kind):
         
         if result.fun < np.inf and np.all(np.isfinite(result.x)):
             final_pos = result.x.reshape(-1, 3)
-            # Check minimum distance constraint
-            min_d = np.inf
-            for i in range(len(final_pos)):
-                for j in range(i+1, len(final_pos)):
-                    d = np.linalg.norm(final_pos[i] - final_pos[j])
-                    if d < min_d:
-                        min_d = d
-            if min_d > 0.35:
+            if np.min(np.linalg.norm(final_pos[:, np.newaxis] - final_pos[np.newaxis, :], axis=2)) > 0.35:
                 return result.fun, final_pos
         return relax(positions, potential, kind)
     except:
@@ -374,7 +368,7 @@ def construct(instance):
         pass
     
     # More random starts for diversity
-    for _ in range(10):
+    for _ in range(12):
         try:
             rand = _random_compact(size, 1.0, rng)
             templates.append(rand)
@@ -382,7 +376,7 @@ def construct(instance):
             pass
     
     # Add liquid-like starts
-    for _ in range(4):
+    for _ in range(5):
         try:
             liq = _liquid_start(size, rng, 1.0)
             templates.append(liq)
@@ -428,7 +422,7 @@ def construct(instance):
         
         template_energies.sort(key=lambda x: x[0])
         
-        for e_t, t in template_energies[:8]:
+        for e_t, t in template_energies[:10]:
             if _time_left() < 25.0:
                 break
             if e_t > best_energy + 5.0:
