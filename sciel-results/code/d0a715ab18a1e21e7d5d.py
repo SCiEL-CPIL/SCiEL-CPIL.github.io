@@ -1,0 +1,286 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+DIMENSIONS = [2, 3, 6]
+import time
+_start_time = time.time()
+TIME_LIMIT = 140.0  # 150s limit, 10s safety margin
+
+# EVOLVE-BLOCK-START
+def construct():
+    n, m, p = DIMENSIONS
+    # n=2, m=3, p=6
+    # U shape: (n*m, R) = (6, R)
+    # V shape: (m*p, R) = (18, R)  
+    # W shape: (p*n, R) = (12, R)
+    
+    def check_time():
+        return (time.time() - _start_time) > TIME_LIMIT
+    
+    best_result = None
+    best_rank = float('inf')
+    
+    def make_vec(size, idx_vals):
+        vec = [0] * size
+        for idx, val in idx_vals.items():
+            vec[idx] = val
+        return vec
+    
+    def build_from_terms(terms):
+        rank = len(terms)
+        U = [[0]*rank for _ in range(n*m)]
+        V = [[0]*rank for _ in range(m*p)]
+        W = [[0]*rank for _ in range(p*n)]
+        for c, (u,v,w) in enumerate(terms):
+            for i in range(n*m):
+                U[i][c] = u[i]
+            for i in range(m*p):
+                V[i][c] = v[i]
+            for i in range(p*n):
+                W[i][c] = w[i]
+        return {"U": U, "V": V, "W": W}
+    
+    def verify_decomposition(U, V, W):
+        rank = len(U[0])
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    s = 0
+                    for c in range(rank):
+                        s += U[i*m+j][c] * V[j*p+k][c] * W[k*n+i][c]
+                    if abs(s - 1) > 1e-9:
+                        return False
+        return True
+    
+    # Construction 1: Trivial rank 36
+    def trivial_decomposition():
+        rank = n * m * p
+        U = [[0] * rank for _ in range(n * m)]
+        V = [[0] * rank for _ in range(m * p)]
+        W = [[0] * rank for _ in range(p * n)]
+        col = 0
+        for i in range(n):
+            for j in range(m):
+                for k in range(p):
+                    U[i * m + j][col] = 1
+                    V[j * p + k][col] = 1
+                    W[k * n + i][col] = 1
+                    col += 1
+        return {"U": U, "V": V, "W": W}
+    
+    # Construction 2: Strassen on 2x2 blocks + separate j=2
+    def strassen_based_decomposition():
+        terms = []
+        for i in range(n):
+            for k in range(p):
+                u_idx = i * m + 2
+                v_idx = 2 * p + k
+                w_idx = k * n + i
+                terms.append((make_vec(n*m, {u_idx: 1}),
+                             make_vec(m*p, {v_idx: 1}),
+                             make_vec(p*n, {w_idx: 1})))
+        
+        for j_block in range(3):
+            b00 = 0 * p + 2*j_block
+            b01 = 0 * p + 2*j_block + 1
+            b10 = 1 * p + 2*j_block
+            b11 = 1 * p + 2*j_block + 1
+            
+            c00 = (2*j_block) * n + 0
+            c01 = (2*j_block + 1) * n + 0
+            c10 = (2*j_block) * n + 1
+            c11 = (2*j_block + 1) * n + 1
+            
+            a00 = 0 * m + 0
+            a01 = 0 * m + 1
+            a10 = 1 * m + 0
+            a11 = 1 * m + 1
+            
+            terms.append((make_vec(6, {a00:1, a11:1}),
+                         make_vec(18, {b00:1, b11:1}),
+                         make_vec(12, {c00:1, c11:1})))
+            terms.append((make_vec(6, {a10:1, a11:1}),
+                         make_vec(18, {b00:1}),
+                         make_vec(12, {c10:1, c11:-1})))
+            terms.append((make_vec(6, {a00:1}),
+                         make_vec(18, {b01:1, b11:-1}),
+                         make_vec(12, {c01:1, c11:1})))
+            terms.append((make_vec(6, {a11:1}),
+                         make_vec(18, {b10:1, b00:-1}),
+                         make_vec(12, {c00:1, c10:1})))
+            terms.append((make_vec(6, {a00:1, a01:1}),
+                         make_vec(18, {b11:1}),
+                         make_vec(12, {c00:-1, c01:1})))
+            terms.append((make_vec(6, {a10:1, a00:-1}),
+                         make_vec(18, {b00:1, b01:1}),
+                         make_vec(12, {c11:1})))
+            terms.append((make_vec(6, {a01:1, a11:-1}),
+                         make_vec(18, {b10:1, b11:1}),
+                         make_vec(12, {c00:1})))
+        
+        return build_from_terms(terms)
+    
+    # Construction 3: Optimization-based search for lower rank
+    def try_optimization_search():
+        """Use structured optimization to find lower-rank decompositions"""
+        import numpy as np
+        from scipy.optimize import minimize
+        
+        def get_strassen_init(R):
+            """Create initial U,V,W matrices of rank R based on Strassen structure"""
+            U = np.zeros((6, R))
+            V = np.zeros((18, R))
+            W = np.zeros((12, R))
+            
+            # First 12 columns: j=2 terms
+            for i in range(n):
+                for k in range(p):
+                    col = i * p + k
+                    if col < R:
+                        U[i*m+2, col] = 1
+                        V[2*p+k, col] = 1
+                        W[k*n+i, col] = 1
+            
+            # Next columns: Strassen terms for j=0,1 blocks
+            strassen_patterns = [
+                # (U indices, V indices, W indices)
+                ({(0,0):1, (1,1):1}, {(0,0):1, (1,1):1}, {(0,0):1, (1,1):1}),
+                ({(1,0):1, (1,1):1}, {(0,0):1}, {(1,0):1, (1,1):-1}),
+                ({(0,0):1}, {(0,1):1, (1,1):-1}, {(0,1):1, (1,1):1}),
+                ({(1,1):1}, {(1,0):1, (0,0):-1}, {(0,0):1, (1,0):1}),
+                ({(0,0):1, (0,1):1}, {(1,1):1}, {(0,0):-1, (0,1):1}),
+                ({(1,0):1, (0,0):-1}, {(0,0):1, (0,1):1}, {(1,1):1}),
+                ({(0,1):1, (1,1):-1}, {(1,0):1, (1,1):1}, {(0,0):1}),
+            ]
+            
+            col = 12
+            for j_block in range(3):
+                for (u_pat, v_pat, w_pat) in strassen_patterns:
+                    if col >= R:
+                        break
+                    for (ii, jj), val in u_pat.items():
+                        U[ii*m + jj, col] = val
+                    for (jj, kk), val in v_pat.items():
+                        V[jj*p + (2*j_block + kk), col] = val
+                    for (kk, ii), val in w_pat.items():
+                        W[(2*j_block + kk)*n + ii, col] = val
+                    col += 1
+            
+            return U, V, W
+        
+        def compute_residual(U, V, W):
+            """Compute the residual tensor and return its norm"""
+            R = U.shape[1]
+            residual = np.zeros((n, m, p))
+            for i in range(n):
+                for j in range(m):
+                    for k in range(p):
+                        s = 0
+                        for c in range(R):
+                            s += U[i*m+j, c] * V[j*p+k, c] * W[k*n+i, c]
+                        residual[i,j,k] = s - 1
+            return np.linalg.norm(residual)
+        
+        def objective(x):
+            """Objective function for optimization"""
+            R = len(x) // (6 + 18 + 12)
+            U = x[:6*R].reshape(6, R)
+            V = x[6*R:6*R+18*R].reshape(18, R)
+            W = x[6*R+18*R:].reshape(12, R)
+            return compute_residual(U, V, W)
+        
+        # Try ranks from current best-1 down to 20
+        for target_rank in range(min(best_rank - 1, 32), 19, -1):
+            if check_time():
+                break
+            
+            # Multiple random restarts
+            for restart in range(3):
+                if check_time():
+                    break
+                
+                np.random.seed(target_rank * 100 + restart)
+                
+                # Initialize based on Strassen structure
+                U0, V0, W0 = get_strassen_init(target_rank)
+                
+                # Add small random perturbation
+                if target_rank > 27:
+                    U0 += 0.01 * np.random.randn(6, target_rank)
+                    V0 += 0.01 * np.random.randn(18, target_rank)
+                    W0 += 0.01 * np.random.randn(12, target_rank)
+                
+                x0 = np.concatenate([U0.flatten(), V0.flatten(), W0.flatten()])
+                
+                try:
+                    result = minimize(objective, x0, method='L-BFGS-B', 
+                                     options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-8})
+                    
+                    if result.fun < 1e-8:
+                        # Check if we can round to exact values
+                        x_opt = result.x
+                        U_opt = x_opt[:6*target_rank].reshape(6, target_rank)
+                        V_opt = x_opt[6*target_rank:6*target_rank+18*target_rank].reshape(18, target_rank)
+                        W_opt = x_opt[6*target_rank+18*target_rank:].reshape(12, target_rank)
+                        
+                        # Try to find a clean solution by rounding
+                        U_rounded = np.round(U_opt * 2) / 2
+                        V_rounded = np.round(V_opt * 2) / 2
+                        W_rounded = np.round(W_opt * 2) / 2
+                        
+                        U_list = U_rounded.tolist()
+                        V_list = V_rounded.tolist()
+                        W_list = W_rounded.tolist()
+                        
+                        if verify_decomposition(U_list, V_list, W_list):
+                            return {"U": U_list, "V": V_list, "W": W_list}
+                        
+                        # If rounding doesn't work, try integer rounding
+                        U_rounded = np.round(U_opt)
+                        V_rounded = np.round(V_opt)
+                        W_rounded = np.round(W_opt)
+                        
+                        U_list = U_rounded.tolist()
+                        V_list = V_rounded.tolist()
+                        W_list = W_rounded.tolist()
+                        
+                        if verify_decomposition(U_list, V_list, W_list):
+                            return {"U": U_list, "V": V_list, "W": W_list}
+                            
+                except Exception:
+                    pass
+        
+        return None
+    
+    # Try constructions
+    for name, decomp_func in [("trivial", trivial_decomposition), 
+                               ("strassen", strassen_based_decomposition)]:
+        if check_time():
+            break
+        try:
+            result = decomp_func()
+            rank = len(result["U"][0])
+            if verify_decomposition(result["U"], result["V"], result["W"]):
+                if rank < best_rank:
+                    best_rank = rank
+                    best_result = result
+        except Exception:
+            pass
+    
+    # Try optimization-based search
+    if not check_time() and best_rank > 28:
+        try:
+            result = try_optimization_search()
+            if result is not None:
+                rank = len(result["U"][0])
+                if verify_decomposition(result["U"], result["V"], result["W"]):
+                    if rank < best_rank:
+                        best_rank = rank
+                        best_result = result
+        except Exception:
+            pass
+    
+    if best_result is None:
+        best_result = trivial_decomposition()
+        best_rank = len(best_result["U"][0])
+    
+    return best_result
+# EVOLVE-BLOCK-END

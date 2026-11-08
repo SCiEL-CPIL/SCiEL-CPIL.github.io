@@ -1,0 +1,87 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def equation(b: np.ndarray, s: np.ndarray, temp: np.ndarray, pH: np.ndarray, params: np.ndarray) -> np.ndarray:
+    """
+    E. coli growth rate model combining Monod substrate limitation,
+    Gaussian temperature and pH optima, and density inhibition.
+    
+    Parameters:
+    b: population density, range [1, 4.998]
+    s: substrate concentration, range [1, 4.999]
+    temp: temperature, range [1.002, 39.98]
+    pH: pH, range [2, 12]
+    params: 10 parameters
+        p[0]: mu_max (maximum growth rate)
+        p[1]: K_s (Monod half-saturation constant)
+        p[2]: T_opt (optimal temperature)
+        p[3]: sigma_T (temperature width)
+        p[4]: pH_opt (optimal pH)
+        p[5]: sigma_pH (pH width)
+        p[6]: K_b (density inhibition constant)
+        p[7]: monod_exp (Monod exponent, for flexibility)
+        p[8]: inh_exp (inhibition exponent)
+        p[9]: offset
+    """
+    p = params
+    
+    # Extract parameters
+    mu_max = p[0]
+    K_s = p[1]
+    T_opt = p[2]
+    sigma_T = p[3]
+    pH_opt = p[4]
+    sigma_pH = p[5]
+    K_b = p[6]
+    monod_exp = p[7]
+    inh_exp = p[8]
+    offset = p[9]
+    
+    # Ensure positive values for denominators and variances to avoid NaNs
+    eps = 1e-8
+    
+    # Use softplus-like or abs to ensure positivity where needed
+    # K_s must be positive
+    K_s_safe = np.log1p(np.exp(np.abs(K_s))) + eps
+    
+    # Sigma must be positive
+    sigma_T_safe = np.abs(sigma_T) + eps
+    sigma_pH_safe = np.abs(sigma_pH) + eps
+    
+    # K_b must be positive
+    K_b_safe = np.log1p(np.exp(np.abs(K_b))) + eps
+    
+    # Monod term for substrate
+    # s is in [1, 4.999] in training
+    # Standard Monod: s / (Ks + s)
+    # We raise to a power for flexibility. 
+    # To avoid issues with negative bases if monod_exp is non-integer, we clamp the base to be positive.
+    # s is always positive in range, K_s_safe is positive, so s/(K_s_safe+s) is positive.
+    monod_base = s / (K_s_safe + s)
+    monod_term = np.power(monod_base, monod_exp)
+    
+    # Temperature term (Gaussian)
+    # temp in [1, 40], T_opt likely around 37
+    # Using exp(-0.5 * ((temp - T_opt) / sigma_T_safe) ** 2)
+    temp_term = np.exp(-0.5 * ((temp - T_opt) / sigma_T_safe) ** 2)
+    
+    # pH term (Gaussian)
+    # pH in [2, 12], pH_opt likely around 7
+    ph_term = np.exp(-0.5 * ((pH - pH_opt) / sigma_pH_safe) ** 2)
+    
+    # Density inhibition term
+    # b in [1, 5], inhibition should reduce growth at high density
+    # Using 1 / (1 + (b / K_b)^inh_exp)
+    # b is positive, K_b_safe is positive, so b/K_b_safe is positive.
+    b_base = b / K_b_safe
+    # Ensure b_base is positive for non-integer exponents
+    b_base = np.maximum(b_base, eps)
+    b_term = 1.0 / (1.0 + np.power(b_base, inh_exp))
+    
+    # Combine all terms
+    mu = mu_max * monod_term * temp_term * ph_term * b_term + offset
+    
+    return mu
+# EVOLVE-BLOCK-END
