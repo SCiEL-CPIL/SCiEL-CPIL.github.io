@@ -1,0 +1,76 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import time
+from math import isqrt
+
+P = {'gaps': [[10007, 10009], [10009, 10037], [10037, 10039], [10039, 10061], [10061, 10067], [10067, 10069], [10069, 10079], [10079, 10091], [10091, 10093], [10093, 10099], [10099, 10103], [10103, 10111], [10111, 10133], [10133, 10139], [10139, 10141], [10141, 10151], [10151, 10159], [10159, 10163], [10163, 10169], [10169, 10177], [10177, 10181], [10181, 10193], [10193, 10211], [10211, 10223], [10223, 10243], [10243, 10247], [10247, 10253], [10253, 10259], [10259, 10267], [10267, 10271], [10271, 10273], [10273, 10289]]}
+
+
+def _sieve_primes_up_to(n):
+    """Return list of all primes <= n."""
+    if n < 2:
+        return []
+    sieve = bytearray(b'\x01') * (n + 1)
+    sieve[0] = sieve[1] = 0
+    for i in range(2, isqrt(n) + 1):
+        if sieve[i]:
+            sieve[i * i::i] = bytearray(len(sieve[i * i::i]))
+    return [i for i in range(2, n + 1) if sieve[i]]
+
+
+def _build_least_prime_factor_table(max_n, primes):
+    """Build an array lpf where lpf[x] is the least prime factor of x for x <= max_n.
+    For primes, lpf[x] = x. Uses a linear-sieve-like approach for O(n) construction."""
+    lpf = [0] * (max_n + 1)
+    for i in range(2, max_n + 1):
+        if lpf[i] == 0:
+            lpf[i] = i
+            if i <= isqrt(max_n):
+                for j in range(i * i, max_n + 1, i):
+                    if lpf[j] == 0:
+                        lpf[j] = i
+    return lpf
+
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 50.0
+
+    gaps = P['gaps']
+    n_gaps = len(gaps)
+    result = [None] * n_gaps
+
+    if not gaps:
+        return result
+
+    # Determine the full range of candidate values
+    min_val = min(lo + 1 for lo, hi in gaps)
+    max_val = max(hi - 1 for lo, hi in gaps)
+
+    # Build primes up to max_val (needed for correct LPF of composites)
+    primes = _sieve_primes_up_to(max_val)
+
+    # Build correct least-prime-factor table over the full candidate range
+    lpf = _build_least_prime_factor_table(max_val, primes)
+
+    for i, (lo, hi) in enumerate(gaps):
+        if time.time() > deadline:
+            break
+        gap = hi - lo
+        # Search for a witness m in (lo, hi) with lpf[m] >= gap
+        for m in range(lo + 1, hi):
+            if lpf[m] >= gap:
+                result[i] = int(m)
+                break
+
+    # Ensure all entries are Python int or None
+    final_result = []
+    for v in result:
+        if v is None:
+            final_result.append(None)
+        else:
+            final_result.append(int(v))
+
+    return final_result
+
+# EVOLVE-BLOCK-END

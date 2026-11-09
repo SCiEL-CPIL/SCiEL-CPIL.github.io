@@ -1,335 +1,287 @@
-import time
 import math
-import scipy.optimize
+import time
 
-# EVOLVE-BLOCK-START
 def find_root(f, x0):
+    """
+    Find root x of f(x) such that |f(x)| <= 1e-8.
+    Structural change: Lead with secant/Newton (fast for close roots),
+    fall back to bracketing with inverse-quadratic/bisection hybrid.
+    """
+    start_time = time.time()
+    deadline = start_time + 10.0
+    tol = 1e-12
+    tol_final = 1e-8
+    max_iter = 100
+
     x0 = float(x0)
-    T0 = time.time()
-    DEADLINE = 148.0
-    TOL = 1e-12
-    CALL_LIMIT = 450  # Target well under 500 to maximize score
-
-    def elapsed_ok():
-        return (time.time() - T0) < DEADLINE
-
-    call_count = 0
-    best_x = x0
-    best_val = float('inf')
-
-    def track(x, fx):
-        nonlocal best_x, best_val
-        if fx == fx:
-            av = abs(fx)
-            if av < best_val:
-                best_val = av
-                best_x = x
-
-    def safe_f(x):
-        nonlocal call_count
-        if call_count >= CALL_LIMIT:
-            return float('nan')
-        call_count += 1
-        try:
-            return f(x)
-        except Exception:
-            return float('nan')
-
-    # 1. Evaluate start
-    f0 = safe_f(x0)
-    track(x0, f0)
-    if f0 == f0 and abs(f0) <= TOL:
+    f0 = f(x0)
+    if abs(f0) <= tol:
         return x0
+    if not math.isfinite(f0):
+        # f0 is non-finite; need to find a finite point first
+        base_step = 1e-4 * max(1.0, abs(x0))
+        for s in [1, -1, 2, -2, 4, -4, 8, -8, 16, -16, 32, -32, 64, -64]:
+            x_try = x0 + s * base_step
+            f_try = f(x_try)
+            if math.isfinite(f_try) and abs(f_try) <= tol:
+                return x_try
+            if math.isfinite(f_try):
+                x0, f0 = x_try, f_try
+                break
+        if not math.isfinite(f0):
+            return x0
 
-    # 2. Adaptive Bracketing Search
-    # We want to find an interval [a, b] such that f(a)*f(b) < 0.
-    # We scan outwards from x0 with increasing step sizes.
-    # We also check for sign changes in the forward and backward direction.
-    
-    a = b = None
-    fa = fb = None
-    
-    # We'll try to find a bracket.
-    # Strategy:
-    # - Keep a list of points visited.
-    # - Expand range exponentially.
-    # - Check sign changes between consecutive points.
-    
-    points = [(x0, f0)]
-    
-    # If x0 is 0, we can't do log scaling easily, so use linear then switch?
-    # Or just use a fixed set of multipliers.
-    # Let's try expanding in both directions.
-    
-    # To save calls, we will interleave forward and backward expansion.
-    # Step sizes: 1, 2, 4, 8, ...
-    
-    # Initial step
-    # If x0 is large, step should be relative.
-    # If x0 is small, step should be absolute.
-    # Let's use a hybrid: step = max(1.0, abs(x0)) * 2^k
-    
-    base_step = max(1.0, abs(x0))
-    
-    # We will store visited points to check for sign changes.
-    # Since we expand exponentially, we can just keep the last point in each direction.
-    
-    # Forward direction
-    x_fwd = x0
-    f_fwd = f0
-    # Backward direction
-    x_bwd = x0
-    f_bwd = f0
-    
-    # We will alternate expanding forward and backward.
-    # But we need to be careful not to waste calls if the function is simple.
-    # Let's do a few steps in one direction, then the other?
-    # Or just expand both simultaneously?
-    
-    # Let's try expanding both sides in a spiral.
-    # Step 1: x0 + base_step, x0 - base_step
-    # Step 2: x0 + 2*base_step, x0 - 2*base_step
-    # ...
-    
-    # Actually, a simpler approach that works well for oscillatory functions:
-    # Just scan linearly with a reasonable step size first?
-    # No, oscillatory functions might have roots far away.
-    # Exponential expansion is safer for finding *a* root, but might miss close ones if step is too big?
-    # No, we check sign changes between consecutive points. If we jump over a root, we miss it.
-    # So we need the step size to be small enough relative to the oscillation period.
-    # But we don't know the period.
-    
-    # Better strategy:
-    # 1. Try small steps first to catch nearby roots.
-    # 2. If not found, expand.
-    
-    # Let's use a fixed sequence of step sizes that grows geometrically.
-    # Steps: 1e-3, 1e-2, 1e-1, 1, 10, 100, ... relative to base_step?
-    # Or absolute?
-    
-    # Let's try:
-    # Phase 1: Dense scan near x0.
-    # Phase 2: Exponential expansion.
-    
-    # Phase 1: Dense scan
-    # Let's scan [x0 - R, x0 + R] with N points.
-    # If R is small, we catch nearby roots.
-    # If we don't find a bracket, we expand R.
-    
-    # Let's combine:
-    # We will maintain a list of intervals we have scanned.
-    # Actually, let's just do a spiral search.
-    
-    # Points visited so far:
-    # (x0, f0)
-    
-    # Let's define a generator for points to visit.
-    # It yields (x, direction)
-    # We check sign change with the previous point in that direction.
-    
-    # Forward sequence: x0 + s, x0 + 2s, x0 + 4s ...
-    # Backward sequence: x0 - s, x0 - 2s, x0 - 4s ...
-    
-    # We alternate: F1, B1, F2, B2, F3, B3...
-    
-    # s_k = base_step * 2^k
-    
-    # We need to track the last point in each direction to check for sign change.
-    # last_fwd = (x0, f0)
-    # last_bwd = (x0, f0)
-    
-    last_fwd_x, last_fwd_f = x0, f0
-    last_bwd_x, last_bwd_f = x0, f0
-    
-    found_bracket = False
-    bracket_a = bracket_b = bracket_fa = bracket_fb = None
-    
-    # We will iterate k from 0 to K_max
-    # K_max such that step is reasonable.
-    # 2^20 is ~ 1e6. base_step * 1e6 is huge.
-    # Let's go up to k=30.
-    
-    for k in range(30):
-        if not elapsed_ok() or call_count >= CALL_LIMIT:
+    # Phase 1: Secant/Newton hybrid — try to converge quickly
+    # Use secant with a small perturbation
+    base_step = 1e-6 * max(1.0, abs(x0))
+    x_prev = x0
+    f_prev = f0
+    x_curr = x0 + base_step
+    f_curr = f(x_curr)
+    if abs(f_curr) <= tol:
+        return x_curr
+    if not math.isfinite(f_curr):
+        # Try other perturbation directions
+        x_curr = x0 - base_step
+        f_curr = f(x_curr)
+        if abs(f_curr) <= tol:
+            return x_curr
+        if not math.isfinite(f_curr):
+            x_curr = x0 + base_step * 10
+            f_curr = f(x_curr)
+            if abs(f_curr) <= tol:
+                return x_curr
+            if not math.isfinite(f_curr):
+                # Fall through to bracketing
+                pass
+
+    best_x = x0
+    best_f = abs(f0)
+    if abs(f_curr) < best_f:
+        best_x, best_f = x_curr, abs(f_curr)
+
+    # Secant iterations
+    for _ in range(20):
+        if time.time() > deadline:
             break
-        
-        step = base_step * (2 ** k)
-        
-        # Forward
-        x_new = last_fwd_x + step
-        f_new = safe_f(x_new)
-        track(x_new, f_new)
-        
-        if f_new == f_new and last_fwd_f == last_fwd_f:
-            if last_fwd_f * f_new < 0:
-                found_bracket = True
-                bracket_a, bracket_b = last_fwd_x, x_new
-                bracket_fa, bracket_fb = last_fwd_f, f_new
-                break
-            # Also check if f_new is very small?
-            if abs(f_new) <= TOL:
-                return x_new
-        
-        last_fwd_x, last_fwd_f = x_new, f_new
-        
-        if not elapsed_ok() or call_count >= CALL_LIMIT:
+        denom = f_curr - f_prev
+        if abs(denom) < 1e-15:
             break
-        
-        # Backward
-        x_new = last_bwd_x - step
-        f_new = safe_f(x_new)
-        track(x_new, f_new)
-        
-        if f_new == f_new and last_bwd_f == last_bwd_f:
-            if last_bwd_f * f_new < 0:
-                found_bracket = True
-                bracket_a, bracket_b = x_new, last_bwd_x
-                bracket_fa, bracket_fb = f_new, last_bwd_f
+        x_next = x_curr - f_curr * (x_curr - x_prev) / denom
+        if not math.isfinite(x_next):
+            break
+        f_next = f(x_next)
+        if not math.isfinite(f_next):
+            break
+        if abs(f_next) < best_f:
+            best_x, best_f = x_next, abs(f_next)
+        if abs(f_next) <= tol_final:
+            return x_next
+        x_prev, f_prev = x_curr, f_curr
+        x_curr, f_curr = x_next, f_next
+
+    if abs(f_curr) <= tol_final:
+        return x_curr
+    if abs(f_prev) <= tol_final:
+        return x_prev
+
+    # Phase 2: Bracketing with hybrid method (bisection + inverse quadratic)
+    # We have two points (x_prev, f_prev) and (x_curr, f_curr)
+    # Try to find a sign change
+    a, fa = x_prev, f_prev
+    b, fb = x_curr, f_curr
+
+    if fa * fb > 0:
+        # No sign change yet; expand to find one
+        # Use adaptive expansion from the point with smaller |f|
+        if abs(fa) < abs(fb):
+            a, b = a, b
+        else:
+            a, b = b, a
+        fa, fb = f(a), f(b)
+
+        base_step2 = 1e-4 * max(1.0, abs(a))
+        bracket_found = False
+        for s in [1, -1, 2, -2, 4, -4, 8, -8, 16, -16, 32, -32, 64, -64, 128, -128, 256, -256, 512, -512]:
+            if time.time() > deadline:
                 break
-            if abs(f_new) <= TOL:
-                return x_new
-        
-        last_bwd_x, last_bwd_f = x_new, f_new
-    
-    # If we didn't find a bracket with exponential expansion, 
-    # it might be because we jumped over roots.
-    # Or the root is very close but we started with a big step?
-    # base_step is max(1, abs(x0)). If x0 is 0, base_step=1.
-    # If the root is at 0.5, and we jump to 1.0, we might miss it if f(0) and f(1) have same sign.
-    # This is a risk.
-    
-    # To mitigate, we should do a dense scan near x0 first.
-    # Let's add a Phase 0: Dense scan near x0.
-    
-    # Actually, the current loop starts with k=0, step=base_step.
-    # If base_step is 1.0, we jump 1.0 away.
-    # If the function oscillates with period 0.5, we might miss roots.
-    
-    # Let's modify the search to include smaller steps first.
-    # We can start k from -10 to 30?
-    # step = base_step * 2^k.
-    # If k=-10, step is very small.
-    
-    # Let's restart the loop with k from -10.
-    # But we already used some calls? No, the loop above is the only one.
-    # I should have started with small steps.
-    
-    # Let's re-implement the search properly.
-    
-    # Clear state? No, we can just continue or restart logic.
-    # Let's just do a fresh, better search if the above failed.
-    
-    if not found_bracket:
-        # Try dense scan near x0
-        # Range: [x0 - 10*base_step, x0 + 10*base_step]
-        # But we want to be efficient.
-        
-        # Let's try a different strategy:
-        # Use scipy.optimize.brentq if we can find a bracket.
-        # If we can't find a bracket, maybe the root is a double root (touching zero)?
-        # Or the function is monotonic and doesn't cross zero in the searched range?
-        # But the task says "root finder", implying roots exist.
-        
-        # Let's try a random search? No, deterministic is better.
-        
-        # Let's try expanding the range further if exponential didn't work.
-        # Maybe the step was too large and we skipped over sign changes.
-        
-        # Let's do a finer scan in the range [last_bwd_x, last_fwd_x].
-        # We have points at x0, x0 +/- step, x0 +/- 2step, etc.
-        # We can fill in the gaps.
-        
-        # This is getting complicated.
-        # Let's stick to the exponential search but start with smaller steps.
-        
-        # I will rewrite the search loop to go from small steps to large steps.
-        
-        # Reset trackers
-        last_fwd_x, last_fwd_f = x0, f0
-        last_bwd_x, last_bwd_f = x0, f0
-        
-        # k from -10 to 30
-        for k in range(-10, 31):
-            if not elapsed_ok() or call_count >= CALL_LIMIT:
-                break
-            
-            step = base_step * (2 ** k)
-            if step < 1e-12:
+            x_try = a + s * base_step2
+            f_try = f(x_try)
+            if not math.isfinite(f_try):
                 continue
-                
-            # Forward
-            x_new = last_fwd_x + step
-            f_new = safe_f(x_new)
-            track(x_new, f_new)
-            
-            if f_new == f_new and last_fwd_f == last_fwd_f:
-                if last_fwd_f * f_new < 0:
-                    found_bracket = True
-                    bracket_a, bracket_b = last_fwd_x, x_new
-                    bracket_fa, bracket_fb = last_fwd_f, f_new
-                    break
-                if abs(f_new) <= TOL:
-                    return x_new
-            
-            last_fwd_x, last_fwd_f = x_new, f_new
-            
-            if not elapsed_ok() or call_count >= CALL_LIMIT:
+            if abs(f_try) <= tol:
+                return x_try
+            if fa * f_try < 0:
+                if abs(fa) < abs(f_try):
+                    a, b, fa, fb = a, x_try, fa, f_try
+                else:
+                    a, b, fa, fb = x_try, a, f_try, fa
+                bracket_found = True
                 break
-            
-            # Backward
-            x_new = last_bwd_x - step
-            f_new = safe_f(x_new)
-            track(x_new, f_new)
-            
-            if f_new == f_new and last_bwd_f == last_bwd_f:
-                if last_bwd_f * f_new < 0:
-                    found_bracket = True
-                    bracket_a, bracket_b = x_new, last_bwd_x
-                    bracket_fa, bracket_fb = f_new, last_bwd_f
-                    break
-                if abs(f_new) <= TOL:
-                    return x_new
-            
-            last_bwd_x, last_bwd_f = x_new, f_new
 
-    if found_bracket:
-        try:
-            # Use brentq for refinement
-            # We have bracket [a, b] with f(a)*f(b) < 0
-            # We can use f directly, but we need to respect call limit?
-            # brentq might use more calls.
-            # Let's use a wrapper that checks call count?
-            # Or just use it and hope it's efficient.
-            # Brentq is usually very efficient.
-            
-            # To be safe, let's implement a simple bisection/illinois if we want to control calls strictly.
-            # But brentq is robust.
-            
-            # Let's try brentq.
-            root = scipy.optimize.brentq(f, bracket_a, bracket_b, xtol=1e-12, rtol=1e-12, maxiter=100)
-            f_root = f(root) # This call is counted? 
-            # The task says "each call is counted".
-            # brentq calls f internally. Those are counted by the evaluator?
-            # "f takes and returns a float and each call is counted."
-            # Yes, any call to f is counted.
-            # So brentq's internal calls count against our budget.
-            # We should be careful.
-            
-            # If brentq succeeds, we return root.
-            # If it fails, we return best_x.
-            
-            if f_root == f_root and abs(f_root) <= 1e-8:
-                return root
+        if not bracket_found:
+            # Return best found
+            return best_x
+
+    # Hybrid: Inverse Quadratic Interpolation with Bisection fallback
+    # Track three points for IQI
+    # Start with a, b and a midpoint
+    m = (a + b) / 2.0
+    fm = f(m)
+    if not math.isfinite(fm):
+        # Use bisection
+        for _ in range(max_iter):
+            if time.time() > deadline:
+                break
+            if abs(fa) <= tol_final:
+                return a
+            if abs(fb) <= tol_final:
+                return b
+            if abs(b - a) < 1e-15:
+                return (a + b) / 2.0
+            mid = (a + b) / 2.0
+            fmid = f(mid)
+            if not math.isfinite(fmid):
+                break
+            if abs(fmid) <= tol_final:
+                return mid
+            if fa * fmid < 0:
+                b, fb = mid, fmid
             else:
-                track(root, f_root)
-                if best_val <= 1e-8:
-                    return best_x
-        except Exception:
-            pass
-    
-    # Fallback: Return best_x found so far
-    if best_x == best_x and best_val < float('inf'):
-        return best_x
-    return x0
+                a, fa = mid, fmid
+        return a if abs(fa) < abs(fb) else b
 
-# EVOLVE-BLOCK-END
+    if abs(fm) <= tol_final:
+        return m
+
+    # Now we have three points: (a,fa), (m,fm), (b,fb)
+    # Use inverse quadratic interpolation when possible, else bisection
+    x1, f1 = a, fa
+    x2, f2 = m, fm
+    x3, f3 = b, fb
+
+    for _ in range(max_iter):
+        if time.time() > deadline:
+            break
+        if abs(f1) <= tol_final:
+            return x1
+        if abs(f2) <= tol_final:
+            return x2
+        if abs(f3) <= tol_final:
+            return x3
+        if abs(x3 - x1) < 1e-15:
+            return (x1 + x3) / 2.0
+
+        # Determine which subinterval contains the root
+        if f1 * f2 < 0:
+            # Root in [x1, x2]
+            x_lo, f_lo, x_hi, f_hi = x1, f1, x2, f2
+            x_mid, f_mid = x3, f3
+        elif f2 * f3 < 0:
+            # Root in [x2, x3]
+            x_lo, f_lo, x_hi, f_hi = x2, f2, x3, f3
+            x_mid, f_mid = x1, f1
+        else:
+            # Shouldn't happen if bracket is maintained; use bisection
+            mid = (x1 + x3) / 2.0
+            fmid = f(mid)
+            if not math.isfinite(fmid):
+                break
+            if abs(fmid) <= tol_final:
+                return mid
+            if f1 * fmid < 0:
+                x3, f3 = mid, fmid
+            else:
+                x1, f1 = mid, fmid
+            continue
+
+        # Try inverse quadratic interpolation on the three points
+        # IQI: fit quadratic to (f1,x1), (f2,x2), (f3,x3) and find where it crosses 0
+        # Lagrange interpolation for x as function of f
+        # x(f) = x1 * (f-f2)(f-f3)/((f1-f2)(f1-f3)) + x2 * (f-f1)(f-f3)/((f2-f1)(f2-f3)) + x3 * (f-f1)(f-f2)/((f3-f1)(f3-f2))
+        # Set f=0:
+        denom1 = (f_lo - f_mid) * (f_lo - f_hi)
+        denom2 = (f_mid - f_lo) * (f_mid - f_hi)
+        denom3 = (f_hi - f_lo) * (f_hi - f_mid)
+
+        x_iqi = None
+        if abs(denom1) > 1e-30 and abs(denom2) > 1e-30 and abs(denom3) > 1e-30:
+            x_iqi = (x_lo * f_mid * f_hi / denom1 +
+                     x_mid * f_lo * f_hi / denom2 +
+                     x_hi * f_lo * f_mid / denom3)
+
+        # Check if IQI point is within the bracket
+        if (x_iqi is not None and math.isfinite(x_iqi)
+                and x_lo < x_iqi < x_hi):
+            x_new = x_iqi
+        else:
+            # Bisection
+            x_new = (x_lo + x_hi) / 2.0
+
+        f_new = f(x_new)
+        if not math.isfinite(f_new):
+            # Fallback to bisection
+            x_new = (x_lo + x_hi) / 2.0
+            f_new = f(x_new)
+            if not math.isfinite(f_new):
+                break
+
+        if abs(f_new) <= tol_final:
+            return x_new
+
+        # Update the three points properly
+        if f_lo * f_new < 0:
+            # Root in [x_lo, x_new]
+            x_hi, f_hi = x_new, f_new
+        else:
+            # Root in [x_new, x_hi]
+            x_lo, f_lo = x_new, f_new
+
+        # x_mid remains the non-bracketing point (the one not in [x_lo, x_hi])
+        # Reassign: x1=x_lo, x2=x_mid, x3=x_hi
+        x1, f1 = x_lo, f_lo
+        x3, f3 = x_hi, f_hi
+        x2, f2 = x_mid, f_mid
+
+    # Final polish: if we have a bracket and haven't hit tol_final, do a few more bisections
+    # to try to squeeze below 1e-8
+    if time.time() < deadline:
+        # Find current best bracket
+        best_a, best_b = None, None
+        best_fa, best_fb = None, None
+        pts = [(x1, f1), (x2, f2), (x3, f3)]
+        for i in range(3):
+            for j in range(i+1, 3):
+                if pts[i][1] * pts[j][1] < 0:
+                    if best_a is None or abs(pts[i][1]) + abs(pts[j][1]) < abs(best_fa) + abs(best_fb):
+                        best_a, best_fa = pts[i]
+                        best_b, best_fb = pts[j]
+        if best_a is not None and best_b is not None:
+            a2, fa2 = best_a
+            b2, fb2 = best_b
+            for _ in range(20):
+                if time.time() > deadline:
+                    break
+                if abs(fa2) <= tol_final:
+                    return a2
+                if abs(fb2) <= tol_final:
+                    return b2
+                if abs(b2 - a2) < 1e-15:
+                    return (a2 + b2) / 2.0
+                mid2 = (a2 + b2) / 2.0
+                fm2 = f(mid2)
+                if not math.isfinite(fm2):
+                    break
+                if abs(fm2) <= tol_final:
+                    return mid2
+                if fa2 * fm2 < 0:
+                    b2, fb2 = mid2, fm2
+                else:
+                    a2, fa2 = mid2, fm2
+            # Return whichever endpoint is closer to zero
+            return a2 if abs(fa2) < abs(fb2) else b2
+
+    # Return best
+    candidates = [(x1, f1), (x2, f2), (x3, f3)]
+    best = min(candidates, key=lambda t: abs(t[1]))
+    return best[0]

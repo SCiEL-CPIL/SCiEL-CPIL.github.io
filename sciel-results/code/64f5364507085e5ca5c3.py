@@ -1,0 +1,6 @@
+    if best_params is None or compute_L_and_penalty(best_params)[1] > 1e-6:
+        # ...
+        best_params = np.array(params_grid, dtype=float)
+        # ...
+        if time.time() < deadline - 10:
+             try_optimize(best_params, 3000, 1e-8, 1e-8)

@@ -1,0 +1,392 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from math import sqrt, inf
+
+def _expand_route(customer_route, dist, ready, due, service, battery_cap, speed, recharge_rate, horizon, stations):
+    """
+    Takes a list of customer IDs and returns (node_ids, total_dist) or (None, 0.0).
+    """
+    if not customer_route:
+        return [], 0.0
+        
+    route = []
+    current_node = 0
+    bat = battery_cap
+    total_time = 0.0
+    total_dist = 0.0
+    
+    for c in customer_route:
+        while True:
+            d = dist[current_node, c]
+            if bat >= d:
+                break
+            best_s = None
+            best_d_s = float('inf')
+            for s in stations:
+                d_to_s = dist[current_node, s]
+                if bat >= d_to_s:
+                    if dist[s, c] <= battery_cap:
+                        if d_to_s < best_d_s:
+                            best_d_s = d_to_s
+                            best_s = s
+            if best_s is None:
+                return None, 0.0
+            d_to_s = dist[current_node, best_s]
+            total_time += d_to_s / speed
+            bat -= d_to_s
+            total_dist += d_to_s
+            total_time += (battery_cap - bat) * recharge_rate
+            bat = battery_cap
+            route.append(best_s)
+            current_node = best_s
+            
+        d = dist[current_node, c]
+        total_time += d / speed
+        bat -= d
+        total_dist += d
+        start_service = max(total_time, ready[c])
+        if start_service > due[c]:
+            return None, 0.0
+        total_time = start_service + service[c]
+        route.append(c)
+        current_node = c
+        
+    while True:
+        d = dist[current_node, 0]
+        if bat >= d:
+            break
+        best_s = None
+        best_d_s = float('inf')
+        for s in stations:
+            d_to_s = dist[current_node, s]
+            if bat >= d_to_s:
+                if dist[s, 0] <= battery_cap:
+                    if d_to_s < best_d_s:
+                        best_d_s = d_to_s
+                        best_s = s
+        if best_s is None:
+            return None, 0.0
+        d_to_s = dist[current_node, best_s]
+        total_time += d_to_s / speed
+        bat -= d_to_s
+        total_dist += d_to_s
+        total_time += (battery_cap - bat) * recharge_rate
+        bat = battery_cap
+        route.append(best_s)
+        current_node = best_s
+        
+    d = dist[current_node, 0]
+    total_time += d / speed
+    bat -= d
+    total_dist += d
+    if total_time > horizon:
+        return None, 0.0
+    return route, total_dist
+
+def _solve_instance(instance, time_limit=120):
+    coords = np.array(instance["coords"], dtype=np.float64)
+    n_customers = instance["n_customers"]
+    demands = np.array(instance["demands"], dtype=np.float64)
+    ready = np.array(instance["ready"], dtype=np.float64)
+    due = np.array(instance["due"], dtype=np.float64)
+    service = np.array(instance["service"], dtype=np.float64)
+    stations = instance["stations"]
+    capacity = instance["capacity"]
+    battery = instance["battery"]
+    speed = instance["speed"]
+    recharge_rate = instance["recharge_rate"]
+    horizon = instance["horizon"]
+    
+    n_nodes = len(coords)
+    # Vectorized distance matrix
+    diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
+    dist = np.sqrt((diff ** 2).sum(axis=2))
+    
+    customers = list(range(1, n_customers + 1))
+    start_time = time.time()
+    
+    # Phase 1: Greedy Construction with Nearest Neighbor
+    routes = [] # list of [customer_list, total_demand, expanded_route, total_dist]
+    
+    unvisited = set(customers)
+    
+    while unvisited:
+        best_c = min(unvisited, key=lambda c: dist[0, c])
+        unvisited.remove(best_c)
+        
+        current_route = [best_c]
+        current_demand = demands[best_c]
+        current_node = best_c
+        
+        while unvisited:
+            best_next = None
+            best_d = float('inf')
+            
+            for c in unvisited:
+                if current_demand + demands[c] > capacity:
+                    continue
+                d = dist[current_node, c]
+                if d < best_d:
+                    best_d = d
+                    best_next = c
+            
+            if best_next is None:
+                break
+            
+            unvisited.remove(best_next)
+            current_route.append(best_next)
+            current_demand += demands[best_next]
+            current_node = best_next
+        
+        exp, d_exp = _expand_route(current_route, dist, ready, due, service, battery, speed, recharge_rate, horizon, stations)
+        if exp is not None:
+            routes.append([current_route, current_demand, exp, d_exp])
+        else:
+            for c in current_route:
+                exp_c, d_exp_c = _expand_route([c], dist, ready, due, service, battery, speed, recharge_rate, horizon, stations)
+                if exp_c is not None:
+                    routes.append([[c], demands[c], exp_c, d_exp_c])
+                else:
+                    routes.append([[c], demands[c], None, float('inf')])
+    
+    # Phase 2: First-Improvement Local Search with Simulated Annealing
+    def get_total_dist():
+        return sum(r[3] for r in routes if r[3] < float('inf'))
+    
+    def try_move(move_type, params):
+        """
+        Try a single move and return (gain, new_routes_state) if improved, else None.
+        move_type: 'relocate', '2opt', 'oropt'
+        """
+        if time.time() - start_time > time_limit:
+            return None
+        
+        current_total = get_total_dist()
+        
+        if move_type == 'relocate':
+            i, k, j, p = params
+            if i >= len(routes) or j >= len(routes) or i == j:
+                return None
+            
+            seq_i = routes[i][0]
+            if k >= len(seq_i):
+                return None
+            c = seq_i[k]
+            
+            if routes[j][1] + demands[c] > capacity:
+                return None
+            
+            new_seq_i = seq_i[:k] + seq_i[k+1:]
+            new_seq_j = routes[j][0][:p] + [c] + routes[j][0][p:]
+            
+            if new_seq_i:
+                exp_i, d_i = _expand_route(new_seq_i, dist, ready, due, service, battery, speed, recharge_rate, horizon, stations)
+                if exp_i is None:
+                    return None
+            else:
+                exp_i, d_i = [], 0.0
+            
+            exp_j, d_j = _expand_route(new_seq_j, dist, ready, due, service, battery, speed, recharge_rate, horizon, stations)
+            if exp_j is None:
+                return None
+            
+            others_sum = 0.0
+            for idx in range(len(routes)):
+                if idx != i and idx != j:
+                    others_sum += routes[idx][3]
+            
+            new_total = d_i + d_j + others_sum
+            gain = current_total - new_total
+            
+            if gain > 0:
+                # Store the move details
+                return (gain, ('relocate', i, k, j, p, new_seq_i, new_seq_j, exp_i, d_i, exp_j, d_j, c))
+            else:
+                # For SA, we might accept worse moves, but let's keep it simple first-improvement for now
+                # Actually, let's return the gain even if negative for SA
+                return (gain, ('relocate', i, k, j, p, new_seq_i, new_seq_j, exp_i, d_i, exp_j, d_j, c))
+        
+        elif move_type == '2opt':
+            i, a, b = params
+            if i >= len(routes):
+                return None
+            seq = routes[i][0]
+            if len(seq) < 2 or a >= len(seq) - 1 or b >= len(seq) or a >= b:
+                return None
+            
+            new_seq = seq[:a] + seq[a:b+1][::-1] + seq[b+1:]
+            exp, d_exp = _expand_route(new_seq, dist, ready, due, service, battery, speed, recharge_rate, horizon, stations)
+            if exp is None:
+                return None
+            
+            others_sum = sum(r[3] for idx, r in enumerate(routes) if idx != i)
+            new_total = d_exp + others_sum
+            gain = current_total - new_total
+            
+            return (gain, ('2opt', i, a, b, new_seq, exp, d_exp))
+        
+        elif move_type == 'oropt':
+            i, k, seg_len, j, p = params
+            if i >= len(routes) or j >= len(routes) or i == j:
+                return None
+            
+            seq_i = routes[i][0]
+            if len(seq_i) < seg_len or k >= len(seq_i) - seg_len + 1:
+                return None
+            
+            segment = seq_i[k:k+seg_len]
+            seg_demand = sum(demands[c] for c in segment)
+            
+            if routes[j][1] + seg_demand > capacity:
+                return None
+            
+            new_seq_i = seq_i[:k] + seq_i[k+seg_len:]
+            new_seq_j = routes[j][0][:p] + segment + routes[j][0][p:]
+            
+            if new_seq_i:
+                exp_i, d_i = _expand_route(new_seq_i, dist, ready, due, service, battery, speed, recharge_rate, horizon, stations)
+                if exp_i is None:
+                    return None
+            else:
+                exp_i, d_i = [], 0.0
+            
+            exp_j, d_j = _expand_route(new_seq_j, dist, ready, due, service, battery, speed, recharge_rate, horizon, stations)
+            if exp_j is None:
+                return None
+            
+            others_sum = 0.0
+            for idx in range(len(routes)):
+                if idx != i and idx != j:
+                    others_sum += routes[idx][3]
+            
+            new_total = d_i + d_j + others_sum
+            gain = current_total - new_total
+            
+            return (gain, ('oropt', i, k, seg_len, j, p, new_seq_i, new_seq_j, exp_i, d_i, exp_j, d_j, segment))
+        
+        return None
+
+    def apply_move(move_data):
+        """Apply a move to the routes list."""
+        move_type = move_data[0]
+        
+        if move_type == 'relocate':
+            _, i, k, j, p, new_seq_i, new_seq_j, exp_i, d_i, exp_j, d_j, c = move_data
+            if new_seq_i:
+                routes[i] = [new_seq_i, routes[i][1] - demands[c], exp_i, d_i]
+                routes[j] = [new_seq_j, routes[j][1] + demands[c], exp_j, d_j]
+            else:
+                del routes[i]
+                if j > i:
+                    j -= 1
+                routes[j] = [new_seq_j, routes[j][1] + demands[c], exp_j, d_j]
+                
+        elif move_type == '2opt':
+            _, i, a, b, new_seq, exp, d_exp = move_data
+            routes[i][0] = new_seq
+            routes[i][2] = exp
+            routes[i][3] = d_exp
+            
+        elif move_type == 'oropt':
+            _, i, k, seg_len, j, p, new_seq_i, new_seq_j, exp_i, d_i, exp_j, d_j, segment = move_data
+            seg_demand = sum(demands[c] for c in segment)
+            if new_seq_i:
+                routes[i] = [new_seq_i, routes[i][1] - seg_demand, exp_i, d_i]
+                routes[j] = [new_seq_j, routes[j][1] + seg_demand, exp_j, d_j]
+            else:
+                del routes[i]
+                if j > i:
+                    j -= 1
+                routes[j] = [new_seq_j, routes[j][1] + seg_demand, exp_j, d_j]
+
+    # Simulated Annealing Parameters
+    T = 10.0
+    T_min = 0.1
+    cooling = 0.995
+    best_routes = [r[:] for r in routes]
+    best_dist = get_total_dist()
+    
+    while time.time() - start_time < time_limit and T > T_min:
+        # Generate a random move
+        move_type = np.random.choice(['relocate', '2opt', 'oropt'], p=[0.4, 0.3, 0.3])
+        
+        if move_type == 'relocate':
+            i = np.random.randint(len(routes))
+            if not routes[i][0]:
+                continue
+            k = np.random.randint(len(routes[i][0]))
+            j = np.random.randint(len(routes))
+            if i == j:
+                continue
+            p = np.random.randint(len(routes[j][0]) + 1)
+            params = (i, k, j, p)
+            
+        elif move_type == '2opt':
+            i = np.random.randint(len(routes))
+            if len(routes[i][0]) < 2:
+                continue
+            a = np.random.randint(len(routes[i][0]) - 1)
+            b = np.random.randint(a + 1, len(routes[i][0]))
+            params = (i, a, b)
+            
+        else:  # oropt
+            i = np.random.randint(len(routes))
+            if len(routes[i][0]) < 1:
+                continue
+            seg_len = np.random.choice([1, 2, 3], p=[0.5, 0.3, 0.2])
+            if len(routes[i][0]) < seg_len:
+                seg_len = len(routes[i][0])
+            k = np.random.randint(len(routes[i][0]) - seg_len + 1)
+            j = np.random.randint(len(routes))
+            if i == j:
+                continue
+            p = np.random.randint(len(routes[j][0]) + 1)
+            params = (i, k, seg_len, j, p)
+        
+        result = try_move(move_type, params)
+        if result is None:
+            T *= cooling
+            continue
+            
+        gain, move_data = result
+        
+        # Accept if improved, or with probability exp(gain/T) if worsened (gain is negative)
+        if gain > 0:
+            apply_move(move_data)
+            new_dist = get_total_dist()
+            if new_dist < best_dist:
+                best_dist = new_dist
+                best_routes = [r[:] for r in routes]
+        else:
+            # gain is negative (worsening)
+            prob = np.exp(gain / T)
+            if np.random.random() < prob:
+                apply_move(move_data)
+        
+        T *= cooling
+    
+    # Restore best solution found
+    routes = best_routes
+    
+    # Build final result
+    final_routes = []
+    for r in routes:
+        if r[2] is not None:
+            final_routes.append(r[2])
+        else:
+            for c in r[0]:
+                exp, _ = _expand_route([c], dist, ready, due, service, battery, speed, recharge_rate, horizon, stations)
+                if exp is not None:
+                    final_routes.append(exp)
+                else:
+                    final_routes.append([c])
+    
+    return final_routes
+
+def plan(instance):
+    start_time = time.time()
+    deadline = start_time + 145
+    routes = _solve_instance(instance, time_limit=140)
+    return routes
+# EVOLVE-BLOCK-END

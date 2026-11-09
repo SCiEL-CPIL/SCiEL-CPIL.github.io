@@ -1,0 +1,3 @@
+    a, sums = [1, 2, 5, 11], set()
+    # ... greedy fill ...
+    return a

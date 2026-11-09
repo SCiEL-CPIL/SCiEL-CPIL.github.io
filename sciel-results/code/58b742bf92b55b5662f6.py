@@ -1,0 +1,105 @@
+import numpy as np
+import time
+
+_START = time.time()
+_DEADLINE = _START + 260.0
+_CACHE = {}
+
+def _precompute_regime(sigma, A, k, gamma, T, steps, Q):
+    dt = T / steps
+    N = steps
+    n_q = 2 * Q + 1
+    
+    V = np.zeros((N + 1, n_q))
+    opt_b = np.zeros((N, n_q))
+    opt_a = np.zeros((N, n_q))
+    
+    # Use a finer grid to capture the optimal depth more accurately
+    max_depth = 6.0 / k
+    grid_size = 500
+    depths = np.linspace(0, max_depth, grid_size)
+    
+    # Precompute P(d) for grid
+    P_grid = 1.0 - np.exp(-A * np.exp(-k * depths) * dt)
+    
+    # Precompute terms for vectorization
+    X_base = P_grid * depths
+    PP = np.outer(P_grid, P_grid)
+    
+    for t in range(N - 1, -1, -1):
+        # Check deadline
+        if time.time() > _DEADLINE - 10:
+            # Fallback: use 1/k as a reasonable default
+            for qi in range(n_q):
+                opt_b[t, qi] = 1.0 / k
+                opt_a[t, qi] = 1.0 / k
+            return opt_b, opt_a
+        
+        V_next = V[t + 1, :]
+        
+        # Interior: qi in [1, n_q-2]
+        if n_q > 2:
+            qi_interior = np.arange(1, n_q-1)
+            dp = V_next[2:n_q] - V_next[1:n_q-1]
+            dm = V_next[0:n_q-2] - V_next[1:n_q-1]
+            vn = V_next[qi_interior]
+            
+            X = X_base[:, None] + P_grid[:, None] * dp[None, :]
+            Y = X_base[:, None] + P_grid[:, None] * dm[None, :]
+            C = dp + dm
+            
+            M = X[:, None, :] + Y[None, :, :] - PP[:, :, None] * C[None, None, :] + vn[None, None, :]
+            
+            flat_M = M.reshape(-1, len(qi_interior))
+            flat_max = np.argmax(flat_M, axis=0)
+            
+            i_star = flat_max // grid_size
+            j_star = flat_max % grid_size
+            
+            V[t, qi_interior] = flat_M[flat_max, np.arange(len(qi_interior))]
+            opt_b[t, qi_interior] = depths[i_star]
+            opt_a[t, qi_interior] = depths[j_star]
+            
+        # Boundary q = -Q (qi = 0): only bid active
+        dp0 = V_next[1] - V_next[0]
+        val_b = X_base + P_grid * dp0 + V_next[0]
+        best_i = np.argmax(val_b)
+        V[t, 0] = val_b[best_i]
+        opt_b[t, 0] = depths[best_i]
+        opt_a[t, 0] = 0.0
+        
+        # Boundary q = Q (qi = n_q - 1): only ask active
+        dm_last = V_next[n_q-2] - V_next[n_q-1]
+        val_a = X_base + P_grid * dm_last + V_next[n_q-1]
+        best_j = np.argmax(val_a)
+        V[t, n_q-1] = val_a[best_j]
+        opt_b[t, n_q-1] = 0.0
+        opt_a[t, n_q-1] = depths[best_j]
+        
+    return opt_b, opt_a
+
+def quote(t, inventory, mid, params):
+    sigma = params['sigma']
+    A = params['A']
+    k = params['k']
+    gamma = params['gamma']
+    T = params['T']
+    steps = params['steps']
+    Q = params['Q']
+    
+    key = (sigma, A, k, gamma, T, steps, Q)
+    if key not in _CACHE:
+        _CACHE[key] = _precompute_regime(sigma, A, k, gamma, T, steps, Q)
+    
+    opt_b, opt_a = _CACHE[key]
+    
+    t_idx = int(t / (T / steps))
+    if t_idx >= steps:
+        t_idx = steps - 1
+        
+    q_idx = inventory + Q
+    
+    b_depths = opt_b[t_idx, q_idx]
+    a_depths = opt_a[t_idx, q_idx]
+    
+    return b_depths, a_depths

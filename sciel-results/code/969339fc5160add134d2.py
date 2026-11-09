@@ -1,0 +1,1 @@
+BET: {mechanism: "Reducing restart count from ~1700 to ~500 while adding local search and better initial ordering should find same or better solutions faster, staying within time limit", q: 0.7, delta: [0.0, 0.3]}

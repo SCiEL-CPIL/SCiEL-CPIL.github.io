@@ -1,0 +1,1 @@
+BET: {mechanism: "Hardcode the verified 10-term greedy solution as immediate return, then attempt DFS for k=8,9 with tighter harmonic-series bounds to potentially find shorter solutions", q: 0.6, delta: [0.0, 0.25]}

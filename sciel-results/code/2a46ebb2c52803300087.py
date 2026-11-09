@@ -1,0 +1,320 @@
+"""Optimized hexagon packing via differentiable overlap penalty + L-BFGS-B."""
+import numpy as np
+import time
+from scipy.optimize import minimize
+
+N = 12
+
+def _hex_vertices(cx, cy, s, ang_deg):
+    a = np.deg2rad(ang_deg)
+    ca, sa = np.cos(a), np.sin(a)
+    # Regular hexagon vertices at angles 0,60,120,180,240,300
+    base_ang = np.arange(6) * np.pi / 3.0
+    vx = np.cos(base_ang) * s
+    vy = np.sin(base_ang) * s
+    # Rotate
+    rx = vx * ca - vy * sa
+    ry = vx * sa + vy * ca
+    return np.column_stack((rx + cx, ry + cy))
+
+def _point_in_hex(px, py, cx, cy, s, ang_deg):
+    a = np.deg2rad(ang_deg)
+    ca, sa = np.cos(a), np.sin(a)
+    dx = px - cx
+    dy = py - cy
+    # Rotate point into hexagon frame
+    lx = dx * ca + dy * sa
+    ly = -dx * sa + dy * ca
+    # Regular hexagon: |x| <= s, |y| <= s*sqrt(3)/2, |x| + |y|/sqrt(3) <= s
+    absx = np.abs(lx)
+    absy = np.abs(ly)
+    return (absx <= s + 1e-9) & (absy <= s * np.sqrt(3) / 2 + 1e-9) & (absx + absy / np.sqrt(3) <= s + 1e-9)
+
+def _seg_intersect(p1, p2, p3, p4):
+    """Check if segment p1-p2 intersects segment p3-p4."""
+    d1 = p2 - p1
+    d2 = p4 - p3
+    cross = d1[0] * d2[1] - d1[1] * d2[0]
+    if abs(cross) < 1e-12:
+        return False
+    t = ((p3[0] - p1[0]) * d2[1] - (p3[1] - p1[1]) * d2[0]) / cross
+    u = ((p3[0] - p1[0]) * d1[1] - (p3[1] - p1[1]) * d1[0]) / cross
+    return -1e-9 <= t <= 1 + 1e-9 and -1e-9 <= u <= 1 + 1e-9
+
+def _poly_overlap_area(v1, v2):
+    """Compute overlap area of two convex polygons using Sutherland-Hodgman clipping."""
+    def clip_polygon(subject, clip_edge_start, clip_edge_end):
+        if len(subject) == 0:
+            return []
+        output = []
+        def inside(p):
+            # Check if p is to the left of directed edge clip_edge_start -> clip_edge_end
+            edge = clip_edge_end - clip_edge_start
+            to_p = p - clip_edge_start
+            cross = edge[0] * to_p[1] - edge[1] * to_p[0]
+            return cross >= -1e-9
+        def intersect(p1, p2):
+            d1 = p2 - p1
+            d2 = clip_edge_end - clip_edge_start
+            cross = d1[0] * d2[1] - d1[1] * d2[0]
+            if abs(cross) < 1e-12:
+                return p1
+            t = ((clip_edge_start[0] - p1[0]) * d2[1] - (clip_edge_start[1] - p1[1]) * d2[0]) / cross
+            return p1 + t * d1
+        n = len(subject)
+        for i in range(n):
+            cur = subject[i]
+            nxt = subject[(i + 1) % n]
+            cur_in = inside(cur)
+            nxt_in = inside(nxt)
+            if cur_in:
+                output.append(cur)
+                if not nxt_in:
+                    output.append(intersect(cur, nxt))
+            elif nxt_in:
+                output.append(intersect(cur, nxt))
+                output.append(nxt)
+        return output
+    
+    # Clip v1 by each edge of v2
+    subject = list(v1)
+    for i in range(len(v2)):
+        a = v2[i]
+        b = v2[(i + 1) % len(v2)]
+        subject = clip_polygon(subject, a, b)
+        if len(subject) == 0:
+            return 0.0
+    
+    if len(subject) < 3:
+        return 0.0
+    
+    # Shoelace formula
+    area = 0.0
+    for i in range(len(subject)):
+        x1, y1 = subject[i]
+        x2, y2 = subject[(i + 1) % len(subject)]
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2.0
+
+def _outer_hex_vertices(cx, cy, s, ang_deg):
+    a = np.deg2rad(ang_deg)
+    ca, sa = np.cos(a), np.sin(a)
+    base_ang = np.arange(6) * np.pi / 3.0
+    vx = np.cos(base_ang) * s
+    vy = np.sin(base_ang) * s
+    rx = vx * ca - vy * sa
+    ry = vx * sa + vy * ca
+    return np.column_stack((rx + cx, ry + cy))
+
+def _inner_in_outer(inner_verts, outer_verts):
+    """Check if all inner vertices are inside outer hexagon."""
+    # For each inner vertex, check if inside outer hexagon
+    # Outer hexagon is convex, so check against each edge
+    for iv in inner_verts:
+        for i in range(len(outer_verts)):
+            a = outer_verts[i]
+            b = outer_verts[(i + 1) % len(outer_verts)]
+            edge = b - a
+            to_p = iv - a
+            cross = edge[0] * to_p[1] - edge[1] * to_p[0]
+            if cross < -1e-6:
+                return False
+    return True
+
+def construct():
+    deadline = time.time() + 140.0  # Safety margin before 150s limit
+    best_result = None
+    best_side = float('inf')
+    
+    # Initial guess: honeycomb-like arrangement
+    # 12 hexagons: center + ring of 6 + partial outer ring
+    # Use a compact hexagonal lattice initial guess
+    s_inner = 1.0
+    # Hex grid spacing: for side s, center-to-center distance for touching hexes is s*sqrt(3)
+    hex_dist = s_inner * np.sqrt(3)
+    
+    # Create initial positions in a hexagonal pattern
+    # 12 hexes: 1 center, 6 in first ring, 5 in second ring (partial)
+    # To ensure no initial overlap, we use exact touching distances.
+    init_positions = []
+    init_angles = []
+    # Center
+    init_positions.append([0.0, 0.0])
+    init_angles.append(0.0)
+    # First ring: 6 hexes at distance hex_dist
+    for k in range(6):
+        ang = k * np.pi / 3.0
+        init_positions.append([hex_dist * np.cos(ang), hex_dist * np.sin(ang)])
+        init_angles.append(0.0)
+    # Second ring: 5 more hexes
+    # We place them in the gaps of the second ring to maximize compactness
+    # The second ring positions in a full hex lattice are at distance 2*hex_dist
+    # Angles are offset by 30 degrees (pi/6) from the first ring if we want to fill gaps?
+    # Actually, standard hex lattice:
+    # Ring 1: angles 0, 60, 120, 180, 240, 300
+    # Ring 2: angles 30, 90, 150, 210, 270, 330 at distance 2*hex_dist? No, that's not right.
+    # Let's just use the standard axial coordinates for a hex grid.
+    # q, r coordinates
+    # Center: (0,0)
+    # Ring 1: (1,0), (1,-1), (0,-1), (-1,0), (-1,1), (0,1)
+    # Ring 2: We need 5 more.
+    # Let's just generate a list of 12 valid axial coordinates that form a compact cluster.
+    # A common compact shape for 12 hexes is a "flower" with 3 petals?
+    # Or a 3x4 rectangle?
+    # Let's stick to the radial approximation but ensure distance is at least hex_dist.
+    # To be safe, I will slightly expand the second ring to ensure no overlap in the initial guess.
+    second_ring_dist = 2.0 * hex_dist * 1.01 
+    for k in range(5):
+        ang = (k + 0.5) * np.pi / 3.0
+        init_positions.append([second_ring_dist * np.cos(ang), second_ring_dist * np.sin(ang)])
+        init_angles.append(0.0)
+    
+    def objective(params):
+        if time.time() > deadline - 5.0:
+            return 1e10
+        # params: [x1,y1,a1, x2,y2,a2, ..., x12,y2,a12, cx, cy, S, A]
+        # Total: 12*3 + 4 = 40
+        inner_params = params[:36].reshape(12, 3)
+        cx = params[36]
+        cy = params[37]
+        S = params[38]
+        A = params[39]
+        
+        if S < 1.0:
+            return 1e10
+        
+        # Compute outer hexagon vertices
+        outer_verts = _outer_hex_vertices(cx, cy, S, A)
+        
+        total_penalty = 0.0
+        inner_verts_list = []
+        
+        for i in range(12):
+            xi, yi, ai = inner_params[i]
+            iv = _hex_vertices(xi, yi, s_inner, ai)
+            inner_verts_list.append(iv)
+            
+            # Check if inner hexagon is inside outer
+            for iv_pt in iv:
+                for j in range(6):
+                    a = outer_verts[j]
+                    b = outer_verts[(j + 1) % 6]
+                    edge = b - a
+                    to_p = iv_pt - a
+                    cross = edge[0] * to_p[1] - edge[1] * to_p[0]
+                    if cross < 0:
+                        total_penalty += abs(cross) * 1000.0
+        
+        # Check pairwise overlaps
+        for i in range(12):
+            for j in range(i + 1, 12):
+                area = _poly_overlap_area(inner_verts_list[i], inner_verts_list[j])
+                if area > 1e-8:
+                    total_penalty += area * 10000.0
+        
+        return S + total_penalty
+    
+    # Construct x0 correctly: [x1, y1, a1, ..., x12, y12, a12, cx, cy, S, A]
+    x0_flat = []
+    for i in range(12):
+        x0_flat.extend([init_positions[i][0], init_positions[i][1], init_angles[i]])
+    x0_flat.extend([0.0, 0.0, 5.0, 0.0])
+    x0 = np.array(x0_flat)
+    
+    # Try multiple restarts with different initial configurations
+    restarts = [
+        # Original honeycomb
+        None,
+        # Slightly perturbed
+        lambda: x0 + np.random.randn(40) * 0.1,
+        # Different initial S
+        lambda: np.concatenate([x0[:36], [0.0, 0.0, 4.5, 0.0]]),
+        # Rotated initial
+        lambda: np.concatenate([x0[:36], [0.0, 0.0, 5.0, 30.0]]),
+    ]
+    
+    for restart_idx, restart in enumerate(restarts):
+        if time.time() > deadline - 30.0:
+            break
+        
+        if restart is None:
+            x_init = x0.copy()
+        else:
+            x_init = restart()
+        
+        try:
+            result = minimize(objective, x_init, method='L-BFGS-B',
+                            options={'maxiter': 500, 'ftol': 1e-10, 'gtol': 1e-8})
+            
+            if result.success or result.fun < best_side:
+                # Verify the solution
+                params = result.x
+                inner_params = params[:36].reshape(12, 3)
+                cx = params[36]
+                cy = params[37]
+                S = params[38]
+                A = params[39]
+                
+                # Check validity
+                outer_verts = _outer_hex_vertices(cx, cy, S, A)
+                valid = True
+                inner_verts_list = []
+                for i in range(12):
+                    xi, yi, ai = inner_params[i]
+                    iv = _hex_vertices(xi, yi, s_inner, ai)
+                    inner_verts_list.append(iv)
+                    for iv_pt in iv:
+                        for j in range(6):
+                            a = outer_verts[j]
+                            b = outer_verts[(j + 1) % 6]
+                            edge = b - a
+                            to_p = iv_pt - a
+                            cross = edge[0] * to_p[1] - edge[1] * to_p[0]
+                            if cross < -1e-4:
+                                valid = False
+                                break
+                        if not valid:
+                            break
+                    if not valid:
+                        break
+                
+                if valid:
+                    for i in range(12):
+                        for j in range(i + 1, 12):
+                            area = _poly_overlap_area(inner_verts_list[i], inner_verts_list[j])
+                            if area > 1e-4:
+                                valid = False
+                                break
+                        if not valid:
+                            break
+                
+                if valid and S < best_side:
+                    best_side = S
+                    best_result = (inner_params, (cx, cy), S, A)
+        except Exception as e:
+            pass
+    
+    if best_result is not None:
+        inner_params, center, S, A = best_result
+        inner = [[float(inner_params[i][0]), float(inner_params[i][1]), float(inner_params[i][2])] for i in range(12)]
+        return inner, (float(center[0]), float(center[1])), float(S), float(A)
+    
+    # Fallback: return a valid, non-overlapping configuration
+    # We use the initial positions but ensure the outer hexagon is large enough to contain them
+    # Calculate max distance from center to any vertex of any inner hexagon
+    max_r = 0.0
+    for pos in init_positions:
+        # Approximate max radius of a unit hexagon is 1.0 (distance to vertex)
+        # But it depends on rotation. Max distance from center to any point is 1.0.
+        # So max distance from origin is dist(pos) + 1.0
+        d = np.sqrt(pos[0]**2 + pos[1]**2)
+        max_r = max(max_r, d + 1.0)
+    
+    # Outer hexagon side length S must be at least max_r / (sqrt(3)/2) ?
+    # Circumradius of outer hexagon is S. Inradius is S*sqrt(3)/2.
+    # We need the inner hexagons to be inside.
+    # If we place outer hexagon centered at 0,0 with side S, its inradius is S*sqrt(3)/2.
+    # So we need S*sqrt(3)/2 >= max_r.
+    S_fallback = max_r / (np.sqrt(3)/2) * 1.1 # Add margin
+    inner = [[float(init_positions[i][0]), float(init_positions[i][1]), 0.0] for i in range(12)]
+    return inner, (0.0, 0.0), float(S_fallback), 0.0

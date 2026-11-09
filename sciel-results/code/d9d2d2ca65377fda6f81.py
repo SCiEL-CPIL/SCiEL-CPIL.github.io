@@ -1,0 +1,236 @@
+import numpy as np
+import time
+from collections import deque
+
+def sign_edges(graph, budget):
+    start_time = time.time()
+    deadline = start_time + 50  # Safety margin before 60s limit
+
+    n = graph['n']
+    edges = graph['edges']
+    m = n // 2
+    num_edges = len(edges)
+
+    # Identify edge types
+    c1_edges = []
+    c2_edges = []
+    m_edges = []
+
+    for i, (u, v) in enumerate(edges):
+        if u < m and v < m:
+            c1_edges.append(i)
+        elif u >= m and v >= m:
+            c2_edges.append(i)
+        else:
+            m_edges.append(i)
+
+    # Precompute edge endpoints
+    edge_u = np.array([u for u, v in edges], dtype=int)
+    edge_v = np.array([v for u, v in edges], dtype=int)
+
+    # Precompute neighbors for fast BFS
+    neighbors = [[] for _ in range(n)]
+    for i, (u, v) in enumerate(edges):
+        neighbors[u].append((v, i))
+        neighbors[v].append((u, i))
+
+    def check_connectivity(signs):
+        """Returns True if the 2-lift is connected (i.e., signed graph has an odd cycle)."""
+        parity = np.full(n, -1, dtype=int)
+        queue = deque([0])
+        parity[0] = 0
+        while queue:
+            u = queue.popleft()
+            for v, i in neighbors[u]:
+                flip = 1 if signs[i] == -1 else 0
+                new_parity = (parity[u] + flip) % 2
+                
+                if parity[v] == -1:
+                    parity[v] = new_parity
+                    queue.append(v)
+                else:
+                    if parity[v] != new_parity:
+                        return True
+        
+        return False
+
+    def spectral_radius(signs):
+        A = np.zeros((n, n), dtype=float)
+        A[edge_u, edge_v] = signs
+        A[edge_v, edge_u] = signs
+        eigvals = np.linalg.eigvalsh(A)
+        return np.max(np.abs(eigvals))
+
+    def evaluate_signs(signs):
+        if not check_connectivity(signs):
+            return float('inf')
+        return spectral_radius(signs)
+
+    best_radius = float('inf')
+    best_signs = None
+
+    def try_signs(signs):
+        nonlocal best_radius, best_signs
+        r = evaluate_signs(signs)
+        if r < best_radius:
+            best_radius = r
+            best_signs = signs.copy()
+
+    # Helper to get cycle edge order
+    def get_cycle_edges_indices(edge_indices, offset=0):
+        pos_map = {}
+        for idx in edge_indices:
+            u, v = edges[idx]
+            u = u - offset
+            v = v - offset
+            if (u + 1) % m == v:
+                pos = u
+            elif (v + 1) % m == u:
+                pos = v
+            else:
+                continue
+            pos_map[pos] = idx
+        return sorted(pos_map.items())
+
+    c1_ordered = get_cycle_edges_indices(c1_edges, 0)
+    c2_ordered = get_cycle_edges_indices(c2_edges, m)
+    m_ordered = sorted(m_edges, key=lambda i: edges[i][0] if edges[i][0] < m else edges[i][1])
+
+    # Generate diverse initial candidates
+    candidates = []
+    
+    # Random initializations
+    rng_init = np.random.default_rng(3)
+    for _ in range(50):
+        s = rng_init.choice([-1, 1], size=num_edges)
+        candidates.append(s)
+
+    # Pattern 1: Alt C1, Alt C2, -1 M
+    s = np.ones(num_edges, dtype=int)
+    for pos, idx in c1_ordered: s[idx] = 1 if pos % 2 == 0 else -1
+    for pos, idx in c2_ordered: s[idx] = 1 if pos % 2 == 0 else -1
+    for idx in m_edges: s[idx] = -1
+    candidates.append(s.copy())
+
+    # Pattern 2: Alt C1, Anti-Alt C2, -1 M
+    s = np.ones(num_edges, dtype=int)
+    for pos, idx in c1_ordered: s[idx] = 1 if pos % 2 == 0 else -1
+    for pos, idx in c2_ordered: s[idx] = -1 if pos % 2 == 0 else 1
+    for idx in m_edges: s[idx] = -1
+    candidates.append(s.copy())
+
+    # Pattern 3: Anti-Alt C1, Alt C2, -1 M
+    s = np.ones(num_edges, dtype=int)
+    for pos, idx in c1_ordered: s[idx] = -1 if pos % 2 == 0 else 1
+    for pos, idx in c2_ordered: s[idx] = 1 if pos % 2 == 0 else -1
+    for idx in m_edges: s[idx] = -1
+    candidates.append(s.copy())
+
+    # Pattern 4: Alt C1, Alt C2, +1 M
+    s = np.ones(num_edges, dtype=int)
+    for pos, idx in c1_ordered: s[idx] = 1 if pos % 2 == 0 else -1
+    for pos, idx in c2_ordered: s[idx] = 1 if pos % 2 == 0 else -1
+    for idx in m_edges: s[idx] = 1
+    candidates.append(s.copy())
+
+    # Pattern 5: All +1 C1, All +1 C2, Alt M
+    s = np.ones(num_edges, dtype=int)
+    for pos, idx in enumerate(m_ordered): s[idx] = 1 if pos % 2 == 0 else -1
+    candidates.append(s.copy())
+
+    # Pattern 6: Alt C1, Alt C2, Alt M
+    s = np.ones(num_edges, dtype=int)
+    for pos, idx in c1_ordered: s[idx] = 1 if pos % 2 == 0 else -1
+    for pos, idx in c2_ordered: s[idx] = 1 if pos % 2 == 0 else -1
+    for pos, idx in enumerate(m_ordered): s[idx] = 1 if pos % 2 == 0 else -1
+    candidates.append(s.copy())
+
+    # Pattern 7: All -1
+    s = -np.ones(num_edges, dtype=int)
+    candidates.append(s.copy())
+
+    # Pattern 8: All +1
+    s = np.ones(num_edges, dtype=int)
+    candidates.append(s.copy())
+
+    # Evaluate initial candidates
+    for s in candidates:
+        try_signs(s)
+
+    if best_signs is None:
+        return np.ones(num_edges, dtype=int)
+
+    # Simulated Annealing
+    current_signs = best_signs.copy()
+    current_radius = best_radius
+    
+    T_start = 0.5
+    T_end = 0.01
+    alpha = 0.99
+    T = T_start
+    
+    rng_sa = np.random.default_rng(42)
+    
+    while time.time() < deadline - 5:
+        if T < T_end:
+            break
+            
+        # Random Flip
+        i = rng_sa.integers(0, num_edges)
+        current_signs[i] *= -1
+        
+        new_radius = evaluate_signs(current_signs)
+        
+        if new_radius < current_radius:
+            current_radius = new_radius
+            best_radius = new_radius
+            best_signs = current_signs.copy()
+        else:
+            delta = new_radius - current_radius
+            if np.log(rng_sa.random()) < -delta / T:
+                current_radius = new_radius
+            else:
+                current_signs[i] *= -1 # Revert
+                
+        T *= alpha
+        
+        # Occasionally do a 2-flip to escape deeper minima
+        if rng_sa.random() < 0.1:
+            j = rng_sa.integers(0, num_edges)
+            if j != i:
+                current_signs[j] *= -1
+                new_radius_2 = evaluate_signs(current_signs)
+                if new_radius_2 < current_radius:
+                    current_radius = new_radius_2
+                    best_radius = new_radius_2
+                    best_signs = current_signs.copy()
+                else:
+                    delta_2 = new_radius_2 - current_radius
+                    if np.log(rng_sa.random()) < -delta_2 / T:
+                        current_radius = new_radius_2
+                    else:
+                        current_signs[j] *= -1 # Revert
+
+    # Final Local Search (1-flip)
+    current_signs = best_signs.copy()
+    current_radius = best_radius
+    for _ in range(10):
+        if time.time() > deadline - 2:
+            break
+        improved = False
+        for i in range(num_edges):
+            if time.time() > deadline - 2:
+                break
+            current_signs[i] *= -1
+            r = evaluate_signs(current_signs)
+            if r < current_radius - 1e-9:
+                current_radius = r
+                best_radius = r
+                best_signs = current_signs.copy()
+                improved = True
+            else:
+                current_signs[i] *= -1
+        if not improved:
+            break
+
+    return best_signs

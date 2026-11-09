@@ -1,0 +1,6 @@
+if some_condition:
+    # primary method
+    ...
+else:
+    # fallback
+    ...

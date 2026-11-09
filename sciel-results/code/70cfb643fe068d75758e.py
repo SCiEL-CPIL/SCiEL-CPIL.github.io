@@ -1,0 +1,1 @@
+BET: {mechanism: "Fixing Warnsdorff heuristic (prefer low-degree unvisited neighbors) and trying multiple start vertices should make the backtracking more reliable at finding cycles in the residual graph, ensuring all 3 cycles are found consistently", q: 0.3, delta: [0.0, 0.0]}

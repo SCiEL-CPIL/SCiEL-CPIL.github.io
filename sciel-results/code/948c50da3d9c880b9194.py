@@ -1,0 +1,690 @@
+"""Direct construction of 12 unit hexagons inside a regular hexagon, minimizing outer side."""
+N = 12
+
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.optimize import minimize, differential_evolution
+import time
+
+def _hex_verts(cx, cy, side, angle_deg):
+    """Vertices of a regular hexagon centered at (cx, cy) with given side and rotation."""
+    a = np.radians(angle_deg)
+    return np.array([
+        [cx + side * np.cos(a + np.radians(60 * i)),
+         cy + side * np.sin(a + np.radians(60 * i))]
+        for i in range(6)
+    ])
+
+def _point_in_polygon(pt, verts):
+    """Check if point is inside polygon using winding number / cross products."""
+    n = len(verts)
+    for i in range(n):
+        v1 = verts[i]
+        v2 = verts[(i + 1) % n]
+        edge = v2 - v1
+        rel = pt - v1
+        cross = edge[0] * rel[1] - edge[1] * rel[0]
+        if cross < -1e-10:
+            return False
+    return True
+
+def _containment_penalty(inner_verts, outer_verts):
+    """Penalty for inner hexagon not being fully inside outer hexagon."""
+    penalty = 0.0
+    n_out = len(outer_verts)
+    for iv in inner_verts:
+        for i in range(n_out):
+            v1 = outer_verts[i]
+            v2 = outer_verts[(i + 1) % n_out]
+            edge = v2 - v1
+            edge_len = np.linalg.norm(edge)
+            if edge_len < 1e-12:
+                continue
+            rel = iv - v1
+            cross = edge[0] * rel[1] - edge[1] * rel[0]
+            if cross < 0:
+                penalty += (-cross) / edge_len
+    return penalty
+
+def _sat_overlap_depth(h1, h2):
+    """Minimum penetration depth between two convex polygons using SAT. Returns 0 if disjoint."""
+    min_depth = float('inf')
+    axes = []
+    for poly in [h1, h2]:
+        n = len(poly)
+        for i in range(n):
+            p1 = poly[i]
+            p2 = poly[(i + 1) % n]
+            edge = p2 - p1
+            norm = np.linalg.norm(edge)
+            if norm < 1e-10:
+                continue
+            normal = np.array([-edge[1], edge[0]]) / norm
+            axes.append(normal)
+    
+    for axis in axes:
+        proj1 = np.dot(h1, axis)
+        proj2 = np.dot(h2, axis)
+        min1, max1 = np.min(proj1), np.max(proj1)
+        min2, max2 = np.min(proj2), np.max(proj2)
+        
+        if max1 <= min2 or max2 <= min1:
+            return 0.0
+        
+        overlap = min(max1, max2) - max(min1, min2)
+        if overlap < min_depth:
+            min_depth = overlap
+    
+    return min_depth
+
+def _smooth_hardcore_potential(params, outer_side, outer_center, outer_angle, beta=50.0):
+    """
+    Smooth surrogate for the nonsmooth min/max objective using log-sum-exp.
+    This creates a 'hard-core' potential field where collisions produce large
+    smooth penalties, enabling gradient-based optimization.
+    """
+    inner_verts_list = []
+    for i in range(N):
+        cx, cy, ang = params[3*i], params[3*i+1], params[3*i+2]
+        inner_verts_list.append(_hex_verts(cx, cy, 1.0, ang))
+    
+    outer_verts = _hex_verts(outer_center[0], outer_center[1], outer_side, outer_angle)
+    
+    # Containment penalty (smooth)
+    cont_pen = 0.0
+    for iv in inner_verts_list:
+        cont_pen += _containment_penalty(iv, outer_verts)
+    
+    # Pairwise disjointness using smooth log-sum-exp approximation of max
+    pairwise_depths = []
+    for i in range(N):
+        for j in range(i + 1, N):
+            depth = _sat_overlap_depth(inner_verts_list[i], inner_verts_list[j])
+            if depth > 0:
+                pairwise_depths.append(depth)
+    
+    if len(pairwise_depths) == 0:
+        disj_pen = 0.0
+    else:
+        depths = np.array(pairwise_depths)
+        smooth_max = (1.0 / beta) * np.log(np.sum(np.exp(depths / beta)))
+        sum_term = np.sum(depths) * 0.1
+        disj_pen = smooth_max + sum_term
+    
+    return cont_pen + disj_pen
+
+def _total_penalty(params, outer_side, outer_center, outer_angle):
+    """Total penalty: containment + pairwise disjointness (original, for validation)."""
+    inner_verts_list = []
+    for i in range(N):
+        cx, cy, ang = params[3*i], params[3*i+1], params[3*i+2]
+        inner_verts_list.append(_hex_verts(cx, cy, 1.0, ang))
+    
+    outer_verts = _hex_verts(outer_center[0], outer_center[1], outer_side, outer_angle)
+    
+    # Containment
+    cont_pen = 0.0
+    for iv in inner_verts_list:
+        cont_pen += _containment_penalty(iv, outer_verts)
+    
+    # Disjointness
+    disj_pen = 0.0
+    for i in range(N):
+        for j in range(i + 1, N):
+            depth = _sat_overlap_depth(inner_verts_list[i], inner_verts_list[j])
+            if depth > 0:
+                disj_pen += depth
+    
+    return cont_pen + disj_pen
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 145.0  # safety margin before 150s limit
+    
+    def build_hexagonal_lattice(nrows, ncols):
+        """Build a hexagonal lattice of positions (offset rows)."""
+        positions = []
+        for r in range(nrows):
+            for c in range(ncols):
+                x = c * 2.0 + (1.0 if r % 2 == 1 else 0.0)
+                y = r * np.sqrt(3)
+                positions.append((x, y))
+        return positions
+    
+    def build_ring_config():
+        """6 around center + 5 more in second ring."""
+        positions = [(0.0, 0.0)]
+        for i in range(6):
+            ang = np.radians(60 * i)
+            positions.append((2.0 * np.cos(ang), 2.0 * np.sin(ang)))
+        for i in range(6):
+            ang = np.radians(60 * i + 30)
+            positions.append((3.464 * np.cos(ang), 3.464 * np.sin(ang)))
+        return positions[:12]
+    
+    def build_compact_config():
+        """Compact 2x6 arrangement with slight rotation."""
+        positions = []
+        for r in range(2):
+            for c in range(6):
+                x = c * 2.0 + (1.0 if r % 2 == 1 else 0.0)
+                y = r * np.sqrt(3)
+                positions.append((x, y))
+        arr = np.array(positions)
+        centroid = arr.mean(axis=0)
+        return (arr - centroid).tolist()
+    
+    # Parametric brick-wall representation: hex lattice topology with 3 params
+    def parametric_brickwall_params(scale, row_shift, rot_deg):
+        """
+        Generate 12 hex positions on a hex lattice with:
+        - scale: inter-hex spacing factor (1.0 = touching)
+        - row_shift: horizontal offset for odd rows (fraction of 2*scale)
+        - rot_deg: global rotation of the whole pattern
+        Topology: 3 rows x 4 cols hex grid
+        """
+        positions = []
+        for r in range(3):
+            for c in range(4):
+                x = c * 2.0 * scale + (row_shift * 2.0 * scale if r % 2 == 1 else 0.0)
+                y = r * np.sqrt(3) * scale
+                positions.append([x, y])
+        arr = np.array(positions)
+        centroid = arr.mean(axis=0)
+        arr = arr - centroid
+        # Rotate
+        a = np.radians(rot_deg)
+        R = np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]])
+        arr = (R @ arr.T).T
+        return arr
+    
+    # Generate candidate initial configurations
+    configs = []
+    
+    pos_3x4 = build_hexagonal_lattice(3, 4)
+    if len(pos_3x4) == N:
+        arr = np.array(pos_3x4)
+        centroid = arr.mean(axis=0)
+        configs.append((arr - centroid).tolist())
+    
+    pos_4x3 = build_hexagonal_lattice(4, 3)
+    if len(pos_4x3) == N:
+        arr = np.array(pos_4x3)
+        centroid = arr.mean(axis=0)
+        configs.append((arr - centroid).tolist())
+    
+    pos_2x6 = build_hexagonal_lattice(2, 6)
+    if len(pos_2x6) == N:
+        arr = np.array(pos_2x6)
+        centroid = arr.mean(axis=0)
+        configs.append((arr - centroid).tolist())
+    
+    ring_pos = build_ring_config()
+    if len(ring_pos) == N:
+        arr = np.array(ring_pos)
+        centroid = arr.mean(axis=0)
+        configs.append((arr - centroid).tolist())
+    
+    pos_6x2 = build_hexagonal_lattice(6, 2)
+    if len(pos_6x2) == N:
+        arr = np.array(pos_6x2)
+        centroid = arr.mean(axis=0)
+        configs.append((arr - centroid).tolist())
+    
+    compact = build_compact_config()
+    configs.append(compact)
+    
+    best_score = float('inf')
+    best_result = None
+    
+    def try_local_optimize_smooth(init_params, outer_side, outer_center, outer_angle, 
+                                   max_iter=100, maxfun=3000, beta=50.0):
+        """Try local optimization with smooth hard-core potential."""
+        def objective(p):
+            return _smooth_hardcore_potential(p, outer_side, outer_center, outer_angle, beta)
+        
+        try:
+            result = minimize(
+                objective,
+                init_params,
+                method='L-BFGS-B',
+                options={'maxiter': max_iter, 'maxfun': maxfun, 'ftol': 1e-14, 'gtol': 1e-10}
+            )
+            return True, result.x, result.fun
+        except Exception:
+            return False, None, float('inf')
+    
+    def try_local_optimize(init_params, outer_side, outer_center, outer_angle, 
+                           max_iter=80, maxfun=2000):
+        """Try local optimization with original penalty."""
+        def objective(p):
+            return _total_penalty(p, outer_side, outer_center, outer_angle)
+        
+        try:
+            result = minimize(
+                objective,
+                init_params,
+                method='L-BFGS-B',
+                options={'maxiter': max_iter, 'maxfun': maxfun, 'ftol': 1e-14, 'gtol': 1e-10}
+            )
+            return True, result.x, result.fun
+        except Exception:
+            return False, None, float('inf')
+    
+    def lagrangian_dual_ascent(init_params, outer_center, outer_angle, 
+                                max_iter=50, lr=0.05, beta=50.0):
+        """
+        Lagrangian dual ascent method for the container scale.
+        Treats the packing as a 2D rigid-body collision problem where
+        the 12 unit hexagons are agents in a hard-core potential field.
+        """
+        s = 4.0
+        lambda_cont = 0.1
+        mu_disj = 0.1
+        
+        best_s = float('inf')
+        best_params = init_params.copy()
+        
+        for it in range(max_iter):
+            if time.time() > deadline - 20.0:
+                break
+            
+            def lagrangian(p):
+                inner_verts_list = []
+                for i in range(N):
+                    cx, cy, ang = p[3*i], p[3*i+1], p[3*i+2]
+                    inner_verts_list.append(_hex_verts(cx, cy, 1.0, ang))
+                
+                outer_verts = _hex_verts(outer_center[0], outer_center[1], s, outer_angle)
+                
+                cont_pen = sum(_containment_penalty(iv, outer_verts) for iv in inner_verts_list)
+                
+                pairwise_depths = []
+                for i in range(N):
+                    for j in range(i + 1, N):
+                        depth = _sat_overlap_depth(inner_verts_list[i], inner_verts_list[j])
+                        if depth > 0:
+                            pairwise_depths.append(depth)
+                
+                if len(pairwise_depths) == 0:
+                    disj_pen = 0.0
+                else:
+                    depths = np.array(pairwise_depths)
+                    smooth_max = (1.0 / beta) * np.log(np.sum(np.exp(depths / beta)))
+                    sum_term = np.sum(depths) * 0.1
+                    disj_pen = smooth_max + sum_term
+                
+                return s + lambda_cont * cont_pen + mu_disj * disj_pen
+            
+            try:
+                result = minimize(
+                    lagrangian,
+                    init_params,
+                    method='L-BFGS-B',
+                    options={'maxiter': 30, 'maxfun': 500, 'ftol': 1e-12, 'gtol': 1e-8}
+                )
+                init_params = result.x
+            except Exception:
+                pass
+            
+            inner_verts_list = []
+            for i in range(N):
+                cx, cy, ang = init_params[3*i], init_params[3*i+1], init_params[3*i+2]
+                inner_verts_list.append(_hex_verts(cx, cy, 1.0, ang))
+            
+            outer_verts = _hex_verts(outer_center[0], outer_center[1], s, outer_angle)
+            
+            cont_viol = 0.0
+            for iv in inner_verts_list:
+                cont_viol += _containment_penalty(iv, outer_verts)
+            
+            disj_viol = 0.0
+            for i in range(N):
+                for j in range(i + 1, N):
+                    depth = _sat_overlap_depth(inner_verts_list[i], inner_verts_list[j])
+                    if depth > 0:
+                        disj_viol += depth
+            
+            lambda_cont = max(0.0, lambda_cont + lr * cont_viol)
+            mu_disj = max(0.0, mu_disj + lr * disj_viol)
+            
+            if cont_viol < 1e-4 and disj_viol < 1e-4:
+                s_new = s * 0.98
+                if s_new < 3.0:
+                    s_new = 3.0
+                s = s_new
+                if s < best_s:
+                    best_s = s
+                    best_params = init_params.copy()
+            else:
+                s_new = s * 1.02
+                if s_new > 8.0:
+                    s_new = 8.0
+                s = s_new
+            
+            lambda_cont = min(lambda_cont, 5.0)
+            mu_disj = min(mu_disj, 5.0)
+        
+        return best_params, best_s
+    
+    def try_de_global(outer_side, outer_center, outer_angle, maxiter=30):
+        """Try differential evolution for global search."""
+        if time.time() > deadline - 20.0:
+            return None
+        
+        bounds = [(-5, 5), (-5, 5), (0, 180)] * N
+        
+        def de_objective(p):
+            return _total_penalty(p, outer_side, outer_center, outer_angle)
+        
+        try:
+            result = differential_evolution(
+                de_objective,
+                bounds,
+                maxiter=maxiter,
+                popsize=10,
+                tol=1e-8,
+                seed=42,
+                polish=True,
+                options={'maxiter': maxiter}
+            )
+            if result.success and result.fun < 1e-6:
+                return result.x
+            elif result.fun < 0.01:
+                return result.x
+        except Exception:
+            pass
+        return None
+    
+    def parametric_search(outer_center, outer_angle):
+        """
+        Parametric brick-wall search: optimize (scale, row_shift, rot_deg)
+        to find minimal outer side. Uses gradient descent on the 3-param space.
+        """
+        best_p = None
+        best_side = float('inf')
+        
+        # Coarse grid search over the 3 params
+        for scale in np.linspace(0.8, 1.3, 10):
+            if time.time() > deadline - 30.0:
+                break
+            for row_shift in np.linspace(0.0, 1.0, 6):
+                if time.time() > deadline - 25.0:
+                    break
+                for rot_deg in np.linspace(0, 60, 7):
+                    if time.time() > deadline - 20.0:
+                        break
+                    
+                    arr = parametric_brickwall_params(scale, row_shift, rot_deg)
+                    init_params = []
+                    for (x, y) in arr:
+                        init_params.extend([float(x), float(y), 0.0])
+                    init_params = np.array(init_params)
+                    
+                    # Binary search for minimal outer side that works
+                    lo, hi = 2.5, 6.0
+                    for _ in range(12):
+                        mid = (lo + hi) / 2
+                        success, opt_params, opt_val = try_local_optimize(
+                            init_params, mid, outer_center, outer_angle,
+                            max_iter=40, maxfun=1000
+                        )
+                        if success and opt_val < 1e-6:
+                            hi = mid
+                            best_p = opt_params
+                            best_side = mid
+                        else:
+                            lo = mid
+                    
+                    if best_side < best_score:
+                        best_score = best_side
+                        best_result = (best_p.copy(), outer_center, best_side, outer_angle)
+        
+        return best_p, best_side
+    
+    # Phase 1: Try local optimization from multiple starts with decreasing outer sides
+    outer_angles = [0.0, 30.0]
+    
+    for outer_angle in outer_angles:
+        if time.time() > deadline - 30.0:
+            break
+        
+        outer_center = (0.0, 0.0)
+        
+        outer_sides = [5.0, 4.5, 4.2, 4.0, 3.8, 3.6, 3.5, 3.4, 3.3, 3.2]
+        
+        for outer_side in outer_sides:
+            if time.time() > deadline - 25.0:
+                break
+            
+            found_valid = False
+            for config in configs:
+                if time.time() > deadline - 20.0:
+                    break
+                
+                init_params = []
+                for (x, y) in config:
+                    init_params.extend([float(x), float(y), 0.0])
+                init_params = np.array(init_params)
+                
+                pen = _total_penalty(init_params, outer_side, outer_center, outer_angle)
+                
+                if pen < 1e-6:
+                    if outer_side < best_score:
+                        best_score = outer_side
+                        best_result = (init_params.copy(), outer_center, outer_side, outer_angle)
+                    found_valid = True
+                    continue
+                
+                # Try smooth optimization first
+                success, opt_params, opt_val = try_local_optimize_smooth(
+                    init_params, outer_side, outer_center, outer_angle
+                )
+                
+                if success:
+                    actual_pen = _total_penalty(opt_params, outer_side, outer_center, outer_angle)
+                    if actual_pen < 1e-6:
+                        if outer_side < best_score:
+                            best_score = outer_side
+                            best_result = (opt_params, outer_center, outer_side, outer_angle)
+                        found_valid = True
+                        continue
+                    
+                    if actual_pen < 0.1:
+                        success2, opt_params2, opt_val2 = try_local_optimize(
+                            opt_params, outer_side, outer_center, outer_angle
+                        )
+                        if success2 and opt_val2 < 1e-6:
+                            if outer_side < best_score:
+                                best_score = outer_side
+                                best_result = (opt_params2, outer_center, outer_side, outer_angle)
+                            found_valid = True
+                            continue
+                
+                # Fallback to original optimization
+                success, opt_params, opt_val = try_local_optimize(
+                    init_params, outer_side, outer_center, outer_angle
+                )
+                
+                if success and opt_val < 1e-6:
+                    if outer_side < best_score:
+                        best_score = outer_side
+                        best_result = (opt_params, outer_center, outer_side, outer_angle)
+                    found_valid = True
+                    continue
+                
+                if success and opt_val < 0.05 and outer_side > 3.2:
+                    smaller = outer_side - 0.1
+                    if time.time() > deadline - 15.0:
+                        continue
+                    success2, opt_params2, opt_val2 = try_local_optimize(
+                        opt_params, smaller, outer_center, outer_angle, max_iter=60, maxfun=1500
+                    )
+                    if success2 and opt_val2 < 1e-6:
+                        if smaller < best_score:
+                            best_score = smaller
+                            best_result = (opt_params2, outer_center, smaller, outer_angle)
+                        found_valid = True
+    
+    # Phase 2: Lagrangian dual ascent for container scale
+    if time.time() < deadline - 40.0:
+        for outer_angle in [0.0, 30.0]:
+            if time.time() > deadline - 35.0:
+                break
+            outer_center = (0.0, 0.0)
+            
+            for config in configs[:3]:
+                if time.time() > deadline - 30.0:
+                    break
+                
+                init_params = []
+                for (x, y) in config:
+                    init_params.extend([float(x), float(y), 0.0])
+                init_params = np.array(init_params)
+                
+                best_params, best_s = lagrangian_dual_ascent(
+                    init_params, outer_center, outer_angle,
+                    max_iter=30, lr=0.05, beta=50.0
+                )
+                
+                if best_s < best_score:
+                    pen = _total_penalty(best_params, best_s, outer_center, outer_angle)
+                    if pen < 1e-4:
+                        best_score = best_s
+                        best_result = (best_params, outer_center, best_s, outer_angle)
+    
+    # Phase 3: Parametric brick-wall search (structural change)
+    if time.time() < deadline - 40.0:
+        for outer_angle in [0.0, 30.0]:
+            if time.time() > deadline - 35.0:
+                break
+            outer_center = (0.0, 0.0)
+            parametric_search(outer_center, outer_angle)
+    
+    # Phase 4: If we have a result, try to improve with binary search
+    if best_result is not None and time.time() < deadline - 15.0:
+        opt_params, outer_center, outer_side, outer_angle = best_result
+        
+        low = outer_side - 0.3
+        high = outer_side
+        for _ in range(5):
+            if time.time() > deadline - 10.0:
+                break
+            mid = (low + high) / 2
+            if mid < 3.0:
+                break
+            
+            # Use smooth optimization for the binary search
+            success, opt_params_new, opt_val = try_local_optimize_smooth(
+                opt_params, mid, outer_center, outer_angle, max_iter=60, maxfun=1500
+            )
+            
+            if success:
+                actual_pen = _total_penalty(opt_params_new, mid, outer_center, outer_angle)
+                if actual_pen < 1e-6:
+                    high = mid
+                    opt_params = opt_params_new
+                    outer_side = mid
+                    if outer_side < best_score:
+                        best_score = outer_side
+                        best_result = (opt_params, outer_center, outer_side, outer_angle)
+                else:
+                    low = mid
+            else:
+                low = mid
+        
+        if time.time() < deadline - 25.0 and outer_side > 3.1:
+            de_params = try_de_global(outer_side - 0.2, outer_center, outer_angle, maxiter=20)
+            if de_params is not None:
+                success, opt_params_de, opt_val_de = try_local_optimize(
+                    de_params, outer_side - 0.2, outer_center, outer_angle, max_iter=40, maxfun=1000
+                )
+                if success and opt_val_de < 1e-6:
+                    new_side = outer_side - 0.2
+                    if new_side < best_score:
+                        best_score = new_side
+                        best_result = (opt_params_de, outer_center, new_side, outer_angle)
+    
+    # Phase 5: Final high-precision polish pass
+    if best_result is not None and time.time() < deadline - 10.0:
+        opt_params, outer_center, outer_side, outer_angle = best_result
+        
+        def polish_objective(p):
+            return _total_penalty(p, outer_side, outer_center, outer_angle)
+        
+        try:
+            result = minimize(
+                polish_objective,
+                opt_params,
+                method='L-BFGS-B',
+                options={'maxiter': 200, 'maxfun': 5000, 'ftol': 1e-16, 'gtol': 1e-12}
+            )
+            if result.fun < 1e-8:
+                for delta in [0.01, 0.02, 0.03, 0.05]:
+                    new_side = outer_side - delta
+                    if new_side < 3.0:
+                        continue
+                    
+                    success, opt_params_new, opt_val = try_local_optimize_smooth(
+                        result.x, new_side, outer_center, outer_angle,
+                        max_iter=80, maxfun=2000
+                    )
+                    
+                    if success:
+                        actual_pen = _total_penalty(opt_params_new, new_side, outer_center, outer_angle)
+                        if actual_pen < 1e-6:
+                            outer_side = new_side
+                            opt_params = opt_params_new
+                            if outer_side < best_score:
+                                best_score = outer_side
+                                best_result = (opt_params, outer_center, outer_side, outer_angle)
+                            break
+        except Exception:
+            pass
+    
+    # Fallback
+    if best_result is None:
+        inner = []
+        pos = build_hexagonal_lattice(3, 4)
+        arr = np.array(pos)
+        centroid = arr.mean(axis=0)
+        for (x, y) in (arr - centroid):
+            inner.append([float(x), float(y), 0.0])
+        return inner, (0.0, 0.0), 5.5, 0.0
+    
+    opt_params, outer_center, outer_side, outer_angle = best_result
+    
+    inner = []
+    for i in range(N):
+        x = float(opt_params[3*i])
+        y = float(opt_params[3*i+1])
+        ang = float(opt_params[3*i+2])
+        inner.append([x, y, ang])
+    
+    # Final validation
+    inner_verts_list = []
+    for i in range(N):
+        cx, cy, ang = opt_params[3*i], opt_params[3*i+1], opt_params[3*i+2]
+        inner_verts_list.append(_hex_verts(cx, cy, 1.0, ang))
+    outer_verts = _hex_verts(outer_center[0], outer_center[1], outer_side, outer_angle)
+    
+    cont_pen = sum(_containment_penalty(iv, outer_verts) for iv in inner_verts_list)
+    disj_pen = 0.0
+    for i in range(N):
+        for j in range(i+1, N):
+            d = _sat_overlap_depth(inner_verts_list[i], inner_verts_list[j])
+            if d > 0:
+                disj_pen += d
+    
+    if cont_pen > 1e-4 or disj_pen > 1e-4:
+        inner = []
+        pos = build_hexagonal_lattice(3, 4)
+        arr = np.array(pos)
+        centroid = arr.mean(axis=0)
+        for (x, y) in (arr - centroid):
+            inner.append([float(x), float(y), 0.0])
+        return inner, (0.0, 0.0), 5.5, 0.0
+    
+    return inner, (float(outer_center[0]), float(outer_center[1])), float(outer_side), float(outer_angle)
+
+# EVOLVE-BLOCK-END

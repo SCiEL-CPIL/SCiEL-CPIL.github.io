@@ -1,0 +1,432 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+import random
+from collections import deque, defaultdict
+import heapq
+
+_DEADLINE = 115.0  # seconds, safety margin before 120s kill
+_START_TIME = None
+
+
+def _compute_resource_slack_scores(durations, demands, capacities, predecessors):
+    """
+    Compute priority scores by simulating a greedy serial schedule where
+    eligible activities are ranked by a composite score that explicitly includes
+    the current resource slack (capacity minus current demand) for each resource
+    they consume. This dynamically penalizes activities that would cause immediate
+    resource bottlenecks.
+    """
+    n = len(durations)
+    m = len(capacities)
+    
+    # Build successor lists
+    in_degree = [0] * n
+    successors = [[] for _ in range(n)]
+    for i in range(n):
+        for p in predecessors[i]:
+            in_degree[i] += 1
+            successors[p].append(i)
+    
+    # Initialize eligible set
+    eligible = set()
+    for i in range(n):
+        if in_degree[i] == 0:
+            eligible.add(i)
+    
+    completed = [False] * n
+    start_times = [0] * n
+    current_time = 0
+    scheduled_count = 0
+    
+    # Track resource usage over time using intervals
+    resource_intervals = [[] for _ in range(m)]  # list of (start, end, activity_id)
+    
+    # Scores for each activity
+    scores = np.zeros(n)
+    
+    while scheduled_count < n:
+        if time.time() - _START_TIME > _DEADLINE - 5.0:
+            break
+        
+        if not eligible:
+            break
+        
+        # For each eligible activity, compute a dynamic score based on resource slack
+        best_activity = None
+        best_score = -float('inf')
+        
+        for a in eligible:
+            # Find earliest start time for this activity
+            earliest = current_time
+            for r in range(m):
+                demand = demands[a][r]
+                if demand == 0:
+                    continue
+                # Check if activity fits at current_time
+                usage = 0
+                for (s, e, aid) in resource_intervals[r]:
+                    if s <= current_time < e:
+                        usage += demands[aid][r]
+                if usage + demand > capacities[r]:
+                    # Need to wait until some interval ends
+                    candidate_times = [current_time]
+                    for (s, e, aid) in resource_intervals[r]:
+                        if s <= current_time < e:
+                            candidate_times.append(e)
+                    earliest = max(earliest, min(candidate_times))
+            
+            # Compute resource slack score: for each resource this activity uses,
+            # measure how much slack is available at its earliest start time
+            slack_score = 0.0
+            for r in range(m):
+                demand = demands[a][r]
+                if demand == 0:
+                    continue
+                # Usage at earliest start
+                usage_at_earliest = 0
+                for (s, e, aid) in resource_intervals[r]:
+                    if s <= earliest < e:
+                        usage_at_earliest += demands[aid][r]
+                slack = capacities[r] - usage_at_earliest - demand
+                # Higher slack is better (more room)
+                if capacities[r] > 0:
+                    slack_score += max(0, slack) / capacities[r]
+            
+            # Combine with criticality-based features
+            # Activities with more successors and on critical path should go first
+            succ_count = len(successors[a])
+            
+            # Dynamic score: prioritize activities that fit well in current resource landscape
+            # and have high impact (more successors)
+            dynamic_score = slack_score + 0.5 * succ_count * (1.0 / (1.0 + durations[a]))
+            
+            if dynamic_score > best_score:
+                best_score = dynamic_score
+                best_activity = a
+        
+        if best_activity is None:
+            break
+        
+        # Schedule the best activity
+        st = current_time
+        # Recalculate earliest start for the chosen activity
+        for r in range(m):
+            demand = demands[best_activity][r]
+            if demand == 0:
+                continue
+            usage = 0
+            for (s, e, aid) in resource_intervals[r]:
+                if s <= st < e:
+                    usage += demands[aid][r]
+            if usage + demand > capacities[r]:
+                candidate_times = [st]
+                for (s, e, aid) in resource_intervals[r]:
+                    if s <= st < e:
+                        candidate_times.append(e)
+                st = max(st, min(candidate_times))
+        
+        start_times[best_activity] = st
+        et = st + durations[best_activity]
+        
+        for r in range(m):
+            if demands[best_activity][r] > 0:
+                resource_intervals[r].append((st, et, best_activity))
+        
+        completed[best_activity] = True
+        scheduled_count += 1
+        eligible.discard(best_activity)
+        
+        if st > current_time:
+            current_time = st
+        
+        for succ in successors[best_activity]:
+            in_degree[succ] -= 1
+            if in_degree[succ] == 0:
+                eligible.add(succ)
+    
+    # Compute final makespan
+    makespan = max(start_times[i] + durations[i] for i in range(n)) if n > 0 else 0
+    
+    # Convert schedule to priority scores: activities scheduled earlier get higher priority
+    # Normalize start times to [0, 1] and invert
+    if n > 0:
+        min_st = min(start_times)
+        max_st = max(start_times)
+        if max_st - min_st > 1e-12:
+            norm_st = (start_times - min_st) / (max_st - min_st)
+        else:
+            norm_st = np.zeros(n)
+        # Earlier start = higher priority
+        scores = 1.0 - norm_st
+    
+    return scores
+
+
+def _serial_schedule(durations, demands, capacities, predecessors, priority_scores):
+    """
+    Serial schedule generation scheme.
+    durations: (n,) array of activity durations
+    demands: (n, m) array of resource demands per activity per resource
+    capacities: (m,) array of resource capacities
+    predecessors: list of lists, predecessors[i] is list of indices
+    priority_scores: (n,) array of priority scores (higher = earlier)
+    Returns: makespan (total project duration)
+    """
+    global _START_TIME
+    if _START_TIME is None:
+        _START_TIME = time.time()
+    
+    n = len(durations)
+    m = len(capacities)
+    
+    # Build successor lists
+    in_degree = [0] * n
+    successors = [[] for _ in range(n)]
+    for i in range(n):
+        for p in predecessors[i]:
+            in_degree[i] += 1
+            successors[p].append(i)
+    
+    start_times = [0] * n
+    completed = [False] * n
+    eligible = set()
+    
+    for i in range(n):
+        if in_degree[i] == 0:
+            eligible.add(i)
+    
+    current_time = 0
+    scheduled_count = 0
+    
+    # For each resource, maintain list of (start, end, activity_id)
+    resource_intervals = [[] for _ in range(m)]
+    
+    def get_usage_at(r, t):
+        """Get total usage of resource r at time t."""
+        total = 0
+        for (s, e, _) in resource_intervals[r]:
+            if s <= t < e:
+                total += demands[r][0]  # placeholder, will fix
+        return total
+    
+    def can_start(activity, t):
+        """Check if activity can start at time t given resource constraints."""
+        for r in range(m):
+            demand = demands[activity][r]
+            if demand == 0:
+                continue
+            # Sum usage of all intervals overlapping t
+            usage = 0
+            for (s, e, _) in resource_intervals[r]:
+                if s <= t < e:
+                    usage += demands[_][r]
+            if usage + demand > capacities[r]:
+                return False
+        return True
+    
+    def earliest_start(activity, t_min):
+        """Find earliest time >= t_min when activity can start."""
+        # Candidate times: t_min, and all start/end times of intervals > t_min
+        candidates = set()
+        candidates.add(t_min)
+        for r in range(m):
+            for (s, e, _) in resource_intervals[r]:
+                if s >= t_min:
+                    candidates.add(s)
+                if e >= t_min:
+                    candidates.add(e)
+        
+        for ct in sorted(candidates):
+            if ct >= t_min and can_start(activity, ct):
+                return ct
+        
+        # Fallback: step through time
+        max_known = max(candidates) if candidates else t_min
+        t = t_min
+        while t < max_known + 10000:
+            if can_start(activity, t):
+                return t
+            # Jump to next boundary
+            next_bp = t + 1
+            for r in range(m):
+                for (s, e, _) in resource_intervals[r]:
+                    if e > t and e < next_bp:
+                        next_bp = e
+            t = next_bp
+        return t
+    
+    while scheduled_count < n:
+        if time.time() - _START_TIME > _DEADLINE - 3.0:
+            # Return best-effort estimate
+            max_st = max(start_times) if any(st > 0 for st in start_times) else 0
+            return max_st + max(durations) if n > 0 else 0
+        
+        # Find highest priority eligible activity
+        best_activity = None
+        best_priority = -float('inf')
+        for a in eligible:
+            if priority_scores[a] > best_priority:
+                best_priority = priority_scores[a]
+                best_activity = a
+        
+        if best_activity is None:
+            break
+        
+        st = earliest_start(best_activity, current_time)
+        start_times[best_activity] = st
+        et = st + durations[best_activity]
+        
+        for r in range(m):
+            if demands[best_activity][r] > 0:
+                resource_intervals[r].append((st, et, best_activity))
+        
+        completed[best_activity] = True
+        scheduled_count += 1
+        eligible.discard(best_activity)
+        
+        if st > current_time:
+            current_time = st
+        
+        for succ in successors[best_activity]:
+            in_degree[succ] -= 1
+            if in_degree[succ] == 0:
+                eligible.add(succ)
+    
+    if any(st > 0 for st in start_times):
+        makespan = max(start_times[i] + durations[i] for i in range(n))
+    else:
+        makespan = sum(durations)
+    
+    return makespan
+
+
+def priority(instance):
+    global _START_TIME
+    if _START_TIME is None:
+        _START_TIME = time.time()
+    
+    durations = np.asarray(instance["durations"], dtype=float)
+    demands = np.asarray(instance["demand"] if "demand" in instance else instance.get("demands", np.zeros((len(durations), 0))), dtype=float)
+    capacities = np.asarray(instance["capacity"] if "capacity" in instance else instance.get("capacities", np.array([float('inf')])), dtype=float)
+    predecessors = instance["predecessors"] if "predecessors" in instance else instance.get("predecessor_lists", [[] for _ in range(len(durations))])
+    
+    n = len(durations)
+    m = len(capacities)
+    
+    if demands.ndim == 1:
+        demands = demands.reshape(n, 1)
+        capacities = capacities.reshape(1)
+        m = 1
+    
+    if m == 0 or len(capacities) == 0:
+        m = 1
+        capacities = np.array([float('inf')])
+        demands = np.zeros((n, 1))
+    
+    if demands.shape[1] < m:
+        pad = np.zeros((n, m - demands.shape[1]))
+        demands = np.hstack([demands, pad])
+    elif demands.shape[1] > m:
+        demands = demands[:, :m]
+    
+    # Build graph
+    successors = [[] for _ in range(n)]
+    in_degree = [0] * n
+    for i in range(n):
+        for p in predecessors[i]:
+            in_degree[i] += 1
+            successors[p].append(i)
+    
+    # Topological order
+    queue = deque([i for i in range(n) if in_degree[i] == 0])
+    topo = []
+    in_deg_copy = in_degree[:]
+    while queue:
+        node = queue.popleft()
+        topo.append(node)
+        for s in successors[node]:
+            in_deg_copy[s] -= 1
+            if in_deg_copy[s] == 0:
+                queue.append(s)
+    if len(topo) < n:
+        for i in range(n):
+            if i not in topo:
+                topo.append(i)
+    
+    # Compute head (earliest start time in unconstrained schedule)
+    head = np.zeros(n)
+    for node in topo:
+        best = 0
+        for p in predecessors[node]:
+            val = head[p] + durations[p]
+            if val > best:
+                best = val
+        head[node] = best
+    
+    # Compute tail (longest path from node to end, excluding node's duration)
+    tail = np.zeros(n)
+    for node in reversed(topo):
+        best = 0
+        for s in successors[node]:
+            val = durations[s] + tail[s]
+            if val > best:
+                best = val
+        tail[node] = best
+    
+    # Critical path length
+    cp_len = max(head[i] + durations[i] + tail[i] for i in range(n)) if n > 0 else 0
+    
+    # Total float (slack)
+    total_float = cp_len - head - durations - tail
+    total_float = np.maximum(total_float, 0)
+    
+    # Number of immediate successors
+    succ_count = np.array([len(succs) for succs in successors], dtype=float)
+    pred_count = np.array([len(preds) for preds in predecessors], dtype=float)
+    
+    # Total resource demand
+    total_demand = demands.sum(axis=1)
+    
+    # Max demand-to-capacity ratio (resource pressure)
+    demand_ratio = np.zeros(n)
+    for r in range(m):
+        if capacities[r] > 0 and np.isfinite(capacities[r]):
+            ratio = demands[:, r] / capacities[r]
+            demand_ratio = np.maximum(demand_ratio, ratio)
+    
+    # Normalize features to [0, 1]
+    def norm(x):
+        x = np.asarray(x, dtype=float)
+        mn, mx = x.min(), x.max()
+        if mx - mn > 1e-12:
+            return (x - mn) / (mx - mn)
+        return np.zeros_like(x)
+    
+    # We want higher score = schedule earlier
+    # Low float -> high priority, so invert
+    norm_float_inv = 1.0 - norm(total_float)
+    norm_tail = norm(tail)
+    norm_duration = norm(durations)
+    norm_demand = norm(total_demand)
+    norm_ratio = norm(demand_ratio)
+    norm_succ = norm(succ_count)
+    norm_pred = norm(pred_count)
+    
+    # Compute dynamic resource-slack-based scores
+    dynamic_scores = _compute_resource_slack_scores(durations, demands, capacities, predecessors)
+    
+    # Weighted combination: blend static criticality with dynamic resource awareness
+    # Inspired by successful solutions: emphasize CPM rank/tail and resource pressure
+    scores = (0.35 * norm_float_inv +
+              0.20 * norm_tail +
+              0.10 * norm_duration +
+              0.05 * norm_demand +
+              0.05 * norm_ratio +
+              0.02 * norm_succ +
+              0.01 * norm_pred +
+              0.22 * dynamic_scores)
+    
+    return scores
+# EVOLVE-BLOCK-END

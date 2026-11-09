@@ -1,85 +1,122 @@
-"""Rewritten program with a stronger, direct, cost-aware acquisition."""
-# EVOLVE-BLOCK-START
 import numpy as np
 from scipy.stats import norm
 import time
 
+# Deadline guard constants
 _START_TIME = time.time()
-_DEADLINE_MARGIN = 5.0  # seconds before the hard 330s limit
-
-
-def _elapsed():
-    return time.time() - _START_TIME
-
-
-def _deadline_exceeded():
-    return _elapsed() > (330.0 - _DEADLINE_MARGIN)
-
+_TIME_LIMIT = 300.0
+_SAFETY_MARGIN = 5.0
 
 def acquisition(mu, sigma, f_best, cost):
     """
-    Cost-aware acquisition function for Bayesian optimization (powell 4d).
-
-    Parameters
-    ----------
-    mu : np.ndarray, shape (2000,)
-        GP mean predictions in objective units.
-    sigma : np.ndarray, shape (2000,)
-        GP standard deviation predictions in objective units.
-    f_best : float
-        Lowest observed function value so far.
-    cost : np.ndarray, shape (2000,)
-        Cost of evaluating each candidate, shape (2000,).
-
-    Returns
-    -------
-    np.ndarray, shape (2000,)
-        Finite scores; higher = prefer to evaluate next.
+    Blended acquisition: Cost-normalized EI + Adaptive UCB exploration term.
+    
+    Strategy:
+    1. Compute Expected Improvement (EI) for minimization.
+       EI = (f_best - mu) * Phi(z) + sigma * phi(z), where z = (f_best - mu) / sigma.
+    2. Compute a UCB-like term for minimization: -mu + kappa * sigma.
+       This encourages exploration in high-uncertainty regions.
+    3. Blend the two: score = (EI + w_ucb * gamma * UCB) / cost.
+       - EI provides principled probabilistic improvement (exploitation).
+       - UCB ensures exploration, especially early on when f_best is high.
+       - w_ucb is an adaptive weight that decays as f_best improves.
+       - gamma scales the UCB contribution to be comparable to EI.
+    4. Cost normalization accounts for the cost-aware setting.
+    
+    This combines the structural idea of the current program's focus on cost-awareness
+    and exploration (via Thompson/UCB) with the refinement machinery of the top
+    inspiration (blended EI + UCB with adaptive weights).
     """
-    # Explicit deadline guard
-    if _deadline_exceeded():
-        # Return a safe, finite fallback: favor low mu / high sigma
-        sigma_safe = np.maximum(sigma, 1e-9)
-        return -mu / (sigma_safe + 1e-9) + np.log(sigma_safe + 1.0)
-
+    # Check time budget
+    if time.time() - _START_TIME > _TIME_LIMIT - _SAFETY_MARGIN:
+        # Fallback to a simple heuristic if we are running out of time
+        # Return inverse cost (prefer cheap points)
+        cost_arr = np.asarray(cost, dtype=np.float64)
+        safe_cost = np.where(cost_arr < 1e-9, 1e-9, cost_arr)
+        return 1.0 / safe_cost
+    
     mu = np.asarray(mu, dtype=np.float64)
     sigma = np.asarray(sigma, dtype=np.float64)
     cost = np.asarray(cost, dtype=np.float64)
-
-    # Guard against non-finite or invalid values
-    mu = np.where(np.isfinite(mu), mu, 1e10)
-    sigma = np.where(np.isfinite(sigma) & (sigma > 0), sigma, 1e-6)
-    cost = np.where(np.isfinite(cost) & (cost > 0), cost, 1.0)
-
-    # Clamp sigma to avoid division issues
-    sigma_safe = np.maximum(sigma, 1e-9)
-
-    # Standard z-score for expected improvement
-    improvement = f_best - mu
-    z = improvement / sigma_safe
-
-    # Expected Improvement (EI)
-    ei = improvement * norm.cdf(z) + sigma_safe * norm.pdf(z)
-    ei = np.where(np.isfinite(ei), ei, 0.0)
-
-    # Upper Confidence Bound (UCB) for minimization
-    # We want to maximize (f_best - mu + kappa * sigma)
-    # This encourages exploration of high uncertainty regions even if mu is not optimal
-    kappa = 1.5
-    ucb_value = f_best - mu + kappa * sigma_safe
-    ucb_value = np.where(np.isfinite(ucb_value), ucb_value, 0.0)
-
-    # Combine EI and UCB
-    # EI is good for exploitation. UCB is good for exploration.
-    # We weight them to balance the two.
-    # The UCB term is in the same units as EI (objective value difference).
-    combined_value = ei + 0.5 * ucb_value
     
-    # Cost-aware: per unit cost
-    total_score = combined_value / cost
-
-    # Ensure finiteness
-    total_score = np.where(np.isfinite(total_score), total_score, -1e10)
-
-    return total_score
-# EVOLVE-BLOCK-END
+    eps = 1e-9
+    
+    # Ensure sigma is positive and finite
+    safe_sigma = np.where(sigma < eps, eps, sigma)
+    safe_sigma = np.where(np.isfinite(safe_sigma), safe_sigma, eps)
+    
+    # Ensure cost is positive and finite
+    safe_cost = np.where(cost < eps, eps, cost)
+    safe_cost = np.where(np.isfinite(safe_cost), safe_cost, eps)
+    
+    # Ensure mu is finite
+    mu_safe = np.where(np.isfinite(mu), mu, f_best)
+    
+    # --- Compute Expected Improvement (EI) ---
+    z = (f_best - mu_safe) / safe_sigma
+    z_clipped = np.clip(z, -10, 10)
+    
+    phi_z = norm.pdf(z_clipped)
+    phi_z = np.where(np.isfinite(phi_z), phi_z, 0.0)
+    
+    cdf_z = norm.cdf(z_clipped)
+    cdf_z = np.where(np.isfinite(cdf_z), cdf_z, 0.0)
+    
+    ei = (f_best - mu_safe) * cdf_z + safe_sigma * phi_z
+    ei = np.maximum(ei, 0.0)
+    
+    # --- Compute UCB term ---
+    # UCB = -mu + kappa * sigma
+    # kappa should be adaptive: higher when f_best is high (early), lower when f_best is low (late)
+    
+    # Adaptive kappa: start around 1.5, decay to ~0.3
+    # Use a smoother, gentler decay based on f_best
+    # f_best for Powell 4D starts ~10-20, ends near 0
+    # Gentler slope (0.5 instead of 0.8) and shifted center (2.0 instead of 3.0)
+    try:
+        kappa = 0.3 + 1.2 / (1.0 + np.exp((f_best - 2.0) * 0.5))
+    except OverflowError:
+        kappa = 0.3 if f_best < 2.0 else 1.5
+    
+    kappa = np.clip(kappa, 0.1, 2.0)
+    
+    ucb = -mu_safe + kappa * safe_sigma
+    
+    # --- Adaptive blend weight ---
+    # w_ucb controls how much UCB contributes relative to EI
+    # We want UCB weight HIGH when f_best is HIGH (early exploration).
+    # w_ucb = 1 / (1 + exp((5 - f_best) * 0.5))
+    # If f_best = 10: exp(-2.5) ~ 0.08, w ~ 0.92 (High)
+    # If f_best = 0: exp(2.5) ~ 12, w ~ 0.08 (Low)
+    
+    try:
+        w_ucb = 1.0 / (1.0 + np.exp((5.0 - f_best) * 0.5))
+    except OverflowError:
+        w_ucb = 1.0 if f_best > 5.0 else 0.0
+        
+    w_ucb = np.clip(w_ucb, 0.0, 1.0)
+    
+    # Scale UCB to be comparable to EI
+    # EI is in objective units. UCB is in objective units.
+    # gamma scales the UCB contribution.
+    # Adaptive gamma: scale relative to typical EI magnitude
+    ei_scale = np.mean(ei) if np.mean(ei) > eps else 1.0
+    ucb_scale = np.mean(np.abs(ucb)) if np.mean(np.abs(ucb)) > eps else 1.0
+    gamma = 0.5 * (ei_scale / ucb_scale)
+    gamma = np.clip(gamma, 0.1, 2.0)
+    
+    blended = ei + w_ucb * gamma * ucb
+    
+    # Cost-aware score
+    scores = blended / safe_cost
+    
+    # Ensure scores are well-behaved: shift to be positive and scale
+    # This helps with numerical stability and ensures ranking is meaningful
+    min_score = np.min(scores)
+    if np.isfinite(min_score) and min_score < 0:
+        scores = scores - min_score + 1e-6
+    
+    # Final safety checks
+    scores = np.where(np.isfinite(scores), scores, 0.0)
+    
+    return scores

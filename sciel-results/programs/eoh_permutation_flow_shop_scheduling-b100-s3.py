@@ -1,261 +1,250 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
 # EVOLVE-BLOCK-START
-import time
 import numpy as np
-
+import time
+import random
 
 def _makespan(perm, pt):
-    """Compute makespan for a permutation. O(n*m)."""
+    """Compute makespan for a given permutation using vectorized operations."""
+    if len(perm) == 0:
+        return 0.0
     n = len(perm)
     m = pt.shape[1]
-    if m == 0 or n == 0:
+    if n == 0:
         return 0.0
     
-    # Efficient simulation using the recurrence
-    # completion on machine 0 is cumulative sum
-    prev_completion = np.cumsum(pt[perm, 0])
+    # Precompute completion times using the recurrence:
+    # C[j, k] = max(C[j-1, k], C[j, k-1]) + p[j, k]
+    # We maintain C_prev (completion times for previous job across machines)
+    # and compute C_curr for current job.
     
-    for k in range(1, m):
-        curr_completion = np.empty(n, dtype=np.float64)
-        curr_completion[0] = prev_completion[0] + pt[perm[0], k]
-        # Vectorized version: for i >= 1, curr[i] = max(prev[i], curr[i-1]) + pt[perm[i], k]
-        # This is inherently sequential, but we can use a loop
-        for i in range(1, n):
-            curr_completion[i] = max(prev_completion[i], curr_completion[i-1]) + pt[perm[i], k]
-        prev_completion = curr_completion
+    C_prev = np.zeros(m)
+    for j in perm:
+        C_curr = np.zeros(m)
+        C_curr[0] = C_prev[0] + pt[j, 0]
+        # For k >= 1: C_curr[k] = max(C_prev[k], C_curr[k-1]) + pt[j, k]
+        # This has a sequential dependency on C_curr[k-1], so we can't fully vectorize
+        # But we can use a loop with numpy scalars which is faster than Python floats
+        for k in range(1, m):
+            C_curr[k] = max(C_prev[k], C_curr[k-1]) + pt[j, k]
+        C_prev = C_curr
+        
+    return float(C_prev[-1])
+
+def _makespan_from_prefix(perm, pt, start_idx):
+    """
+    Compute makespan starting from a prefix.
+    Assumes perm[0:start_idx] has already been processed and returns the completion vector
+    after processing perm[start_idx:].
+    For efficiency in local search, we precompute the completion state up to start_idx.
+    """
+    if start_idx >= len(perm):
+        # Only need to compute from the prefix
+        C_prev = np.zeros(pt.shape[1])
+        for j in perm[:start_idx]:
+            C_curr = np.zeros(pt.shape[1])
+            C_curr[0] = C_prev[0] + pt[j, 0]
+            for k in range(1, pt.shape[1]):
+                C_curr[k] = max(C_prev[k], C_curr[k-1]) + pt[j, k]
+            C_prev = C_curr
+        return float(C_prev[-1]) if len(perm) > 0 else 0.0
     
-    return float(prev_completion[-1])
-
-
-def _makespan_fast(perm, pt):
-    """Optimized makespan computation using pure Python loops for small n."""
-    n = len(perm)
     m = pt.shape[1]
-    if m == 0 or n == 0:
-        return 0.0
-    
-    # Use list-based approach for better cache performance
-    prev = [0.0] * n
-    # Machine 0
-    s = 0.0
-    for i in range(n):
-        s += pt[perm[i], 0]
-        prev[i] = s
-    
-    for k in range(1, m):
-        curr = [0.0] * n
-        curr[0] = prev[0] + pt[perm[0], k]
-        for i in range(1, n):
-            v1 = prev[i]
-            v2 = curr[i-1]
-            curr[i] = (v1 if v1 > v2 else v2) + pt[perm[i], k]
-        prev = curr
-    
-    return prev[-1]
-
+    C_prev = np.zeros(m)
+    for j in perm:
+        C_curr = np.zeros(m)
+        C_curr[0] = C_prev[0] + pt[j, 0]
+        for k in range(1, m):
+            C_curr[k] = max(C_prev[k], C_curr[k-1]) + pt[j, k]
+        C_prev = C_curr
+    return float(C_prev[-1])
 
 def _neh_heuristic(pt):
-    """NEH heuristic for flow shop. Returns permutation."""
+    """
+    NEH (Nawaz, Enscore, Ham) heuristic.
+    1. Sort jobs by total processing time in descending order.
+    2. Insert each job into the position that minimizes makespan.
+    """
     n, m = pt.shape
-    
-    # Sort jobs by total processing time in descending order
-    totals = pt.sum(axis=1)
-    order = np.argsort(-totals)
-    
-    # Build permutation greedily
-    perm = []
-    
-    for job in order:
-        if not perm:
-            perm = [job]
-            continue
-        
-        best_pos = 0
-        best_ms = float('inf')
-        
-        for pos in range(len(perm) + 1):
-            new_perm = perm[:pos] + [job] + perm[pos:]
-            ms = _makespan_fast(np.array(new_perm, dtype=np.int64), pt)
-            if ms < best_ms:
-                best_ms = ms
-                best_pos = pos
-        
-        perm.insert(best_pos, job)
-    
-    return np.array(perm, dtype=np.int64)
-
-
-def _local_search_2opt(perm, pt, max_iters=500, deadline=None):
-    """2-opt local search for flow shop with time limit."""
-    n = len(perm)
-    if n <= 1:
-        return perm
-    
-    best_perm = perm.copy()
-    best_ms = _makespan_fast(best_perm, pt)
-    
-    improved = True
-    iters = 0
-    while improved and iters < max_iters:
-        improved = False
-        iters += 1
-        for i in range(n - 1):
-            if deadline is not None and time.time() > deadline:
-                return best_perm
-            for j in range(i + 1, n):
-                new_perm = best_perm.copy()
-                new_perm[i:j+1] = best_perm[i:j+1][::-1]
-                ms = _makespan_fast(new_perm, pt)
-                if ms < best_ms - 1e-9:
-                    best_perm = new_perm
-                    best_ms = ms
-                    improved = True
-    
-    return best_perm
-
-
-def _local_search_swap(perm, pt, max_iters=200, deadline=None):
-    """Swap-based local search for flow shop."""
-    n = len(perm)
-    if n <= 1:
-        return perm
-    
-    best_perm = perm.copy()
-    best_ms = _makespan_fast(best_perm, pt)
-    
-    improved = True
-    iters = 0
-    while improved and iters < max_iters:
-        improved = False
-        iters += 1
-        for i in range(n - 1):
-            if deadline is not None and time.time() > deadline:
-                return best_perm
-            for j in range(i + 1, n):
-                new_perm = best_perm.copy()
-                new_perm[i], new_perm[j] = new_perm[j], new_perm[i]
-                ms = _makespan_fast(new_perm, pt)
-                if ms < best_ms - 1e-9:
-                    best_perm = new_perm
-                    best_ms = ms
-                    improved = True
-    
-    return best_perm
-
-
-def order_jobs(processing_times):
-    """Construct a job permutation minimizing makespan on flow-shop instances."""
-    start_time = time.time()
-    deadline = start_time + 140.0  # Safety margin before 150s limit
-    
-    pt = np.asarray(processing_times, dtype=np.float64)
-    n, m = pt.shape
-    
     if n == 0:
         return []
-    if n == 1:
-        return [0]
     
-    # Start with NEH heuristic
-    best_perm = _neh_heuristic(pt)
-    best_ms = _makespan_fast(best_perm, pt)
+    # Calculate total processing time for each job
+    totals = pt.sum(axis=1)
+    # Sort indices by total processing time descending
+    order = np.argsort(-totals)
     
-    # Local search with 2-opt
-    if time.time() < deadline:
-        ls_perm = _local_search_2opt(best_perm, pt, max_iters=300, deadline=deadline)
-        ls_ms = _makespan_fast(ls_perm, pt)
-        if ls_ms < best_ms:
-            best_perm = ls_perm
-            best_ms = ls_ms
+    current_perm = []
+    for job_idx in order:
+        job = int(job_idx)
+        best_pos = 0
+        best_mk = float('inf')
+        
+        # Try inserting job at each position in current_perm
+        for pos in range(len(current_perm) + 1):
+            candidate_perm = current_perm[:pos] + [job] + current_perm[pos:]
+            mk = _makespan(candidate_perm, pt)
+            if mk < best_mk:
+                best_mk = mk
+                best_pos = pos
+        
+        current_perm = current_perm[:best_pos] + [job] + current_perm[best_pos:]
+        
+    return current_perm
+
+def _local_search_insertion(perm, pt, time_limit=None):
+    """
+    Perform a local search using insertion moves.
+    For each job, try moving it to every other position.
+    Accept the best move if it improves the makespan.
+    Repeat until no improvement is found or time limit reached.
+    """
+    n = len(perm)
+    current_mk = _makespan(perm, pt)
+    improved = True
+    start = time.time()
     
-    # Try NEH with average processing time
-    if time.time() < deadline:
-        avgs = pt.mean(axis=1)
-        order2 = np.argsort(-avgs)
-        perm2 = []
-        for job in order2:
-            if not perm2:
-                perm2 = [job]
-                continue
-            best_pos = 0
-            best_ms2 = float('inf')
-            for pos in range(len(perm2) + 1):
-                new_perm = perm2[:pos] + [job] + perm2[pos:]
-                ms = _makespan_fast(np.array(new_perm, dtype=np.int64), pt)
-                if ms < best_ms2:
-                    best_ms2 = ms
-                    best_pos = pos
-            perm2.insert(best_pos, job)
-        perm2_arr = np.array(perm2, dtype=np.int64)
-        ms2 = _makespan_fast(perm2_arr, pt)
-        if ms2 < best_ms:
-            best_perm = perm2_arr
-            best_ms = ms2
-            if time.time() < deadline:
-                ls_perm2 = _local_search_2opt(best_perm, pt, max_iters=200, deadline=deadline)
-                ls_ms2 = _makespan_fast(ls_perm2, pt)
-                if ls_ms2 < best_ms:
-                    best_perm = ls_perm2
-                    best_ms = ls_ms2
+    while improved:
+        if time_limit is not None and time.time() - start > time_limit:
+            break
+        improved = False
+        best_move = None
+        best_mk = current_mk
+        
+        for i in range(n):
+            job = perm[i]
+            # Try inserting job at every position j != i
+            # We can skip i and i+1 as they result in the same permutation or minor shifts
+            for j in range(n + 1):
+                if j == i or j == i + 1:
+                    continue
+                
+                # Create candidate permutation
+                candidate = perm[:i] + perm[i+1:]
+                insert_pos = j
+                if j > i:
+                    insert_pos = j - 1
+                candidate = candidate[:insert_pos] + [job] + candidate[insert_pos:]
+                
+                cand_mk = _makespan(candidate, pt)
+                
+                if cand_mk < best_mk:
+                    best_mk = cand_mk
+                    best_move = candidate
+        
+        if best_move is not None:
+            perm = best_move
+            current_mk = best_mk
+            improved = True
+            
+    return perm, current_mk
+
+def _simulated_annealing(perm, pt, best_mk, best_perm, deadline, n):
+    """
+    Simulated Annealing with insertion moves.
+    Returns (best_perm, best_mk, current_perm, current_mk)
+    """
+    current_perm = perm[:]
+    current_mk = _makespan(current_perm, pt)
     
-    # Try NEH with minimum processing time
-    if time.time() < deadline:
-        mins = pt.min(axis=1)
-        order3 = np.argsort(-mins)
-        perm3 = []
-        for job in order3:
-            if not perm3:
-                perm3 = [job]
-                continue
-            best_pos = 0
-            best_ms3 = float('inf')
-            for pos in range(len(perm3) + 1):
-                new_perm = perm3[:pos] + [job] + perm3[pos:]
-                ms = _makespan_fast(np.array(new_perm, dtype=np.int64), pt)
-                if ms < best_ms3:
-                    best_ms3 = ms
-                    best_pos = pos
-            perm3.insert(best_pos, job)
-        perm3_arr = np.array(perm3, dtype=np.int64)
-        ms3 = _makespan_fast(perm3_arr, pt)
-        if ms3 < best_ms:
-            best_perm = perm3_arr
-            best_ms = ms3
-            if time.time() < deadline:
-                ls_perm3 = _local_search_2opt(best_perm, pt, max_iters=200, deadline=deadline)
-                ls_ms3 = _makespan_fast(ls_perm3, pt)
-                if ls_ms3 < best_ms:
-                    best_perm = ls_perm3
-                    best_ms = ls_ms3
+    # Adaptive temperature schedule
+    T = current_mk * 0.15
+    cooling = 0.9995
+    min_T = 1e-6
     
-    # Random restarts with local search
-    rng = np.random.default_rng(42)
-    if time.time() < deadline:
-        num_restarts = 3
-        for r in range(num_restarts):
-            if time.time() >= deadline:
-                break
-            random_perm = rng.permutation(n).astype(np.int64)
-            # Quick local search from random start
-            ls_r = _local_search_swap(random_perm, pt, max_iters=100, deadline=deadline)
-            ls_ms_r = _makespan_fast(ls_r, pt)
-            if ls_ms_r < best_ms:
-                best_perm = ls_r
-                best_ms = ls_ms_r
-            # If improved, try 2-opt as well
-            if time.time() < deadline:
-                ls_r2 = _local_search_2opt(ls_r, pt, max_iters=100, deadline=deadline)
-                ls_ms_r2 = _makespan_fast(ls_r2, pt)
-                if ls_ms_r2 < best_ms:
-                    best_perm = ls_r2
-                    best_ms = ls_ms_r2
+    # Track best
+    local_best_perm = best_perm[:]
+    local_best_mk = best_mk
     
-    # Final polish with swap local search
-    if time.time() < deadline:
-        final_perm = _local_search_swap(best_perm, pt, max_iters=50, deadline=deadline)
-        final_ms = _makespan_fast(final_perm, pt)
-        if final_ms < best_ms:
-            best_perm = final_perm
-            best_ms = final_ms
+    while time.time() < deadline:
+        if T < min_T:
+            break
+            
+        # Generate neighbor: Insertion move
+        i = random.randint(0, n - 1)
+        j = random.randint(0, n)
+        if j == i or j == i + 1:
+            # Skip trivial moves but still cool
+            T *= cooling
+            continue
+            
+        job = current_perm[i]
+        # Remove job
+        candidate = current_perm[:i] + current_perm[i+1:]
+        # Insert job at j
+        insert_pos = j
+        if j > i:
+            insert_pos = j - 1
+        candidate = candidate[:insert_pos] + [job] + candidate[insert_pos:]
+        
+        cand_mk = _makespan(candidate, pt)
+        delta = cand_mk - current_mk
+        
+        if delta < 0 or random.random() < np.exp(-delta / T):
+            current_perm = candidate
+            current_mk = cand_mk
+            
+            if current_mk < local_best_mk:
+                local_best_mk = current_mk
+                local_best_perm = current_perm[:]
+                
+        T *= cooling
+        
+    return local_best_perm, local_best_mk, current_perm, current_mk
+
+def order_jobs(processing_times):
+    n, m = processing_times.shape
+    if n <= 1:
+        return list(range(n))
+        
+    start_time = time.time()
+    deadline = start_time + 115.0  # 5s margin
     
+    # 1. Initial solution via NEH
+    current_perm = _neh_heuristic(processing_times)
+    current_mk = _makespan(current_perm, processing_times)
+    best_perm = current_perm[:]
+    best_mk = current_mk
+    
+    # 2. Local Search: Insertion with time limit
+    ls_time_limit = min(10.0, (deadline - time.time()) * 0.3)
+    current_perm, current_mk = _local_search_insertion(current_perm, processing_times, time_limit=ls_time_limit)
+    if current_mk < best_mk:
+        best_perm = current_perm[:]
+        best_mk = current_mk
+        
+    # 3. Simulated Annealing with multiple restarts
+    # Run SA for the remaining time, with restarts if needed
+    remaining_time = deadline - time.time()
+    
+    if remaining_time > 5.0:
+        # First SA run: use most of remaining time
+        sa_time1 = remaining_time * 0.6
+        deadline1 = start_time + (115.0 - sa_time1)
+        best_perm, best_mk, current_perm, current_mk = _simulated_annealing(
+            current_perm, processing_times, best_mk, best_perm, deadline1, n
+        )
+        
+        remaining_time = deadline - time.time()
+        if remaining_time > 5.0:
+            # Second SA run from best solution with fresh temperature
+            sa_time2 = remaining_time * 0.8
+            deadline2 = start_time + (115.0 - sa_time2)
+            # Restart from best solution
+            best_perm, best_mk, current_perm, current_mk = _simulated_annealing(
+                best_perm, processing_times, best_mk, best_perm, deadline2, n
+            )
+            
+            # Final local search polish
+            remaining_time = deadline - time.time()
+            if remaining_time > 2.0:
+                ls_time_limit = min(3.0, remaining_time * 0.5)
+                current_perm, current_mk = _local_search_insertion(
+                    current_perm, processing_times, time_limit=ls_time_limit
+                )
+                if current_mk < best_mk:
+                    best_perm = current_perm[:]
+                    best_mk = current_mk
+                    
     return list(best_perm)
 # EVOLVE-BLOCK-END

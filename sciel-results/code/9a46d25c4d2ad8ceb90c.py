@@ -1,0 +1,174 @@
+import numpy as np
+import time
+
+DIMENSIONS = [2, 3, 9]
+
+def construct():
+    n, m, p = DIMENSIONS
+    nm = n * m
+    mp = m * p
+    pn = p * n
+    
+    # Schoolbook baseline
+    rank_sb = nm * mp // m  # n * m * p = 54
+    U_sb = np.zeros((nm, rank_sb))
+    V_sb = np.zeros((mp, rank_sb))
+    W_sb = np.zeros((pn, rank_sb))
+    col = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U_sb[i*m + j, col] = 1
+                V_sb[j*p + k, col] = 1
+                W_sb[k*n + i, col] = 1
+                col += 1
+                
+    # Build the multiplication tensor T
+    # T[a, b, c] = 1 if a=(i,j), b=(j,k), c=(k,i) for some i,j,k
+    T = np.zeros((nm, mp, pn))
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                a = i * m + j
+                b = j * p + k
+                c = k * n + i
+                T[a, b, c] = 1.0
+    
+    # Pre-compute some useful matrices
+    # For each c, T_c is a (nm x mp) matrix where T_c[a,b] = T[a,b,c]
+    T_by_c = np.zeros((pn, nm, mp))
+    for c in range(pn):
+        T_by_c[c] = T[:, :, c]
+    
+    # For each a, T_a is a (mp x pn) matrix where T_a[b,c] = T[a,b,c]
+    T_by_a = np.zeros((nm, mp, pn))
+    for a in range(nm):
+        T_by_a[a] = T[a, :, :]
+    
+    # For each b, T_b is a (nm x pn) matrix where T_b[a,c] = T[a,b,c]
+    T_by_b = np.zeros((mp, nm, pn))
+    for b in range(mp):
+        T_by_b[b] = T[:, b, :]
+    
+    start_time = time.time()
+    time_limit = 130  # Leave 20s margin
+    
+    best_rank = rank_sb
+    best_U = U_sb.copy()
+    best_V = V_sb.copy()
+    best_W = W_sb.copy()
+    
+    # Theoretical lower bound: max(n*m, m*p, p*n) / something
+    # For matrix multiplication, the lower bound is at least max(n, m, p)
+    # But more precisely, for (n,m,p) matrix multiplication, the lower bound is at least max(n*m, m*p, p*n)
+    # Actually the lower bound is max(n, m, p) for the "dimension" but for rank it's more subtle.
+    # The trivial lower bound is max(n*m, m*p, p*n) / max(n, m, p) = max(m, p, n) * min(n,m,p)
+    # Actually, let's just try ranks from rank_sb-1 down to some lower bound.
+    # A reasonable lower bound is max(n, m, p) * min(n, m, p) = 9 * 2 = 18
+    # But let's be more aggressive and try down to 20.
+    
+    lower_bound = max(n, m, p) * min(n, m, p)  # 18
+    
+    # Try ranks from rank_sb-1 down to lower_bound
+    for rank in range(rank_sb - 1, lower_bound - 1, -1):
+        if time.time() - start_time > time_limit - 30:
+            break
+        
+        found = False
+        # Try multiple random initializations
+        max_restarts = 5
+        for restart in range(max_restarts):
+            if time.time() - start_time > time_limit - 30:
+                break
+            
+            np.random.seed(42 + restart * 1000 + rank)
+            
+            # Random initialization
+            U = np.random.randn(nm, rank)
+            V = np.random.randn(mp, rank)
+            W = np.random.randn(pn, rank)
+            
+            # Scale to reasonable magnitude
+            U /= np.linalg.norm(U)
+            V /= np.linalg.norm(V)
+            W /= np.linalg.norm(W)
+            
+            # Alternating least squares
+            max_iter = 200
+            for iteration in range(max_iter):
+                if time.time() - start_time > time_limit - 30:
+                    break
+                
+                # Solve for U given V, W
+                # For each a, we need: sum_r U[a,r] * (V[:,r] outer W[:,r]) = T[a, :, :]
+                # This is a linear system in U[a, :]
+                # P[r, b, c] = V[b, r] * W[c, r]
+                # We need: sum_r U[a, r] * P[r, b, c] = T[a, b, c] for all b, c
+                # Flatten: sum_r U[a, r] * P_flat[r, bc] = T_flat[a, bc]
+                # So U[a, :] = (P_flat^T P_flat)^{-1} P_flat^T T_flat[a, :]
+                
+                P_flat = np.zeros((rank, mp * pn))
+                for r in range(rank):
+                    P_flat[r, :] = np.outer(V[:, r], W[:, r]).reshape(-1)
+                
+                T_flat_a = T_by_a.reshape(nm, mp * pn)
+                
+                # Solve least squares: P_flat^T U[a,:]^T = T_flat_a[a,:]^T
+                # U[a,:] P_flat = T_flat_a[a,:]
+                # This is: for each a, solve U[a,:] = T_flat_a[a,:] P_flat^T (P_flat P_flat^T)^{-1}
+                # Or use lstsq
+                try:
+                    U_new, _, _, _ = np.linalg.lstsq(P_flat.T, T_flat_a.T, rcond=None)
+                    U = U_new.T
+                except:
+                    break
+                
+                # Solve for V given U, W
+                P_flat_v = np.zeros((rank, nm * pn))
+                for r in range(rank):
+                    P_flat_v[r, :] = np.outer(U[:, r], W[:, r]).reshape(-1)
+                
+                T_flat_b = T_by_b.reshape(mp, nm * pn)
+                
+                try:
+                    V_new, _, _, _ = np.linalg.lstsq(P_flat_v.T, T_flat_b.T, rcond=None)
+                    V = V_new.T
+                except:
+                    break
+                
+                # Solve for W given U, V
+                P_flat_w = np.zeros((rank, nm * mp))
+                for r in range(rank):
+                    P_flat_w[r, :] = np.outer(U[:, r], V[:, r]).reshape(-1)
+                
+                T_flat_c = T_by_c.reshape(pn, nm * mp)
+                
+                try:
+                    W_new, _, _, _ = np.linalg.lstsq(P_flat_w.T, T_flat_c.T, rcond=None)
+                    W = W_new.T
+                except:
+                    break
+                
+                # Check error every 10 iterations
+                if iteration % 10 == 0:
+                    T_recon = np.einsum('ar,br,cr->abc', U, V, W)
+                    error = np.linalg.norm(T_recon - T)
+                    if error < 1e-8:
+                        found = True
+                        break
+            
+            if found:
+                best_rank = rank
+                best_U = U.copy()
+                best_V = V.copy()
+                best_W = W.copy()
+                break
+        
+        if found:
+            # Try to go lower
+            continue
+    
+    if best_rank < rank_sb:
+        return {"U": best_U.tolist(), "V": best_V.tolist(), "W": best_W.tolist()}
+    else:
+        return {"U": U_sb.tolist(), "V": V_sb.tolist(), "W": W_sb.tolist()}

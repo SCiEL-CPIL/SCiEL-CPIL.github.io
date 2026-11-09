@@ -1,0 +1,311 @@
+import time
+import math
+import random
+from fractions import Fraction
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 138.0  # safety margin before 150s kill
+
+    # Moduli 20..200
+    moduli = list(range(20, 201))
+    n_mod = len(moduli)
+    mod_idx = {m: i for i, m in enumerate(moduli)}
+
+    # Precompute gcd table
+    gcd_table = [[0] * n_mod for _ in range(n_mod)]
+    for i in range(n_mod):
+        for j in range(i, n_mod):
+            g = math.gcd(moduli[i], moduli[j])
+            gcd_table[i][j] = g
+            gcd_table[j][i] = g
+
+    def is_compatible(placed, m, r):
+        """Check if (m, r) is compatible with all placed classes."""
+        for m2, r2 in placed:
+            g = math.gcd(m, m2)
+            if r % g == r2 % g:
+                return False
+        return True
+
+    def find_residue(placed, m):
+        """Find a compatible residue for modulus m."""
+        for r in range(m):
+            if is_compatible(placed, m, r):
+                return r
+        return None
+
+    def compute_valid_mask(m, existing_classes):
+        """Bitmask of valid residues for modulus m given existing classes."""
+        m_val = m
+        all_mask = (1 << m_val) - 1
+        valid = all_mask
+
+        for (m2, r2) in existing_classes:
+            i = mod_idx[m]
+            j = mod_idx[m2]
+            g = gcd_table[i][j]
+            if g == 1:
+                return 0, 0
+            r0 = r2 % g
+            forbidden = 0
+            for r in range(r0, m_val, g):
+                forbidden |= (1 << r)
+            valid &= ~forbidden
+
+        count = bin(valid).count('1')
+        return valid, count
+
+    def pick_best_residue(valid_mask, m, existing_classes):
+        """Pick a residue from valid_mask that maximizes flexibility for future additions."""
+        if valid_mask == 0:
+            return None
+
+        valid_residues = []
+        r = 0
+        while r < m and not ((valid_mask >> r) & 1):
+            r += 1
+        while r < m:
+            if (valid_mask >> r) & 1:
+                valid_residues.append(r)
+            r += 1
+
+        if len(valid_residues) == 0:
+            return None
+        if len(valid_residues) == 1:
+            return valid_residues[0]
+
+        # Limit evaluation to a subset if too many candidates
+        if len(valid_residues) > 30:
+            step = max(1, len(valid_residues) // 30)
+            candidates = valid_residues[::step]
+        else:
+            candidates = valid_residues
+
+        used_moduli = set(m2 for m2, r2 in existing_classes)
+        best_r = candidates[0]
+        best_score = -1
+
+        for r_cand in candidates:
+            # Estimate flexibility: how many valid residues remain for each unused modulus
+            score_cand = 0
+            for m2 in moduli:
+                if m2 in used_moduli or m2 == m:
+                    continue
+                j2 = mod_idx[m2]
+                g2 = gcd_table[mod_idx[m]][j2]
+                if g2 > 1:
+                    r0_cand = r_cand % g2
+                    n_forbidden = m2 // g2 + (1 if m2 % g2 > r0_cand else 0)
+                    n_valid = m2 - n_forbidden
+                    score_cand += n_valid
+            if score_cand > best_score:
+                best_score = score_cand
+                best_r = r_cand
+
+        return best_r
+
+    def score(classes):
+        total = Fraction(0, 1)
+        for (m, r) in classes:
+            total += Fraction(1, m)
+        return total
+
+    def greedy_construct(order=None, seed=None):
+        if seed is not None:
+            random.seed(seed)
+        if order is None:
+            order = sorted(moduli)  # smallest first
+        classes = []
+        for m in order:
+            valid_mask, count = compute_valid_mask(m, classes)
+            if count > 0:
+                r = pick_best_residue(valid_mask, m, classes)
+                classes.append([m, r])
+        return classes
+
+    def try_add_class(classes, m):
+        """Try to add modulus m to classes; return (new_classes, r) or (None, None)."""
+        valid_mask, count = compute_valid_mask(m, classes)
+        if count > 0:
+            r = pick_best_residue(valid_mask, m, classes)
+            return classes + [[m, r]], r
+        return None, None
+
+    def local_search(classes, max_iter=5000):
+        """Local search: add missing small moduli, 1-for-1 swaps, and residue reassignment."""
+        best = [list(c) for c in classes]
+        best_score = score(best)
+        used_moduli = set(m for m, r in best)
+
+        for it in range(max_iter):
+            if time.time() > deadline:
+                break
+
+            improved = False
+
+            # Pass A: try to add an unused modulus (prefer small m)
+            for m in sorted(moduli):
+                if m in used_moduli:
+                    continue
+                new_classes, r = try_add_class(best, m)
+                if new_classes is not None:
+                    new_score = score(new_classes)
+                    if new_score > best_score:
+                        best = new_classes
+                        best_score = new_score
+                        used_moduli.add(m)
+                        improved = True
+                        break
+            if improved:
+                continue
+
+            # Pass B: try 1-for-1 swaps (remove one, add a smaller one)
+            for i in range(len(best)):
+                m_i = best[i][0]
+                without_i = [c for j, c in enumerate(best) if j != i]
+                base_score = score(without_i)
+
+                # Try adding a smaller modulus
+                for m_new in sorted(moduli):
+                    if m_new >= m_i:
+                        break
+                    if m_new in used_moduli:
+                        continue
+                    new_classes, r = try_add_class(without_i, m_new)
+                    if new_classes is not None:
+                        new_score = score(new_classes)
+                        if new_score > best_score:
+                            best = new_classes
+                            best_score = new_score
+                            used_moduli.remove(m_i)
+                            used_moduli.add(m_new)
+                            improved = True
+                            break
+                if improved:
+                    break
+            if improved:
+                continue
+
+            # Pass C: try residue reassignment to enable additions
+            for i in range(len(best)):
+                m_i, r_i = best[i]
+                others = [c for j, c in enumerate(best) if j != i]
+
+                valid_mask, count = compute_valid_mask(m_i, others)
+                if count == 0:
+                    continue
+
+                valid_residues = []
+                r = 0
+                while r < m_i and not ((valid_mask >> r) & 1):
+                    r += 1
+                while r < m_i:
+                    if (valid_mask >> r) & 1:
+                        valid_residues.append(r)
+                    r += 1
+
+                for r_new in valid_residues[:10]:  # limit to first 10
+                    if r_new == r_i:
+                        continue
+                    new_classes = others + [[m_i, r_new]]
+                    # Try to add more moduli with this new configuration
+                    for m_add in sorted(moduli):
+                        if m_add in used_moduli:
+                            continue
+                        add_classes, r_add = try_add_class(new_classes, m_add)
+                        if add_classes is not None:
+                            new_score = score(add_classes)
+                            if new_score > best_score:
+                                best = add_classes
+                                best_score = new_score
+                                used_moduli.add(m_add)
+                                improved = True
+                                break
+                    if improved:
+                        break
+                if improved:
+                    break
+
+            if not improved:
+                break
+
+        return best, best_score
+
+    # Run multiple greedy constructions with different orders
+    best_classes = []
+    best_score = Fraction(0, 1)
+
+    # Standard greedy
+    classes = greedy_construct()
+    s = score(classes)
+    if s > best_score:
+        best_score = s
+        best_classes = classes
+
+    # Randomized greedy with multiple seeds
+    for seed in range(20):
+        if time.time() > deadline:
+            break
+        # Shuffle slightly: keep small moduli mostly in order but perturb
+        order = list(moduli)
+        random.seed(seed)
+        # Perturb the order slightly
+        for i in range(len(order) - 1):
+            if random.random() < 0.1:
+                j = min(i + random.randint(1, 10), len(order) - 1)
+                order[i], order[j] = order[j], order[i]
+
+        classes = greedy_construct(order=order, seed=seed)
+        s = score(classes)
+        if s > best_score:
+            best_score = s
+            best_classes = classes
+
+    # Run local search on the best solution
+    if time.time() < deadline:
+        improved_classes, improved_score = local_search(best_classes)
+        if improved_score > best_score:
+            best_score = improved_score
+            best_classes = improved_classes
+
+    # Additional local search passes with different starting points
+    for seed in range(5):
+        if time.time() > deadline:
+            break
+        order = list(moduli)
+        random.seed(100 + seed)
+        for i in range(len(order) - 1):
+            if random.random() < 0.15:
+                j = min(i + random.randint(1, 15), len(order) - 1)
+                order[i], order[j] = order[j], order[i]
+
+        classes = greedy_construct(order=order, seed=100 + seed)
+        s = score(classes)
+        if s > best_score:
+            best_score = s
+            best_classes = classes
+
+        if time.time() < deadline:
+            improved_classes, improved_score = local_search(best_classes, max_iter=3000)
+            if improved_score > best_score:
+                best_score = improved_score
+                best_classes = improved_classes
+
+    # Final polish: try to add any remaining moduli
+    if time.time() < deadline:
+        used_moduli = set(m for m, r in best_classes)
+        for m in sorted(moduli):
+            if m in used_moduli:
+                continue
+            new_classes, r = try_add_class(best_classes, m)
+            if new_classes is not None:
+                new_score = score(new_classes)
+                if new_score > best_score:
+                    best_score = new_score
+                    best_classes = new_classes
+                    used_moduli.add(m)
+
+    # Convert to required format
+    result = [[m, r] for m, r in best_classes]
+    return result

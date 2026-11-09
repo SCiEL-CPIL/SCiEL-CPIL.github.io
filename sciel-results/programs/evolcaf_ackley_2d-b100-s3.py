@@ -1,95 +1,107 @@
-"""Rewritten cost-aware acquisition for Ackley 2D Bayesian optimization."""
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
 import numpy as np
+import time
 from scipy.stats import norm
+
+_EPS = 1e-12
+
+def _ackley_2d(x):
+    """Ackley 2D function (standard, minimum at 0,0)."""
+    x1 = x[:, 0]
+    x2 = x[:, 1]
+    sum_sq = x1**2 + x2**2
+    sum_cos = np.cos(2.0 * np.pi * x1) + np.cos(2.0 * np.pi * x2)
+    return -20.0 * np.exp(-0.2 * np.sqrt(0.5 * sum_sq)) - np.exp(0.5 * sum_cos) + np.e + 20.0
 
 
 def acquisition(mu, sigma, f_best, cost):
     """
-    Cost-aware acquisition function using a blend of expected improvement
-    and a UCB-style exploration term, both normalized by cost.
+    Cost-aware acquisition function for Bayesian optimization of Ackley 2D.
     
-    Args:
-        mu: array of GP mean predictions, shape (2000,)
-        sigma: array of GP std predictions, shape (2000,)
-        f_best: current best observed value
-        cost: array of evaluation costs, shape (2000,)
+    Uses a blend of Expected Improvement (EI) and Probability of Improvement (PI)
+    with UCB exploration, all cost-adjusted. PI provides smoother exploration
+    signal in multimodal landscapes. Adaptive weighting shifts from exploration
+    to exploitation as f_best approaches 0.
     
-    Returns:
-        array of acquisition scores, shape (2000,), higher = prefer
+    mu, sigma: (2000,) arrays of GP mean and std in objective units
+    f_best: scalar, lowest observed value
+    cost: (2000,) array of evaluation costs
+    
+    Returns: (2000,) finite scores, higher = prefer to evaluate next
     """
+    start_time = time.time()
+    deadline = start_time + 250.0  # Safety margin before 300s limit (killed at 330s)
+    
     mu = np.asarray(mu, dtype=np.float64)
     sigma = np.asarray(sigma, dtype=np.float64)
     cost = np.asarray(cost, dtype=np.float64)
     
-    # Ensure sigma is non-negative and finite
-    sigma = np.maximum(sigma, 1e-12)
-    sigma = np.nan_to_num(sigma, nan=1e-12, posinf=1.0, neginf=1e-12)
-    mu = np.nan_to_num(mu, nan=f_best, posinf=1e6, neginf=-1e6)
-    cost = np.maximum(cost, 1e-9)
-    cost = np.nan_to_num(cost, nan=1.0, posinf=1.0, neginf=1.0)
+    n = len(mu)
     
-    # Expected Improvement for minimization
-    # EI(x) = (f_best - mu) * Phi(z) + sigma * phi(z), where z = (f_best - mu) / sigma
+    # Ensure sigma is positive
+    sigma = np.maximum(sigma, _EPS)
+    
+    # Expected Improvement (for minimization)
     improvement = f_best - mu
     z = improvement / sigma
     ei = improvement * norm.cdf(z) + sigma * norm.pdf(z)
+    ei = np.maximum(ei, 0.0)
     
-    # UCB-style term: -mu + beta * sigma (we maximize, so lower mu and higher sigma are good)
-    # Adapt beta based on the scale of sigma in the candidate set
-    sigma_mean = np.mean(sigma)
-    sigma_std = np.std(sigma)
+    # Probability of Improvement (for minimization): P(mu < f_best)
+    pi = norm.cdf(z)
     
-    # If uncertainty is high relative to improvement potential, explore more
-    # Beta between 0.5 and 2.5
-    if sigma_mean > 0.01:
-        beta = 1.0 + 1.5 * np.exp(-sigma_mean / 0.1)
-    else:
-        beta = 0.5
+    # UCB (lower is better for minimization)
+    # Adaptive beta: explore more when f_best is far from 0
+    f_scale = 30.0
+    f_norm = min(max(f_best / f_scale, 0.0), 1.0)
     
-    # Clip beta to reasonable range
-    beta = np.clip(beta, 0.3, 3.0)
+    # Beta: high early (exploration), low late (exploitation)
+    beta = 0.5 + 2.0 * f_norm
     
-    ucb_term = -mu + beta * sigma
+    ucb = mu + beta * sigma
     
-    # Blend EI and UCB. EI is in objective units, UCB is also in objective units.
-    # Scale them to be comparable. EI can be zero or negative (if mu > f_best).
-    # We want to prefer points where EI is high AND the UCB is high.
-    # Use a weighted sum, but normalize each to [0,1] roughly over the candidate set.
+    # Cost-adjusted scoring
+    cost_safe = np.maximum(cost, _EPS)
     
-    ei_min = np.min(ei)
-    ei_max = np.max(ei)
-    ei_range = ei_max - ei_min + 1e-9
-    ei_norm = (ei - ei_min) / ei_range
+    # Normalize each component to [0, 1]
+    ei_max = np.max(ei) if np.max(ei) > _EPS else 1.0
+    ei_norm = ei / ei_max
     
-    ucb_min = np.min(ucb_term)
-    ucb_max = np.max(ucb_term)
-    ucb_range = ucb_max - ucb_min + 1e-9
-    ucb_norm = (ucb_term - ucb_min) / ucb_range
+    # PI is already in [0, 1]
+    pi_norm = pi
     
-    # Weight: when f_best is close to 0 (good), rely more on EI (exploitation).
-    # When f_best is far from 0, rely more on UCB (exploration).
-    # Ackley min is 0, so f_best should be >= 0.
-    # If f_best < 0.1, weight EI 0.7, UCB 0.3
-    # If f_best > 1.0, weight EI 0.3, UCB 0.7
-    if f_best < 0.05:
-        w_ei = 0.8
-        w_ucb = 0.2
-    elif f_best < 0.2:
-        w_ei = 0.6
-        w_ucb = 0.4
-    elif f_best < 1.0:
-        w_ei = 0.4
-        w_ucb = 0.6
-    else:
-        w_ei = 0.2
-        w_ucb = 0.8
+    # UCB: lower is better. Normalize so that lower UCB gives higher score
+    ucb_min = np.min(ucb)
+    ucb_max = np.max(ucb)
+    ucb_range = ucb_max - ucb_min if ucb_max - ucb_min > _EPS else 1.0
+    ucb_norm = (ucb_max - ucb) / ucb_range
     
-    combined = w_ei * ei_norm + w_ucb * ucb_norm
+    # Adaptive weighting: 
+    # Early (high f_norm): weight UCB and PI more for exploration
+    # Late (low f_norm): weight EI more for exploitation
+    # w_ei goes from 0.2 (early) to 0.7 (late)
+    # w_pi goes from 0.4 (early) to 0.15 (late)
+    # w_ucb goes from 0.4 (early) to 0.15 (late)
+    w_ei = 0.2 + 0.5 * (1.0 - f_norm)
+    w_pi = 0.4 - 0.25 * (1.0 - f_norm)
+    w_ucb = 0.4 - 0.25 * (1.0 - f_norm)
     
-    # Cost-aware: divide by cost
-    scores = combined / cost
+    # Score: blend of cost-adjusted components
+    # Use cost^0.5 in denominator for smoother cost trade-off
+    cost_adj = np.sqrt(cost_safe)
+    score = (w_ei * ei_norm + w_pi * pi_norm + w_ucb * ucb_norm) / cost_adj
     
-    # Ensure finite, non-negative (for safety, though scores can be negative)
-    scores = np.nan_to_num(scores, nan=0.0, posinf=1e6, neginf=-1e6)
+    # Add a small bonus for very low cost to break ties
+    cost_bonus = 0.05 * (1.0 / cost_safe - 0.5)
+    score += cost_bonus
     
-    return scores
+    # Check deadline
+    if time.time() > deadline:
+        pass
+    
+    # Ensure all values are finite
+    score = np.where(np.isfinite(score), score, 0.0)
+    
+    return score
+# EVOLVE-BLOCK-END

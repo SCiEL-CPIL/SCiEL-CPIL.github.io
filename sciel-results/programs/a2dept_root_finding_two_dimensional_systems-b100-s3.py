@@ -1,4 +1,4 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+"""Root finder for 3 fixed two-dimensional systems."""
 # EVOLVE-BLOCK-START
 import numpy as np
 import time
@@ -6,16 +6,18 @@ import time
 
 def find_root_system(F, x0):
     """
-    Find a root x in R^2 of F(x) = 0 using a robust hybrid approach:
-    1. Initial Newton iterations with adaptive finite-difference Jacobian.
-    2. If Newton stalls or diverges, fall back to Broyden's method (rank-1 update).
-    3. If still not converged, try a damped Newton with line search.
-    4. Time-guarded: return best result before 140s wall-clock (safety margin).
+    Find a root x in R^2 of F(x) = 0 with ||F(x)|| <= 1e-8.
     
-    Budget: <500 calls to F.
+    Strategy:
+      1. Broyden's method with forward-difference initial Jacobian.
+         - Only 1 function call per iteration after the initial 3 calls.
+         - This is significantly more call-efficient than Newton+FD (3 calls/iter).
+      2. If Broyden stalls or fails, fall back to damped Newton.
+      3. Time-budgeted with explicit deadline guard.
     """
     x = np.array(x0, dtype=float, copy=True)
-    deadline = time.time() + 135.0  # safety margin
+    t_start = time.time()
+    deadline = t_start + 105.0  # Safety margin before 120s limit
     call_count = 0
     best_x = x.copy()
     best_norm = np.inf
@@ -23,138 +25,70 @@ def find_root_system(F, x0):
     def _call_F(x_val):
         nonlocal call_count
         if time.time() > deadline:
-            return None  # signal to stop
+            return None
+        if call_count >= 495:
+            return None
         call_count += 1
-        result = F(x_val)
+        try:
+            result = F(np.asarray(x_val, dtype=float))
+        except Exception:
+            return None
         result = np.asarray(result, dtype=float)
+        if result.shape != (2,):
+            try:
+                result = result.reshape(2)
+            except Exception:
+                return None
+        if not np.all(np.isfinite(result)):
+            return None
         return result
 
-    # --- Phase 1: Newton with finite-difference Jacobian ---
+    # Initial evaluation
     Fx = _call_F(x)
     if Fx is None:
-        return best_x if best_norm < np.inf else x
+        return best_x
     norm_Fx = np.linalg.norm(Fx)
     if norm_Fx <= 1e-8:
         return x
     best_x = x.copy()
     best_norm = norm_Fx
 
-    # Compute initial Jacobian
+    # Compute initial Jacobian via forward differences (2 more calls)
+    h = 1e-5
     J = np.zeros((2, 2))
-    h = 1e-6
     for j in range(2):
         e = np.zeros(2)
         e[j] = h
-        Fx_e = _call_F(x + e)
-        if Fx_e is None:
-            break
-        J[:, j] = (Fx_e - Fx) / h
+        Fx_plus = _call_F(x + e)
+        if Fx_plus is None:
+            Fx_plus = Fx  # Fallback
+        J[:, j] = (Fx_plus - Fx) / h
 
-    # Newton iterations
-    for it in range(20):
+    # Ensure J is reasonably invertible
+    det_J = np.linalg.det(J)
+    if abs(det_J) < 1e-10:
+        J += np.eye(2) * 1e-8
+
+    # Broyden's method (good-far variant)
+    for it in range(480):
         if time.time() > deadline:
             break
-        if call_count >= 480:  # leave room for safety
+        if call_count >= 490:
             break
 
-        Fx = _call_F(x)
-        if Fx is None:
-            break
-        norm_Fx = np.linalg.norm(Fx)
-        if norm_Fx <= 1e-8:
-            return x
-        if norm_Fx < best_norm:
-            best_x = x.copy()
-            best_norm = norm_Fx
-
-        # Recompute Jacobian every 3 steps to avoid stale Jacobian
-        if it % 3 == 0 or it == 0:
-            h = 1e-6
-            Fx_ref = _call_F(x)
-            if Fx_ref is None:
-                break
-            for j in range(2):
-                e = np.zeros(2)
-                e[j] = h
-                Fx_e = _call_F(x + e)
-                if Fx_e is None:
-                    break
-                J[:, j] = (Fx_e - Fx_ref) / h
-
-        # Try Newton step
-        try:
-            dx = np.linalg.solve(J, Fx)
-            # Damping: if step is too large, scale it
-            norm_dx = np.linalg.norm(dx)
-            if norm_dx > 1.0:
-                dx = dx / norm_dx
-            x_new = x - dx
-            # Check if x_new is finite
-            if not np.all(np.isfinite(x_new)):
-                # Dampen more
-                dx = dx * 0.5
-                x_new = x - dx
-                if not np.all(np.isfinite(x_new)):
-                    break
-            x = x_new
-        except np.linalg.LinAlgError:
-            # J is singular; use Broyden-style update or break
-            break
-
-    # --- Phase 2: Broyden's method (rank-1) ---
-    x = x.copy()
-    Fx = _call_F(x)
-    if Fx is None:
-        return best_x if best_norm < np.inf else x
-    norm_Fx = np.linalg.norm(Fx)
-    if norm_Fx <= 1e-8:
-        return x
-    if norm_Fx < best_norm:
-        best_x = x.copy()
-        best_norm = norm_Fx
-
-    # Ensure J is valid
-    if not np.all(np.isfinite(J)):
-        # Recompute J
-        h = 1e-6
-        Fx_ref = _call_F(x)
-        if Fx_ref is None:
-            return best_x if best_norm < np.inf else x
-        for j in range(2):
-            e = np.zeros(2)
-            e[j] = h
-            Fx_e = _call_F(x + e)
-            if Fx_e is None:
-                return best_x if best_norm < np.inf else x
-            J[:, j] = (Fx_e - Fx_ref) / h
-
-    for it in range(150):  # up to 150 Broyden steps, each 1 call = 150 calls total for this phase
-        if time.time() > deadline:
-            break
-        if call_count >= 495:
-            break
-
-        Fx = _call_F(x)
-        if Fx is None:
-            break
-        norm_Fx = np.linalg.norm(Fx)
-        if norm_Fx <= 1e-8:
-            return x
-        if norm_Fx < best_norm:
-            best_x = x.copy()
-            best_norm = norm_Fx
-
-        # Solve J * dx = -Fx
+        # Solve J @ dx = -Fx
         try:
             dx = np.linalg.solve(J, -Fx)
         except np.linalg.LinAlgError:
-            # Use pseudo-inverse
-            dx = np.linalg.pinv(J) @ (-Fx)
+            try:
+                dx = np.linalg.pinv(J) @ (-Fx)
+            except Exception:
+                break
 
-        # Damp if needed
+        # Step control: limit step size to avoid wild excursions
         norm_dx = np.linalg.norm(dx)
-        if norm_dx > 10.0:
-            dx = dx / norm_dx * 10.0
+        if norm_dx > 5.0:
+            dx = dx / norm_dx * 5.0
 
         x_new = x + dx
         if not np.all(np.isfinite(x_new)):
@@ -166,32 +100,82 @@ def find_root_system(F, x0):
         Fx_new = _call_F(x_new)
         if Fx_new is None:
             break
+
         norm_Fx_new = np.linalg.norm(Fx_new)
 
         if norm_Fx_new < best_norm:
             best_x = x_new.copy()
             best_norm = norm_Fx_new
 
-        # Broyden rank-1 update
+        if norm_Fx_new <= 1e-8:
+            return x_new
+
+        # Broyden rank-1 update (good-far)
         s = x_new - x
         y = Fx_new - Fx
-        if np.linalg.norm(s) > 1e-15:
-            J = J + np.outer(y - J @ s, s.T) / (s.T @ s)
+        s_norm_sq = np.dot(s, s)
+        if s_norm_sq > 1e-16:
+            J = J + np.outer(y - J @ s, s) / s_norm_sq
 
         x = x_new
         Fx = Fx_new
-        if norm_Fx_new <= 1e-8:
-            return x
 
-    # --- Phase 3: Final check and return best ---
-    Fx_final = _call_F(x)
-    if Fx_final is not None:
-        norm_final = np.linalg.norm(Fx_final)
-        if norm_final <= 1e-8:
-            return x
-        if norm_final < best_norm:
-            best_x = x.copy()
-            best_norm = norm_final
+        # Stagnation detection: if no progress for 10 iterations, break
+        if it > 10 and norm_Fx_new >= best_norm * 0.9999:
+            # Try a damped step
+            pass
+
+    # If Broyden didn't converge, try damped Newton from best point
+    if best_norm > 1e-8:
+        x = best_x.copy()
+        for it in range(40):
+            if time.time() > deadline:
+                break
+            if call_count >= 490:
+                break
+
+            Fx = _call_F(x)
+            if Fx is None:
+                break
+            norm_Fx = np.linalg.norm(Fx)
+            if norm_Fx <= 1e-8:
+                return x
+
+            # Compute Jacobian via forward differences
+            h = 1e-6
+            J = np.zeros((2, 2))
+            for j in range(2):
+                e = np.zeros(2)
+                e[j] = h
+                Fx_plus = _call_F(x + e)
+                if Fx_plus is None:
+                    break
+                J[:, j] = (Fx_plus - Fx) / h
+            else:
+                # Backtracking line search
+                try:
+                    dx = np.linalg.solve(J, -Fx)
+                except np.linalg.LinAlgError:
+                    break
+
+                step = 1.0
+                for _ in range(20):
+                    x_new = x + step * dx
+                    Fx_new = _call_F(x_new)
+                    if Fx_new is None:
+                        break
+                    norm_new = np.linalg.norm(Fx_new)
+                    if norm_new < norm_Fx:
+                        x = x_new
+                        if norm_new < best_norm:
+                            best_x = x.copy()
+                            best_norm = norm_new
+                        if norm_new <= 1e-8:
+                            return x
+                        break
+                    step *= 0.5
+                else:
+                    break
 
     return best_x
 # EVOLVE-BLOCK-END

@@ -1,0 +1,327 @@
+# EVOLVE-BLOCK-START
+import time
+import random
+from math import gcd
+from fractions import Fraction
+
+def is_valid(classes):
+    if not classes:
+        return True
+    for i in range(len(classes)):
+        for j in range(i + 1, len(classes)):
+            m1, r1 = classes[i]
+            m2, r2 = classes[j]
+            g = gcd(m1, m2)
+            if r1 % g == r2 % g:
+                return False
+    moduli = [m for m, r in classes]
+    if len(moduli) != len(set(moduli)):
+        return False
+    for m, r in classes:
+        if not (20 <= m <= 200):
+            return False
+        if not (0 <= r < m):
+            return False
+    return True
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 145.0  # safety margin before 150s kill
+
+    # Moduli 20..200
+    moduli = list(range(20, 201))
+    n_mod = len(moduli)
+    mod_idx = {m: i for i, m in enumerate(moduli)}
+
+    # Precompute gcd table
+    gcd_table = [[0] * n_mod for _ in range(n_mod)]
+    for i in range(n_mod):
+        for j in range(i, n_mod):
+            g = gcd(moduli[i], moduli[j])
+            gcd_table[i][j] = g
+            gcd_table[j][i] = g
+
+    def compute_valid_mask(m, existing_classes):
+        """Bitmask of valid residues for modulus m given existing classes.
+        IMPORTANT: gcd==1 means NO constraint (all residues valid)."""
+        m_val = m
+        all_mask = (1 << m_val) - 1
+        valid = all_mask
+
+        for (m2, r2) in existing_classes:
+            i = mod_idx[m]
+            j = mod_idx[m2]
+            g = gcd_table[i][j]
+            if g == 1:
+                continue  # no constraint, all residues valid
+            # Forbidden: r ≡ r2 (mod g)
+            r0 = r2 % g
+            forbidden = 0
+            for r in range(r0, m_val, g):
+                forbidden |= (1 << r)
+            valid &= ~forbidden
+
+        count = bin(valid).count('1')
+        return valid, count
+
+    def pick_residue(valid_mask, m, existing_classes, strategy='flex'):
+        """Pick a residue from valid_mask."""
+        if valid_mask == 0:
+            return None
+
+        # Get all valid residues
+        valid_residues = []
+        r = 0
+        while r < m:
+            if (valid_mask >> r) & 1:
+                valid_residues.append(r)
+            r += 1
+
+        if len(valid_residues) == 0:
+            return None
+        if len(valid_residues) == 1:
+            return valid_residues[0]
+
+        used_moduli = set(m2 for m2, r2 in existing_classes)
+
+        # For each candidate, count how many unused moduli remain addable
+        # and how many valid residues they'd have
+        best_r = valid_residues[0]
+        best_score = -1
+
+        # Limit evaluation
+        if len(valid_residues) > 15:
+            step = max(1, len(valid_residues) // 15)
+            candidates = valid_residues[::step]
+        else:
+            candidates = valid_residues
+
+        for r_cand in candidates:
+            total_valid = 0
+            for m2 in moduli:
+                if m2 in used_moduli or m2 == m:
+                    continue
+                j2 = mod_idx[m2]
+                g2 = gcd_table[mod_idx[m]][j2]
+                if g2 == 1:
+                    total_valid += m2  # all valid
+                else:
+                    r0_cand = r_cand % g2
+                    n_forbidden = m2 // g2 + (1 if m2 % g2 > r0_cand else 0)
+                    total_valid += m2 - n_forbidden
+            if total_valid > best_score:
+                best_score = total_valid
+                best_r = r_cand
+
+        return best_r
+
+    def score(classes):
+        total = Fraction(0, 1)
+        for (m, r) in classes:
+            total += Fraction(1, m)
+        return total
+
+    def greedy_construct(order=None):
+        if order is None:
+            order = sorted(moduli)
+        classes = []
+        for m in order:
+            valid_mask, count = compute_valid_mask(m, classes)
+            if count > 0:
+                r = pick_residue(valid_mask, m, classes)
+                if r is not None:
+                    classes.append([m, r])
+        return classes
+
+    def try_add_class(classes, m):
+        """Try to add modulus m to classes, return (success, new_classes)."""
+        valid_mask, count = compute_valid_mask(m, classes)
+        if count > 0:
+            r = pick_residue(valid_mask, m, classes)
+            if r is not None:
+                return True, classes + [[m, r]]
+        return False, classes
+
+    def local_search(classes, max_iter=1000):
+        """Local search with add, 1-for-1 swap, 1-for-2 swap, and residue reassignment."""
+        best = [list(c) for c in classes]
+        best_score = score(best)
+        used_moduli = set(m for m, r in best)
+
+        for it in range(max_iter):
+            if time.time() > deadline:
+                break
+
+            improved = False
+
+            # Phase 1: Try to add any unused modulus (sorted by 1/m descending)
+            for m in sorted(moduli):
+                if m in used_moduli:
+                    continue
+                success, new_classes = try_add_class(best, m)
+                if success:
+                    new_score = score(new_classes)
+                    if new_score > best_score:
+                        best = new_classes
+                        best_score = new_score
+                        used_moduli.add(m)
+                        improved = True
+                        break
+
+            # Phase 2: Try 1-for-2 swap (remove one, add up to two)
+            if not improved:
+                for i in range(len(best)):
+                    if time.time() > deadline:
+                        break
+                    m_rem, r_rem = best[i]
+                    temp = [best[j] for j in range(len(best)) if j != i]
+                    temp_used = set(m for m, r in temp)
+                    added = 0
+                    # Try to add up to 2 moduli, smallest first
+                    for m in sorted(moduli):
+                        if m in temp_used or m == m_rem:
+                            continue
+                        success, new_temp = try_add_class(temp, m)
+                        if success:
+                            temp = new_temp
+                            temp_used.add(m)
+                            added += 1
+                            if added == 2:
+                                break
+                    if added >= 1:
+                        new_score = score(temp)
+                        if new_score > best_score:
+                            best = temp
+                            best_score = new_score
+                            used_moduli = set(m for m, r in best)
+                            improved = True
+                            break
+
+            # Phase 3: Residue reassignment - try to reassign residues to free space
+            if not improved:
+                # Find smallest missing modulus
+                missing = [m for m in sorted(moduli) if m not in used_moduli]
+                if missing:
+                    target_m = missing[0]
+                    # Try reassigning residues of existing classes to make room
+                    for i in range(len(best)):
+                        if time.time() > deadline:
+                            break
+                        m_i, r_i = best[i]
+                        # Try different residues for class i
+                        valid_mask, count = compute_valid_mask(m_i, [best[j] for j in range(len(best)) if j != i])
+                        if count > 1:
+                            # Get valid residues
+                            valid_residues = []
+                            r = 0
+                            while r < m_i:
+                                if (valid_mask >> r) & 1:
+                                    valid_residues.append(r)
+                                r += 1
+                            for r_new in valid_residues:
+                                if r_new == r_i:
+                                    continue
+                                # Try with new residue
+                                test_classes = [list(best[j]) for j in range(len(best))]
+                                test_classes[i] = [m_i, r_new]
+                                success, new_classes = try_add_class(test_classes, target_m)
+                                if success:
+                                    new_score = score(new_classes)
+                                    if new_score > best_score:
+                                        best = new_classes
+                                        best_score = new_score
+                                        used_moduli = set(m for m, r in best)
+                                        improved = True
+                                        break
+                        if improved:
+                            break
+
+            if not improved:
+                break
+
+        return best
+
+    # Multi-start search
+    best_classes = None
+    best_score = Fraction(0, 1)
+
+    # Start 1: pure greedy, smallest moduli first
+    classes = greedy_construct()
+    classes = local_search(classes, max_iter=500)
+    s = score(classes)
+    if s > best_score:
+        best_score = s
+        best_classes = [list(c) for c in classes]
+
+    # Multiple randomized starts
+    random.seed(42)
+    num_starts = 60
+    for start in range(num_starts):
+        if time.time() > deadline - 10:
+            break
+
+        # Weighted random ordering: strongly favor small moduli
+        alpha = 1.0 + 0.5 * random.random()
+        weights = [(m, 1.0 / (m ** alpha)) for m in moduli]
+
+        # Weighted sampling without replacement
+        order = []
+        remaining = list(weights)
+        while remaining:
+            total_w = sum(w for _, w in remaining)
+            if total_w <= 0:
+                order.append(remaining[0][0])
+                remaining.pop(0)
+                continue
+            r = random.random() * total_w
+            cum = 0
+            chosen_idx = 0
+            for i, (m, w) in enumerate(remaining):
+                cum += w
+                if r <= cum:
+                    chosen_idx = i
+                    break
+            order.append(remaining[chosen_idx][0])
+            remaining.pop(chosen_idx)
+
+        classes = greedy_construct(order)
+        classes = local_search(classes, max_iter=200)
+        s = score(classes)
+        if s > best_score:
+            best_score = s
+            best_classes = [list(c) for c in classes]
+
+    # Final intensive local search on best
+    if best_classes is not None:
+        best_classes = local_search(best_classes, max_iter=2000)
+    
+    # Safety check: if the result is invalid, fall back to a known valid solution
+    if best_classes is not None and not is_valid(best_classes):
+        # Try to find a valid solution from the previous steps or generate a simple one
+        # We store the best valid solution found during the main loop
+        # Since we didn't track that explicitly, we can re-run a simple greedy
+        # or just return a minimal valid set to avoid 0 score
+        # But likely the greedy result was valid. Let's try to recover.
+        # For now, return a simple valid set to ensure it doesn't crash, 
+        # but we want to maximize. 
+        # Let's try the first greedy result again? 
+        # We didn't save it separately. 
+        # Let's just generate a quick valid set.
+        simple_classes = []
+        for m in range(20, 201):
+            valid_mask, count = compute_valid_mask(m, simple_classes)
+            if count > 0:
+                r = 0
+                while r < m:
+                    if (valid_mask >> r) & 1:
+                        simple_classes.append([m, r])
+                        break
+                    r += 1
+        if is_valid(simple_classes):
+            return simple_classes
+        else:
+            # Absolute fallback
+            return [[20, 0]]
+
+    return best_classes if best_classes is not None else []
+# EVOLVE-BLOCK-END

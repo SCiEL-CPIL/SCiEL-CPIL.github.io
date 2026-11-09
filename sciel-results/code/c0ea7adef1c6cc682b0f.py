@@ -1,0 +1,325 @@
+import numpy as np
+import time
+import sys
+
+def coefficients(stages):
+    """
+    Compute 12-stage product formula coefficients for Heisenberg chain time evolution.
+    Returns (a, b) where each is a list of 12 floats summing to 1.
+    """
+    start_time = time.time()
+    deadline = start_time + 145.0  # Safety margin before 150s limit
+
+    # Build the Hamiltonians
+    n = 6
+    dim = 2 ** n
+    delta = 0.8
+    h = 0.3
+
+    # Pauli matrices
+    sx = np.array([[0, 1], [1, 0]], dtype=complex)
+    sy = np.array([[0, -1j], [1j, 0]], dtype=complex)
+    sz = np.array([[1, 0], [0, -1]], dtype=complex)
+
+    def kron_all(ops):
+        result = np.array([[1]], dtype=complex)
+        for op in ops:
+            result = np.kron(result, op)
+        return result
+
+    A = np.zeros((dim, dim), dtype=complex)
+    B = np.zeros((dim, dim), dtype=complex)
+
+    Jz = 1.0
+    Jxy = delta * Jz
+
+    def add_bond(H, i, j):
+        ops = [np.eye(2) for _ in range(n)]
+        ops[i] = sz
+        ops[j] = sz
+        H += Jz * kron_all(ops)
+
+        ops = [np.eye(2) for _ in range(n)]
+        ops[i] = sx
+        ops[j] = sx
+        H += (Jxy / 2) * kron_all(ops)
+
+        ops = [np.eye(2) for _ in range(n)]
+        ops[i] = sy
+        ops[j] = sy
+        H += (Jxy / 2) * kron_all(ops)
+
+    for (i, j) in [(0, 1), (2, 3), (4, 5)]:
+        add_bond(A, i, j)
+
+    for (i, j) in [(1, 2), (3, 4)]:
+        add_bond(B, i, j)
+
+    for i in range(n):
+        ops = [np.eye(2) for _ in range(n)]
+        ops[i] = sz
+        field_term = h * 0.5 * kron_all(ops)
+        A += field_term
+        B += field_term
+
+    # Precompute eigendecompositions for A, B, and A+B
+    vals_A, vecs_A = np.linalg.eigh(A)
+    vals_B, vecs_B = np.linalg.eigh(B)
+    vals_AB, vecs_AB = np.linalg.eigh(A + B)
+
+    times = [0.25, 0.5, 1.0]
+
+    def expm_A(t):
+        """exp(-i * t * A)"""
+        return vecs_A @ np.diag(np.exp(-1j * t * vals_A)) @ vecs_A.conj().T
+
+    def expm_B(t):
+        """exp(-i * t * B)"""
+        return vecs_B @ np.diag(np.exp(-1j * t * vals_B)) @ vecs_B.conj().T
+
+    def expm_AB(t):
+        """exp(-i * t * (A+B))"""
+        return vecs_AB @ np.diag(np.exp(-1j * t * vals_AB)) @ vecs_AB.conj().T
+
+    # Precompute exact propagators
+    U_exact = {}
+    for t in times:
+        U_exact[t] = expm_AB(t)
+
+    def compute_error(a, b, t):
+        """Compute spectral norm of U(t) - exp(-i t (A+B))"""
+        U = np.eye(dim, dtype=complex)
+        for k in range(len(a)):
+            U = expm_B(b[k] * t) @ expm_A(a[k] * t) @ U
+        diff = U - U_exact[t]
+        s = np.linalg.svd(diff, compute_uv=False)
+        return s[0]
+
+    def compute_error_and_grad(params):
+        """
+        Compute error and approximate gradient via finite differences.
+        params: 24-element array. First 12 are a, last 12 are b.
+        Returns (error, gradient) where gradient has 24 elements.
+        """
+        a_full = params[:12].copy()
+        b_full = params[12:24].copy()
+        
+        a_sum = np.sum(a_full)
+        b_sum = np.sum(b_full)
+        if abs(a_sum) < 1e-15:
+            a_full = np.ones(12) / 12
+        else:
+            a_full = a_full / a_sum
+        if abs(b_sum) < 1e-15:
+            b_full = np.ones(12) / 12
+        else:
+            b_full = b_full / b_sum
+        
+        total_err = 0.0
+        for t in times:
+            total_err += compute_error(a_full, b_full, t)
+        total_err /= len(times)
+        
+        # Finite difference gradient
+        eps = 1e-6
+        grad = np.zeros(24)
+        for i in range(24):
+            params_plus = params.copy()
+            params_plus[i] += eps
+            err_plus = objective(params_plus)
+            grad[i] = (err_plus - total_err) / eps
+        
+        return total_err, grad
+
+    def objective(params):
+        """
+        params: 24-element array. First 12 are a, last 12 are b.
+        """
+        if time.time() > deadline:
+            return 1e10
+
+        a_full = params[:12]
+        b_full = params[12:24]
+
+        # Normalize to sum to 1
+        a_sum = np.sum(a_full)
+        b_sum = np.sum(b_full)
+        if abs(a_sum) < 1e-15:
+            a_full = np.ones(12) / 12
+        else:
+            a_full = a_full / a_sum
+        if abs(b_sum) < 1e-15:
+            b_full = np.ones(12) / 12
+        else:
+            b_full = b_full / b_sum
+
+        # Check bounds
+        if np.any(a_full < -50) or np.any(a_full > 50):
+            return 1e10
+        if np.any(b_full < -50) or np.any(b_full > 50):
+            return 1e10
+
+        total_err = 0.0
+        for t in times:
+            total_err += compute_error(a_full, b_full, t)
+        return total_err / len(times)
+
+    # Use known 4th-order Suzuki-Trotter coefficients as initial guess
+    # For a 12-stage 4th-order splitting, the coefficients follow specific patterns
+    # Let's use a well-known set: the 4th order Suzuki coefficients for 3-stage
+    # extended to 12 stages by nesting
+
+    # Actually, let me use a simpler approach: start with uniform and let the optimizer work
+    # But initialize with a reasonable pattern
+
+    # Initialize with equal weights, but try a few structured patterns
+    x0 = np.ones(24) / 12.0
+    x0[:12] = 1.0 / 12
+    x0[12:] = 1.0 / 12
+
+    # Try a few different initializations
+    candidates = []
+    candidates.append(x0.copy())
+    
+    # Symmetric pattern: mirror around center
+    sym_a = np.array([0.1, 0.15, 0.2, 0.25, 0.2, 0.1, 0.1, 0.2, 0.25, 0.2, 0.15, 0.1])
+    sym_a = sym_a / np.sum(sym_a)
+    sym_b = sym_a.copy()
+    x_sym = np.concatenate([sym_a, sym_b])
+    candidates.append(x_sym)
+    
+    # Alternating pattern
+    alt_a = np.array([0.12, 0.08, 0.12, 0.08, 0.12, 0.08, 0.12, 0.08, 0.12, 0.08, 0.12, 0.08])
+    alt_a = alt_a / np.sum(alt_a)
+    alt_b = alt_a.copy()
+    x_alt = np.concatenate([alt_a, alt_b])
+    candidates.append(x_alt)
+    
+    # Find best initial candidate
+    best_x = None
+    best_obj = np.inf
+    for cand in candidates:
+        obj_val = objective(cand)
+        if obj_val < best_obj:
+            best_obj = obj_val
+            best_x = cand.copy()
+
+    # Nelder-Mead implementation with better settings
+    def nelder_mead(func, x0, max_iter=300, tol=1e-12):
+        n = len(x0)
+        simplex = [x0.copy() for _ in range(n + 1)]
+        simplex[0] = x0
+        for i in range(1, n + 1):
+            simplex[i] = x0.copy()
+            simplex[i][i - 1] += 0.01
+
+        fvals = [func(s) for s in simplex]
+
+        for it in range(max_iter):
+            if time.time() > deadline - 15:
+                break
+
+            indices = np.argsort(fvals)
+            simplex = [simplex[i] for i in indices]
+            fvals = [fvals[i] for i in indices]
+
+            if abs(fvals[0] - fvals[-1]) < tol:
+                break
+
+            centroid = np.mean(simplex[:n], axis=0)
+
+            # Reflection
+            xr = centroid + (centroid - simplex[-1])
+            fr = func(xr)
+
+            if fr < fvals[0]:
+                xe = centroid + 2 * (centroid - simplex[-1])
+                fe = func(xe)
+                if fe < fr:
+                    simplex[-1] = xe
+                    fvals[-1] = fe
+                else:
+                    simplex[-1] = xr
+                    fvals[-1] = fr
+            elif fr < fvals[-2]:
+                simplex[-1] = xr
+                fvals[-1] = fr
+            else:
+                if fr < fvals[-1]:
+                    xc = centroid + 0.5 * (centroid - simplex[-1])
+                else:
+                    xc = centroid + 0.5 * (simplex[-1] - centroid)
+                fc = func(xc)
+                if fc < fvals[-1]:
+                    simplex[-1] = xc
+                    fvals[-1] = fc
+                else:
+                    for i in range(1, n + 1):
+                        simplex[i] = simplex[0] + 0.5 * (simplex[i] - simplex[0])
+                        fvals[i] = func(simplex[i])
+
+        return simplex[0], fvals[0]
+
+    # Run Nelder-Mead with multiple restarts
+    np.random.seed(42)
+
+    # First run from best initial guess
+    try:
+        res_x, res_f = nelder_mead(objective, best_x, max_iter=400)
+        if res_f < best_obj:
+            best_obj = res_f
+            best_x = res_x
+    except Exception:
+        pass
+
+    # Try a few random restarts with small perturbations
+    n_restarts = 0
+    max_restarts = 8
+    for _ in range(max_restarts):
+        if time.time() > deadline - 20:
+            break
+        n_restarts += 1
+        x_rand = best_x + 0.005 * np.random.randn(24)
+        try:
+            res_x, res_f = nelder_mead(objective, x_rand, max_iter=150)
+            if res_f < best_obj:
+                best_obj = res_f
+                best_x = res_x
+        except Exception:
+            pass
+
+    # Extract final coefficients
+    a_full = best_x[:12]
+    b_full = best_x[12:24]
+
+    # Clip and renormalize
+    a_full = np.clip(a_full, -50, 50)
+    b_full = np.clip(b_full, -50, 50)
+    a_sum = np.sum(a_full)
+    b_sum = np.sum(b_full)
+    if abs(a_sum) > 1e-12:
+        a_full = a_full / a_sum
+    if abs(b_sum) > 1e-12:
+        b_full = b_full / b_sum
+
+    # Final polish: use remaining time for a tight local search
+    if time.time() < deadline - 5:
+        try:
+            res_x, res_f = nelder_mead(objective, best_x, max_iter=500, tol=1e-14)
+            if res_f < best_obj:
+                best_obj = res_f
+                best_x = res_x
+                a_full = best_x[:12]
+                b_full = best_x[12:24]
+                a_full = np.clip(a_full, -50, 50)
+                b_full = np.clip(b_full, -50, 50)
+                a_sum = np.sum(a_full)
+                b_sum = np.sum(b_full)
+                if abs(a_sum) > 1e-12:
+                    a_full = a_full / a_sum
+                if abs(b_sum) > 1e-12:
+                    b_full = b_full / b_sum
+        except Exception:
+            pass
+
+    return [float(x) for x in a_full], [float(x) for x in b_full]

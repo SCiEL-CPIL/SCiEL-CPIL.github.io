@@ -1,0 +1,313 @@
+import random
+import time
+import sys
+from functools import lru_cache
+
+L = 5354228880  # lcm(1..24)
+L_weights = [0] + [L // i for i in range(1, 25)]
+
+@lru_cache(maxsize=100000)
+def subset_sum_cached(weight_tuple, target):
+    """
+    Check if target can be formed by a subset of weights (tuple for caching).
+    Uses optimized meet-in-the-middle.
+    """
+    if target == 0:
+        return True
+    if not weight_tuple:
+        return False
+    
+    # Filter weights > target
+    weights = [w for w in weight_tuple if w <= target]
+    if not weights:
+        return False
+    if sum(weights) < target:
+        return False
+        
+    n = len(weights)
+    mid = n // 2
+    left = weights[:mid]
+    right = weights[mid:]
+    
+    # Generate all subset sums for left
+    left_sums = [0]
+    for w in left:
+        left_sums += [s + w for s in left_sums if s + w <= target]
+        
+    if target in left_sums:
+        return True
+        
+    # Generate all subset sums for right
+    right_sums = [0]
+    for w in right:
+        right_sums += [s + w for s in right_sums if s + w <= target]
+        
+    right_set = set(right_sums)
+    
+    for ls in left_sums:
+        if target - ls in right_set:
+            return True
+            
+    return False
+
+def subset_sum_exists(weights, target):
+    """
+    Check if target can be formed by a subset of weights.
+    """
+    if target == 0:
+        return True
+    if not weights:
+        return False
+    
+    # Filter weights > target
+    weights = [w for w in weights if w <= target]
+    if not weights:
+        return False
+    if sum(weights) < target:
+        return False
+    
+    return subset_sum_cached(tuple(sorted(weights)), target)
+
+def is_valid(S):
+    """
+    Check if S is a valid set.
+    S is a list of ints.
+    """
+    if not S:
+        return True
+    S_set = set(S)
+    for x in S:
+        target = L_weights[x]
+        weights = [L_weights[y] for y in S_set if y != x]
+        if subset_sum_exists(weights, target):
+            return False
+    return True
+
+def can_add_fast(S_set, S_weights, x):
+    """
+    Fast check if x can be added to valid set.
+    S_set: set of elements in S
+    S_weights: list of L_weights[y] for y in S (same order as S_set iteration not guaranteed, but we need consistent)
+    Actually, let's just pass the list and set.
+    """
+    if x in S_set:
+        return False
+    
+    # 1. Check if x is covered by S
+    target_x = L_weights[x]
+    weights_for_x = [L_weights[y] for y in S_set]
+    if subset_sum_exists(weights_for_x, target_x):
+        return False
+        
+    # 2. Check if adding x covers any y in S
+    for y in S_set:
+        target_diff = L_weights[y] - L_weights[x]
+        if target_diff < 0:
+            continue
+        if target_diff == 0:
+            continue
+        weights_for_y = [L_weights[z] for z in S_set if z != y and z != x]
+        if subset_sum_exists(weights_for_y, target_diff):
+            return False
+            
+    return True
+
+def can_add(S, x):
+    """
+    Check if x can be added to valid set S.
+    Returns True if S U {x} is valid.
+    """
+    if x in S:
+        return False
+    S_set = set(S)
+    return can_add_fast(S_set, None, x)
+
+def can_add(S, x):
+    """
+    Check if x can be added to valid set S.
+    Returns True if S U {x} is valid.
+    """
+    if x in S:
+        return False
+    
+    S_set = set(S)
+    
+    # 1. Check if x is covered by S
+    target_x = L_weights[x]
+    weights_for_x = [L_weights[y] for y in S_set]
+    if subset_sum_exists(weights_for_x, target_x):
+        return False
+        
+    # 2. Check if adding x covers any y in S
+    # y is covered if L_y = L_x + sum(subset of S \ {x, y})
+    # i.e., L_y - L_x is a subset sum of {L_z | z in S, z != x, z != y}
+    for y in S:
+        target_diff = L_weights[y] - L_weights[x]
+        if target_diff < 0:
+            continue
+        if target_diff == 0:
+            # L_y == L_x, implies x=y which is false, or subset is empty?
+            # If L_y == L_x, then y=x, which is not possible as x not in S.
+            # Wait, L_weights are distinct for distinct integers 1..24.
+            # So target_diff == 0 implies L_y == L_x, impossible.
+            continue
+            
+        weights_for_y = [L_weights[z] for z in S_set if z != y and z != x]
+        if subset_sum_exists(weights_for_y, target_diff):
+            return False
+            
+    return True
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 55  # 55s safety margin
+    
+    best_set = None
+    best_size = 0
+    
+    # Initial guess: Seed solution
+    seed_set = list(range(13, 25))
+    if is_valid(seed_set):
+        best_set = seed_set
+        best_size = len(seed_set)
+    
+    # Deterministic greedy construction
+    def greedy_construct(order):
+        S = []
+        S_set = set()
+        for x in order:
+            if x in S_set:
+                continue
+            if can_add(S, x):
+                S.append(x)
+                S_set.add(x)
+        return S
+    
+    # Try several deterministic orders
+    orders = [
+        list(range(24, 0, -1)),
+        list(range(1, 25)),
+        [12, 13, 11, 14, 10, 15, 9, 16, 8, 17, 7, 18, 6, 19, 5, 20, 4, 21, 3, 22, 2, 23, 1, 24],
+        [24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1],
+        [1, 24, 2, 23, 3, 22, 4, 21, 5, 20, 6, 19, 7, 18, 8, 17, 9, 16, 10, 15, 11, 14, 12, 13],
+    ]
+    
+    for order in orders:
+        if time.time() > deadline:
+            break
+        S = greedy_construct(order)
+        if len(S) > best_size:
+            best_size = len(S)
+            best_set = S
+    
+    # Local search with 1-for-1 swaps and additions
+    def local_search(S, max_iterations=200):
+        S = list(S)
+        S_set = set(S)
+        improved = True
+        iterations = 0
+        while improved and iterations < max_iterations and time.time() < deadline:
+            improved = False
+            iterations += 1
+            
+            # Try adding each missing element
+            missing = [i for i in range(1, 25) if i not in S_set]
+            random.shuffle(missing)
+            for m in missing:
+                if time.time() > deadline:
+                    return S
+                if can_add(S, m):
+                    S.append(m)
+                    S_set.add(m)
+                    improved = True
+            
+            # Try 1-for-1 swap: remove y, add c (if c not in S)
+            if not improved and len(S) >= 1:
+                for y in S:
+                    if time.time() > deadline:
+                        return S
+                    S_without_y = [x for x in S if x != y]
+                    S_without_y_set = set(S_without_y)
+                    candidates = [k for k in range(1, 25) if k not in S_without_y_set and k != y]
+                    random.shuffle(candidates)
+                    for c in candidates:
+                        if time.time() > deadline:
+                            return S
+                        if can_add(S_without_y, c):
+                            S = S_without_y + [c]
+                            S_set = S_without_y_set | {c}
+                            improved = True
+                            break
+                    if improved:
+                        break
+                        
+            # Try 2-for-1 swap: remove one, add two (only if 1-for-1 didn't help)
+            if not improved and len(S) >= 2 and time.time() < deadline:
+                for i in range(len(S)):
+                    if time.time() > deadline:
+                        return S
+                    y = S[i]
+                    S_without_y = [x for x in S if x != y]
+                    S_without_y_set = set(S_without_y)
+                    candidates = [k for k in range(1, 25) if k not in S_without_y_set and k != y]
+                    random.shuffle(candidates)
+                    # Limit candidates to first 10 for speed
+                    candidates = candidates[:10]
+                    
+                    for c1 in candidates:
+                        if time.time() > deadline:
+                            return S
+                        if can_add(S_without_y, c1):
+                            S_temp = S_without_y + [c1]
+                            S_temp_set = S_without_y_set | {c1}
+                            for c2 in candidates:
+                                if c2 == c1:
+                                    continue
+                                if time.time() > deadline:
+                                    return S
+                                if can_add(S_temp, c2):
+                                    S = S_temp + [c2]
+                                    S_set = S_temp_set | {c2}
+                                    improved = True
+                                    break
+                        if improved:
+                            break
+                    if improved:
+                        break
+                        
+        return S
+
+    # Apply local search to best set found so far
+    if best_set is not None and time.time() < deadline:
+        improved_set = local_search(best_set)
+        if len(improved_set) > best_size:
+            best_size = len(improved_set)
+            best_set = improved_set
+    
+    # Random restarts
+    random.seed(42)
+    attempts = 0
+    while time.time() < deadline and best_size < 24:
+        attempts += 1
+        
+        random_order = list(range(1, 25))
+        random.shuffle(random_order)
+        S = greedy_construct(random_order)
+        
+        if len(S) > best_size:
+            best_size = len(S)
+            best_set = S
+        
+        if time.time() < deadline:
+            improved_set = local_search(S, max_iterations=300)
+            if len(improved_set) > best_size:
+                best_size = len(improved_set)
+                best_set = improved_set
+        
+        if best_size == 24:
+            break
+    
+    if best_set is None:
+        return [1]
+        
+    return best_set

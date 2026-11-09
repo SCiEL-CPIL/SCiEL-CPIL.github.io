@@ -1,0 +1,215 @@
+"""
+Non-stationary Linear Contextual Bandit Policy.
+
+Uses a multi-timescale Linear UCB approach:
+1. Short-window model (fast adaptation) for primary arm selection.
+2. Long-window model (stable baseline) for regularization/backup.
+3. Adaptive forgetting factors for both windows.
+"""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+class Policy:
+    def __init__(self, n_arms, dim):
+        self.n_arms = n_arms
+        self.dim = dim
+        
+        # Short-window models (fast)
+        self.A_short = [np.eye(dim) * 1.0 for _ in range(n_arms)]
+        self.b_short = [np.zeros(dim) for _ in range(n_arms)]
+        
+        # Long-window models (slow)
+        self.A_long = [np.eye(dim) * 1.0 for _ in range(n_arms)]
+        self.b_long = [np.zeros(dim) for _ in range(n_arms)]
+        
+        # Forgetting factors
+        self.lambda_short_base = 0.95
+        self.lambda_short_min = 0.70
+        self.lambda_short_max = 0.99
+        self.lambda_short = self.lambda_short_base
+        
+        self.lambda_long_base = 0.995
+        self.lambda_long_min = 0.95
+        self.lambda_long_max = 0.9999
+        self.lambda_long = self.lambda_long_base
+        
+        # Error tracking
+        self.error_buffer_short = np.zeros(30)
+        self.error_idx_short = 0
+        self.error_count_short = 0
+        self.expected_var_short = 1.0
+        
+        self.error_buffer_long = np.zeros(50)
+        self.error_idx_long = 0
+        self.error_count_long = 0
+        self.expected_var_long = 1.0
+        
+        # Exploration
+        self.alpha_start = 2.5
+        self.alpha_min = 0.5
+        self.decay_rate = 0.002
+        
+        # Time
+        self.t = 0
+        self.start_time = time.time()
+        self.deadline = self.start_time + 145.0
+        
+        # Reset thresholds
+        self.reset_threshold = 3.0
+
+    def _solve(self, A, b):
+        """Solve linear system with fallback."""
+        try:
+            return np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            return np.linalg.lstsq(A, b, rcond=None)[0]
+
+    def _get_inverse_solve(self, A, vec):
+        """Solve A x = vec."""
+        try:
+            return np.linalg.solve(A, vec)
+        except np.linalg.LinAlgError:
+            return np.linalg.lstsq(A, vec, rcond=None)[0]
+
+    def _update_lambda_short(self, sq_error):
+        """Update short-window forgetting factor."""
+        self.error_buffer_short[self.error_idx_short] = sq_error
+        self.error_idx_short = (self.error_idx_short + 1) % len(self.error_buffer_short)
+        if self.error_count_short < len(self.error_buffer_short):
+            self.error_count_short += 1
+            
+        if self.error_count_short == 0:
+            return
+            
+        avg_sq_err = np.mean(self.error_buffer_short[:self.error_count_short])
+        error_ratio = avg_sq_err / self.expected_var_short
+        penalty = error_ratio / (1.0 + error_ratio)
+        new_lambda = self.lambda_short_max - (self.lambda_short_max - self.lambda_short_min) * penalty
+        self.lambda_short = 0.9 * self.lambda_short + 0.1 * new_lambda
+        self.expected_var_short = 0.99 * self.expected_var_short + 0.01 * (avg_sq_err + 0.1)
+
+    def _update_lambda_long(self, sq_error):
+        """Update long-window forgetting factor."""
+        self.error_buffer_long[self.error_idx_long] = sq_error
+        self.error_idx_long = (self.error_idx_long + 1) % len(self.error_buffer_long)
+        if self.error_count_long < len(self.error_buffer_long):
+            self.error_count_long += 1
+            
+        if self.error_count_long == 0:
+            return
+            
+        avg_sq_err = np.mean(self.error_buffer_long[:self.error_count_long])
+        error_ratio = avg_sq_err / self.expected_var_long
+        penalty = error_ratio / (1.0 + error_ratio)
+        new_lambda = self.lambda_long_max - (self.lambda_long_max - self.lambda_long_min) * penalty
+        self.lambda_long = 0.95 * self.lambda_long + 0.05 * new_lambda
+        self.expected_var_long = 0.999 * self.expected_var_long + 0.001 * (avg_sq_err + 0.1)
+
+    def select(self, context):
+        # Deadline check
+        if time.time() > self.deadline:
+             best_arm = 0
+             best_score = -np.inf
+             for a in range(self.n_arms):
+                 theta = self._solve(self.A_short[a], self.b_short[a])
+                 mu = theta @ context
+                 if mu > best_score:
+                     best_score = mu
+                     best_arm = a
+             return best_arm
+
+        self.t += 1
+        context = np.asarray(context, dtype=np.float64)
+        
+        alpha = max(self.alpha_min, self.alpha_start * np.exp(-self.decay_rate * self.t))
+        
+        best_arm = 0
+        best_score = -np.inf
+        
+        for a in range(self.n_arms):
+            # Use short-window model for primary scoring
+            A_s = self.A_short[a]
+            b_s = self.b_short[a]
+            
+            theta_s = self._solve(A_s, b_s)
+            mu_s = theta_s @ context
+            
+            # Uncertainty from short model
+            A_inv_x_s = self._get_inverse_solve(A_s, context)
+            v_s = context @ A_inv_x_s
+            
+            # Use long-window model for regularization/baseline
+            A_l = self.A_long[a]
+            b_l = self.b_long[a]
+            theta_l = self._solve(A_l, b_l)
+            mu_l = theta_l @ context
+            
+            # Blend: primarily short, but regularize towards long if short is uncertain
+            # If short uncertainty is high, trust long more
+            weight_s = 1.0 / (1.0 + v_s)  # High v -> low weight for short
+            weight_l = 1.0 - weight_s
+            
+            mu_blend = weight_s * mu_s + weight_l * mu_l
+            
+            # Uncertainty: use short model's uncertainty
+            score = mu_blend + alpha * np.sqrt(max(v_s, 0.0))
+            
+            if score > best_score:
+                best_score = score
+                best_arm = a
+                
+        return best_arm
+
+    def update(self, context, arm, reward):
+        context = np.asarray(context, dtype=np.float64)
+        
+        # Update short-window model
+        A_s = self.A_short[arm]
+        b_s = self.b_short[arm]
+        theta_s = self._solve(A_s, b_s)
+        mu_pred_s = theta_s @ context
+        
+        A_inv_x_s = self._get_inverse_solve(A_s, context)
+        v_s = context @ A_inv_x_s
+        std_pred_s = np.sqrt(max(v_s, 0.0)) + np.sqrt(self.expected_var_short)
+        
+        residual_s = reward - mu_pred_s
+        sq_error_s = residual_s ** 2
+        
+        self._update_lambda_short(sq_error_s)
+        lam_s = self.lambda_short
+        
+        # Check for shock reset on short model
+        if abs(residual_s) > self.reset_threshold * std_pred_s:
+            self.A_short[arm] = np.eye(self.dim) * 1.0
+            self.b_short[arm] = reward * context
+        else:
+            self.A_short[arm] = lam_s * self.A_short[arm] + np.outer(context, context)
+            self.b_short[arm] = lam_s * self.b_short[arm] + reward * context
+        
+        # Update long-window model
+        A_l = self.A_long[arm]
+        b_l = self.b_long[arm]
+        theta_l = self._solve(A_l, b_l)
+        mu_pred_l = theta_l @ context
+        
+        A_inv_x_l = self._get_inverse_solve(A_l, context)
+        v_l = context @ A_inv_x_l
+        std_pred_l = np.sqrt(max(v_l, 0.0)) + np.sqrt(self.expected_var_long)
+        
+        residual_l = reward - mu_pred_l
+        sq_error_l = residual_l ** 2
+        
+        self._update_lambda_long(sq_error_l)
+        lam_l = self.lambda_long
+        
+        # Less aggressive reset for long model
+        if abs(residual_l) > 4.0 * std_pred_l:
+            self.A_long[arm] = np.eye(self.dim) * 1.0
+            self.b_long[arm] = reward * context
+        else:
+            self.A_long[arm] = lam_l * self.A_long[arm] + np.outer(context, context)
+            self.b_long[arm] = lam_l * self.b_long[arm] + reward * context
+
+# EVOLVE-BLOCK-END

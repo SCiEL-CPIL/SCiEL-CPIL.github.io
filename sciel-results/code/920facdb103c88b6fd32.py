@@ -1,0 +1,19 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+
+
+def beat_the_average_measure() -> tuple[np.ndarray, np.ndarray]:
+    """
+    Beat-the-average game. Construct a discrete probability measure mu on [0, inf)
+    that maximizes P[X1 + X2 + X3 < 2*X4], where X1, X2, X3, X4 are i.i.d. with law mu.
+
+    Uses a 2-point distribution on {0, 1} with probability p at 1 and 1-p at 0,
+    where p = (1 + sqrt(33)) / 16.
+    """
+    p = (1.0 + np.sqrt(33.0)) / 16.0
+    support = np.array([0.0, 1.0], dtype=np.float64)
+    weights = np.array([1.0 - p, p], dtype=np.float64)
+    return support, weights
+
+
+# EVOLVE-BLOCK-END

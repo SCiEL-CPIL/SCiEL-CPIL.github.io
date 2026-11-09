@@ -1,0 +1,2 @@
+
+BET: {mechanism: "Optimizes the true 6-pair mean per-spin gap objective with a deadline-guarded two-stage L-BFGS-B using a guaranteed-correct finite-difference gradient (verified against the analytic energy), replacing the seed's fixed |+> product state so the circuit actually fits each field's ground state and the raw value drops far below the seed's ~1.0 baseline.", q: 0.75, delta: [1.0, 15.0]}

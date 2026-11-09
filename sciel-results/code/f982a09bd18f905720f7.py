@@ -1,0 +1,3 @@
+    if not is_valid:
+        # Fallback to grid configuration
+        ...

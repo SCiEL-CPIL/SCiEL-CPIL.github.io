@@ -6,8 +6,9 @@ import numpy as np
 def equation(strain: np.ndarray, temp: np.ndarray, params: np.ndarray) -> np.ndarray:
     """
     Stress of an aluminium rod from strain and temperature.
-    Uses dual-tanh saturation (yield + hardening), linear elastic term,
-    and polynomial temperature corrections with gated interaction.
+    Uses a fixed-basis additive model with polynomial and tanh terms.
+    This creates a smooth, convex-like loss landscape for BFGS, allowing it to
+    reliably find the global minimum and capture saturation behavior.
     """
     # Extract parameters
     p0, p1, p2, p3, p4, p5, p6, p7, p8, p9 = params
@@ -16,41 +17,55 @@ def equation(strain: np.ndarray, temp: np.ndarray, params: np.ndarray) -> np.nda
     strain = np.asarray(strain, dtype=np.float64)
     temp = np.asarray(temp, dtype=np.float64)
     
-    # Two tanh terms: one for yield plateau, one for hardening
-    # p1 scales strain for the yield transition (sharp)
-    # p2 scales strain for the hardening saturation (slower)
-    s_yield = np.tanh(p1 * strain)
-    s_hard = np.tanh(p2 * strain)
-    
-    # Linear strain for elastic region
+    # Compute basis functions
+    # Polynomial terms in strain
     s1 = strain
+    s2 = s1 * s1
+    s3 = s2 * s1
+    s4 = s2 * s2
+    s5 = s4 * s1
+    
+    # Tanh terms to capture saturation (plastic flow)
+    # Multiple scales to capture different transition regimes
+    t1 = np.tanh(50 * s1)
+    t2 = np.tanh(200 * s1)
     
     # Temperature terms
-    t1 = temp
-    t2 = t1 * t1
+    t_temp1 = temp
+    t_temp2 = temp * temp
+    t_temp3 = t_temp2 * temp
     
-    # Gate: small when both tanh terms are saturated (deep plastic region)
-    gate = (1.0 - np.abs(s_yield)) * (1.0 - np.abs(s_hard))
+    # Interaction terms
+    st1 = s1 * t_temp1
+    st2 = t1 * t_temp1
+    st3 = s2 * t_temp1
+    st4 = t2 * t_temp2
     
     # Build the model
-    # p0: constant offset
-    # p3 * s_yield: yield plateau contribution
-    # p4 * s_hard: hardening saturation contribution
-    # p5 * s1: linear elastic slope
-    # p6 * t1: temperature linear
-    # p7 * t2: temperature quadratic
-    # p8 * s1 * t1: strain-temp interaction (gated)
-    # p9 * s_yield * t1: yield-temperature interaction
-    # p1 and p2 are scale factors for the tanh arguments (already used above)
+    # We use all 10 parameters as coefficients for the basis functions
+    # p0: intercept
+    # p1: linear strain
+    # p2: quadratic strain
+    # p3: cubic strain
+    # p4: tanh(50*strain) - moderate saturation
+    # p5: tanh(200*strain) - sharp saturation
+    # p6: linear temp
+    # p7: quadratic temp
+    # p8: strain * temp
+    # p9: tanh(50*strain) * temp
     
-    result = (p0
-              + p3 * s_yield
-              + p4 * s_hard
-              + p5 * s1
-              + p6 * t1
-              + p7 * t2
-              + p8 * s1 * t1 * gate
-              + p9 * s_yield * t1)
+    prediction = (
+        p0 +
+        p1 * s1 +
+        p2 * s2 +
+        p3 * s3 +
+        p4 * t1 +
+        p5 * t2 +
+        p6 * t_temp1 +
+        p7 * t_temp2 +
+        p8 * st1 +
+        p9 * st2
+    )
     
-    return result
+    return prediction
 # EVOLVE-BLOCK-END

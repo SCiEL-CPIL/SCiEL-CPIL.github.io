@@ -1,0 +1,3 @@
+    def add_strassen_2x2(i_off, j_off, k_off):
+        # M1: (a+d)(e+h)
+        # ...

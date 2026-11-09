@@ -1,0 +1,1 @@
+BET: {mechanism: "Replaces ineffective random+local search with structured filtering (triangle/4-cycle rejection) and more aggressive random restarts at each size, increasing the probability of finding a valid girth-16 graph within the time budget", q: 0.35, delta: [0.0, 0.15]}

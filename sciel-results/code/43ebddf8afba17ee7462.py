@@ -1,0 +1,179 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+
+class Optimizer:
+    """Adaptive (1+1)-ES with diverse initialization and adaptive restarts for BBOB-style optimization."""
+
+    def __init__(self, budget, dim):
+        self.budget = budget
+        self.dim = dim
+
+    def __call__(self, func):
+        dim = self.dim
+        budget = self.budget
+        start_time = time.time()
+        deadline = start_time + 295  # Safety margin before 300s limit
+
+        rng = np.random.default_rng(123)
+
+        # Phase 1: Diverse initialization with structured points
+        best_x = np.zeros(dim)
+        best_f = func(best_x)
+        calls = 1
+
+        # Structured initialization: origin, mid-range, and diverse random
+        init_points = []
+        # Centered points
+        for scale in [1.0, 2.0, 3.0]:
+            init_points.append(np.ones(dim) * scale)
+            init_points.append(np.ones(dim) * (-scale))
+        # A few random diverse points
+        for _ in range(5):
+            init_points.append(rng.uniform(-4, 4, dim))
+
+        for pt in init_points:
+            if calls >= budget:
+                break
+            if time.time() > deadline:
+                break
+            pt = np.clip(pt, -5, 5)
+            f = func(pt)
+            calls += 1
+            if f < best_f:
+                best_f = f
+                best_x = pt.copy()
+
+        # Phase 2: (1+1)-ES with adaptive sigma and smart restarts
+        x = best_x.copy()
+        fx = best_f
+        sigma = 1.0  # Initial step size
+        
+        # Track success rate for 1/5th rule adaptation
+        success_window = []
+        window_size = 15
+        
+        # Stagnation tracking
+        stagnation = 0
+        no_improve_count = 0
+        
+        # Adaptive parameters
+        sigma_min = 0.005
+        sigma_max = 4.0
+        
+        # Budget allocation: use last 15% for polish
+        polish_start = int(budget * 0.85)
+        
+        while calls < budget:
+            if time.time() > deadline:
+                break
+
+            # Determine if we're in polish phase
+            in_polish = calls >= polish_start
+            if in_polish:
+                sigma = min(sigma, 0.1)
+            
+            # Generate offspring
+            y = np.clip(x + sigma * rng.standard_normal(dim), -5, 5)
+            fy = func(y)
+            calls += 1
+
+            # Track success
+            success = fy < fx
+            success_window.append(success)
+            if len(success_window) > window_size:
+                success_window.pop(0)
+            
+            # 1/5th success rule for sigma adaptation
+            if len(success_window) >= window_size:
+                success_rate = sum(success_window) / len(success_window)
+                if success_rate > 0.3:
+                    sigma = min(sigma * 1.2, sigma_max)
+                elif success_rate < 0.1:
+                    sigma = max(sigma * 0.7, sigma_min)
+            
+            # Update current solution
+            if success:
+                x, fx = y, fy
+                stagnation = 0
+            else:
+                stagnation += 1
+
+            # Update global best
+            if fy < best_f:
+                best_f = fy
+                best_x = y.copy()
+                no_improve_count = 0
+            else:
+                no_improve_count += 1
+
+            # Adaptive restart conditions
+            # Stagnation limit decreases as we progress (more patient early, less later)
+            progress_ratio = calls / budget
+            stagnation_limit = int(40 * (1.0 - 0.5 * progress_ratio))
+            no_improve_limit = int(60 * (1.0 - 0.5 * progress_ratio))
+            
+            if in_polish:
+                stagnation_limit = 15
+                no_improve_limit = 25
+
+            # Restart if stagnated
+            if stagnation >= stagnation_limit:
+                # Adaptive restart: more likely to explore globally as we've been stuck longer
+                explore_prob = min(0.3 + 0.01 * no_improve_count, 0.8)
+                
+                if rng.random() < explore_prob:
+                    # Global exploration
+                    x = rng.uniform(-5, 5, dim)
+                    sigma = 2.0
+                else:
+                    # Local exploration around best
+                    local_sigma = max(sigma * 2.0, 0.5)
+                    x = np.clip(best_x + local_sigma * rng.standard_normal(dim), -5, 5)
+                    sigma = local_sigma
+                    
+                fx = func(x)
+                calls += 1
+                stagnation = 0
+                no_improve_count = 0
+                success_window = []
+                
+                if fx < best_f:
+                    best_f = fx
+                    best_x = x.copy()
+
+                if calls >= budget:
+                    break
+
+            # Aggressive restart if no global improvement
+            if no_improve_count >= no_improve_limit:
+                # Try multiple random restarts and pick the best
+                best_restart_x = x
+                best_restart_f = fx
+                n_restarts = 3
+                for _ in range(n_restarts):
+                    if calls >= budget:
+                        break
+                    cand = rng.uniform(-5, 5, dim)
+                    cand_f = func(cand)
+                    calls += 1
+                    if cand_f < best_restart_f:
+                        best_restart_f = cand_f
+                        best_restart_x = cand
+                    if cand_f < best_f:
+                        best_f = cand_f
+                        best_x = cand.copy()
+                
+                x = best_restart_x
+                fx = best_restart_f
+                sigma = 1.5
+                stagnation = 0
+                no_improve_count = 0
+                success_window = []
+
+                if calls >= budget:
+                    break
+
+        return best_x, best_f
+# EVOLVE-BLOCK-END

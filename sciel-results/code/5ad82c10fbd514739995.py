@@ -1,0 +1,237 @@
+import random
+import time
+import sys
+
+L = 5354228880  # lcm(1..24)
+
+# Precompute L//x for x in 1..24
+L_DIV = [0] + [L // i for i in range(1, 25)]
+
+def subset_sum_exists(weights, target):
+    """
+    Check if target can be formed by a subset of weights.
+    Uses meet-in-the-middle with early termination.
+    """
+    if target == 0:
+        return True
+    if not weights:
+        return False
+    
+    # Filter weights > target
+    weights = [w for w in weights if w <= target]
+    if not weights:
+        return False
+    if len(weights) == 1:
+        return weights[0] == target
+    if len(weights) == 2:
+        return weights[0] == target or weights[1] == target or weights[0] + weights[1] == target
+    
+    n = len(weights)
+    mid = n // 2
+    left = weights[:mid]
+    right = weights[mid:]
+    
+    left_sums = {0}
+    for w in left:
+        new_sums = set()
+        for s in left_sums:
+            ns = s + w
+            if ns <= target:
+                new_sums.add(ns)
+        left_sums.update(new_sums)
+    
+    right_sums = {0}
+    for w in right:
+        new_sums = set()
+        for s in right_sums:
+            ns = s + w
+            if ns <= target:
+                new_sums.add(ns)
+        right_sums.update(new_sums)
+        for rs in right_sums:
+            if target - rs in left_sums:
+                return True
+    
+    for s in left_sums:
+        if target - s in right_sums:
+            return True
+    return False
+
+# Cache for subset sum results
+_subset_sum_cache = {}
+
+def subset_sum_cached(weights_tuple, target):
+    """Cached version of subset_sum_exists."""
+    if target == 0:
+        return True
+    if not weights_tuple:
+        return False
+    key = (weights_tuple, target)
+    if key in _subset_sum_cache:
+        return _subset_sum_cache[key]
+    result = subset_sum_exists(list(weights_tuple), target)
+    _subset_sum_cache[key] = result
+    return result
+
+def is_valid(S):
+    """
+    Check if S is a valid set.
+    """
+    if not S:
+        return True
+    S_set = set(S)
+    for x in S:
+        target = L_DIV[x]
+        weights = tuple(L_DIV[y] for y in S_set if y != x)
+        if subset_sum_cached(weights, target):
+            return False
+    return True
+
+def can_add(S_set, x):
+    """
+    Check if x can be added to valid set S_set.
+    """
+    # Check for x: L//x should not be formable by subset of {L//y for y in S_set}
+    if S_set:
+        weights_for_x = tuple(L_DIV[y] for y in S_set)
+        if subset_sum_cached(weights_for_x, L_DIV[x]):
+            return False
+    
+    # Check for each y in S_set: L//y should not be formable by subset of
+    # {L//z for z in S_set, z != y} union {L//x}
+    for y in S_set:
+        A = tuple(L_DIV[z] for z in S_set if z != y and z != x)
+        tx = L_DIV[x]
+        ty = L_DIV[y]
+        
+        # Case 1: don't use L//x
+        if A and subset_sum_cached(A, ty):
+            return False
+        # Case 2: use L//x
+        if ty >= tx:
+            if subset_sum_cached(A, ty - tx):
+                return False
+    
+    return True
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 55  # 55s safety margin
+    
+    best_set = None
+    best_size = 0
+    
+    # Initial guess: Seed solution
+    seed_set = list(range(13, 25))
+    if is_valid(seed_set):
+        best_set = seed_set
+        best_size = len(seed_set)
+    
+    # Deterministic greedy construction with multiple insertion orders
+    def greedy_construct(order):
+        """Build a valid set by greedily adding elements in the given order."""
+        S = []
+        S_set = set()
+        for x in order:
+            if x in S_set:
+                continue
+            if can_add(S_set, x):
+                S.append(x)
+                S_set.add(x)
+        return S
+    
+    # Try several deterministic orders
+    orders = [
+        list(range(24, 0, -1)),  # Descending
+        list(range(1, 25)),      # Ascending
+        # Interleaved large/small
+        [12, 13, 11, 14, 10, 15, 9, 16, 8, 17, 7, 18, 6, 19, 5, 20, 4, 21, 3, 22, 2, 23, 1, 24],
+        # Pairs from middle outward
+        [13, 12, 14, 11, 15, 10, 16, 9, 17, 8, 18, 7, 19, 6, 20, 5, 21, 4, 22, 3, 23, 2, 24, 1],
+    ]
+    
+    for order in orders:
+        if time.time() > deadline:
+            break
+        S = greedy_construct(order)
+        if len(S) > best_size:
+            best_size = len(S)
+            best_set = S
+    
+    # Local search: try to improve by adding elements
+    def local_search(S, max_iterations=200):
+        """Try to improve set S by adding elements."""
+        S = list(S)
+        S_set = set(S)
+        improved = True
+        iterations = 0
+        while improved and iterations < max_iterations and time.time() < deadline:
+            improved = False
+            iterations += 1
+            
+            # Try adding each missing element
+            missing = [i for i in range(1, 25) if i not in S_set]
+            random.shuffle(missing)
+            for m in missing:
+                if time.time() > deadline:
+                    return S
+                if can_add(S_set, m):
+                    S.append(m)
+                    S_set.add(m)
+                    improved = True
+            
+            # If no single addition works, try swap: remove one, add one
+            if not improved and len(S) >= 1:
+                for i in range(len(S)):
+                    if time.time() > deadline:
+                        return S
+                    S_without = [x for x in S if x != S[i]]
+                    S_without_set = set(S_without)
+                    candidates = [k for k in range(1, 25) if k not in S_without_set and k != S[i]]
+                    random.shuffle(candidates)
+                    for c in candidates[:15]:
+                        if time.time() > deadline:
+                            return S
+                        if can_add(S_without_set, c):
+                            S = S_without + [c]
+                            S_set = set(S)
+                            improved = True
+                            break
+                    if improved:
+                        break
+        
+        return S
+    
+    # Apply local search to best set found so far
+    if best_set is not None and time.time() < deadline:
+        improved_set = local_search(best_set)
+        if len(improved_set) > best_size:
+            best_size = len(improved_set)
+            best_set = improved_set
+    
+    # Random restarts with greedy + local search
+    random.seed(42)
+    while time.time() < deadline and best_size < 24:
+        # Random order for greedy construction
+        random_order = list(range(1, 25))
+        random.shuffle(random_order)
+        S = greedy_construct(random_order)
+        
+        if len(S) > best_size:
+            best_size = len(S)
+            best_set = S
+        
+        # Local search on this set
+        if time.time() < deadline:
+            improved_set = local_search(S, max_iterations=80)
+            if len(improved_set) > best_size:
+                best_size = len(improved_set)
+                best_set = improved_set
+        
+        if best_size == 24:
+            break
+    
+    if best_set is None:
+        return [1]
+        
+    return best_set

@@ -1,0 +1,566 @@
+"""Model-and-optimize root finder for ill-conditioned equations with homotopy continuation."""
+import time
+import math
+
+# EVOLVE-BLOCK-START
+def find_root(f, x0):
+    _t0 = time.time()
+    _TIME_LIMIT = 115.0
+    _MAX_EVALS = 450
+    _evals = 0
+
+    def _f(x):
+        nonlocal _evals
+        _evals += 1
+        try:
+            return float(f(x))
+        except Exception:
+            return float('nan')
+
+    def _time_ok():
+        return (time.time() - _t0) < _TIME_LIMIT
+
+    def _budget_ok():
+        return _evals < _MAX_EVALS
+
+    def _safe(x):
+        return math.isfinite(x)
+
+    best_x = float(x0)
+    best_fx = _f(best_x)
+    best_abs = abs(best_fx) if _safe(best_fx) else float('inf')
+
+    def _update(x, fx):
+        nonlocal best_x, best_fx, best_abs
+        if not _safe(fx):
+            return False
+        af = abs(fx)
+        if af < best_abs:
+            best_abs = af
+            best_x = float(x)
+            best_fx = float(fx)
+            return af <= 1e-8
+        return False
+
+    _update(best_x, best_fx)
+    if best_abs <= 1e-8:
+        return best_x
+
+    def _iqi(x1, f1, x2, f2, x3, f3):
+        if not all(_safe(v) for v in [x1, f1, x2, f2, x3, f3]):
+            return None
+        denom = (f1 - f2) * (f1 - f3) * (f2 - f3)
+        if abs(denom) < 1e-30:
+            return None
+        x0_iqi = (f2 * f3 * x1 / ((f1 - f2) * (f1 - f3)) +
+                  f1 * f3 * x2 / ((f2 - f1) * (f2 - f3)) +
+                  f1 * f2 * x3 / ((f3 - f1) * (f3 - f2)))
+        if not _safe(x0_iqi):
+            return None
+        return x0_iqi
+
+    def _secant(x1, f1, x2, f2):
+        if not all(_safe(v) for v in [x1, f1, x2, f2]):
+            return None
+        denom = f2 - f1
+        if abs(denom) < 1e-30:
+            return None
+        x_new = x1 - f1 * (x2 - x1) / denom
+        if not _safe(x_new):
+            return None
+        return x_new
+
+    def _bisect(a, b, fa, fb, max_iter=60):
+        for _ in range(max_iter):
+            if not _time_ok() or not _budget_ok():
+                break
+            mid = (a + b) / 2.0
+            fmid = _f(mid)
+            if not _safe(fmid):
+                break
+            _update(mid, fmid)
+            if abs(fmid) <= 1e-8:
+                return mid
+            if (fmid <= 0 and fa <= 0) or (fmid >= 0 and fa >= 0):
+                a, fa = mid, fmid
+            else:
+                b, fb = mid, fmid
+            if abs(b - a) < 1e-14 * max(1.0, abs(a), abs(b)):
+                break
+        return (a + b) / 2.0
+
+    # Local IQI/secant solver starting from two points
+    def _local_solve(x_start, f_start, max_iter=30):
+        """IQI/secant solver from initial point. Returns (x, f) or None."""
+        if not _safe(f_start):
+            return None
+        if abs(f_start) <= 1e-8:
+            return (x_start, f_start)
+        
+        scale = max(1.0, abs(x_start))
+        x2 = x_start + 0.1 * scale
+        f2 = _f(x2)
+        if not _safe(f2):
+            x2 = x_start - 0.1 * scale
+            f2 = _f(x2)
+            if not _safe(f2):
+                return None
+        
+        _update(x_start, f_start)
+        _update(x2, f2)
+        if abs(f2) <= 1e-8:
+            return (x2, f2)
+        
+        pts = [(x_start, f_start), (x2, f2)]
+        ba = bb = bfa = bfb = None
+        
+        for _ in range(max_iter):
+            if not _time_ok() or not _budget_ok():
+                break
+            xp, fp = pts[-1]
+            if abs(fp) <= 1e-8:
+                return (xp, fp)
+            
+            xn = None
+            if len(pts) >= 3:
+                xn = _iqi(pts[-3][0], pts[-3][1], pts[-2][0], pts[-2][1], pts[-1][0], pts[-1][1])
+            if xn is None and len(pts) >= 2:
+                xn = _secant(pts[-2][0], pts[-2][1], pts[-1][0], pts[-1][1])
+            if xn is None:
+                xn = xp + 0.1 * max(1.0, abs(xp))
+            
+            max_step = 5.0 * max(1.0, abs(xp))
+            if abs(xn - xp) > max_step:
+                xn = xp + max_step * (1 if xn > xp else -1)
+            if not _safe(xn):
+                xn = xp + 0.01 * max(1.0, abs(xp))
+                if not _safe(xn):
+                    break
+            
+            fn = _f(xn)
+            if not _safe(fn):
+                xn = xp - 0.5 * (xn - xp)
+                fn = _f(xn)
+                if not _safe(fn):
+                    break
+            
+            _update(xn, fn)
+            if abs(fn) <= 1e-8:
+                return (xn, fn)
+            
+            if (fn <= 0 and fp >= 0) or (fn >= 0 and fp <= 0):
+                ba, bb = xp, xn
+                bfa, bfb = fp, fn
+            
+            pts.append((xn, fn))
+            if len(pts) > 3:
+                pts.pop(0)
+            if abs(xn - xp) < 1e-15 * max(1.0, abs(xn)):
+                break
+        
+        # Try bracket if found
+        if ba is not None and bb is not None:
+            if (bfa <= 0 and bfb >= 0) or (bfa >= 0 and bfb <= 0):
+                res = _bisect(ba, bb, bfa, bfb, max_iter=40)
+                fres = _f(res)
+                _update(res, fres)
+                if abs(fres) <= 1e-8:
+                    return (res, fres)
+                return (res, fres)
+        
+        return None
+
+    # Homotopy continuation: blend from linear to target
+    def _homotopy_solve(x_init, max_steps=15):
+        """
+        Homotopy: H_t(x) = (1-t)*g(x) + t*f(x)
+        where g(x) = f(x0) + f'(x0)*(x-x0) approximated by secant slope.
+        Start at t=0 (easy linear root), follow path to t=1.
+        """
+        if not _time_ok() or not _budget_ok():
+            return None
+        
+        # Estimate slope from two nearby points
+        scale = max(1.0, abs(x_init))
+        h = 0.01 * scale
+        fx0 = _f(x_init)
+        fxh = _f(x_init + h)
+        if not (_safe(fx0) and _safe(fxh)):
+            return None
+        slope = (fxh - fx0) / h
+        if not _safe(slope) or abs(slope) < 1e-15:
+            slope = 1.0
+        
+        # Linear function g(x) = fx0 + slope*(x - x_init)
+        # Root of g: x_g = x_init - fx0/slope
+        x_g = x_init - fx0 / slope if abs(slope) > 1e-15 else x_init
+        if not _safe(x_g):
+            x_g = x_init
+        
+        _update(x_g, _f(x_g))
+        
+        # Homotopy parameter schedule: geometric from small to 1
+        t_values = [0.05, 0.15, 0.35, 0.6, 0.8, 1.0]
+        
+        # Evaluate H_t at current best
+        def _H(t, x):
+            """H_t(x) = (1-t)*g(x) + t*f(x)"""
+            g_val = fx0 + slope * (x - x_init)
+            f_val = _f(x)
+            if not _safe(f_val):
+                return float('nan')
+            return (1.0 - t) * g_val + t * f_val
+        
+        # Start from root of g
+        x_cur = x_g
+        for t in t_values:
+            if not _time_ok() or not _budget_ok():
+                break
+            if t >= 1.0:
+                # Just solve f directly from x_cur
+                res = _local_solve(x_cur, _f(x_cur), max_iter=25)
+                if res is not None:
+                    return res
+                break
+            
+            # Solve H_t(x) = 0 starting from x_cur
+            f_cur = _H(t, x_cur)
+            if not _safe(f_cur):
+                continue
+            
+            # Use secant/IQI to solve H_t
+            scale_t = max(1.0, abs(x_cur))
+            x2 = x_cur + 0.1 * scale_t
+            f2 = _H(t, x2)
+            if not _safe(f2):
+                x2 = x_cur - 0.1 * scale_t
+                f2 = _H(t, x2)
+                if not _safe(f2):
+                    continue
+            
+            pts = [(x_cur, f_cur), (x2, f2)]
+            solved = False
+            for _ in range(15):
+                if not _time_ok() or not _budget_ok():
+                    break
+                xp, fp = pts[-1]
+                if abs(fp) <= 1e-10:
+                    x_cur = xp
+                    solved = True
+                    break
+                
+                xn = None
+                if len(pts) >= 3:
+                    xn = _iqi(pts[-3][0], pts[-3][1], pts[-2][0], pts[-2][1], pts[-1][0], pts[-1][1])
+                if xn is None and len(pts) >= 2:
+                    xn = _secant(pts[-2][0], pts[-2][1], pts[-1][0], pts[-1][1])
+                if xn is None:
+                    xn = xp + 0.1 * max(1.0, abs(xp))
+                
+                max_step = 3.0 * max(1.0, abs(xp))
+                if abs(xn - xp) > max_step:
+                    xn = xp + max_step * (1 if xn > xp else -1)
+                if not _safe(xn):
+                    xn = xp + 0.01 * max(1.0, abs(xp))
+                    if not _safe(xn):
+                        break
+                
+                fn = _H(t, xn)
+                if not _safe(fn):
+                    xn = xp - 0.5 * (xn - xp)
+                    fn = _H(t, xn)
+                    if not _safe(fn):
+                        break
+                
+                pts.append((xn, fn))
+                if len(pts) > 3:
+                    pts.pop(0)
+                if abs(xn - xp) < 1e-14 * max(1.0, abs(xn)):
+                    x_cur = xn
+                    solved = True
+                    break
+            if solved:
+                x_cur = pts[-1][0]
+        
+        # Final: solve f from x_cur
+        if _time_ok() and _budget_ok():
+            res = _local_solve(x_cur, _f(x_cur), max_iter=25)
+            if res is not None:
+                return res
+        
+        return None
+
+    # --- Phase 1: Direct IQI/Secant ---
+    x1 = float(x0)
+    f1 = _f(x1)
+    if not _safe(f1):
+        x1 = best_x
+        f1 = best_fx
+    _update(x1, f1)
+
+    scale = max(1.0, abs(x1))
+    x2 = x1 + 0.1 * scale
+    f2 = _f(x2)
+    _update(x2, f2)
+
+    if abs(f1) <= 1e-8:
+        return x1
+    if abs(f2) <= 1e-8:
+        return x2
+
+    points = [(x1, f1), (x2, f2)]
+    bracket_a = bracket_b = None
+    bracket_fa = bracket_fb = None
+
+    for i in range(60):
+        if not _time_ok() or not _budget_ok():
+            break
+
+        x_prev = points[-1][0]
+        f_prev = points[-1][1]
+
+        if abs(f_prev) <= 1e-8:
+            return x_prev
+
+        x_new = None
+        if len(points) >= 3:
+            x_new = _iqi(points[-3][0], points[-3][1], points[-2][0], points[-2][1], points[-1][0], points[-1][1])
+        if x_new is None and len(points) >= 2:
+            x_new = _secant(points[-2][0], points[-2][1], points[-1][0], points[-1][1])
+        if x_new is None:
+            x_new = x_prev + 0.1 * max(1.0, abs(x_prev))
+
+        max_step = 5.0 * max(1.0, abs(x_prev))
+        if abs(x_new - x_prev) > max_step:
+            x_new = x_prev + max_step * (1 if x_new > x_prev else -1)
+        if not _safe(x_new):
+            x_new = x_prev + 0.01 * max(1.0, abs(x_prev))
+            if not _safe(x_new):
+                break
+
+        if any(abs(x_new - px) < 1e-15 * max(1.0, abs(px)) for px, _ in points):
+            x_new = x_new + 1e-10 * max(1.0, abs(x_new))
+
+        f_new = _f(x_new)
+        if not _safe(f_new):
+            x_new = x_prev - 0.5 * (x_new - x_prev)
+            f_new = _f(x_new)
+            if not _safe(f_new):
+                break
+
+        _update(x_new, f_new)
+        if abs(f_new) <= 1e-8:
+            return x_new
+
+        if (f_new <= 0 and f_prev >= 0) or (f_new >= 0 and f_prev <= 0):
+            bracket_a, bracket_b = x_prev, x_new
+            bracket_fa, bracket_fb = f_prev, f_new
+            if abs(bracket_fa) > abs(bracket_fb):
+                bracket_a, bracket_b = bracket_b, bracket_a
+                bracket_fa, bracket_fb = bracket_fb, bracket_fa
+
+        points.append((x_new, f_new))
+        if len(points) > 3:
+            points.pop(0)
+
+        if abs(x_new - x_prev) < 1e-15 * max(1.0, abs(x_new)):
+            break
+
+    # --- Phase 2: Bracket refinement ---
+    if bracket_a is not None and bracket_b is not None:
+        if (bracket_fa <= 0 and bracket_fb >= 0) or (bracket_fa >= 0 and bracket_fb <= 0):
+            a, b = bracket_a, bracket_b
+            fa, fb = bracket_fa, bracket_fb
+            hist = [(a, fa), (b, fb)]
+
+            for i in range(40):
+                if not _time_ok() or not _budget_ok():
+                    break
+                x_trial = None
+                if len(hist) >= 3:
+                    x_trial = _iqi(hist[0][0], hist[0][1], hist[1][0], hist[1][1], hist[2][0], hist[2][1])
+                if x_trial is None or not _safe(x_trial) or not (a < x_trial < b):
+                    x_trial = (a + b) / 2.0
+                    if not _safe(x_trial):
+                        break
+                f_trial = _f(x_trial)
+                if not _safe(f_trial):
+                    break
+                _update(x_trial, f_trial)
+                if abs(f_trial) <= 1e-8:
+                    return x_trial
+                if (f_trial <= 0 and fa <= 0) or (f_trial >= 0 and fa >= 0):
+                    a, fa = x_trial, f_trial
+                else:
+                    b, fb = x_trial, f_trial
+                hist.append((x_trial, f_trial))
+                if len(hist) > 3:
+                    hist.pop(0)
+                if abs(b - a) < 1e-14 * max(1.0, abs(a), abs(b)):
+                    break
+
+            res = (a + b) / 2.0
+            fres = _f(res)
+            _update(res, fres)
+            if abs(fres) <= 1e-8:
+                return res
+
+    # --- Phase 3: Homotopy continuation from best point ---
+    if not _time_ok() or not _budget_ok():
+        return best_x
+
+    hom_res = _homotopy_solve(best_x, max_steps=15)
+    if hom_res is not None:
+        hx, hf = hom_res
+        _update(hx, hf)
+        if abs(hf) <= 1e-8:
+            return hx
+
+    # --- Phase 4: Scan for brackets ---
+    if not _time_ok() or not _budget_ok():
+        return best_x
+
+    base = best_x
+    scan_scale = max(1.0, abs(base))
+    found = False
+    for mult in [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]:
+        if not _time_ok() or not _budget_ok():
+            break
+        for sign in [-1, 1]:
+            a = base - sign * mult * scan_scale
+            b = base + sign * mult * scan_scale
+            if a == b:
+                continue
+            fa = _f(a)
+            fb = _f(b)
+            if not (_safe(fa) and _safe(fb)):
+                continue
+            _update(a, fa)
+            _update(b, fb)
+            if abs(fa) <= 1e-8:
+                return a
+            if abs(fb) <= 1e-8:
+                return b
+            if (fa <= 0 and fb >= 0) or (fa >= 0 and fb <= 0):
+                res = _bisect(a, b, fa, fb, max_iter=45)
+                fres = _f(res)
+                _update(res, fres)
+                if abs(fres) <= 1e-8:
+                    return res
+                found = True
+                break
+        if found:
+            break
+
+    # --- Phase 5: Golden section minimization of |f| ---
+    if not _time_ok() or not _budget_ok():
+        return best_x
+
+    center = best_x
+    scale = max(1.0, abs(center))
+    a = center - 20.0 * scale
+    b = center + 20.0 * scale
+
+    fa = _f(a)
+    fb = _f(b)
+    if not (_safe(fa) and _safe(fb)):
+        for mult in [10.0, 5.0, 2.0, 1.0, 0.5, 0.25, 0.1]:
+            a = center - mult * scale
+            b = center + mult * scale
+            fa = _f(a)
+            fb = _f(b)
+            if _safe(fa) and _safe(fb):
+                break
+            a, b = center, center
+            break
+
+    if _safe(fa) and _safe(fb) and a != b:
+        gr = (math.sqrt(5.0) - 1.0) / 2.0
+        c = b - gr * (b - a)
+        d = a + gr * (b - a)
+        fc = _f(c)
+        fd = _f(d)
+        _update(c, fc)
+        _update(d, fd)
+
+        for _ in range(40):
+            if not _time_ok() or not _budget_ok():
+                break
+            if abs(fc) <= 1e-8:
+                return c
+            if abs(fd) <= 1e-8:
+                return d
+            if abs(fc) < abs(fd):
+                b, d, fd = d, c, fc
+                c = b - gr * (b - a)
+                fc = _f(c)
+                _update(c, fc)
+            else:
+                a, c, fc = c, d, fd
+                d = a + gr * (b - a)
+                fd = _f(d)
+                _update(d, fd)
+            if abs(b - a) < 1e-14 * max(1.0, abs(a), abs(b)):
+                break
+        mid = (a + b) / 2.0
+        fmid = _f(mid)
+        _update(mid, fmid)
+        if abs(fmid) <= 1e-8:
+            return mid
+
+    # --- Phase 6: Final secant polish ---
+    if _time_ok() and _budget_ok():
+        x_a = best_x
+        f_a = _f(x_a)
+        if not _safe(f_a):
+            return best_x
+
+        scale = max(1.0, abs(x_a))
+        x_b = x_a + 0.01 * scale
+        f_b = _f(x_b)
+        if not _safe(f_b):
+            x_b = x_a - 0.01 * scale
+            f_b = _f(x_b)
+            if not _safe(f_b):
+                return best_x
+
+        _update(x_a, f_a)
+        _update(x_b, f_b)
+
+        if abs(f_a) <= 1e-8:
+            return x_a
+        if abs(f_b) <= 1e-8:
+            return x_b
+
+        for _ in range(15):
+            if not _time_ok() or not _budget_ok():
+                break
+            if abs(f_a) <= 1e-8:
+                return x_a
+            if abs(f_b) <= 1e-8:
+                return x_b
+
+            x_new = _secant(x_a, f_a, x_b, f_b)
+            if x_new is None:
+                break
+
+            max_step = 5.0 * max(1.0, abs(x_a))
+            if abs(x_new - x_a) > max_step:
+                x_new = x_a + max_step * (1 if x_new > x_a else -1)
+
+            if not _safe(x_new):
+                break
+
+            f_new = _f(x_new)
+            if not _safe(f_new):
+                break
+
+            _update(x_new, f_new)
+            if abs(f_new) <= 1e-8:
+                return x_new
+
+            x_a, f_a = x_b, f_b
+            x_b, f_b = x_new, f_new
+
+    return best_x
+# EVOLVE-BLOCK-END

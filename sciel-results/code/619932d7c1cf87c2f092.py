@@ -1,0 +1,174 @@
+import time
+import random
+import math
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 85  # Leave 5s margin for safety
+    
+    N = 256
+    
+    # Perfect squares up to 2*256 = 512
+    squares = set()
+    i = 2
+    while i * i <= 2 * N:
+        squares.add(i * i)
+        i += 1
+    
+    # Identify valid nodes (no self-conflict: 2v not a square)
+    valid_nodes = []
+    for v in range(1, N + 1):
+        if 2 * v not in squares:
+            valid_nodes.append(v)
+    
+    node_set = set(valid_nodes)
+    node_to_idx = {v: i for i, v in enumerate(valid_nodes)}
+    n = len(valid_nodes)
+    
+    # Build conflict adjacency: conflicts[i] = set of indices j where valid_nodes[i]+valid_nodes[j] is a square
+    conflicts = [set() for _ in range(n)]
+    for i_idx in range(n):
+        v = valid_nodes[i_idx]
+        for j_idx in range(i_idx + 1, n):
+            w = valid_nodes[j_idx]
+            if v + w in squares:
+                conflicts[i_idx].add(j_idx)
+                conflicts[j_idx].add(i_idx)
+    
+    def is_valid_set(selected):
+        """Verify selected indices form an independent set."""
+        sel_set = set(selected)
+        for idx in sel_set:
+            for nb in conflicts[idx]:
+                if nb in sel_set:
+                    return False
+        return True
+    
+    def greedy_mis(order):
+        """Greedy: process nodes in given order, add if no conflict with already selected."""
+        selected = set()
+        for idx in order:
+            if all(nb not in selected for nb in conflicts[idx]):
+                selected.add(idx)
+        return selected
+    
+    def local_search(selected, max_iters=5000):
+        """Try to improve by removing one and adding multiple, or swapping."""
+        selected = set(selected)
+        improved = True
+        while improved and (time.time() - start_time) < deadline - 1:
+            improved = False
+            # Try adding a single unselected node
+            for idx in range(n):
+                if idx not in selected:
+                    if all(nb not in selected for nb in conflicts[idx]):
+                        selected.add(idx)
+                        improved = True
+                        break
+            if improved:
+                continue
+            # Try removing one node and adding multiple
+            for rem in list(selected):
+                if (time.time() - start_time) > deadline - 1:
+                    break
+                new_sel = selected - {rem}
+                # Try to greedily add back as many as possible
+                added = 0
+                for idx in range(n):
+                    if idx not in new_sel and idx != rem:
+                        if all(nb not in new_sel for nb in conflicts[idx]):
+                            new_sel.add(idx)
+                            added += 1
+                if len(new_sel) > len(selected):
+                    selected = new_sel
+                    improved = True
+                    break
+            # Try swap: remove one, add one different
+            if not improved:
+                for rem in list(selected):
+                    if (time.time() - start_time) > deadline - 1:
+                        break
+                    for add in range(n):
+                        if add not in selected and add != rem:
+                            new_sel = (selected - {rem}) | {add}
+                            # Check validity
+                            valid = True
+                            for nb in conflicts[add]:
+                                if nb in new_sel:
+                                    valid = False
+                                    break
+                            if valid:
+                                # No size gain, skip (we want max cardinality)
+                                pass
+        return selected
+    
+    best = set()
+    best_size = 0
+    
+    # Multiple greedy initializations with different orderings
+    random.seed(42)
+    
+    # Order 1: natural order
+    order = list(range(n))
+    sel = greedy_mis(order)
+    sel = local_search(sel)
+    if len(sel) > best_size:
+        best = sel
+        best_size = len(sel)
+    
+    # Order 2: reverse
+    order = list(range(n - 1, -1, -1))
+    sel = greedy_mis(order)
+    sel = local_search(sel)
+    if len(sel) > best_size:
+        best = sel
+        best_size = len(sel)
+    
+    # Order 3: sorted by degree (fewest conflicts first)
+    degrees = [len(conflicts[i]) for i in range(n)]
+    order = sorted(range(n), key=lambda x: degrees[x])
+    sel = greedy_mis(order)
+    sel = local_search(sel)
+    if len(sel) > best_size:
+        best = sel
+        best_size = len(sel)
+    
+    # Order 4: sorted by degree (most conflicts first)
+    order = sorted(range(n), key=lambda x: -degrees[x])
+    sel = greedy_mis(order)
+    sel = local_search(sel)
+    if len(sel) > best_size:
+        best = sel
+        best_size = len(sel)
+    
+    # Random orderings
+    for trial in range(50):
+        if (time.time() - start_time) > deadline - 2:
+            break
+        order = list(range(n))
+        random.shuffle(order)
+        sel = greedy_mis(order)
+        sel = local_search(sel)
+        if len(sel) > best_size:
+            best = sel
+            best_size = len(sel)
+    
+    # More aggressive local search on best
+    if (time.time() - start_time) < deadline - 3:
+        best = local_search(best, max_iters=20000)
+        best_size = len(best)
+    
+    # Final verification
+    if not is_valid_set(best):
+        # Fallback: rebuild
+        order = list(range(n))
+        best = greedy_mis(order)
+    
+    # Convert back to values
+    result = sorted(valid_nodes[i] for i in best)
+    
+    if not result:
+        # Absolute fallback
+        result = [1]
+    
+    return result

@@ -1,0 +1,160 @@
+import time
+import random
+from collections import defaultdict
+
+def construct():
+    t0 = time.time()
+    DEADLINE = 145.0
+
+    def instance(n, p, seed):
+        rng = random.Random(seed)
+        order = list(range(n))
+        rng.shuffle(order)
+        edges = {tuple(sorted(e)) for e in zip(order, order[1:])}
+        edges |= {(u, v) for u in range(n) for v in range(u + 1, n) if rng.random() < p}
+        return sorted(edges)
+
+    def decompose(edges, deadline):
+        adj = defaultdict(set)
+        for u, v in edges:
+            adj[u].add(v)
+            adj[v].add(u)
+        
+        def greedy_path_init(seed_offset=0):
+            rng = random.Random(seed_offset)
+            remaining = set(edges)
+            paths = []
+            
+            while remaining:
+                deg = defaultdict(int)
+                for u, v in remaining:
+                    deg[u] += 1
+                    deg[v] += 1
+                if not deg: break
+                
+                # Prioritize odd-degree vertices (must be endpoints)
+                odd_verts = [v for v, d in deg.items() if d % 2 == 1]
+                if odd_verts:
+                    start = rng.choice(odd_verts)
+                else:
+                    # Pick degree 1 if exists, else max degree
+                    deg1_verts = [v for v, d in deg.items() if d == 1]
+                    if deg1_verts:
+                        start = rng.choice(deg1_verts)
+                    else:
+                        max_deg = max(deg.values())
+                        max_verts = [v for v, d in deg.items() if d == max_deg]
+                        start = rng.choice(max_verts)
+                
+                path = [start]
+                pverts = {start}
+                pedges = set()
+                cur = start
+                
+                while True:
+                    nbrs = list(adj[cur])
+                    rng.shuffle(nbrs)
+                    best_next = None
+                    best_score = float('inf')
+                    
+                    for v in nbrs:
+                        e = (min(cur, v), max(cur, v))
+                        if e in remaining and v not in pverts:
+                            # Heuristic: Prefer neighbors with higher degree to keep path alive
+                            v_deg = deg.get(v, 0)
+                            score = -v_deg + rng.random() * 0.1
+                            if score < best_score:
+                                best_score = score
+                                best_next = v
+                    if best_next is None:
+                        break
+                    path.append(best_next)
+                    pverts.add(best_next)
+                    e = (min(cur, best_next), max(cur, best_next))
+                    pedges.add(e)
+                    cur = best_next
+                    
+                if len(path) > 1:
+                    paths.append(path)
+                    for e in pedges:
+                        remaining.discard(e)
+                else:
+                    if remaining:
+                        e = next(iter(remaining))
+                        paths.append(list(e))
+                        remaining.discard(e)
+            return paths
+
+        def try_merge(paths):
+            for i in range(len(paths)):
+                for j in range(i+1, len(paths)):
+                    p1 = paths[i]
+                    p2 = paths[j]
+                    if len(p1) < 2 or len(p2) < 2:
+                        continue
+                    set1 = set(p1)
+                    set2 = set(p2)
+                    common = set1 & set2
+                    if len(common) != 1:
+                        continue
+                    shared = list(common)[0]
+                    is_ep1 = (p1[0] == shared or p1[-1] == shared)
+                    is_ep2 = (p2[0] == shared or p2[-1] == shared)
+                    if is_ep1 and is_ep2:
+                        if p1[-1] == shared and p2[0] == shared:
+                            new_p = p1 + p2[1:]
+                        elif p1[0] == shared and p2[-1] == shared:
+                            new_p = p2 + p1[1:]
+                        elif p1[0] == shared and p2[0] == shared:
+                            new_p = p1[::-1] + p2[1:]
+                        elif p1[-1] == shared and p2[-1] == shared:
+                            new_p = p2 + p1[::-1][1:]
+                        else:
+                            continue
+                        if len(new_p) == len(set(new_p)):
+                            new_paths = [p for k, p in enumerate(paths) if k != i and k != j]
+                            new_paths.append(new_p)
+                            return new_paths
+            return None
+
+        def local_search(paths, deadline):
+            changed = True
+            while changed and time.time() < deadline:
+                changed = False
+                new_paths = try_merge(paths)
+                if new_paths is not None:
+                    paths = new_paths
+                    changed = True
+            return paths
+
+        best_paths = None
+        best_count = float('inf')
+        
+        for attempt in range(20):
+            if time.time() > deadline - 2:
+                break
+            paths = greedy_path_init(attempt * 13 + 1)
+            paths = local_search(paths, deadline - 1)
+            count = len(paths)
+            if count < best_count:
+                best_count = count
+                best_paths = paths
+                # Check lower bound
+                deg = defaultdict(int)
+                for u, v in edges:
+                    deg[u] += 1
+                    deg[v] += 1
+                lb = sum(1 for d in deg.values() if d % 2 == 1) // 2
+                if best_count <= lb:
+                    break
+
+        if best_paths is None:
+            best_paths = greedy_path_init(0)
+        return best_paths
+
+    result = []
+    for spec in ((20, 0.3, 1), (25, 0.3, 2), (30, 0.25, 3)):
+        edges = instance(*spec)
+        paths = decompose(edges, DEADLINE)
+        result.append(paths)
+    return result

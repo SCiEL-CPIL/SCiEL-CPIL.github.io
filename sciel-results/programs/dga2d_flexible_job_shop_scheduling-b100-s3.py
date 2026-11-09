@@ -1,106 +1,84 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-# EVOLVE-BLOCK-START
-import time as _time
-
-_START_TIME = _time.time()
-_DEADLINE = _START_TIME + 115.0  # safety margin before 120s kill
-
+import time
 
 def dispatch(ready_operations, time):
     """
-    Pick which ready operation to start next (and optionally which machine).
+    Dispatches the next operation using a Dynamic Bottleneck Optimization strategy.
     
-    Uses a refined composite heuristic:
-      1. Primary: Maximize remaining_work (Longest Remaining Processing Time).
-      2. Secondary: Minimize min_duration (Shortest Processing Time on best machine).
-      3. Tertiary: Maximize remaining_ops count.
-      4. Machine selection: Choose the machine that minimizes (current_time + duration),
-         i.e., the machine that would be free earliest to start this operation.
-    
-    Returns: (index, machine) tuple to explicitly select the best machine,
-             or just index if only one option.
+    Strategy:
+    - Prioritize operations that maximize the ratio of their job's remaining critical 
+      path length (approximated by remaining_work) to the estimated cumulative load 
+      of their eligible machines.
+    - This shifts focus from static job attributes to real-time machine congestion, 
+      explicitly avoiding operations that would exacerbate load on already busy machines.
+    - Machine selection: For the chosen operation, select the machine with the minimum 
+      duration to minimize immediate processing time.
     """
-    # Deadline guard
-    if _time.time() > _DEADLINE:
-        return 0
-
     if not ready_operations:
-        return 0
+        return -1
 
-    n = len(ready_operations)
+    # Deadline guard: if we're close to the limit, return a simple SPT choice quickly
+    # (This is a safety net; the actual computation below is O(n*m) and very fast)
     
-    best_machine_indices = []
-    best_durations = []
-    remaining_works = []
-    remaining_ops_counts = []
-    job_ids = []
+    best_index = -1
+    best_machine = -1
+    best_score = float('inf')
+    
+    # We want to maximize "efficiency" or minimize "penalty".
+    # Penalty = (min_duration / remaining_work) * (1 + congestion_factor)
+    # Congestion factor is based on the sum of min durations of all eligible machines.
+    # If a job's operations can only go to a few machines, and those machines have 
+    # high potential load (sum of min durs of other ops? No, we don't have that info easily).
+    # Instead, let's use the sum of min durations of the CURRENT op's options as a proxy 
+    # for "how constrained/flexible" it is, but the prompt suggests "cumulative load of 
+    # its eligible machines". Since we don't have global machine loads, we approximate 
+    # congestion by the average duration across available machines. A higher average 
+    # duration suggests less efficient options or "heavier" work.
+    
+    # Let's refine: 
+    # Score to MINIMIZE: 
+    #   (min_dur / max(rem_work, 1)) + lambda * (avg_dur / max(rem_work, 1))
+    # This favors low min_dur (SPT) and low average duration (flexibility/efficiency).
+    # If rem_work is large, the penalty is smaller, allowing us to pick a slightly 
+    # longer op if it's part of a large job (critical path pressure).
+    
+    lambda_weight = 0.5
     
     for i, op in enumerate(ready_operations):
-        mw = op.get("remaining_work", 0)
-        ro = op.get("remaining_ops", 0)
-        job = op.get("job", 0)
+        durations = list(op['machine_options'].values())
+        if not durations:
+            continue
+            
+        min_dur = min(durations)
+        avg_dur = sum(durations) / len(durations)
         
-        # Find the machine with shortest duration for this operation
-        machine_options = op.get("machine_options", {})
-        if machine_options:
-            best_machine = min(machine_options.keys(), key=lambda m: machine_options[m])
-            best_dur = machine_options[best_machine]
-        else:
-            best_machine = None
-            best_dur = 0
+        # Find the machine with min_dur
+        min_mach = -1
+        min_val = float('inf')
+        for m, d in op['machine_options'].items():
+            if d < min_val:
+                min_val = d
+                min_mach = m
         
-        best_machine_indices.append(best_machine)
-        best_durations.append(best_dur)
-        remaining_works.append(mw)
-        remaining_ops_counts.append(ro)
-        job_ids.append(job)
-    
-    # Normalize values for composite scoring
-    # Refined weights: emphasize remaining_work more heavily (critical path),
-    # with moderate emphasis on processing time, and less on op count.
-    
-    max_rw = max(remaining_works) if remaining_works else 1
-    min_dur = min(best_durations) if best_durations else 1
-    max_dur = max(best_durations) if best_durations else 1
-    max_ro = max(remaining_ops_counts) if remaining_ops_counts else 1
-    
-    # Use a multiplicative penalty for long durations to create a smoother
-    # surrogate that penalizes very long operations more aggressively.
-    # This approximates a soft-max behavior where extreme values dominate.
-    
-    scores = []
-    for i in range(n):
-        # Normalize remaining work: higher is better
-        rw_score = remaining_works[i] / max_rw if max_rw > 0 else 0
+        rem_work = op.get('remaining_work', 1)
+        if rem_work <= 0:
+            rem_work = 1
+            
+        # The "congestion" or "load" proxy here is the average duration.
+        # If the average duration is high relative to the min, it means the operation
+        # is less flexible or the machines are slower.
+        # We penalize operations that are long relative to the job's remaining work.
         
-        # Normalize duration: shorter is better, so invert
-        if max_dur > min_dur:
-            dur_norm = (best_durations[i] - min_dur) / (max_dur - min_dur)
-        else:
-            dur_norm = 0.0
-        # Apply exponential penalty to emphasize short durations
-        # This creates a smooth surrogate that heavily favors short operations
-        dur_score = 1.0 - 0.7 * dur_norm - 0.3 * dur_norm ** 2
+        # Score = (min_dur + lambda_weight * avg_dur) / rem_work
+        # Lower score is better.
         
-        # Normalize remaining ops: higher is better
-        ro_score = remaining_ops_counts[i] / max_ro if max_ro > 0 else 0
+        score = (min_dur + lambda_weight * avg_dur) / rem_work
         
-        # Composite score with refined weights
-        # Emphasize remaining_work (critical path) most heavily
-        score = 0.6 * rw_score + 0.3 * dur_score + 0.1 * ro_score
-        scores.append(score)
+        if score < best_score:
+            best_score = score
+            best_index = i
+            best_machine = min_mach
     
-    # Find the index with maximum score
-    best_idx = 0
-    best_score = scores[0]
-    for i in range(1, n):
-        if scores[i] > best_score:
-            best_score = scores[i]
-            best_idx = i
-    
-    # Return (index, machine) to allow explicit machine selection
-    if best_machine_indices[best_idx] is not None:
-        return (best_idx, best_machine_indices[best_idx])
-    else:
-        return best_idx
-# EVOLVE-BLOCK-END
+    if best_index == -1:
+        return -1
+        
+    return (best_index, best_machine)

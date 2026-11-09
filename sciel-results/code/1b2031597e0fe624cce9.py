@@ -1,0 +1,278 @@
+import time
+import random
+import math
+
+N = 16
+NUM_EDGES = N * (N - 1) // 2  # 120
+MAX_COLOR = 119
+
+def _edge_idx(i, j):
+    if i > j:
+        i, j = j, i
+    return i * (N - 1) - i * (i - 1) // 2 + (j - i - 1)
+
+# Precompute all 4-cycles as tuples of 4 edge indices
+_CYCLES = []
+for a in range(N):
+    for b in range(a + 1, N):
+        for c in range(b + 1, N):
+            for d in range(c + 1, N):
+                _CYCLES.append((_edge_idx(a,b), _edge_idx(b,c), _edge_idx(c,d), _edge_idx(d,a)))
+                _CYCLES.append((_edge_idx(a,b), _edge_idx(b,d), _edge_idx(d,c), _edge_idx(c,a)))
+                _CYCLES.append((_edge_idx(a,c), _edge_idx(c,b), _edge_idx(b,d), _edge_idx(d,a)))
+
+NUM_CYCLES = len(_CYCLES)
+
+# For each edge, precompute which cycles contain it
+_EDGE_TO_CYCLES = [[] for _ in range(NUM_EDGES)]
+for ci, cycle in enumerate(_CYCLES):
+    for e in cycle:
+        _EDGE_TO_CYCLES[e].append(ci)
+
+def _check_edge_change(colors, edge_idx, new_color):
+    """Check if changing colors[edge_idx] to new_color maintains validity."""
+    old_color = colors[edge_idx]
+    if old_color == new_color:
+        return True
+    for ci in _EDGE_TO_CYCLES[edge_idx]:
+        e0, e1, e2, e3 = _CYCLES[ci]
+        c0 = colors[e0] if e0 != edge_idx else new_color
+        c1 = colors[e1] if e1 != edge_idx else new_color
+        c2 = colors[e2] if e2 != edge_idx else new_color
+        c3 = colors[e3] if e3 != edge_idx else new_color
+        if c0 != c1 and c0 != c2 and c0 != c3 and c1 != c2 and c1 != c3 and c2 != c3:
+            return False
+    return True
+
+def _count_colors(colors):
+    return len(set(colors))
+
+def _is_valid(colors):
+    """Check if no 4-cycle has four distinct edge colors."""
+    for cycle in _CYCLES:
+        e0, e1, e2, e3 = cycle
+        c0, c1, c2, c3 = colors[e0], colors[e1], colors[e2], colors[e3]
+        if c0 != c1 and c0 != c2 and c0 != c3 and c1 != c2 and c1 != c3 and c2 != c3:
+            return False
+    return True
+
+def _build_hierarchical(vertices, start_color, splits, color_map):
+    """
+    Build a hierarchical Gallai coloring.
+    """
+    n = len(vertices)
+    if n <= 1:
+        return start_color
+    if n == 2:
+        u, v = vertices
+        color_map[(min(u,v), max(u,v))] = start_color
+        return start_color + 1
+    if n == 3:
+        u, v, w = vertices
+        color_map[(min(u,v), max(u,v))] = start_color
+        color_map[(min(v,w), max(v,w))] = start_color + 1
+        color_map[(min(u,w), max(u,w))] = start_color + 2
+        return start_color + 3
+    
+    k = splits.get(n, n // 2)
+    v1 = vertices[:k]
+    v2 = vertices[k:]
+    
+    # Cross edges get one shared color
+    cross_color = start_color
+    for u in v1:
+        for v in v2:
+            color_map[(min(u,v), max(u,v))] = cross_color
+    
+    next_color = start_color + 1
+    next_color = _build_hierarchical(v1, next_color, splits, color_map)
+    next_color = _build_hierarchical(v2, next_color, splits, color_map)
+    return next_color
+
+def _get_optimal_splits():
+    """
+    Compute the optimal split configuration to maximize colors in hierarchical coloring.
+    f(m) = 1 + max(f(k) + f(m-k)) for m >= 4
+    f(1)=0, f(2)=1, f(3)=3
+    """
+    f = [0] * (N + 1)
+    f[1] = 0
+    f[2] = 1
+    f[3] = 3
+    splits = {}
+    
+    for m in range(4, N + 1):
+        max_val = -1
+        best_k = m // 2
+        for k in range(1, m):
+            val = f[k] + f[m-k]
+            if val > max_val:
+                max_val = val
+                best_k = k
+        f[m] = 1 + max_val
+        splits[m] = best_k
+        
+    return splits, f[N]
+
+def _build_transitive_coloring():
+    """
+    Build a coloring based on transitive tournament: c(i,j) = i for i<j.
+    This gives N-1 distinct colors and is always valid.
+    """
+    colors = [0] * NUM_EDGES
+    for i in range(N):
+        for j in range(i+1, N):
+            colors[_edge_idx(i, j)] = i
+    return colors
+
+def _build_hierarchical_with_permutation(perm, splits):
+    """
+    Build hierarchical coloring on a permuted vertex order.
+    """
+    color_map = {}
+    _build_hierarchical(perm, 0, splits, color_map)
+    colors = [0] * NUM_EDGES
+    for i in range(N):
+        for j in range(i+1, N):
+            colors[_edge_idx(i, j)] = color_map[(i, j)]
+    return colors
+
+def construct():
+    deadline = time.time() + 50.0  # Safety margin before 60s kill
+    
+    random.seed(42)
+    
+    # Step 1: Generate best initial coloring from multiple strategies
+    splits, max_hier_colors = _get_optimal_splits()
+    
+    # Try hierarchical with identity permutation
+    color_map = {}
+    _build_hierarchical(list(range(N)), 0, splits, color_map)
+    colors = [0] * NUM_EDGES
+    for i in range(N):
+        for j in range(i+1, N):
+            colors[_edge_idx(i, j)] = color_map[(i, j)]
+            
+    current_score = _count_colors(colors)
+    best_score = current_score
+    best_colors = colors[:]
+    
+    # Try transitive coloring
+    trans_colors = _build_transitive_coloring()
+    trans_score = _count_colors(trans_colors)
+    if trans_score > best_score:
+        best_score = trans_score
+        best_colors = trans_colors[:]
+    
+    # Try a few random permutations for hierarchical
+    for attempt in range(5):
+        perm = list(range(N))
+        random.shuffle(perm)
+        perm_colors = _build_hierarchical_with_permutation(perm, splits)
+        perm_score = _count_colors(perm_colors)
+        if perm_score > best_score:
+            best_score = perm_score
+            best_colors = perm_colors[:]
+            colors = perm_colors[:]
+            current_score = perm_score
+    
+    # Maintain color counts for fast delta calculation
+    color_counts = {}
+    for c in colors:
+        color_counts[c] = color_counts.get(c, 0) + 1
+        
+    # Set of unused colors for quick selection
+    all_colors = set(range(MAX_COLOR + 1))
+    used_colors_set = set(color_counts.keys())
+    unused_colors_set = all_colors - used_colors_set
+    
+    # Simulated Annealing with improved parameters
+    T = 8.0
+    cooling_rate = 0.99995
+    min_T = 0.01
+    
+    # Track no-improve to potentially restart
+    no_improve = 0
+    max_no_improve = 30000
+    
+    while time.time() < deadline:
+        if T < min_T:
+            if no_improve > max_no_improve:
+                break
+            T = min_T
+            no_improve = 0
+            
+        edge_idx = random.randint(0, NUM_EDGES - 1)
+        old_color = colors[edge_idx]
+        
+        # Choose new color with improved strategy
+        # Bias more strongly towards unused colors to increase distinct count
+        if unused_colors_set:
+            if random.random() < 0.6:
+                # Pick a random unused color
+                unused_list = list(unused_colors_set)
+                new_color = unused_list[random.randint(0, len(unused_list)-1)]
+            else:
+                # Pick a random used color (not the same as old)
+                used_list = list(used_colors_set)
+                if len(used_list) > 1:
+                    new_color = used_list[random.randint(0, len(used_list)-1)]
+                    if new_color == old_color:
+                        new_color = used_list[random.randint(0, len(used_list)-1)]
+                else:
+                    new_color = old_color
+        else:
+            new_color = random.randint(0, MAX_COLOR)
+            
+        if new_color == old_color:
+            continue
+            
+        if _check_edge_change(colors, edge_idx, new_color):
+            old_count = color_counts[old_color]
+            new_count = color_counts.get(new_color, 0)
+            
+            delta = 0
+            if old_count == 1:
+                delta -= 1
+            if new_count == 0:
+                delta += 1
+                
+            # Acceptance probability
+            if delta > 0:
+                accept = True
+            else:
+                if delta == 0:
+                    accept = True
+                else:
+                    accept = random.random() < math.exp(delta / T)
+                    
+            if accept:
+                colors[edge_idx] = new_color
+                # Update counts and sets
+                color_counts[old_color] -= 1
+                if color_counts[old_color] == 0:
+                    del color_counts[old_color]
+                    used_colors_set.discard(old_color)
+                    unused_colors_set.add(old_color)
+                color_counts[new_color] = color_counts.get(new_color, 0) + 1
+                if new_count == 0:
+                    used_colors_set.add(new_color)
+                    unused_colors_set.discard(new_color)
+                
+                current_score += delta
+                if current_score > best_score:
+                    best_score = current_score
+                    best_colors = colors[:]
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                    
+                T *= cooling_rate
+            else:
+                no_improve += 1
+                T *= cooling_rate
+        else:
+            no_improve += 1
+            T *= cooling_rate
+
+    return best_colors

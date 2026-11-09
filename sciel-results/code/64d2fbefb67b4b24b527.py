@@ -1,0 +1,266 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+class Optimizer:
+    """
+    Hybrid Optimizer for BBOB-style f13 (Sharp Ridge).
+    
+    Combines:
+    1. Nelder-Mead simplex for global-ish convergence and robustness.
+    2. Coordinate-descent line search (Powell-like) for exploiting ridge structure.
+       This is crucial for f13 where the ridge is sharp in one direction and flat in others.
+    3. Adaptive step sizes and stall detection with random restarts/perturbations.
+    4. Strict time and budget guards.
+    """
+
+    def __init__(self, budget, dim):
+        self.budget = budget
+        self.dim = dim
+
+    def __call__(self, func):
+        start_time = time.time()
+        # Safety margin: 300s limit, aim for 285s to be safe
+        deadline = start_time + 285.0
+        rng = np.random.default_rng(42)
+        
+        best_x = None
+        best_f = np.inf
+        calls_made = 0
+
+        def timed_call(x):
+            nonlocal best_x, best_f, calls_made
+            if calls_made >= self.budget:
+                return None
+            if time.time() > deadline - 2:
+                return None
+            fx = func(x)
+            calls_made += 1
+            if fx < best_f:
+                best_f = fx
+                best_x = x.copy()
+            return fx
+
+        # Phase 1: Initialization
+        # Use a small set of random points to find a good starting basin.
+        # 15 points is enough to get a reasonable start without wasting budget.
+        n_init = 15
+        for _ in range(n_init):
+            if calls_made >= self.budget:
+                break
+            x = rng.uniform(-5, 5, self.dim)
+            timed_call(x)
+            
+        if best_x is None:
+            # Fallback: center point
+            x = np.zeros(self.dim)
+            fx = func(x)
+            calls_made += 1
+            if fx < best_f:
+                best_f = fx
+                best_x = x.copy()
+        
+        x = best_x.copy()
+        fx = best_f
+
+        # Phase 2: Main Loop - Alternating Nelder-Mead and Coordinate Descent
+        # We will alternate between these two methods to balance exploration and exploitation.
+        # NM is good for general convergence, CD is good for ridges.
+        
+        # NM State
+        n = self.dim
+        simplex = np.zeros((n + 1, n))
+        simplex[0] = x
+        for i in range(n):
+            simplex[i + 1] = x.copy()
+            # Initial simplex size
+            step_init = 0.5
+            simplex[i + 1][i] += step_init if x[i] < 4.5 else -step_init
+            simplex[i + 1] = np.clip(simplex[i + 1], -5, 5)
+        
+        fvals = np.zeros(n + 1)
+        for i in range(n + 1):
+            if calls_made >= self.budget or time.time() > deadline:
+                break
+            fvals[i] = timed_call(simplex[i])
+        
+        # CD State
+        steps = np.ones(self.dim) * 1.0
+        no_improvement_count = 0
+        max_no_improvement = 30 # Stall threshold
+
+        # NM Parameters
+        alpha = 1.0
+        gamma = 2.0
+        rho = 0.5
+        sigma = 0.5
+
+        use_nm = True
+        
+        while calls_made < self.budget and time.time() < deadline - 2:
+            
+            if use_nm:
+                # --- Nelder-Mead Step ---
+                if no_improvement_count > max_no_improvement:
+                    # Stall detected in NM, switch to CD or restart
+                    use_nm = False
+                    continue
+
+                # Sort simplex
+                order = np.argsort(fvals)
+                simplex = simplex[order]
+                fvals = fvals[order]
+                
+                centroid = np.mean(simplex[:-1], axis=0)
+                
+                # Reflection
+                xr = centroid + alpha * (centroid - simplex[-1])
+                xr = np.clip(xr, -5, 5)
+                if calls_made >= self.budget or time.time() > deadline:
+                    break
+                fr = timed_call(xr)
+                if fr is None:
+                    break
+
+                if fr < fvals[0]:
+                    # Expansion
+                    xe = centroid + gamma * (centroid - simplex[-1])
+                    xe = np.clip(xe, -5, 5)
+                    if calls_made >= self.budget or time.time() > deadline:
+                        break
+                    fe = timed_call(xe)
+                    if fe is None:
+                        break
+                    if fe < fr:
+                        simplex[-1] = xe
+                        fvals[-1] = fe
+                    else:
+                        simplex[-1] = xr
+                        fvals[-1] = fr
+                    no_improvement_count = 0
+                elif fr < fvals[-2]:
+                    # Reflection accepted
+                    simplex[-1] = xr
+                    fvals[-1] = fr
+                    no_improvement_count = 0
+                else:
+                    # Contraction
+                    if fr < fvals[-1]:
+                        xc = centroid + rho * (xr - centroid)
+                    else:
+                        xc = centroid - rho * (centroid - simplex[-1])
+                    xc = np.clip(xc, -5, 5)
+                    if calls_made >= self.budget or time.time() > deadline:
+                        break
+                    fc = timed_call(xc)
+                    if fc is None:
+                        break
+
+                    if fc < min(fr, fvals[-1]):
+                        simplex[-1] = xc
+                        fvals[-1] = fc
+                        no_improvement_count = 0
+                    else:
+                        # Shrink
+                        for i in range(1, n + 1):
+                            simplex[i] = simplex[0] + sigma * (simplex[i] - simplex[0])
+                            simplex[i] = np.clip(simplex[i], -5, 5)
+                            if calls_made >= self.budget or time.time() > deadline:
+                                break
+                            fvals[i] = timed_call(simplex[i])
+                            if fvals[i] is None:
+                                break
+                        no_improvement_count += 1
+
+                # Update best
+                idx = np.argmin(fvals)
+                if fvals[idx] < best_f:
+                    best_f = fvals[idx]
+                    best_x = simplex[idx].copy()
+                    x = best_x.copy()
+                    fx = best_f
+                else:
+                    # Even if best didn't improve, check if simplex moved
+                    # Update x to the best point in simplex for CD start
+                    x = simplex[idx].copy()
+                    fx = fvals[idx]
+
+                # Switch to CD periodically to exploit ridge structure
+                # Every 10 NM iterations or so
+                if no_improvement_count % 10 == 0 and no_improvement_count > 0:
+                    use_nm = False
+                else:
+                    use_nm = True
+
+            else:
+                # --- Coordinate Descent Step ---
+                if no_improvement_count > max_no_improvement:
+                    # Stall detected in CD, switch to NM or restart
+                    # Reset simplex around current best
+                    simplex[0] = best_x
+                    for i in range(n):
+                        simplex[i + 1] = best_x.copy()
+                        simplex[i + 1][i] += 0.5 if best_x[i] < 4.5 else -0.5
+                        simplex[i + 1] = np.clip(simplex[i + 1], -5, 5)
+                    for i in range(n + 1):
+                        if calls_made >= self.budget or time.time() > deadline:
+                            break
+                        fvals[i] = timed_call(simplex[i])
+                        if fvals[i] is None:
+                            break
+                    no_improvement_count = 0
+                    use_nm = True
+                    continue
+
+                improved_in_cycle = False
+                for d in range(self.dim):
+                    if calls_made >= self.budget or time.time() > deadline:
+                        break
+                    
+                    # 1D search along axis d
+                    # Try +/- step
+                    x_plus = x.copy()
+                    x_plus[d] += steps[d]
+                    x_plus = np.clip(x_plus, -5, 5)
+                    
+                    x_minus = x.copy()
+                    x_minus[d] -= steps[d]
+                    x_minus = np.clip(x_minus, -5, 5)
+
+                    fx_plus = timed_call(x_plus)
+                    if fx_plus is None:
+                        break
+                    fx_minus = timed_call(x_minus)
+                    if fx_minus is None:
+                        break
+
+                    if fx_plus < fx and fx_plus < fx_minus:
+                        x = x_plus
+                        fx = fx_plus
+                        steps[d] *= 1.5
+                        improved_in_cycle = True
+                    elif fx_minus < fx and fx_minus < fx_plus:
+                        x = x_minus
+                        fx = fx_minus
+                        steps[d] *= 1.5
+                        improved_in_cycle = True
+                    else:
+                        steps[d] *= 0.5
+                        if steps[d] < 1e-4:
+                            steps[d] = 1e-4
+
+                if improved_in_cycle:
+                    no_improvement_count = 0
+                    if fx < best_f:
+                        best_f = fx
+                        best_x = x.copy()
+                    # Switch back to NM after some CD progress
+                    use_nm = True
+                else:
+                    no_improvement_count += 1
+                    # If CD stalls, switch to NM
+                    use_nm = True
+
+        return best_x, best_f
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,156 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import time as _time
+import numpy as np
+
+_DEADLINE_START = _time.time()
+_MAX_WALL = 140.0  # Safety margin before the 150s kill
+
+
+def _check_deadline(fallback):
+    """If we're getting close to the wall-clock limit, return fallback immediately."""
+    if _time.time() - _DEADLINE_START > _MAX_WALL:
+        return fallback
+    return None
+
+
+def _smooth_min(values, temperature=1.0):
+    """Smooth min via log-sum-exp: -log(sum(exp(-v_i/T)))*T approximates min(v_i) smoothly."""
+    if len(values) == 0:
+        return 0.0
+    v = np.array(values, dtype=np.float64)
+    if len(v) == 1:
+        return v[0]
+    # For numerical stability
+    v_min = np.min(v)
+    exp_terms = np.exp(-(v - v_min) / temperature)
+    log_sum = np.log(np.sum(exp_terms))
+    return v_min + temperature * log_sum
+
+
+def dispatch(ready_operations, time):
+    # Check deadline first; if we're over, pick the first available (index 0)
+    fallback = 0
+    early = _check_deadline(fallback)
+    if early is not None:
+        return early
+
+    n = len(ready_operations)
+    if n == 0:
+        return 0
+    if n == 1:
+        # Return the single operation with its best machine
+        op = ready_operations[0]
+        if op["machine_options"]:
+            best_machine = min(op["machine_options"], key=lambda m: op["machine_options"][m])
+            return (0, best_machine)
+        return 0
+
+    # Extract features
+    remaining_works = np.array([op["remaining_work"] for op in ready_operations], dtype=np.float64)
+    remaining_ops = np.array([op["remaining_ops"] for op in ready_operations], dtype=np.float64)
+    
+    # Smooth min duration using log-sum-exp (temperature=1.0)
+    smooth_min_durations = np.array([
+        _smooth_min(list(op["machine_options"].values()), temperature=1.0) if op["machine_options"] else 0.0
+        for op in ready_operations
+    ], dtype=np.float64)
+    
+    # Exact min for machine selection
+    exact_min_durations = np.array([
+        min(op["machine_options"].values()) if op["machine_options"] else 0.0
+        for op in ready_operations
+    ], dtype=np.float64)
+    
+    # Number of machine options (flexibility)
+    n_machines = np.array([
+        len(op["machine_options"]) if op["machine_options"] else 0
+        for op in ready_operations
+    ], dtype=np.float64)
+    
+    # Calculate average remaining work per op (intensity)
+    safe_ops = np.maximum(remaining_ops, 1.0)
+    intensity = remaining_works / safe_ops
+
+    # Z-Score Normalization
+    def _z_norm(x):
+        mean = np.mean(x)
+        std = np.std(x)
+        if std < 1e-12:
+            return np.zeros_like(x)
+        return (x - mean) / std
+
+    # Model:
+    # High Intensity (high work per op) is good (LRPT variant).
+    # High Remaining Ops is good (keep jobs in pipeline).
+    # Low Smooth Min Duration is good (SPT, clears machine quickly).
+    # High flexibility (more machine options) is slightly good (more scheduling options).
+    # Time-aware urgency: later in schedule, prefer ops that finish sooner.
+    
+    # Parameters (Weights) - tuned for open-shop
+    w_intensity = 1.5
+    w_ops = 0.6
+    w_min_dur = -0.5
+    w_flex = 0.2
+    w_time_urgency = 0.3
+    
+    z_intensity = _z_norm(intensity)
+    z_ops = _z_norm(remaining_ops)
+    z_min_dur = _z_norm(smooth_min_durations)
+    z_flex = _z_norm(n_machines)
+    
+    # Time-aware urgency: as time increases, weight shorter durations more heavily
+    # Normalize time to [0,1] range based on max remaining work
+    max_remaining = np.max(remaining_works) if len(remaining_works) > 0 else 1.0
+    time_norm = min(time / max(max_remaining, 1e-6), 2.0)  # Cap at 2x to avoid extreme weights
+    w_min_dur_eff = w_min_dur * (1.0 + 0.5 * time_norm)
+    
+    # Add a small bonus for operations with fewer remaining ops (urgency)
+    # This helps prioritize jobs that are close to completion
+    urgency_bonus = -0.1 * z_ops
+    
+    score = (w_intensity * z_intensity + w_ops * z_ops + 
+             w_min_dur_eff * z_min_dur + w_flex * z_flex + urgency_bonus)
+
+    # Handle NaNs or Infs
+    score = np.nan_to_num(score, nan=0.0, posinf=1e9, neginf=-1e9)
+
+    # Use a slightly different tie-breaking strategy: if scores are very close,
+    # prefer the operation with the smaller minimum duration (SPT tie-break)
+    best_idx = int(np.argmax(score))
+    
+    # Check for near-ties and break them with SPT
+    max_score = np.max(score)
+    close_indices = np.where(score >= max_score - 1e-3)[0]
+    if len(close_indices) > 1:
+        # Among near-ties, pick the one with smallest exact min duration
+        min_durs = exact_min_durations[close_indices]
+        best_idx = close_indices[np.argmin(min_durs)]
+    
+    # Select best machine for the chosen operation
+    # Consider both duration and how many other ops could use this machine
+    # (avoiding machine conflicts when possible)
+    op = ready_operations[best_idx]
+    if op["machine_options"]:
+        # Count how many other ready ops also prefer this machine
+        machine_preference = {}
+        for other_op in ready_operations:
+            if other_op is op:
+                continue
+            if other_op["machine_options"]:
+                other_best = min(other_op["machine_options"], key=lambda m: other_op["machine_options"][m])
+                machine_preference[other_best] = machine_preference.get(other_best, 0) + 1
+        
+        # Score each machine: prefer shorter duration, penalize if many others prefer it
+        # Also consider the total remaining work on each machine to avoid bottlenecks
+        def machine_score(m):
+            dur = op["machine_options"][m]
+            conflict = machine_preference.get(m, 0)
+            # Balance: shorter duration is better, but avoid heavily contested machines
+            # Add a small penalty for machines that are already heavily loaded
+            return dur * (1.0 + 0.15 * conflict)
+        
+        best_machine = min(op["machine_options"].keys(), key=machine_score)
+        return (best_idx, best_machine)
+    return best_idx
+# EVOLVE-BLOCK-END

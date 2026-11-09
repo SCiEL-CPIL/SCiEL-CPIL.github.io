@@ -1,407 +1,349 @@
 import numpy as np
 import time
+import itertools
 from scipy.optimize import minimize
 from scipy.spatial import ConvexHull
-from itertools import combinations
 
 N = 14
+_DEADLINE = 142.0  # Safety margin before 150s kill
 
-# Pre-compute all triangle index combinations
-_TRIS = list(combinations(range(N), 3))
-_TRI_I = np.array([t[0] for t in _TRIS])
-_TRI_J = np.array([t[1] for t in _TRIS])
-_TRI_K = np.array([t[2] for t in _TRIS])
-_N_TRI = len(_TRIS)  # 364
+def _params_to_points(params):
+    """Convert angular/radial perturbation params to 2D points.
+    params shape (N, 2): [angle_offset, radial_scale] for each vertex of regular N-gon.
+    Ensures strict convexity by construction."""
+    base_angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
+    angle_offsets = params[:, 0]
+    radial_scales = params[:, 1]
+    # Constrain angles to maintain ordering (convexity)
+    # Small angular perturbations around base angles
+    angles = base_angles + angle_offsets
+    # Sort by angle to maintain convex polygon order
+    order = np.argsort(angles)
+    angles_sorted = angles[order]
+    radials_sorted = radial_scales[order]
+    # Ensure positive radii
+    radials_sorted = np.maximum(radials_sorted, 0.1)
+    x = radials_sorted * np.cos(angles_sorted)
+    y = radials_sorted * np.sin(angles_sorted)
+    return np.column_stack([x, y])
 
-def _get_all_triangle_areas(points):
-    """Vectorized computation of all triangle areas."""
-    pi = points[_TRI_I]
-    pj = points[_TRI_J]
-    pk = points[_TRI_K]
-    v1 = pj - pi
-    v2 = pk - pi
+def _triangle_areas(pts):
+    """Compute all C(n,3) triangle areas."""
+    n = len(pts)
+    idx = list(itertools.combinations(range(n), 3))
+    i_idx = np.array([c[0] for c in idx])
+    j_idx = np.array([c[1] for c in idx])
+    k_idx = np.array([c[2] for c in idx])
+    v1 = pts[j_idx] - pts[i_idx]
+    v2 = pts[k_idx] - pts[i_idx]
     areas = 0.5 * np.abs(v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])
     return areas
 
-def _min_triangle_area(points):
-    """Calculate the minimum area of any triangle formed by 3 points."""
-    return np.min(_get_all_triangle_areas(points))
+def _soft_min(areas, tau):
+    """Soft minimum via log-sum-exp."""
+    m = np.min(areas)
+    shifted = areas - m
+    shifted = np.clip(shifted, 0, 50.0 / tau)  # numerical stability
+    sum_exp = np.sum(np.exp(-tau * shifted))
+    return m - (1.0 / tau) * np.log(sum_exp)
 
-def _hull_area(points):
-    """Calculate convex hull area."""
+def _min_triangle_area(pts):
+    """Minimum triangle area."""
+    return np.min(_triangle_areas(pts))
+
+def _hull_area(pts):
+    """Convex hull area."""
     try:
-        hull = ConvexHull(points)
+        hull = ConvexHull(pts)
         return hull.volume
     except Exception:
         return 0.0
 
-def _score(points):
-    """Calculate the score: min triangle area / convex hull area."""
-    n = len(points)
+def _score(pts):
+    """Score = min triangle area / hull area."""
+    n = len(pts)
     if n < 3:
         return 0.0
-    hull_area = _hull_area(points)
-    if hull_area < 1e-10:
+    ha = _hull_area(pts)
+    if ha < 1e-10:
         return 0.0
-    min_area = _min_triangle_area(points)
-    return min_area / hull_area
+    ma = _min_triangle_area(pts)
+    return ma / ha
 
-def _normalize_points(points):
-    """Center and scale points to unit hull area."""
-    points = points - np.mean(points, axis=0)
-    hull_area = _hull_area(points)
-    if hull_area < 1e-10:
-        return points
-    scale = 1.0 / np.sqrt(hull_area)
-    return points * scale
+def _normalize(pts):
+    """Center and scale to unit hull area."""
+    pts = pts - np.mean(pts, axis=0)
+    ha = _hull_area(pts)
+    if ha < 1e-10:
+        return pts
+    return pts / np.sqrt(ha)
 
-def _neg_objective(points_flat):
-    """Objective for minimization: negative of min triangle area (unit hull area)."""
-    points = points_flat.reshape(-1, 2)
-    points = _normalize_points(points)
-    hull_area = _hull_area(points)
-    if hull_area < 1e-10:
+def _neg_objective(flat):
+    """Negative score after normalization."""
+    pts = flat.reshape(-1, 2)
+    pts = _normalize(pts)
+    ha = _hull_area(pts)
+    if ha < 1e-10:
         return 1e6
-    min_area = _min_triangle_area(points)
-    return -min_area
+    return -_min_triangle_area(pts)
 
-def _smooth_neg_min_area(points_flat, tau=100.0):
-    """Smooth surrogate using log-sum-exp."""
-    points = points_flat.reshape(-1, 2)
-    points = _normalize_points(points)
-    hull_area = _hull_area(points)
-    if hull_area < 1e-10:
+def _smooth_objective(flat, tau=50.0):
+    """Smooth surrogate: minimize -soft_min(areas)/hull_area."""
+    pts = flat.reshape(-1, 2)
+    pts = _normalize(pts)
+    ha = _hull_area(pts)
+    if ha < 1e-10:
         return 1e6
-    areas = _get_all_triangle_areas(points)
-    m = np.min(areas)
-    shifted = areas - m
-    sum_exp = np.sum(np.exp(-tau * shifted))
-    smooth_val = -m + (1.0 / tau) * np.log(sum_exp)
-    return smooth_val
+    areas = _triangle_areas(pts)
+    sm = _soft_min(areas, tau)
+    return -sm / ha
 
-def _local_refine(points, max_iters=100, step_size=0.005):
-    """
-    Local refinement that targets the worst triangles.
-    Uses a more aggressive search with adaptive step sizes.
-    """
-    points = points.copy()
-    current_score = _score(points)
+def _neg_objective_param(params):
+    """Negative score using angular/radial parametrization."""
+    pts = _params_to_points(params.reshape(-1, 2))
+    pts = _normalize(pts)
+    ha = _hull_area(pts)
+    if ha < 1e-10:
+        return 1e6
+    return -_min_triangle_area(pts)
+
+def _smooth_objective_param(params, tau=50.0):
+    """Smooth surrogate using angular/radial parametrization."""
+    pts = _params_to_points(params.reshape(-1, 2))
+    pts = _normalize(pts)
+    ha = _hull_area(pts)
+    if ha < 1e-10:
+        return 1e6
+    areas = _triangle_areas(pts)
+    sm = _soft_min(areas, tau)
+    return -sm / ha
+
+def _points_to_params(pts):
+    """Convert points to angular/radial params relative to regular N-gon."""
+    cx, cy = np.mean(pts[:, 0]), np.mean(pts[:, 1])
+    pts_c = pts - np.array([cx, cy])
+    angles = np.arctan2(pts_c[:, 1], pts_c[:, 0])
+    radii = np.sqrt(pts_c[:, 0]**2 + pts_c[:, 1]**2)
+    base_angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
+    # Unwrap angle differences
+    angle_diffs = np.unwrap(angles - base_angles)
+    # Scale radii relative to mean
+    mean_r = np.mean(radii)
+    if mean_r < 1e-10:
+        return np.zeros((N, 2))
+    radial_scales = radii / mean_r
+    return np.column_stack([angle_diffs, radial_scales])
+
+def _local_refine(pts, max_iters=300, base_step=0.01, deadline=None):
+    """Fast local refinement: perturb points in worst triangles using in-place updates."""
+    pts = pts.copy()
+    current = _score(pts)
+    n = len(pts)
+    idx = list(itertools.combinations(range(n), 3))
+    idx_arr = np.array(idx)  # shape (C(n,3), 3)
     
     for it in range(max_iters):
-        areas = _get_all_triangle_areas(points)
-        min_area = np.min(areas)
+        if deadline is not None and time.time() > deadline:
+            break
+        areas = _triangle_areas(pts)
+        min_a = np.min(areas)
+        # Find points in triangles with area close to minimum
+        tol = 1e-6
+        worst_mask = np.abs(areas - min_a) < tol
+        worst_tris = np.where(worst_mask)[0][:30]
+        worst_pts = set()
+        for ti in worst_tris:
+            for p in idx_arr[ti]:
+                worst_pts.add(p)
         
-        # Find triangles close to minimum
-        threshold = min_area + 0.01 * min_area
-        min_indices = np.where(areas <= threshold)[0]
-        
-        # Collect point indices involved in worst triangles
-        worst_points = set()
-        for tri_idx in min_indices[:20]:
-            worst_points.add(_TRI_I[tri_idx])
-            worst_points.add(_TRI_J[tri_idx])
-            worst_points.add(_TRI_K[tri_idx])
+        if not worst_pts:
+            break
         
         improved = False
-        # Try multiple step sizes for each worst point
-        for pt_idx in list(worst_points):
-            for s_mult in [1.0, 0.5, 0.25, 2.0]:
-                s = step_size * s_mult
-                # Try 8 directions
-                for dx in [-s, 0, s]:
-                    for dy in [-s, 0, s]:
-                        if dx == 0 and dy == 0:
-                            continue
-                        new_points = points.copy()
-                        new_points[pt_idx, 0] += dx
-                        new_points[pt_idx, 1] += dy
-                        new_score = _score(new_points)
-                        if new_score > current_score + 1e-12:
-                            points = new_points
-                            current_score = new_score
-                            improved = True
-                            break
-                    if improved:
-                        break
-                if improved:
+        step = base_step * (0.7 ** (it // 30))
+        for pi in sorted(worst_pts):
+            # Try 8 directions + radial
+            for dx, dy in [(-step, 0), (step, 0), (0, -step), (0, step),
+                          (-step, -step), (step, step), (-step, step), (step, -step)]:
+                orig_x, orig_y = pts[pi, 0], pts[pi, 1]
+                pts[pi, 0] += dx
+                pts[pi, 1] += dy
+                s = _score(pts)
+                if s > current + 1e-12:
+                    current = s
+                    improved = True
                     break
+                else:
+                    pts[pi, 0] = orig_x
+                    pts[pi, 1] = orig_y
             if improved:
                 break
-        
         if not improved:
-            # Try all points with smaller step
-            step_size *= 0.7
-            if step_size < 1e-8:
+            # Try smaller steps
+            if step < 1e-6:
                 break
-            improved = False
-            for pt_idx in range(N):
-                for dx in [-step_size, step_size]:
-                    for dy in [-step_size, step_size]:
-                        new_points = points.copy()
-                        new_points[pt_idx, 0] += dx
-                        new_points[pt_idx, 1] += dy
-                        new_score = _score(new_points)
-                        if new_score > current_score + 1e-12:
-                            points = new_points
-                            current_score = new_score
-                            improved = True
-                            break
-                    if improved:
-                        break
-                if improved:
-                    break
-    
-    return points, current_score
-
-def _parametrized_objective(params):
-    """
-    Objective for parametrized optimization.
-    params: [dtheta_0..dtheta_13, dr_0..dr_13]
-    dtheta: angular perturbations (radians)
-    dr: radial perturbations
-    """
-    base_angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
-    dtheta = params[:N]
-    dr = params[N:]
-    
-    angles = base_angles + dtheta
-    radii = 1.0 + dr
-    
-    # Ensure radii are positive
-    if np.any(radii <= 0.1):
-        return 1e6
-    
-    # Check for valid convex configuration
-    # Points must be in convex position
-    x = radii * np.cos(angles)
-    y = radii * np.sin(angles)
-    points = np.column_stack([x, y])
-    
-    # Check if all points are on the convex hull (strictly convex)
-    try:
-        hull = ConvexHull(points)
-        if len(hull.vertices) < N:
-            # Not all points are on the hull - penalty
-            return 1e6
-    except Exception:
-        return 1e6
-    
-    points = _normalize_points(points)
-    hull_area = _hull_area(points)
-    if hull_area < 1e-10:
-        return 1e6
-    
-    min_area = _min_triangle_area(points)
-    return -min_area
-
-def _parametrized_smooth_objective(params, tau=100.0):
-    """Smooth version of parametrized objective."""
-    base_angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
-    dtheta = params[:N]
-    dr = params[N:]
-    
-    angles = base_angles + dtheta
-    radii = 1.0 + dr
-    
-    if np.any(radii <= 0.1):
-        return 1e6
-    
-    x = radii * np.cos(angles)
-    y = radii * np.sin(angles)
-    points = np.column_stack([x, y])
-    
-    try:
-        hull = ConvexHull(points)
-        if len(hull.vertices) < N:
-            return 1e6
-    except Exception:
-        return 1e6
-    
-    points = _normalize_points(points)
-    hull_area = _hull_area(points)
-    if hull_area < 1e-10:
-        return 1e6
-    
-    areas = _get_all_triangle_areas(points)
-    m = np.min(areas)
-    shifted = areas - m
-    sum_exp = np.sum(np.exp(-tau * shifted))
-    smooth_val = -m + (1.0 / tau) * np.log(sum_exp)
-    return smooth_val
+            base_step *= 0.5
+    return pts, current
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 140.0  # 10s margin before 150s limit
+    deadline = start_time + _DEADLINE
     
     best_score = -1.0
     best_points = None
     
-    def _update_best(points):
-        nonlocal best_score, best_points
-        points = _normalize_points(points)
-        s = _score(points)
-        if s > best_score:
-            best_score = s
-            best_points = points.copy()
+    # Generate diverse initial configurations in parameter space
+    param_configs = []
     
-    # Generate initial configurations
-    configs = []
+    # 1. Regular 14-gon (zero perturbations)
+    param_configs.append(np.zeros((N, 2)))
     
-    # 1. Regular 14-gon
+    # 2. Small random angular/radial perturbations
+    for scale_a, scale_r in [(0.02, 0.02), (0.05, 0.05), (0.1, 0.1), (0.03, 0.08)]:
+        param_configs.append(np.column_stack([
+            scale_a * np.random.randn(N),
+            1.0 + scale_r * np.random.randn(N)
+        ]))
+    
+    # 3. Structured radial perturbations (alternating in/out)
+    for amp in [0.05, 0.1, 0.15]:
+        radial = 1.0 + amp * np.array([1, -1] * (N // 2) + [1] if N % 2 else [1, -1] * (N // 2))
+        param_configs.append(np.column_stack([np.zeros(N), radial]))
+    
+    # 4. Rotational symmetry breaking
+    for phase in [np.pi / 14, 2 * np.pi / 14, np.pi / 7]:
+        angles = np.linspace(0, 2 * np.pi, N, endpoint=False) + phase
+        pts = np.column_stack([np.cos(angles), np.sin(angles)])
+        param_configs.append(_points_to_params(pts))
+    
+    # 5. Random parameters
+    for _ in range(4):
+        param_configs.append(np.column_stack([
+            0.05 * np.random.randn(N),
+            1.0 + 0.1 * np.random.randn(N)
+        ]))
+    
+    # Also keep some raw point configs for diversity
+    point_configs = []
     angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
-    x0_reg = np.column_stack([np.cos(angles), np.sin(angles)])
-    configs.append(x0_reg)
+    x0 = np.column_stack([np.cos(angles), np.sin(angles)])
+    point_configs.append(x0.copy())
+    for scale in [0.03, 0.05, 0.1]:
+        point_configs.append(x0 + scale * np.random.randn(N, 2))
     
-    # 2. Regular 14-gon with noise
-    configs.append(x0_reg + 0.03 * np.random.randn(N, 2))
-    
-    # 3. Two rings: 7 outer, 7 inner
-    ang1 = np.linspace(0, 2 * np.pi, 7, endpoint=False)
-    outer = np.column_stack([np.cos(ang1), np.sin(ang1)])
-    ang2 = np.linspace(0, 2 * np.pi, 7, endpoint=False) + np.pi/7
-    inner = 0.5 * np.column_stack([np.cos(ang2), np.sin(ang2)])
-    configs.append(np.vstack([outer, inner]))
-    
-    # 4. Three rings: 5, 5, 4
-    ang1 = np.linspace(0, 2 * np.pi, 5, endpoint=False)
-    ring1 = np.column_stack([np.cos(ang1), np.sin(ang1)])
-    ang2 = np.linspace(0, 2 * np.pi, 5, endpoint=False) + np.pi/5
-    ring2 = 0.6 * np.column_stack([np.cos(ang2), np.sin(ang2)])
-    ang3 = np.linspace(0, 2 * np.pi, 4, endpoint=False) + np.pi/4
-    ring3 = 0.3 * np.column_stack([np.cos(ang3), np.sin(ang3)])
-    configs.append(np.vstack([ring1, ring2, ring3]))
-    
-    # 5. Fibonacci spiral
-    golden = (1 + np.sqrt(5)) / 2
-    fib_angles = np.arange(N) * 2 * np.pi / (golden * golden)
-    fib_radii = np.sqrt(np.arange(N) / N)
-    x0_fib = np.column_stack([fib_radii * np.cos(fib_angles), fib_radii * np.sin(fib_angles)])
-    configs.append(x0_fib)
-    
-    # 6. Random points
-    configs.append(np.random.randn(N, 2))
-    
-    # 7. More diverse random starts
-    for _ in range(5):
-        configs.append(np.random.randn(N, 2))
-    
-    # --- Phase A: Cartesian optimization for all configs ---
-    tau_values = [50.0, 100.0, 200.0]
-    
-    for x_init in configs:
-        if time.time() > deadline - 35:
+    # Optimize in parameter space first
+    for params_init in param_configs:
+        if time.time() > deadline - 25:
             break
         
-        for tau in tau_values:
-            if time.time() > deadline - 30:
+        try:
+            p_flat = params_init.flatten()
+            
+            # Phase 1: Smooth optimization in param space with Powell
+            res1 = minimize(_smooth_objective_param, p_flat, args=(100.0,),
+                          method='Powell',
+                          options={'maxiter': 150, 'xtol': 1e-8, 'ftol': 1e-10, 'adaptive': True})
+            
+            if time.time() > deadline - 20:
                 break
             
-            try:
-                # Smooth optimization with Powell
-                res_smooth = minimize(lambda x, t=tau: _smooth_neg_min_area(x, tau=t),
-                                      x_init.flatten(),
-                                      method='Powell',
-                                      options={'maxiter': 300, 'xtol': 1e-8, 'ftol': 1e-10, 'adaptive': True})
+            p1_params = res1.x.reshape(-1, 2)
+            p1_pts = _params_to_points(p1_params)
+            p1_pts = _normalize(p1_pts)
+            
+            # Phase 2: Refine in Cartesian space with Nelder-Mead
+            res2 = minimize(_neg_objective, p1_pts.flatten(),
+                          method='Nelder-Mead',
+                          options={'maxiter': 500, 'xatol': 1e-10, 'fatol': 1e-12, 'adaptive': True})
+            
+            if time.time() > deadline - 15:
+                break
+            
+            p2 = res2.x.reshape(-1, 2)
+            p2 = _normalize(p2)
+            
+            # Phase 3: Local refinement
+            if time.time() < deadline - 10:
+                p3, s3 = _local_refine(p2, max_iters=150, base_step=0.005, deadline=deadline - 7)
+            else:
+                p3, s3 = p2, _score(p2)
+            
+            s = _score(p3)
+            if s > best_score:
+                best_score = s
+                best_points = p3.copy()
                 
-                if time.time() > deadline - 25:
-                    break
-                    
-                p_opt = res_smooth.x.reshape(-1, 2)
-                p_opt = _normalize_points(p_opt)
-                
-                # Polish with exact objective using Nelder-Mead
-                res_exact = minimize(_neg_objective,
-                                     p_opt.flatten(),
-                                     method='Nelder-Mead',
-                                     options={'maxiter': 1500, 'xatol': 1e-12, 'fatol': 1e-14, 'adaptive': True})
-                
-                if time.time() > deadline - 20:
-                    break
-                    
-                p_polished = res_exact.x.reshape(-1, 2)
-                p_polished = _normalize_points(p_polished)
-                
-                _update_best(p_polished)
-                
-            except Exception:
-                pass
+        except Exception:
+            pass
     
-    # --- Phase B: Parametrized optimization (regular polygon with perturbations) ---
-    # Start from zero perturbations (regular polygon)
-    base_angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
-    
-    # Multiple parametrized starts
-    param_starts = [np.zeros(2 * N)]
-    # Add some random perturbations
-    for _ in range(8):
-        param_starts.append(0.05 * np.random.randn(2 * N))
-    
-    for p_init in param_starts:
+    # Optimize some raw point configs
+    for x_init in point_configs:
         if time.time() > deadline - 15:
             break
         
         try:
-            # Smooth optimization in parameter space
-            res_param_smooth = minimize(lambda x: _parametrized_smooth_objective(x, tau=100.0),
-                                        p_init,
-                                        method='Powell',
-                                        options={'maxiter': 250, 'xtol': 1e-8, 'ftol': 1e-10, 'adaptive': True})
+            x_flat = x_init.flatten()
+            
+            res1 = minimize(_smooth_objective, x_flat, args=(80.0,),
+                          method='Powell',
+                          options={'maxiter': 100, 'xtol': 1e-8, 'ftol': 1e-10, 'adaptive': True})
+            
+            if time.time() > deadline - 12:
+                break
+            
+            p1 = res1.x.reshape(-1, 2)
+            p1 = _normalize(p1)
+            
+            res2 = minimize(_neg_objective, p1.flatten(),
+                          method='Nelder-Mead',
+                          options={'maxiter': 400, 'xatol': 1e-10, 'fatol': 1e-12, 'adaptive': True})
             
             if time.time() > deadline - 10:
                 break
             
-            p_opt_params = res_param_smooth.x
-            base_angles_local = np.linspace(0, 2 * np.pi, N, endpoint=False)
-            dtheta = p_opt_params[:N]
-            dr = p_opt_params[N:]
-            angles = base_angles_local + dtheta
-            radii = 1.0 + dr
-            x = radii * np.cos(angles)
-            y = radii * np.sin(angles)
-            p_opt = np.column_stack([x, y])
-            p_opt = _normalize_points(p_opt)
+            p2 = res2.x.reshape(-1, 2)
+            p2 = _normalize(p2)
             
-            # Polish in Cartesian space
-            res_exact = minimize(_neg_objective,
-                                 p_opt.flatten(),
-                                 method='Nelder-Mead',
-                                 options={'maxiter': 1000, 'xatol': 1e-12, 'fatol': 1e-14, 'adaptive': True})
+            if time.time() < deadline - 8:
+                p3, s3 = _local_refine(p2, max_iters=100, base_step=0.005, deadline=deadline - 6)
+            else:
+                p3, s3 = p2, _score(p2)
             
-            if time.time() > deadline - 5:
-                break
-            
-            p_polished = res_exact.x.reshape(-1, 2)
-            p_polished = _normalize_points(p_polished)
-            
-            _update_best(p_polished)
-            
-        except Exception:
-            pass
-    
-    # --- Phase C: Local refinement ---
-    if best_points is not None and time.time() < deadline - 3:
-        refined, refined_score = _local_refine(best_points, max_iters=150, step_size=0.005)
-        if refined_score > best_score:
-            best_score = refined_score
-            best_points = refined
-    
-    # --- Phase D: Additional polish with very tight tolerances ---
-    if best_points is not None and time.time() < deadline - 1:
-        try:
-            res_final = minimize(_neg_objective,
-                                 best_points.flatten(),
-                                 method='Nelder-Mead',
-                                 options={'maxiter': 2000, 'xatol': 1e-14, 'fatol': 1e-16, 'adaptive': True})
-            p_final = res_final.x.reshape(-1, 2)
-            p_final = _normalize_points(p_final)
-            _update_best(p_final)
+            s = _score(p3)
+            if s > best_score:
+                best_score = s
+                best_points = p3.copy()
+                
         except Exception:
             pass
     
     if best_points is None:
-        # Fallback to regular polygon
-        angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
-        best_points = np.column_stack([np.cos(angles), np.sin(angles)])
-        best_points = _normalize_points(best_points)
+        best_points = _normalize(x0.copy())
+    
+    # Final high-precision polish in Cartesian space
+    if best_points is not None and time.time() < deadline - 5:
+        try:
+            res_final = minimize(_neg_objective, best_points.flatten(),
+                              method='Nelder-Mead',
+                              options={'maxiter': 3000, 'xatol': 1e-12, 'fatol': 1e-14, 'adaptive': True})
+            pf = res_final.x.reshape(-1, 2)
+            pf = _normalize(pf)
+            sf = _score(pf)
+            if sf > best_score:
+                best_points = pf
+                best_score = sf
+        except Exception:
+            pass
+    
+    # Second polish pass if time allows
+    if best_points is not None and time.time() < deadline - 3:
+        try:
+            p_final = best_points.copy()
+            p_final, s_final = _local_refine(p_final, max_iters=200, base_step=0.001, deadline=deadline - 1)
+            if s_final > best_score:
+                best_points = p_final
+                best_score = s_final
+        except Exception:
+            pass
     
     return best_points

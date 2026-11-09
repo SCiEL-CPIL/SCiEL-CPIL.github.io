@@ -1,0 +1,228 @@
+import time
+from math import gcd
+from fractions import Fraction
+import random
+
+def _try_add_class(classes, new_class):
+    """Check if a new class can be added to the existing set while maintaining disjointness."""
+    m_new, r_new = new_class
+    for m, r in classes:
+        g = gcd(m_new, m)
+        if g == 1:
+            return False  # coprime moduli always intersect
+        if r_new % g == r % g:
+            return False
+    return True
+
+def _score(classes):
+    """Compute the exact rational score (sum of 1/m)."""
+    total = Fraction(0, 1)
+    for m, r in classes:
+        total += Fraction(1, m)
+    return total
+
+def _score_float(classes):
+    """Compute float score for fast comparison."""
+    return sum(1.0 / m for m, r in classes)
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140  # Safety margin before 150s limit
+    
+    all_moduli = list(range(20, 201))
+    
+    def greedy_construct(moduli_list):
+        """Greedy: add moduli in given order, pick first valid residue."""
+        classes = []
+        for m in moduli_list:
+            found = False
+            for r in range(m):
+                if _try_add_class(classes, [m, r]):
+                    classes.append([m, r])
+                    found = True
+                    break
+        return classes
+    
+    # Strategy 1: Greedy with smallest moduli first
+    best_classes = greedy_construct(all_moduli)
+    best_score_f = _score_float(best_classes)
+    
+    # Strategy 2: Focus on even moduli (all share factor 2)
+    even_moduli = [m for m in all_moduli if m % 2 == 0]
+    classes_even = greedy_construct(even_moduli)
+    score_even = _score_float(classes_even)
+    if score_even > best_score_f:
+        best_classes = classes_even
+        best_score_f = score_even
+    
+    # Strategy 3: Multiples of 3
+    mult3 = [m for m in all_moduli if m % 3 == 0]
+    classes_m3 = greedy_construct(mult3)
+    score_m3 = _score_float(classes_m3)
+    if score_m3 > best_score_f:
+        best_classes = classes_m3
+        best_score_f = score_m3
+    
+    # Strategy 4: Multiples of 6
+    mult6 = [m for m in all_moduli if m % 6 == 0]
+    classes_m6 = greedy_construct(mult6)
+    score_m6 = _score_float(classes_m6)
+    if score_m6 > best_score_f:
+        best_classes = classes_m6
+        best_score_f = score_m6
+    
+    # Local search improvement
+    def try_improve(classes, max_iters=500):
+        current = [c[:] for c in classes]
+        current_score_f = _score_float(current)
+        improved = True
+        iters = 0
+        while improved and iters < max_iters:
+            improved = False
+            iters += 1
+            if time.time() > deadline - 5:
+                break
+            
+            # Try adding a new modulus
+            for m in all_moduli:
+                if any(c[0] == m for c in current):
+                    continue
+                added = False
+                for r in range(m):
+                    if _try_add_class(current, [m, r]):
+                        current = current + [[m, r]]
+                        current_score_f += 1.0/m
+                        improved = True
+                        added = True
+                        break
+                if added:
+                    break
+            
+            # Try replacing a class with a smaller modulus
+            for i in range(len(current)):
+                m_old = current[i][0]
+                replaced = False
+                for m_new in all_moduli:
+                    if m_new >= m_old:
+                        continue
+                    if any(c[0] == m_new for c in current if c[0] != m_old):
+                        continue
+                    others = [c for c in current if c[0] != m_old]
+                    for r_new in range(m_new):
+                        if _try_add_class(others, [m_new, r_new]):
+                            new_score_f = current_score_f - 1.0/m_old + 1.0/m_new
+                            if new_score_f > current_score_f:
+                                current = others + [[m_new, r_new]]
+                                current_score_f = new_score_f
+                                improved = True
+                                replaced = True
+                                break
+                    if replaced:
+                        break
+                if replaced:
+                    break
+                    
+        return current, current_score_f
+    
+    best_classes, best_score_f = try_improve(best_classes, max_iters=500)
+    
+    # Try improving even-based solution
+    if time.time() < deadline - 10:
+        classes_even2, score_even2 = try_improve(classes_even, max_iters=300)
+        if score_even2 > best_score_f:
+            best_classes = classes_even2
+            best_score_f = score_even2
+    
+    # Try improving mult3-based solution
+    if time.time() < deadline - 10:
+        classes_m32, score_m32 = try_improve(classes_m3, max_iters=300)
+        if score_m32 > best_score_f:
+            best_classes = classes_m32
+            best_score_f = score_m32
+    
+    # Bitset-based branch and bound for exact optimization
+    if time.time() < deadline - 20:
+        # Build candidate nodes: for each modulus, try to find best residue
+        # that maximizes compatibility with other moduli
+        # We'll use a simplified approach: build conflict graph and use B&B
+        
+        # First, let's try a more systematic approach
+        # Group moduli by their gcd structure
+        # For moduli sharing a common factor d, residues must differ mod d
+        
+        # Try multiple starting points with different orderings
+        random.seed(42)
+        
+        for attempt in range(5):
+            if time.time() > deadline - 10:
+                break
+            
+            # Different greedy orderings
+            if attempt == 0:
+                order = sorted(all_moduli, key=lambda m: -1.0/m)  # largest reciprocal first
+            elif attempt == 1:
+                order = sorted(all_moduli, key=lambda m: m)  # smallest first
+            elif attempt == 2:
+                order = list(all_moduli)
+                random.shuffle(order)
+            elif attempt == 3:
+                # Prefer moduli with many divisors
+                def num_divisors(n):
+                    count = 0
+                    for i in range(2, int(n**0.5)+1):
+                        if n % i == 0:
+                            count += 2
+                    return count
+                order = sorted(all_moduli, key=lambda m: -num_divisors(m))
+            else:
+                # Multiples of small primes
+                def prime_factor_count(n):
+                    count = 0
+                    d = 2
+                    while d * d <= n:
+                        if n % d == 0:
+                            count += 1
+                            while n % d == 0:
+                                n //= d
+                        d += 1
+                    if n > 1:
+                        count += 1
+                    return count
+                order = sorted(all_moduli, key=lambda m: -prime_factor_count(m))
+            
+            # Greedy with backtracking-lite: try each residue, pick best
+            classes = []
+            for m in order:
+                best_r = None
+                best_compat = -1
+                for r in range(m):
+                    # Count how many existing classes this would conflict with
+                    # (should be 0 for valid)
+                    valid = True
+                    for m2, r2 in classes:
+                        g = gcd(m, m2)
+                        if g == 1 or r % g == r2 % g:
+                            valid = False
+                            break
+                    if valid:
+                        # Prefer residues that leave more room for future additions
+                        # Heuristic: prefer residues that are "central" or have properties
+                        best_r = r
+                        break  # Take first valid for speed
+                
+                if best_r is not None:
+                    classes.append([m, best_r])
+            
+            cur_score = _score_float(classes)
+            if cur_score > best_score_f:
+                best_score_f = cur_score
+                best_classes = classes
+            
+            # Local search on this solution
+            if time.time() < deadline - 10:
+                improved_classes, improved_score = try_improve(classes, max_iters=200)
+                if improved_score > best_score_f:
+                    best_score_f = improved_score
+                    best_classes = improved_classes
+    
+    return [[m, r] for m, r in best_classes]

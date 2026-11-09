@@ -1,0 +1,273 @@
+import time
+import random
+import sys
+from collections import defaultdict
+
+P = {'n': 30, 'edges': [[0, 4], [0, 7], [0, 9], [0, 10], [0, 11], [0, 16], [0, 17], [0, 18], [0, 19], [0, 23], [0, 24], [0, 26], [0, 27], [0, 28], [1, 2], [1, 4], [1, 6], [1, 8], [1, 10], [1, 11], [1, 12], [1, 14], [1, 15], [1, 16], [1, 17], [1, 21], [1, 24], [1, 25], [1, 28], [1, 29], [2, 6], [2, 7], [2, 9], [2, 12], [2, 13], [2, 14], [2, 19], [2, 22], [2, 23], [2, 26], [2, 27], [2, 29], [3, 5], [3, 7], [3, 10], [3, 11], [3, 16], [3, 17], [3, 19], [3, 20], [3, 22], [3, 23], [3, 24], [3, 28], [3, 29], [4, 5], [4, 8], [4, 10], [4, 12], [4, 14], [4, 16], [4, 17], [4, 18], [4, 20], [4, 21], [4, 28], [5, 6], [5, 7], [5, 10], [5, 15], [5, 17], [5, 18], [5, 20], [5, 21], [5, 22], [5, 23], [5, 29], [6, 7], [6, 11], [6, 12], [6, 14], [6, 17], [6, 18], [6, 19], [6, 20], [6, 21], [6, 24], [6, 25], [6, 27], [7, 8], [7, 14], [7, 15], [7, 16], [7, 17], [7, 18], [7, 19], [7, 21], [7, 24], [7, 25], [7, 26], [7, 28], [8, 9], [8, 10], [8, 11], [8, 12], [8, 14], [8, 18], [8, 19], [8, 20], [8, 23], [8, 24], [8, 25], [8, 27], [8, 28], [9, 10], [9, 12], [9, 17], [9, 18], [9, 19], [9, 20], [9, 21], [9, 23], [9, 24], [9, 28], [9, 29], [10, 11], [10, 12], [10, 14], [10, 17], [10, 18], [10, 22], [10, 24], [10, 27], [10, 29], [11, 14], [11, 16], [11, 20], [11, 24], [11, 25], [11, 27], [11, 28], [11, 29], [12, 14], [12, 17], [12, 19], [12, 20], [12, 26], [12, 29], [13, 14], [13, 15], [13, 19], [13, 22], [13, 23], [13, 25], [13, 26], [13, 27], [13, 28], [13, 29], [14, 15], [14, 24], [14, 26], [14, 27], [14, 28], [15, 19], [15, 24], [15, 25], [15, 29], [16, 18], [16, 20], [16, 21], [16, 27], [16, 28], [17, 18], [17, 19], [17, 21], [17, 23], [17, 24], [17, 25], [17, 27], [17, 28], [17, 29], [18, 19], [18, 21], [18, 24], [18, 25], [18, 27], [18, 29], [19, 23], [19, 24], [19, 26], [19, 27], [19, 29], [20, 21], [20, 22], [20, 23], [20, 24], [20, 26], [20, 29], [21, 23], [21, 25], [21, 26], [21, 28], [21, 29], [22, 23], [22, 24], [22, 25], [24, 29], [25, 26], [26, 29], [27, 29]]}
+
+def construct():
+    n = P['n']
+    edges = P['edges']
+    
+    # Build adjacency matrix for O(1) edge check
+    adj = [[False] * n for _ in range(n)]
+    for u, v in edges:
+        adj[u][v] = True
+        adj[v][u] = True
+        
+    # Normalize edges
+    norm_edges = set()
+    for u, v in edges:
+        if u < v:
+            norm_edges.add((u, v))
+        else:
+            norm_edges.add((v, u))
+            
+    all_edges = list(norm_edges)
+    m = len(all_edges)
+    
+    # Precompute adjacency as bitsets for faster operations
+    adj_bits = [0] * n
+    for u, v in edges:
+        adj_bits[u] |= (1 << v)
+        adj_bits[v] |= (1 << u)
+    
+    start_time = time.time()
+    deadline = start_time + 55
+    
+    def expand_biclique(seed_u, seed_v, uncovered_edges):
+        """
+        Expand the seed edge (seed_u, seed_v) into a maximal biclique
+        using only edges present in uncovered_edges.
+        """
+        L = {seed_u}
+        R = {seed_v}
+        
+        # Precompute which uncovered edges are incident to seed_u and seed_v
+        # For fast expansion, maintain sets of neighbors in the residual graph
+        
+        changed = True
+        while changed:
+            changed = False
+            
+            # Try to add vertices to L: w must be connected to all in R via uncovered edges
+            candidates_L = []
+            for w in range(n):
+                if w in L or w in R:
+                    continue
+                can_add = True
+                for r in R:
+                    edge = (min(w, r), max(w, r))
+                    if edge not in uncovered_edges:
+                        can_add = False
+                        break
+                if can_add:
+                    candidates_L.append(w)
+            
+            if candidates_L:
+                L.update(candidates_L)
+                changed = True
+                continue
+            
+            # Try to add vertices to R: w must be connected to all in L via uncovered edges
+            candidates_R = []
+            for w in range(n):
+                if w in L or w in R:
+                    continue
+                can_add = True
+                for l in L:
+                    edge = (min(l, w), max(l, w))
+                    if edge not in uncovered_edges:
+                        can_add = False
+                        break
+                if can_add:
+                    candidates_R.append(w)
+            
+            if candidates_R:
+                R.update(candidates_R)
+                changed = True
+                continue
+        
+        # The resulting biclique covers all edges between L and R
+        covered_edges = set()
+        for l in L:
+            for r in R:
+                covered_edges.add((min(l, r), max(l, r)))
+                
+        return L, R, covered_edges
+
+    def greedy_set_cover(uncovered_edges, strategy='random'):
+        """
+        Greedy set cover: repeatedly pick a biclique covering the most uncovered edges.
+        """
+        uncovered = set(uncovered_edges)
+        bicliques = []
+        
+        while uncovered:
+            if time.time() > deadline:
+                return None
+            
+            best_L = None
+            best_R = None
+            best_covered = None
+            best_count = -1
+            
+            # Compute degree of each edge in the residual graph for better seeding
+            edge_degree = {}
+            for edge in uncovered:
+                u, v = edge
+                edge_degree[edge] = 0
+            
+            # For each vertex, count how many uncovered edges it's incident to
+            vert_degree = defaultdict(int)
+            for u, v in uncovered:
+                vert_degree[u] += 1
+                vert_degree[v] += 1
+            
+            # Score edges by sum of endpoint degrees (prefer high-degree edges)
+            scored_edges = []
+            for edge in uncovered:
+                u, v = edge
+                score = vert_degree[u] + vert_degree[v]
+                scored_edges.append((score, edge))
+            
+            # Sort by score descending, take top candidates
+            scored_edges.sort(reverse=True)
+            
+            # Sample from top candidates and some random ones
+            top_k = min(len(scored_edges), 20)
+            top_candidates = [edge for _, edge in scored_edges[:top_k]]
+            
+            # Add some random candidates for diversity
+            remaining = len(uncovered) - top_k
+            if remaining > 0:
+                random_candidates = random.sample(list(uncovered), min(10, remaining))
+                top_candidates.extend(random_candidates)
+            
+            for seed_edge in top_candidates:
+                u, v = seed_edge
+                L, R, covered = expand_biclique(u, v, uncovered)
+                
+                if not L or not R:
+                    continue
+                
+                count = len(covered)
+                if count > best_count:
+                    best_count = count
+                    best_L = L
+                    best_R = R
+                    best_covered = covered
+            
+            if best_L is None:
+                # Fallback
+                u, v = next(iter(uncovered))
+                best_L = {u}
+                best_R = {v}
+                best_covered = {(u, v)}
+            
+            bicliques.append((list(best_L), list(best_R)))
+            uncovered -= best_covered
+            
+        return bicliques
+
+    def get_edges_from_bicliques(bicliques):
+        edges = set()
+        for L, R in bicliques:
+            for u in L:
+                for v in R:
+                    edges.add((min(u, v), max(u, v)))
+        return edges
+
+    def local_search(bicliques):
+        """
+        Try to improve the partition by merging pairs of bicliques.
+        """
+        improved = True
+        while improved:
+            improved = False
+            if time.time() > deadline:
+                break
+                
+            n_bicliques = len(bicliques)
+            for i in range(n_bicliques):
+                for j in range(i + 1, n_bicliques):
+                    if time.time() > deadline:
+                        return bicliques
+                        
+                    # Get edges covered by biclique i and j
+                    edges_i = get_edges_from_bicliques([bicliques[i]])
+                    edges_j = get_edges_from_bicliques([bicliques[j]])
+                    combined_edges = edges_i.union(edges_j)
+                    
+                    # Try to cover combined_edges with 1 biclique
+                    # We run greedy on these edges. If it returns 1 biclique, we merge.
+                    # To be safe, we check if the union of L and R sets forms a valid biclique?
+                    # No, the greedy might find a different biclique.
+                    
+                    # Optimization: Check if bicliques[i] and bicliques[j] can be merged directly
+                    # Let L1, R1 = bicliques[i], L2, R2 = bicliques[j]
+                    # Possible merges:
+                    # 1. L1+L2, R1+R2 (if all cross edges exist)
+                    # 2. L1+R2, R1+L2 (if all cross edges exist)
+                    # ... but greedy is more general.
+                    
+                    new_bicliques = greedy_set_cover(combined_edges, strategy='random')
+                    
+                    if new_bicliques is not None and len(new_bicliques) == 1:
+                        # Merge successful
+                        new_b = new_bicliques[0]
+                        # Remove i and j, add new_b
+                        # Be careful with indices
+                        bicliques.pop(j)
+                        bicliques.pop(i)
+                        bicliques.append(new_b)
+                        improved = True
+                        break # Restart the outer loop as indices changed
+                if improved:
+                    break
+                    
+        return bicliques
+
+    best_bicliques = None
+    best_count = float('inf')
+    
+    # Run multiple restarts with different random seeds
+    restart = 0
+    while time.time() < deadline:
+        random.seed(restart)
+        
+        # Initial Greedy
+        result = greedy_set_cover(all_edges, strategy='random')
+        
+        if result is None:
+            restart += 1
+            continue
+            
+        # Local Search
+        result = local_search(result)
+        
+        if len(result) < best_count:
+            best_count = len(result)
+            best_bicliques = result
+            
+        if best_count == 1:
+            break
+            
+        restart += 1
+
+    # Fallback
+    if best_bicliques is None:
+        best_bicliques = []
+        uncovered = set(all_edges)
+        while uncovered:
+            u, v = next(iter(uncovered))
+            best_bicliques.append([[u], [v]])
+            uncovered.remove((u, v))
+
+    # Convert to required format
+    final_result = []
+    for L, R in best_bicliques:
+        # Ensure types are list of int
+        final_result.append([list(L), list(R)])
+        
+    return final_result

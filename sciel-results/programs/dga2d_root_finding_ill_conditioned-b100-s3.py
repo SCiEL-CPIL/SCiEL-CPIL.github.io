@@ -1,293 +1,428 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-import math
+"""Model-and-optimize root finder for ill-conditioned equations."""
 import time
+import math
 
 # EVOLVE-BLOCK-START
 def find_root(f, x0):
-    """
-    Find a root of f near x0 using a robust combination of methods:
-    1. Try Newton's method with adaptive step size and damping
-    2. If that fails, try secant method
-    3. If that fails, try bisection on a bracketed interval
-    4. Track the best solution found (smallest |f(x)|)
-    
-    Returns x with |f(x)| <= 1e-8 if possible, within 500 evaluations and 150s.
-    """
-    start_time = time.time()
-    deadline = start_time + 145.0  # 5 second safety margin
-    
-    # Wrap f to count evaluations and handle potential issues
-    eval_count = 0
-    max_evals = 500
-    
-    def safe_f(x):
-        nonlocal eval_count
-        if eval_count >= max_evals:
-            return None
-        eval_count += 1
+    _t0 = time.time()
+    _TIME_LIMIT = 115.0  # safety margin before 120s
+    _MAX_EVALS = 450
+    _evals = 0
+
+    def _f(x):
+        nonlocal _evals
+        _evals += 1
         try:
-            val = f(x)
-            if val is None:
-                return None
-            val = float(val)
-            if math.isnan(val) or math.isinf(val):
-                return None
-            return val
-        except (ValueError, OverflowError, ZeroDivisionError, TypeError):
-            return None
-    
-    def time_ok():
-        return time.time() < deadline and eval_count < max_evals
-    
-    x = float(x0)
-    
-    # First evaluation
-    fx = safe_f(x)
-    if fx is None:
-        return x
-    best_x = x
-    best_fx = fx
-    best_abs_fx = abs(fx)
-    
-    if best_abs_fx <= 1e-8:
+            return float(f(x))
+        except Exception:
+            return float('nan')
+
+    def _time_ok():
+        return (time.time() - _t0) < _TIME_LIMIT
+
+    def _budget_ok():
+        return _evals < _MAX_EVALS
+
+    def _safe(x):
+        return math.isfinite(x)
+
+    # Best candidate tracking
+    best_x = float(x0)
+    best_fx = _f(best_x)
+    best_abs = abs(best_fx) if _safe(best_fx) else float('inf')
+
+    def _update(x, fx):
+        nonlocal best_x, best_fx, best_abs
+        if not _safe(fx):
+            return False
+        af = abs(fx)
+        if af < best_abs:
+            best_abs = af
+            best_x = float(x)
+            best_fx = float(fx)
+            return af <= 1e-8
+        return False
+
+    _update(best_x, best_fx)
+    if best_abs <= 1e-8:
         return best_x
-    
-    # Strategy 1: Newton's method with adaptive finite difference and damping
-    h_base = 1e-5 * max(1.0, abs(x))
-    x_newton = x
-    fx_newton = fx
-    newton_success = False
-    
-    for i in range(100):
-        if not time_ok():
-            break
-        
-        # Finite difference derivative with adaptive step
-        h = h_base * max(1.0, abs(x_newton))
-        fx_plus = safe_f(x_newton + h)
-        if fx_plus is None:
-            break
-        
-        # Try central difference if we have budget
-        if eval_count < max_evals - 1:
-            fx_minus = safe_f(x_newton - h)
-            if fx_minus is not None:
-                d = (fx_plus - fx_minus) / (2 * h)
-            else:
-                d = (fx_plus - fx_newton) / h
-        else:
-            d = (fx_plus - fx_newton) / h
-        
-        if d == 0 or math.isnan(d) or math.isinf(d):
-            break
-        
-        # Newton step
-        step = fx_newton / d
-        
-        # Damping: if step is too large, reduce it
-        max_step = 1.0 * max(1.0, abs(x_newton))
-        if abs(step) > max_step:
-            step = max_step * math.copysign(1.0, step)
-        
-        x_trial = x_newton - step
-        fx_trial = safe_f(x_trial)
-        
-        if fx_trial is None:
-            # Try smaller step
-            step *= 0.5
-            x_trial = x_newton - step
-            fx_trial = safe_f(x_trial)
-            if fx_trial is None:
+
+    # Inverse quadratic interpolation (IQI)
+    def _iqi(x1, f1, x2, f2, x3, f3):
+        if not all(_safe(v) for v in [x1, f1, x2, f2, x3, f3]):
+            return None
+        denom = (f1 - f2) * (f1 - f3) * (f2 - f3)
+        if abs(denom) < 1e-30:
+            return None
+        x0_iqi = (f2 * f3 * x1 / ((f1 - f2) * (f1 - f3)) +
+                  f1 * f3 * x2 / ((f2 - f1) * (f2 - f3)) +
+                  f1 * f2 * x3 / ((f3 - f1) * (f3 - f2)))
+        if not _safe(x0_iqi):
+            return None
+        return x0_iqi
+
+    # Secant method step
+    def _secant(x1, f1, x2, f2):
+        if not all(_safe(v) for v in [x1, f1, x2, f2]):
+            return None
+        denom = f2 - f1
+        if abs(denom) < 1e-30:
+            return None
+        x_new = x1 - f1 * (x2 - x1) / denom
+        if not _safe(x_new):
+            return None
+        return x_new
+
+    # Bisection
+    def _bisect(a, b, fa, fb, max_iter=60):
+        for _ in range(max_iter):
+            if not _time_ok() or not _budget_ok():
                 break
-        
-        # Update best
-        abs_fx_trial = abs(fx_trial)
-        if abs_fx_trial < best_abs_fx:
-            best_x = x_trial
-            best_fx = fx_trial
-            best_abs_fx = abs_fx_trial
-        
-        if best_abs_fx <= 1e-8:
+            mid = (a + b) / 2.0
+            fmid = _f(mid)
+            if not _safe(fmid):
+                break
+            _update(mid, fmid)
+            if abs(fmid) <= 1e-8:
+                return mid
+            if (fmid <= 0 and fa <= 0) or (fmid >= 0 and fa >= 0):
+                a, fa = mid, fmid
+            else:
+                b, fb = mid, fmid
+            if abs(b - a) < 1e-14 * max(1.0, abs(a), abs(b)):
+                break
+        return (a + b) / 2.0
+
+    # --- Phase 1: IQI/Secant with bracket tracking ---
+    x1 = float(x0)
+    f1 = _f(x1)
+    if not _safe(f1):
+        x1 = best_x
+        f1 = best_fx
+    _update(x1, f1)
+
+    if abs(f1) <= 1e-8:
+        return x1
+
+    # Try several offsets to find a second point (ideally with opposite sign)
+    scale = max(1.0, abs(x1))
+    offsets = [0.1, -0.1, 0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 0.01, -0.01]
+    x2 = None
+    f2 = None
+    for off in offsets:
+        if not _budget_ok():
+            break
+        cand = x1 + off * scale
+        fc = _f(cand)
+        if not _safe(fc):
+            continue
+        _update(cand, fc)
+        if abs(fc) <= 1e-8:
+            return cand
+        # Prefer a point with opposite sign to f1
+        if (f1 <= 0 and fc >= 0) or (f1 >= 0 and fc <= 0):
+            x2, f2 = cand, fc
+            break
+        if x2 is None:
+            x2, f2 = cand, fc
+        elif abs(fc) < abs(f2):
+            x2, f2 = cand, fc
+
+    if x2 is None:
+        x2 = x1 + 0.1 * scale
+        f2 = _f(x2)
+        _update(x2, f2)
+        if not _safe(f2):
+            x2 = x1 - 0.1 * scale
+            f2 = _f(x2)
+            _update(x2, f2)
+
+    if abs(f2) <= 1e-8:
+        return x2
+
+    points = [(x1, f1), (x2, f2)]
+
+    bracket_a = bracket_b = None
+    bracket_fa = bracket_fb = None
+
+    for i in range(80):
+        if not _time_ok() or not _budget_ok():
+            break
+
+        x_prev = points[-1][0]
+        f_prev = points[-1][1]
+
+        if abs(f_prev) <= 1e-8:
+            return x_prev
+
+        x_new = None
+
+        if len(points) >= 3:
+            x3, f3 = points[-3]
+            x2_, f2_ = points[-2]
+            x1_, f1_ = points[-1]
+            x_new = _iqi(x1_, f1_, x2_, f2_, x3, f3)
+
+        if x_new is None and len(points) >= 2:
+            x_a, f_a = points[-2]
+            x_b, f_b = points[-1]
+            x_new = _secant(x_a, f_a, x_b, f_b)
+
+        if x_new is None:
+            x_new = x_prev + 0.1 * max(1.0, abs(x_prev))
+
+        max_step = 5.0 * max(1.0, abs(x_prev))
+        if abs(x_new - x_prev) > max_step:
+            x_new = x_prev + max_step * (1 if x_new > x_prev else -1)
+
+        if not _safe(x_new):
+            x_new = x_prev + 0.01 * max(1.0, abs(x_prev))
+            if not _safe(x_new):
+                break
+
+        if any(abs(x_new - px) < 1e-15 * max(1.0, abs(px)) for px, _ in points):
+            x_new = x_new + 1e-10 * max(1.0, abs(x_new))
+
+        f_new = _f(x_new)
+        if not _safe(f_new):
+            x_new = x_prev - 0.5 * (x_new - x_prev)
+            f_new = _f(x_new)
+            if not _safe(f_new):
+                break
+
+        _update(x_new, f_new)
+        if abs(f_new) <= 1e-8:
+            return x_new
+
+        if (f_new <= 0 and f_prev >= 0) or (f_new >= 0 and f_prev <= 0):
+            bracket_a, bracket_b = x_prev, x_new
+            bracket_fa, bracket_fb = f_prev, f_new
+            if abs(bracket_fa) > abs(bracket_fb):
+                bracket_a, bracket_b = bracket_b, bracket_a
+                bracket_fa, bracket_fb = bracket_fb, bracket_fa
+
+        points.append((x_new, f_new))
+        if len(points) > 3:
+            points.pop(0)
+
+        if abs(x_new - x_prev) < 1e-15 * max(1.0, abs(x_new)):
+            break
+
+    # --- Phase 2: Bracket refinement with IQI acceleration ---
+    if bracket_a is not None and bracket_b is not None:
+        if (bracket_fa <= 0 and bracket_fb >= 0) or (bracket_fa >= 0 and bracket_fb <= 0):
+            a, b = bracket_a, bracket_b
+            fa, fb = bracket_fa, bracket_fb
+            hist = [(a, fa), (b, fb)]
+
+            for i in range(60):
+                if not _time_ok() or not _budget_ok():
+                    break
+
+                x_trial = None
+                if len(hist) >= 3:
+                    x_trial = _iqi(hist[0][0], hist[0][1],
+                                   hist[1][0], hist[1][1],
+                                   hist[2][0], hist[2][1])
+
+                if x_trial is None or not _safe(x_trial) or not (a < x_trial < b):
+                    # Try secant on last two points
+                    if len(hist) >= 2:
+                        x_trial = _secant(hist[-2][0], hist[-2][1], hist[-1][0], hist[-1][1])
+                        if x_trial is not None and _safe(x_trial) and (a < x_trial < b):
+                            pass
+                        else:
+                            x_trial = (a + b) / 2.0
+                    else:
+                        x_trial = (a + b) / 2.0
+
+                    if not _safe(x_trial) or not (a < x_trial < b):
+                        x_trial = (a + b) / 2.0
+                        if not _safe(x_trial):
+                            break
+
+                f_trial = _f(x_trial)
+                if not _safe(f_trial):
+                    break
+                _update(x_trial, f_trial)
+                if abs(f_trial) <= 1e-8:
+                    return x_trial
+
+                if (f_trial <= 0 and fa <= 0) or (f_trial >= 0 and fa >= 0):
+                    a, fa = x_trial, f_trial
+                else:
+                    b, fb = x_trial, f_trial
+
+                hist.append((x_trial, f_trial))
+                if len(hist) > 3:
+                    hist.pop(0)
+
+                if abs(b - a) < 1e-14 * max(1.0, abs(a), abs(b)):
+                    break
+
+            res = (a + b) / 2.0
+            fres = _f(res)
+            _update(res, fres)
+            if abs(fres) <= 1e-8:
+                return res
+
+    # --- Phase 3: Scan for brackets ---
+    if not _time_ok() or not _budget_ok():
+        return best_x
+
+    base = best_x
+    scan_scale = max(1.0, abs(base))
+    found = False
+    for mult in [0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0]:
+        if not _time_ok() or not _budget_ok():
+            break
+        for sign in [-1, 1]:
+            a = base - sign * mult * scan_scale
+            b = base + sign * mult * scan_scale
+            if a == b:
+                continue
+            fa = _f(a)
+            fb = _f(b)
+            if not (_safe(fa) and _safe(fb)):
+                continue
+            _update(a, fa)
+            _update(b, fb)
+            if abs(fa) <= 1e-8:
+                return a
+            if abs(fb) <= 1e-8:
+                return b
+            if (fa <= 0 and fb >= 0) or (fa >= 0 and fb <= 0):
+                res = _bisect(a, b, fa, fb, max_iter=50)
+                fres = _f(res)
+                _update(res, fres)
+                if abs(fres) <= 1e-8:
+                    return res
+                found = True
+                break
+        if found:
+            break
+
+    # --- Phase 4: Minimize |f| via golden section ---
+    if not _time_ok() or not _budget_ok():
+        return best_x
+
+    center = best_x
+    scale = max(1.0, abs(center))
+    a = center - 20.0 * scale
+    b = center + 20.0 * scale
+
+    fa = _f(a)
+    fb = _f(b)
+    if not (_safe(fa) and _safe(fb)):
+        for mult in [10.0, 5.0, 2.0, 1.0, 0.5, 0.25, 0.1]:
+            a = center - mult * scale
+            b = center + mult * scale
+            fa = _f(a)
+            fb = _f(b)
+            if _safe(fa) and _safe(fb):
+                break
+            a, b = center, center
+            break
+
+    if _safe(fa) and _safe(fb) and a != b:
+        gr = (math.sqrt(5.0) - 1.0) / 2.0
+        c = b - gr * (b - a)
+        d = a + gr * (b - a)
+        fc = _f(c)
+        fd = _f(d)
+        _update(c, fc)
+        _update(d, fd)
+
+        for _ in range(50):
+            if not _time_ok() or not _budget_ok():
+                break
+            if abs(fc) <= 1e-8:
+                return c
+            if abs(fd) <= 1e-8:
+                return d
+            if abs(fc) < abs(fd):
+                b, d, fd = d, c, fc
+                c = b - gr * (b - a)
+                fc = _f(c)
+                _update(c, fc)
+            else:
+                a, c, fc = c, d, fd
+                d = a + gr * (b - a)
+                fd = _f(d)
+                _update(d, fd)
+            if abs(b - a) < 1e-14 * max(1.0, abs(a), abs(b)):
+                break
+        mid = (a + b) / 2.0
+        fmid = _f(mid)
+        _update(mid, fmid)
+        if abs(fmid) <= 1e-8:
+            return mid
+
+    # --- Phase 5: Final secant polish with tighter tolerance ---
+    if _time_ok() and _budget_ok():
+        x_a = best_x
+        f_a = _f(x_a)
+        if not _safe(f_a):
             return best_x
-        
-        # Accept if it reduces |f|, or if it's a small step
-        if abs_fx_trial < abs(fx_newton) * 0.5 or abs(step) < 1e-10:
-            x_newton = x_trial
-            fx_newton = fx_trial
-        else:
-            # Damp more
-            step *= 0.25
-            x_trial = x_newton - step
-            fx_trial = safe_f(x_trial)
-            if fx_trial is not None:
-                abs_fx_trial = abs(fx_trial)
-                if abs_fx_trial < best_abs_fx:
-                    best_x = x_trial
-                    best_fx = fx_trial
-                    best_abs_fx = abs_fx_trial
-                if best_abs_fx <= 1e-8:
-                    return best_x
-                if abs_fx_trial < abs(fx_newton):
-                    x_newton = x_trial
-                    fx_newton = fx_trial
+
+        scale = max(1.0, abs(x_a))
+        x_b = x_a + 0.01 * scale
+        f_b = _f(x_b)
+        if not _safe(f_b):
+            x_b = x_a - 0.01 * scale
+            f_b = _f(x_b)
+            if not _safe(f_b):
+                return best_x
+
+        _update(x_a, f_a)
+        _update(x_b, f_b)
+
+        if abs(f_a) <= 1e-8:
+            return x_a
+        if abs(f_b) <= 1e-8:
+            return x_b
+
+        for _ in range(30):
+            if not _time_ok() or not _budget_ok():
+                break
+            if abs(f_a) <= 1e-8:
+                return x_a
+            if abs(f_b) <= 1e-8:
+                return x_b
+
+            x_new = _secant(x_a, f_a, x_b, f_b)
+            if x_new is None:
+                # Try Newton-like step using derivative estimate
+                if abs(x_b - x_a) > 1e-30:
+                    deriv = (f_b - f_a) / (x_b - x_a)
+                    if abs(deriv) > 1e-30:
+                        x_new = x_a - f_a / deriv
+                    else:
+                        break
                 else:
                     break
-            else:
+
+            max_step = 5.0 * max(1.0, abs(x_a))
+            if abs(x_new - x_a) > max_step:
+                x_new = x_a + max_step * (1 if x_new > x_a else -1)
+
+            if not _safe(x_new):
                 break
-    
-    # Strategy 2: Secant method
-    if best_abs_fx > 1e-8 and time_ok():
-        x0_sec = x
-        x1_sec = x + 1e-4 * max(1.0, abs(x))
-        fx0 = safe_f(x0_sec)
-        fx1 = safe_f(x1_sec)
-        
-        if fx0 is not None and fx1 is not None:
-            for i in range(100):
-                if not time_ok():
-                    break
-                
-                if fx1 == 0 or abs(fx1) <= 1e-8:
-                    best_x = x1_sec
-                    best_fx = fx1
-                    best_abs_fx = abs(fx1)
-                    break
-                
-                if fx0 == 0:
-                    best_x = x0_sec
-                    best_fx = fx0
-                    best_abs_fx = abs(fx0)
-                    break
-                
-                denom = fx1 - fx0
-                if denom == 0 or math.isnan(denom) or math.isinf(denom):
-                    break
-                
-                x2 = x1_sec - fx1 * (x1_sec - x0_sec) / denom
-                fx2 = safe_f(x2)
-                
-                if fx2 is None:
-                    break
-                
-                abs_fx2 = abs(fx2)
-                if abs_fx2 < best_abs_fx:
-                    best_x = x2
-                    best_fx = fx2
-                    best_abs_fx = abs_fx2
-                
-                if best_abs_fx <= 1e-8:
-                    break
-                
-                # Check for sign change to switch to bisection
-                if fx0 * fx2 < 0:
-                    # We have a bracket
-                    a, fa = x0_sec, fx0
-                    b, fb = x2, fx2
-                    for j in range(50):
-                        if not time_ok():
-                            break
-                        m = 0.5 * (a + b)
-                        fm = safe_f(m)
-                        if fm is None:
-                            break
-                        abs_fm = abs(fm)
-                        if abs_fm < best_abs_fx:
-                            best_x = m
-                            best_fx = fm
-                            best_abs_fx = abs_fm
-                        if best_abs_fx <= 1e-8:
-                            break
-                        if fa * fm <= 0:
-                            b = m
-                            fb = fm
-                        else:
-                            a = m
-                            fa = fm
-                        if abs(b - a) < 1e-12 * max(1.0, abs(m)):
-                            break
-                    break
-                elif fx1 * fx2 < 0:
-                    a, fa = x1_sec, fx1
-                    b, fb = x2, fx2
-                    for j in range(50):
-                        if not time_ok():
-                            break
-                        m = 0.5 * (a + b)
-                        fm = safe_f(m)
-                        if fm is None:
-                            break
-                        abs_fm = abs(fm)
-                        if abs_fm < best_abs_fx:
-                            best_x = m
-                            best_fx = fm
-                            best_abs_fx = abs_fm
-                        if best_abs_fx <= 1e-8:
-                            break
-                        if fa * fm <= 0:
-                            b = m
-                            fb = fm
-                        else:
-                            a = m
-                            fa = fm
-                        if abs(b - a) < 1e-12 * max(1.0, abs(m)):
-                            break
-                    break
-                
-                x0_sec, fx0 = x1_sec, fx1
-                x1_sec, fx1 = x2, fx2
-    
-    # Strategy 3: Try to find a bracket and use bisection
-    if best_abs_fx > 1e-8 and time_ok():
-        # Try expanding from x0 to find a sign change
-        a = x0
-        fa = safe_f(a)
-        if fa is None:
-            return best_x
-        
-        step_size = 1e-4 * max(1.0, abs(a))
-        for direction in [1, -1]:
-            b = a + direction * step_size
-            fb = safe_f(b)
-            if fb is None:
-                continue
-            
-            if fa * fb < 0:
-                # Found a bracket, use bisection
-                for i in range(80):
-                    if not time_ok():
-                        break
-                    m = 0.5 * (a + b)
-                    fm = safe_f(m)
-                    if fm is None:
-                        break
-                    abs_fm = abs(fm)
-                    if abs_fm < best_abs_fx:
-                        best_x = m
-                        best_fx = fm
-                        best_abs_fx = abs_fm
-                    if best_abs_fx <= 1e-8:
-                        break
-                    if fa * fm <= 0:
-                        b = m
-                        fb = fm
-                    else:
-                        a = m
-                        fa = fm
-                    if abs(b - a) < 1e-12 * max(1.0, abs(m)):
-                        break
+
+            f_new = _f(x_new)
+            if not _safe(f_new):
                 break
+
+            _update(x_new, f_new)
+            if abs(f_new) <= 1e-8:
+                return x_new
+
+            if abs(f_new) < abs(f_a):
+                x_a, f_a = x_b, f_b
+                x_b, f_b = x_new, f_new
             else:
-                # Expand
-                a = b
-                fa = fb
-                step_size *= 2
-                if step_size > 1e6 * max(1.0, abs(x0)):
-                    break
-    
-    # Final check
-    if best_abs_fx <= 1e-8:
-        return best_x
-    
-    # Return best found
+                x_a, f_a = x_b, f_b
+                x_b, f_b = x_new, f_new
+
     return best_x
 # EVOLVE-BLOCK-END

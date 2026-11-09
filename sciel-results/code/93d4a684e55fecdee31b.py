@@ -1,0 +1,281 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+_deadline = time.time() + 130  # Safety margin before 150s kill
+
+
+def _simulate_bin_packing(items, capacity, score_fn, deadline=None):
+    """
+    Simulate online bin packing with a given scoring function.
+    items: array of item sizes
+    capacity: bin capacity
+    score_fn: callable(item, remaining_array) -> score_array
+    Returns: number of bins used
+    """
+    bins = []  # list of remaining capacities
+    for item in items:
+        if deadline is not None and time.time() > deadline:
+            return None  # timeout sentinel
+        if not bins:
+            bins.append(capacity - item)
+            continue
+
+        remaining = np.array(bins)
+        valid = remaining >= item
+
+        if not np.any(valid):
+            bins.append(capacity - item)
+            continue
+
+        # Compute scores for valid bins
+        scores = score_fn(item, remaining)
+        # Among valid bins, pick the one with highest score
+        valid_indices = np.where(valid)[0]
+        valid_scores = scores[valid_indices]
+        best_idx = valid_indices[np.argmax(valid_scores)]
+        bins[best_idx] -= item
+
+    return len(bins)
+
+
+def _l1_lower_bound(items, capacity):
+    total = np.sum(items)
+    max_item = np.max(items)
+    lb1 = int(np.ceil(total / capacity))
+    lb2 = int(np.ceil(max_item))
+    return max(lb1, lb2)
+
+
+def _generate_sequences(n_sequences=5, n_items=1000, capacity=100):
+    """Generate Weibull sequences for testing."""
+    sequences = []
+    for seed in range(n_sequences):
+        rng = np.random.RandomState(seed)
+        items = rng.weibull(2, size=n_items) * 20
+        items = items[items <= capacity]
+        while len(items) < n_items:
+            new_items = rng.weibull(2, size=n_items) * 20
+            new_items = new_items[new_items <= capacity]
+            items = np.concatenate([items, new_items])[:n_items]
+        sequences.append(items)
+    return sequences
+
+
+def _make_score_fn(family, *args):
+    """Build a scoring function closure for a given family/params."""
+    if family == 'alpha':
+        alpha = args[0]
+        def score_fn(item, remaining):
+            valid = remaining >= item
+            scores = np.full(len(remaining), -np.inf, dtype=np.float64)
+            if np.any(valid):
+                scores[valid] = -(remaining[valid] - item) ** alpha
+            return scores
+        return score_fn
+    if family == 'target':
+        t = args[0]
+        def score_fn(item, remaining):
+            valid = remaining >= item
+            scores = np.full(len(remaining), -np.inf, dtype=np.float64)
+            if np.any(valid):
+                scores[valid] = -((remaining[valid] - item) - t) ** 2
+            return scores
+        return score_fn
+    if family == 'quadratic':
+        a, b = args
+        def score_fn(item, remaining):
+            valid = remaining >= item
+            scores = np.full(len(remaining), -np.inf, dtype=np.float64)
+            if np.any(valid):
+                diff = remaining[valid] - item
+                scores[valid] = -a * diff - b * diff ** 2
+            return scores
+        return score_fn
+    if family == 'weighted_diff':
+        alpha = args[0]
+        def score_fn(item, remaining):
+            valid = remaining >= item
+            scores = np.full(len(remaining), -np.inf, dtype=np.float64)
+            if np.any(valid):
+                diff = remaining[valid] - item
+                scores[valid] = -remaining[valid] * diff ** alpha
+            return scores
+        return score_fn
+    raise ValueError(f"unknown family {family}")
+
+
+def _eval_params(sequences, family, args, deadline):
+    """Evaluate a (family, args) pair across all sequences. Returns mean excess or inf on timeout."""
+    total_excess = 0.0
+    count = 0
+    for seq in sequences:
+        if time.time() > deadline:
+            return float('inf')
+        score_fn = _make_score_fn(family, *args)
+        bins_used = _simulate_bin_packing(seq, 100, score_fn, deadline)
+        if bins_used is None:
+            return float('inf')
+        lb = _l1_lower_bound(seq, 100)
+        total_excess += (bins_used - lb) / lb * 100.0
+        count += 1
+    if count == 0:
+        return float('inf')
+    return total_excess / count
+
+
+def _fit_parameters():
+    """
+    Coarse grid search over scoring-function families, then a two-stage
+    local refinement around the best coarse point.
+    """
+    sequences = _generate_sequences()
+    precomputed_lb = [_l1_lower_bound(s, 100) for s in sequences]
+
+    # Coarse grid — expanded to explore worst-fit territory (larger alpha/t)
+    coarse_grid = []
+    # Family: alpha
+    for alpha in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.5, 2.0, 2.5, 3.0]:
+        coarse_grid.append(('alpha', (alpha,)))
+    # Family: target
+    for t in [0.0, 2.0, 5.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0, 60.0, 75.0]:
+        coarse_grid.append(('target', (t,)))
+    # Family: quadratic
+    for a in [0.5, 1.0, 2.0]:
+        for b in [0.01, 0.05, 0.1, 0.5, 1.0]:
+            coarse_grid.append(('quadratic', (a, b)))
+    # Family: weighted_diff
+    for alpha in [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]:
+        coarse_grid.append(('weighted_diff', (alpha,)))
+
+    # Stage 1: coarse search
+    best_score = float('inf')
+    best_params = None
+    # Reserve ~40s for refinement; use the rest for coarse
+    coarse_deadline = time.time() + max(5.0, min(80.0, (_deadline - time.time()) * 0.6))
+    for family, args in coarse_grid:
+        if time.time() > coarse_deadline:
+            break
+        s = _eval_params(sequences, family, args, coarse_deadline)
+        if s < best_score:
+            best_score = s
+            best_params = (family,) + args
+
+    # Stage 2: local refinement around the best coarse point
+    if best_params is not None and time.time() < _deadline - 15:
+        fam = best_params[0]
+        # Build a fine grid around the best point in the same family
+        refine_grid = []
+        if fam == 'alpha':
+            center = best_params[1]
+            for d in [-0.3, -0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.2, 0.3]:
+                a = center + d
+                if a > 0.01:
+                    refine_grid.append(('alpha', (a,)))
+        elif fam == 'target':
+            center = best_params[1]
+            for d in [-5.0, -3.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0, 5.0]:
+                t = center + d
+                if t >= 0.0:
+                    refine_grid.append(('target', (t,)))
+        elif fam == 'quadratic':
+            a0, b0 = best_params[1], best_params[2]
+            for da in [-0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5]:
+                for db in [-0.25, -0.1, -0.05, 0.0, 0.05, 0.1, 0.25]:
+                    a = a0 + da
+                    b = b0 + db
+                    if a > 0.05 and b > 0.001:
+                        refine_grid.append(('quadratic', (a, b)))
+        elif fam == 'weighted_diff':
+            center = best_params[1]
+            for d in [-0.3, -0.2, -0.1, -0.05, 0.0, 0.05, 0.1, 0.2, 0.3]:
+                a = center + d
+                if a > 0.01:
+                    refine_grid.append(('weighted_diff', (a,)))
+
+        refine_deadline = _deadline - 10
+        for family, args in refine_grid:
+            if time.time() > refine_deadline:
+                break
+            s = _eval_params(sequences, family, args, refine_deadline)
+            if s < best_score:
+                best_score = s
+                best_params = (family,) + args
+
+    if best_params is None:
+        best_params = ('alpha', 1.0)  # Default to standard BF
+
+    return best_params, best_score
+
+
+# Try fitting at module load time, but with a time guard
+_start_time = time.time()
+
+try:
+    _BEST_PARAMS, _BEST_SCORE = _fit_parameters()
+except Exception:
+    _BEST_PARAMS = ('alpha', 1.0)
+    _BEST_SCORE = float('inf')
+
+# Build the scoring function based on best params
+_param_type = _BEST_PARAMS[0]
+if _param_type == 'alpha':
+    _ALPHA = _BEST_PARAMS[1]
+    _USE_ALPHA = True
+    _USE_TARGET = False
+    _USE_QUAD = False
+    _USE_WEIGHTED = False
+elif _param_type == 'target':
+    _TARGET = _BEST_PARAMS[1]
+    _USE_ALPHA = False
+    _USE_TARGET = True
+    _USE_QUAD = False
+    _USE_WEIGHTED = False
+elif _param_type == 'quadratic':
+    _QUAD_A = _BEST_PARAMS[1]
+    _QUAD_B = _BEST_PARAMS[2]
+    _USE_ALPHA = False
+    _USE_TARGET = False
+    _USE_QUAD = True
+    _USE_WEIGHTED = False
+elif _param_type == 'weighted_diff':
+    _WD_ALPHA = _BEST_PARAMS[1]
+    _USE_ALPHA = False
+    _USE_TARGET = False
+    _USE_QUAD = False
+    _USE_WEIGHTED = True
+else:
+    _ALPHA = 1.0
+    _USE_ALPHA = True
+    _USE_TARGET = False
+    _USE_QUAD = False
+    _USE_WEIGHTED = False
+
+
+def priority(item: float, bins: np.ndarray) -> np.ndarray:
+    """
+    Score each bin with enough remaining capacity.
+    Returns an array of scores; the item goes to the highest-scoring bin.
+    """
+    remaining = bins if isinstance(bins, np.ndarray) and bins.dtype == np.float64 else np.asarray(bins, dtype=np.float64)
+    valid_mask = remaining >= item
+
+    scores = np.full(remaining.shape, -np.inf, dtype=np.float64)
+
+    if not valid_mask.any():
+        return scores
+
+    if _USE_ALPHA:
+        scores[valid_mask] = -(remaining[valid_mask] - item) ** _ALPHA
+    elif _USE_TARGET:
+        scores[valid_mask] = -((remaining[valid_mask] - item) - _TARGET) ** 2
+    elif _USE_QUAD:
+        diff = remaining[valid_mask] - item
+        scores[valid_mask] = -_QUAD_A * diff - _QUAD_B * diff ** 2
+    elif _USE_WEIGHTED:
+        diff = remaining[valid_mask] - item
+        scores[valid_mask] = -remaining[valid_mask] * diff ** _WD_ALPHA
+
+    return scores
+# EVOLVE-BLOCK-END
