@@ -1,0 +1,344 @@
+"""MODEL-AND-OPTIMIZE approach: Halton exploration + multi-fidelity (1+1)-ES + Nelder-Mead polish."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+
+class Optimizer:
+    """Halton space-filling + parallel (1+1)-ES trajectories + Nelder-Mead refinement."""
+
+    def __init__(self, budget, dim):
+        self.budget = budget
+        self.dim = dim
+
+    def __call__(self, func):
+        start_time = time.time()
+        deadline = start_time + 285.0  # safety margin before 300s limit
+        budget = self.budget
+        dim = self.dim
+
+        best_x = None
+        best_f = float('inf')
+        calls_made = 0
+
+        def eval_func(x):
+            nonlocal calls_made, best_f, best_x
+            if calls_made >= budget:
+                return None
+            x = np.asarray(x, dtype=np.float64)
+            x = np.clip(x, -5.0, 5.0)
+            calls_made += 1
+            fx = float(func(x))
+            if not np.isfinite(fx):
+                fx = 1e10
+            if fx < best_f:
+                best_f = fx
+                best_x = x.copy()
+            return fx
+
+        def halton_sequence(n, dim, base_start=2):
+            """Generate Halton sequence points in [0,1]^dim."""
+            points = np.zeros((n, dim))
+            for d in range(dim):
+                base = base_start + d
+                for i in range(n):
+                    f = 1.0
+                    r = 0.0
+                    idx = i + 1
+                    while idx > 0:
+                        idx, rem = divmod(idx, base)
+                        f /= base
+                        r += rem * f
+                    points[i, d] = r
+            return points
+
+        def nelder_mead(x0, max_evals, seed=42):
+            """Nelder-Mead simplex method for local refinement."""
+            nonlocal best_x, best_f, calls_made
+            n = dim
+            rng = np.random.default_rng(seed)
+
+            # Build initial simplex
+            simplex = np.zeros((n + 1, n))
+            simplex[0] = x0
+            for i in range(n):
+                simplex[i + 1] = x0.copy()
+                simplex[i + 1, i] += 0.25 * max(0.1, abs(x0[i]))
+
+            # Evaluate simplex
+            fvals = np.zeros(n + 1)
+            for i in range(n + 1):
+                fx = eval_func(simplex[i])
+                if fx is None:
+                    return
+                fvals[i] = fx
+
+            # Nelder-Mead parameters
+            alpha = 1.0   # reflection
+            gamma = 2.0   # expansion
+            rho = 0.5     # contraction
+            sigma = 0.5   # shrink
+
+            for iteration in range(max_evals):
+                if time.time() > deadline:
+                    break
+                if calls_made >= budget - 2:
+                    break
+
+                # Sort by fitness
+                idx = np.argsort(fvals)
+                simplex = simplex[idx]
+                fvals = fvals[idx]
+
+                # Centroid of all but worst
+                centroid = np.mean(simplex[:-1], axis=0)
+
+                # Reflection
+                x_reflect = centroid + alpha * (centroid - simplex[-1])
+                x_reflect = np.clip(x_reflect, -5.0, 5.0)
+                f_reflect = eval_func(x_reflect)
+                if f_reflect is None:
+                    break
+
+                if f_reflect < fvals[0]:
+                    # Expansion
+                    x_expand = centroid + gamma * (x_reflect - centroid)
+                    x_expand = np.clip(x_expand, -5.0, 5.0)
+                    f_expand = eval_func(x_expand)
+                    if f_expand is None:
+                        break
+                    if f_expand < f_reflect:
+                        simplex[-1] = x_expand
+                        fvals[-1] = f_expand
+                    else:
+                        simplex[-1] = x_reflect
+                        fvals[-1] = f_reflect
+                elif f_reflect < fvals[-2]:
+                    # Accept reflection
+                    simplex[-1] = x_reflect
+                    fvals[-1] = f_reflect
+                else:
+                    # Contraction
+                    if f_reflect < fvals[-1]:
+                        # Outside contraction
+                        x_contract = centroid + rho * (x_reflect - centroid)
+                    else:
+                        # Inside contraction
+                        x_contract = centroid - rho * (x_reflect - centroid)
+                    x_contract = np.clip(x_contract, -5.0, 5.0)
+                    f_contract = eval_func(x_contract)
+                    if f_contract is None:
+                        break
+                    if f_contract < min(f_reflect, fvals[-1]):
+                        simplex[-1] = x_contract
+                        fvals[-1] = f_contract
+                    else:
+                        # Shrink
+                        for i in range(1, n + 1):
+                            simplex[i] = simplex[0] + sigma * (simplex[i] - simplex[0])
+                            fx = eval_func(simplex[i])
+                            if fx is None:
+                                return
+                            fvals[i] = fx
+                        break
+
+                # Check convergence
+                if np.max(fvals) - np.min(fvals) < 1e-12 * (1 + np.abs(fvals[0])):
+                    break
+
+            return simplex[0], fvals[0]
+
+        def es_trajectory(x0, sigma, max_evals, seed=42):
+            """(1+1)-ES trajectory with adaptive step size."""
+            nonlocal best_x, best_f, calls_made
+            rng = np.random.default_rng(seed)
+            n = dim
+            x = np.asarray(x0, dtype=np.float64).copy()
+            fx = eval_func(x)
+            if fx is None:
+                return x, fx
+
+            success_count = 0
+            total_steps = 0
+            improvement_history = []
+
+            for step in range(max_evals):
+                if time.time() > deadline:
+                    break
+                if calls_made >= budget - 2:
+                    break
+
+                # Generate candidate
+                y = rng.standard_normal(n)
+                x_trial = x + sigma * y
+                x_trial = np.clip(x_trial, -5.0, 5.0)
+                f_trial = eval_func(x_trial)
+                if f_trial is None:
+                    break
+
+                total_steps += 1
+
+                if f_trial < fx:
+                    # Success: increase sigma slightly
+                    x = x_trial
+                    fx = f_trial
+                    sigma *= 1.05
+                    success_count += 1
+                    improvement_history.append(fx)
+                else:
+                    # Failure: decrease sigma
+                    sigma *= 0.95
+                    improvement_history.append(fx)
+
+                # Adapt sigma based on recent success rate
+                if total_steps >= 20:
+                    recent_success = success_count / total_steps
+                    target_success = 1 / (n + 1)  # ~1/6 for n=5
+                    if recent_success > target_success * 1.5:
+                        sigma *= 1.1
+                    elif recent_success < target_success * 0.5:
+                        sigma *= 0.9
+
+                sigma = np.clip(sigma, 1e-6, 5.0)
+
+            return x, fx
+
+        # Phase 1: Halton space-filling for systematic early exploration
+        n_halton = min(80, max(40, budget // 6))
+
+        # Add center point first
+        x0 = np.zeros(dim)
+        fx0 = eval_func(x0)
+        if fx0 is None:
+            return best_x, best_f
+
+        # Halton points mapped to [-5, 5]^dim
+        halton_pts = halton_sequence(n_halton - 1, dim)
+        for i in range(n_halton - 1):
+            if time.time() > deadline:
+                break
+            if calls_made >= budget - 10:
+                break
+            x = halton_pts[i] * 10.0 - 5.0  # map [0,1] to [-5,5]
+            x = np.clip(x, -5.0, 5.0)
+            fx = eval_func(x)
+            if fx is None:
+                break
+
+        if best_x is None:
+            return best_x, best_f
+
+        # Phase 2: Parallel multi-fidelity (1+1)-ES trajectories
+        # Different step sizes to explore different scales
+        step_sizes = [0.1, 0.5, 1.0, 2.0, 4.0]
+        n_traj = len(step_sizes)
+
+        # Allocate remaining budget dynamically based on improvement
+        remaining = budget - calls_made
+        if remaining < 20:
+            return best_x, best_f
+
+        # Reserve some for final polish
+        polish_budget = min(50, remaining // 5)
+        es_budget_total = remaining - polish_budget
+
+        # Initial equal allocation
+        alloc = np.ones(n_traj) * (es_budget_total // n_traj)
+        # Ensure minimum allocation
+        alloc = np.maximum(alloc, 5)
+        # Adjust to fit budget
+        total_alloc = alloc.sum()
+        if total_alloc > es_budget_total:
+            alloc = alloc * (es_budget_total / total_alloc)
+            alloc = np.maximum(alloc, 3)
+
+        # Track improvement for each trajectory
+        traj_best_f = np.full(n_traj, float('inf'))
+        traj_best_x = [None] * n_traj
+        traj_improvement = np.zeros(n_traj)
+
+        # Run trajectories in parallel (sequentially but with dynamic reallocation)
+        for round_idx in range(3):  # 3 rounds of dynamic allocation
+            if time.time() > deadline:
+                break
+            if calls_made >= budget - polish_budget - 5:
+                break
+
+            # Determine which trajectory to run next based on recent improvement
+            # Prioritize trajectories with largest relative improvement in last 20 calls
+            priorities = np.zeros(n_traj)
+            for t in range(n_traj):
+                if traj_best_f[t] < float('inf'):
+                    # Relative improvement: how much better than initial best
+                    rel_imp = (best_f - traj_best_f[t]) / (1 + abs(best_f))
+                    priorities[t] = rel_imp
+                else:
+                    priorities[t] = -1  # not yet started
+
+            # Pick the trajectory with highest priority (or least used if all similar)
+            if np.all(priorities < 0):
+                # All trajectories not started; pick round-robin
+                t = round_idx % n_traj
+            else:
+                # Weighted selection based on priority
+                max_p = np.max(priorities)
+                min_p = np.min(priorities)
+                if max_p - min_p < 1e-6:
+                    t = round_idx % n_traj
+                else:
+                    # Normalize and pick best
+                    t = np.argmax(priorities)
+
+            # Run one step of the selected trajectory
+            if t >= n_traj:
+                continue
+
+            sigma = step_sizes[t]
+            if traj_best_x[t] is None:
+                # Start new trajectory from best known point with perturbation
+                rng_t = np.random.default_rng(1000 + t + round_idx * 10)
+                x_start = best_x + sigma * 0.5 * rng_t.standard_normal(dim)
+                x_start = np.clip(x_start, -5.0, 5.0)
+            else:
+                x_start = traj_best_x[t].copy()
+
+            # Run a small batch of ES steps
+            batch_size = max(3, int(alloc[t] // 3))
+            x_end, f_end = es_trajectory(x_start, sigma, batch_size, seed=2000 + t + round_idx * 10)
+
+            if f_end < traj_best_f[t]:
+                traj_best_f[t] = f_end
+                traj_best_x[t] = x_end.copy()
+                traj_improvement[t] += (best_f - f_end) / (1 + abs(best_f))
+
+            # Update global best
+            if f_end < best_f:
+                best_f = f_end
+                best_x = x_end.copy()
+
+            # Reallocate budget: give more to improving trajectories
+            for t2 in range(n_traj):
+                if traj_improvement[t2] > 0:
+                    alloc[t2] = min(alloc[t2] * 1.3, es_budget_total // 2)
+                else:
+                    alloc[t2] = max(alloc[t2] * 0.7, 3)
+
+            # Check if we've used enough budget
+            if calls_made >= budget - polish_budget - 5:
+                break
+
+        # Phase 3: Final Nelder-Mead polish from best point
+        if best_x is not None and calls_made < budget - 5:
+            remaining_polish = budget - calls_made - 5
+            if remaining_polish > 10:
+                nelder_mead(best_x.copy(), max_evals=remaining_polish, seed=5000)
+
+        # Phase 4: Very fine local search if budget remains
+        if best_x is not None and calls_made < budget - 2:
+            remaining_fine = budget - calls_made - 2
+            if remaining_fine > 5:
+                # Tiny step ES for final precision
+                es_trajectory(best_x.copy(), sigma=0.01, max_evals=remaining_fine, seed=6000)
+
+        return best_x, best_f
+# EVOLVE-BLOCK-END

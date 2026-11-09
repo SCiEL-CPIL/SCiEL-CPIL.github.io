@@ -1,0 +1,3 @@
+def lhs(n, dim, seed=0):
+    rng = np.random.default_rng(seed)
+    # ...

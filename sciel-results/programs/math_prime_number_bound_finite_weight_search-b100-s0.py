@@ -1,114 +1,81 @@
 import numpy as np
+import scipy.optimize as opt
 import time
-from scipy.optimize import linprog
 
 def prime_number_theorem_partial_function():
+    """
+    Construct a partial function f from a subset of the positive integers to the reals
+    that maximizes the objective a = -sum_k f(k) log(k) / k subject to M(x) <= 1.
+    """
+    # Set a deadline guard
     start_time = time.time()
+    deadline = 500  # Leave 100s margin
     
-    # Try different K values
-    # Start with a small K to ensure we have a valid result quickly
-    # Then try larger K if time permits
+    # Choose K. 
+    # Based on knowledge, K=50 gave 1.009. 
+    # Let's try K=200 or 500.
+    # The LP size is (10*K) x K.
+    # For K=500, size is 5000x500 = 2.5M elements. Fast.
+    # For K=1000, size is 10000x1000 = 10M elements. Still fast.
+    # Let's try K=1000.
     
-    best_domain = None
-    best_values = None
-    best_score = -np.inf
+    K = 1000
     
-    for K in [50, 100, 200, 500, 1000, 2000]:
-        if time.time() - start_time > 500:
-            break
-            
-        # Variables: g(2) ... g(K)
-        n_vars = K - 1
-        if n_vars <= 0:
-            continue
-            
-        # Objective: minimize sum( (log(k)/k) * g(k) )
-        # c_k = log(k) / k
-        ks = np.arange(2, K + 1)
-        c = np.log(ks) / ks
-        
-        # Constraints:
-        # sum_{k=2}^K g(k) * {x/k} >= -1  for x in [1, 10K]
-        # - sum_{k=2}^K g(k) * {x/k} <= 1
-        # A_ub @ g <= b_ub
-        
-        max_x = 10 * K
-        # We don't need to check all x from 1 to 10K if we can reduce them?
-        # {x/k} depends on x mod k.
-        # The set of vectors { {x/2}, {x/3}, ..., {x/K} } for x=1..10K.
-        # There are at most LCM(2..K) distinct patterns, which is huge.
-        # But we just iterate x.
-        
-        # Building A_ub (10K x (K-1)) might be memory heavy for K=2000 (20000 x 1999 ~ 40M floats ~ 320MB).
-        # Might be okay.
-        
-        A_rows = []
-        for x in range(1, max_x + 1):
-            # row: - {x/k} for k=2..K
-            row = np.empty(n_vars)
-            for i, k in enumerate(ks):
-                row[i] = - (x % k) / k
-            A_rows.append(row)
-            
-        A_ub = np.array(A_rows)
-        b_ub = np.ones(max_x)
-        
-        # Bounds: -10 <= g(k) <= 10
-        bounds = [(-10, 10)] * n_vars
-        
-        try:
-            res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
-            if res.success:
-                g = res.x
-                # Construct f
-                f = np.zeros(K + 1)
-                f[2:K+1] = g
-                # Calculate S = sum_{k=2}^K f(k)/k
-                S = np.sum(f[2:K+1] / ks)
-                f[1] = -S
-                
-                # Check M(x) <= 1 for all x in [1, 10K]
-                # M(x) = sum f(k) floor(x/k)
-                # We already enforced the constraint derived from M(x) <= 1 and sum f(k)/k = 0.
-                # Let's verify.
-                # M(x) = f(1) x + sum_{k=2}^K f(k) floor(x/k)
-                # = -S x + sum_{k=2}^K f(k) floor(x/k)
-                # = sum_{k=2}^K f(k) (floor(x/k) - x/k)
-                # = - sum_{k=2}^K f(k) {x/k}
-                # Constraint was - sum f(k) {x/k} <= 1.
-                # So M(x) <= 1 is satisfied.
-                
-                # Calculate score a
-                # a = - sum_{k=1}^K f(k) log(k)/k
-                # log(1)=0, so a = - sum_{k=2}^K f(k) log(k)/k
-                a = -np.sum(f[2:K+1] * c)
-                
-                # Clip values to [-10, 10] as per evaluator?
-                # The LP enforced bounds [-10, 10] on g.
-                # f(1) might be outside?
-                # S = sum g(k)/k. g(k) in [-10, 10].
-                # S is roughly O(1). f(1) = -S.
-                # If f(1) is outside [-10, 10], evaluator clips it.
-                # If clipped, sum f(k)/k != 0, and M(x) changes.
-                # We should ensure f(1) is in [-10, 10] or handle clipping.
-                # Given g(k) are small on average, f(1) should be small.
-                
-                if a > best_score:
-                    best_score = a
-                    domain = np.arange(1, K + 1)
-                    values = f[1:K+1]
-                    # Clip values to [-10, 10]
-                    values = np.clip(values, -10, 10)
-                    best_domain = domain
-                    best_values = values
-                    
-        except Exception as e:
-            pass
-
-    if best_domain is not None:
-        return best_domain, best_values
-    else:
-        # Fallback to seed
+    # Check time
+    if time.time() - start_time > deadline:
+        # Fallback to seed if something goes wrong immediately
         domain = np.array([1, 2, 3, 5, 30], dtype=np.int64)
         values = np.array([3.47155351603266, -1.0, -1.0, -1.0, 1.0], dtype=np.float64)
         return domain, values
+
+    # Construct the constraint matrix B
+    # B[x-1, j-1] = floor(x/j) - x/j for x in 1..10K, j in 1..K
+    # We want to minimize -c^T f subject to B f <= 1
+    
+    # Vectorized construction
+    # x ranges from 1 to 10K
+    # j ranges from 1 to K
+    x_vals = np.arange(1, 10 * K + 1)[:, np.newaxis]  # shape (10K, 1)
+    j_vals = np.arange(1, K + 1)[np.newaxis, :]      # shape (1, K)
+    
+    # Calculate floor(x/j) - x/j
+    # Be careful with floating point precision? 
+    # floor(x/j) is integer. x/j is float.
+    # The result is in [-1, 0].
+    B = np.floor(x_vals / j_vals) - (x_vals / j_vals)
+    
+    # The constraints are B @ f <= 1
+    # We also need bounds -10 <= f <= 10
+    bounds = [(-10.0, 10.0)] * K
+    
+    # Objective: Maximize sum_{k=2}^K (-log(k)/k) * f_k
+    # So minimize sum_{k=2}^K (log(k)/k) * f_k
+    c = np.zeros(K)
+    k_vals = np.arange(1, K + 1)
+    # k=1 term is 0
+    c[1:] = np.log(k_vals[1:]) / k_vals[1:]
+    
+    # Solve LP
+    # Use HiGHS if available, otherwise CBC
+    res = opt.linprog(c, A_ub=B, b_ub=np.ones(10 * K), bounds=bounds, method='highs')
+    
+    # Check time again
+    if time.time() - start_time > deadline:
+        # If it's taking too long, we might need to abort, but linprog is synchronous.
+        # If it returns, we are good.
+        pass
+
+    if res.success:
+        f_vals = res.x
+    else:
+        # If LP fails, fallback to a heuristic or seed
+        # Try to use the seed or a simple Mobius approximation
+        # For now, return seed to ensure validity
+        domain = np.array([1, 2, 3, 5, 30], dtype=np.int64)
+        values = np.array([3.47155351603266, -1.0, -1.0, -1.0, 1.0], dtype=np.float64)
+        return domain, values
+
+    domain = np.arange(1, K + 1, dtype=np.int64)
+    values = f_vals.astype(np.float64)
+    
+    return domain, values

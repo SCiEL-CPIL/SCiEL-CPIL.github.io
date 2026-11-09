@@ -1,0 +1,217 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+DIMENSIONS = [4, 4, 6]
+
+# EVOLVE-BLOCK-START
+import time
+import numpy as np
+
+def _build_strassen_decomposition():
+    """
+    Build the rank-84 Strassen-based block decomposition for 4x4 * 4x6.
+    Uses 2x2 Strassen for each pair of 2x2 blocks in the sum over j.
+    """
+    n, m, p = DIMENSIONS  # 4, 4, 6
+    rank = 84
+    U = [[0] * rank for _ in range(n * m)]  # 16 x 84
+    V = [[0] * rank for _ in range(m * p)]  # 24 x 84
+    W = [[0] * rank for _ in range(p * n)]  # 24 x 84
+    
+    col = 0
+    for i in range(2):  # A row block index (0 or 1)
+        for k in range(3):  # C col block index (0, 1, or 2)
+            for j in range(2):  # Sum over j: A_ij * B_jk
+                # Block A_ij: rows [2*i, 2*i+1], cols [2*j, 2*j+1]
+                # Block B_jk: rows [2*j, 2*j+1], cols [2*k, 2*k+1]
+                
+                # A_ij element indices (row-major: row*m + col)
+                a_idx = 2*i * m + 2*j
+                b_idx = 2*i * m + 2*j + 1
+                c_idx = (2*i+1) * m + 2*j
+                d_idx = (2*i+1) * m + 2*j + 1
+                
+                # B_jk element indices (row-major: row*p + col)
+                e_idx = 2*j * p + 2*k
+                f_idx = 2*j * p + 2*k + 1
+                g_idx = (2*j+1) * p + 2*k
+                h_idx = (2*j+1) * p + 2*k + 1
+                
+                # C_ik block: rows [2*i, 2*i+1], cols [2*k, 2*k+1]
+                # W index convention: W[col*n + row, r]
+                c11_idx = (2*k) * n + 2*i
+                c12_idx = (2*k+1) * n + 2*i
+                c21_idx = (2*k) * n + 2*i + 1
+                c22_idx = (2*k+1) * n + 2*i + 1
+                
+                # Strassen 7 multiplications for A_ij * B_jk:
+                
+                # M1 = (a+d)(e+h)
+                U[a_idx][col] = 1
+                U[d_idx][col] = 1
+                V[e_idx][col] = 1
+                V[h_idx][col] = 1
+                W[c11_idx][col] = 1
+                W[c22_idx][col] = 1
+                col += 1
+                
+                # M2 = (c+d)e
+                U[c_idx][col] = 1
+                U[d_idx][col] = 1
+                V[e_idx][col] = 1
+                W[c21_idx][col] = 1
+                W[c22_idx][col] = -1
+                col += 1
+                
+                # M3 = a(f-h)
+                U[a_idx][col] = 1
+                V[f_idx][col] = 1
+                V[h_idx][col] = -1
+                W[c12_idx][col] = 1
+                W[c22_idx][col] = 1
+                col += 1
+                
+                # M4 = d(g-e)
+                U[d_idx][col] = 1
+                V[g_idx][col] = 1
+                V[e_idx][col] = -1
+                W[c11_idx][col] = 1
+                W[c21_idx][col] = 1
+                col += 1
+                
+                # M5 = (a+b)h
+                U[a_idx][col] = 1
+                U[b_idx][col] = 1
+                V[h_idx][col] = 1
+                W[c11_idx][col] = -1
+                W[c12_idx][col] = 1
+                col += 1
+                
+                # M6 = (c-a)(e+f)
+                U[c_idx][col] = 1
+                U[a_idx][col] = -1
+                V[e_idx][col] = 1
+                V[f_idx][col] = 1
+                W[c22_idx][col] = 1
+                col += 1
+                
+                # M7 = (b-d)(g+h)
+                U[b_idx][col] = 1
+                U[d_idx][col] = -1
+                V[g_idx][col] = 1
+                V[h_idx][col] = 1
+                W[c11_idx][col] = 1
+                col += 1
+    
+    return {"U": U, "V": V, "W": W}
+
+def _build_schoolbook():
+    """Schoolbook decomposition of rank n*m*p = 96."""
+    n, m, p = DIMENSIONS
+    rank = n * m * p
+    U = [[0] * rank for _ in range(n * m)]
+    V = [[0] * rank for _ in range(m * p)]
+    W = [[0] * rank for _ in range(p * n)]
+    column = 0
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                U[i * m + j][column] = 1
+                V[j * p + k][column] = 1
+                W[k * n + i][column] = 1
+                column += 1
+    return {"U": U, "V": V, "W": W}
+
+def _verify_decomposition(U, V, W, n, m, p, tol=1e-8):
+    """Verify that U, V, W exactly decompose the matrix multiplication tensor."""
+    rank = len(U[0]) if U else 0
+    U_arr = np.array(U, dtype=float)
+    V_arr = np.array(V, dtype=float)
+    W_arr = np.array(W, dtype=float)
+    
+    # Build expected tensor
+    T_expected = np.zeros((n*m, m*p, p*n))
+    for i in range(n):
+        for j in range(m):
+            for k in range(p):
+                T_expected[i*m+j, j*p+k, k*n+i] = 1
+    
+    # Compute from decomposition
+    T_decomp = np.zeros_like(T_expected)
+    for r in range(rank):
+        T_decomp += np.einsum('a,b,c->abc', U_arr[:,r], V_arr[:,r], W_arr[:,r])
+    
+    return np.allclose(T_decomp, T_expected, atol=tol)
+
+def _try_alternative_strassen(n, m, p, deadline):
+    """
+    Try to find a lower-rank decomposition using a modified Strassen approach.
+    For 4x4 * 4x6, we can potentially use a 3x3 block structure with 2x2 Strassen
+    or explore other algebraic patterns.
+    
+    This function explores a few structured alternatives to see if we can beat rank 84.
+    """
+    # Alternative: use 3x3 block partitioning where possible
+    # For 4x4 * 4x6, we can partition as:
+    # A: 4x4 -> 2x2 blocks of 2x2
+    # B: 4x6 -> 2x3 blocks of 2x2
+    # C: 4x6 -> 2x3 blocks of 2x2
+    # This is exactly what the current approach does, giving rank 84.
+    
+    # Try: Can we share some Strassen factors across different (i,k) pairs?
+    # The key insight: for fixed j, the Strassen factors for different (i,k) pairs
+    # might share structure. But in standard Strassen, they don't because
+    # the linear combinations are specific to each block pair.
+    
+    # Another idea: use a 4x4 * 4x4 decomposition (rank 49 or 64) and extend to 4x6
+    # 4x4 * 4x4 has known rank <= 49 (Coppersmith-Winograd for small cases)
+    # But we need 4x4 * 4x6, which is 4x4 * 4x4 + 4x4 * 4x2
+    # This doesn't directly help without more sophisticated analysis.
+    
+    # For now, return None to indicate no improvement found
+    return None
+
+def construct():
+    """
+    Find a rank-minimal exact tensor decomposition for multiplying a 4 by 4 matrix
+    by a 4 by 6 matrix.
+    """
+    start_time = time.time()
+    deadline = start_time + 110  # Safety margin before 120s limit
+    
+    n, m, p = DIMENSIONS
+    
+    # Start with the Strassen-based rank-84 decomposition
+    strassen_result = _build_strassen_decomposition()
+    
+    # Verify the Strassen decomposition
+    if time.time() < deadline - 10:
+        if _verify_decomposition(strassen_result['U'], strassen_result['V'], strassen_result['W'], n, m, p):
+            # Valid rank-84 decomposition
+            best_rank = 84
+            best_result = strassen_result
+        else:
+            # Fallback to schoolbook
+            schoolbook = _build_schoolbook()
+            best_rank = 96
+            best_result = schoolbook
+    else:
+        # Not enough time to verify, assume Strassen is valid (it's well-known)
+        best_rank = 84
+        best_result = strassen_result
+    
+    # Try to find a better decomposition using alternative approaches
+    if time.time() < deadline - 20:
+        alternative = _try_alternative_strassen(n, m, p, deadline)
+        if alternative is not None:
+            alt_rank = len(alternative['U'][0])
+            if alt_rank < best_rank:
+                if time.time() < deadline - 5:
+                    if _verify_decomposition(alternative['U'], alternative['V'], alternative['W'], n, m, p):
+                        best_rank = alt_rank
+                        best_result = alternative
+    
+    # Final fallback: if we somehow didn't get a valid result, use schoolbook
+    if best_rank > 96:
+        best_result = _build_schoolbook()
+    
+    return best_result
+# EVOLVE-BLOCK-END

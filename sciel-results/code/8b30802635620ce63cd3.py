@@ -1,0 +1,1 @@
+BET: {mechanism: "Structured sparse coordinate-descent (alternating exact lstsq solves) over rank-r<63 random sparse starts may discover a rank-deficient exact decomposition of the 3x3x7 multiplication tensor that the schoolbook seed cannot, since the 3x3x3 core may admit sub-9 bilinear structure in the p=7 stacking.", q: 0.15, delta: [0, 5]}

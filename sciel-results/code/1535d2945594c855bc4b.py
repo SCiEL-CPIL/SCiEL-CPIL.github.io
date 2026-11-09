@@ -1,0 +1,55 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.stats import norm
+
+
+def acquisition(mu, sigma, f_best, cost):
+    """
+    Cost-aware acquisition function with strict penalty on uncertainty.
+    
+    Uses a modified Expected Improvement where the uncertainty term is
+    heavily penalized to prevent domination by high-noise regions in
+    early sparse data regimes.
+    """
+    # Small epsilon to avoid division by zero
+    eps = 1e-9
+    
+    # Standardize sigma for numerical stability
+    sigma_safe = np.maximum(sigma, eps)
+    
+    # z-score for standard normal CDF/PDF
+    z = (f_best - mu) / sigma_safe
+    
+    # Standard EI components
+    ei_mean = (f_best - mu) * norm.cdf(z)
+    ei_uncertainty = sigma_safe * norm.pdf(z)
+    
+    # Strict penalty on uncertainty: scale uncertainty by a factor that
+    # decreases with sigma magnitude, forcing high-confidence improvements
+    # to dominate. We use a soft penalty: uncertainty is multiplied by
+    # exp(-alpha * sigma) where alpha controls the strength of the penalty.
+    # This makes high-noise regions much less attractive.
+    # Increased alpha to 2.0 for stricter penalty on high-noise regions.
+    alpha = 2.0
+    uncertainty_penalty = np.exp(-alpha * sigma_safe)
+    
+    # Modified EI: mean improvement + penalized uncertainty
+    modified_ei = ei_mean + uncertainty_penalty * ei_uncertainty
+    
+    # Ensure non-negative scores
+    modified_ei = np.maximum(modified_ei, 0.0)
+    
+    # Cost-aware: divide by cost to get improvement per unit cost.
+    # Soften the cost impact to avoid excessive bias towards the cheapest
+    # corner (which may be far from the global minimum).
+    # Original cost range [1, 2]. Mapped to [1, 1.5] for milder bias.
+    cost_mild = 1.0 + 0.5 * (cost - 1.0)
+    cost_safe = np.maximum(cost_mild, eps)
+    scores = modified_ei / cost_safe
+    
+    # Ensure all values are finite
+    scores = np.where(np.isfinite(scores), scores, 0.0)
+    
+    return scores
+# EVOLVE-BLOCK-END

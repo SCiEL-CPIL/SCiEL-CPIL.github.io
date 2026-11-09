@@ -1,269 +1,293 @@
-import time
 import numpy as np
-from scipy.optimize import differential_evolution, minimize
 from scipy.spatial.distance import pdist
+from scipy.optimize import minimize
+import time
 
-_DEADLINE_SECONDS = 630.0
-_SAFETY_MARGIN = 60.0
-
-def _raw_score(points):
-    """
-    Calculate the score: (d_min / d_max)^2.
-    Returns 0 if invalid.
-    """
+def _score(points):
     if points.shape != (14, 3):
         return 0.0
     if not np.all(np.isfinite(points)):
         return 0.0
-    
+    dists = pdist(points, metric='euclidean')
+    if len(dists) == 0:
+        return 0.0
+    d_min = np.min(dists)
+    d_max = np.max(dists)
+    if d_max < 1e-12:
+        return 0.0
+    return (d_min / d_max) ** 2
+
+def _spherical_to_cartesian(theta_phi):
+    n = len(theta_phi) // 2
+    theta = theta_phi[:n]
+    phi = theta_phi[n:]
+    x = np.sin(theta) * np.cos(phi)
+    y = np.sin(theta) * np.sin(phi)
+    z = np.cos(theta)
+    return np.column_stack([x, y, z])
+
+def _neg_score_spherical(x, alpha_min=100.0, alpha_max=100.0):
+    points = _spherical_to_cartesian(x)
     dists = pdist(points)
     if len(dists) == 0:
         return 0.0
-    
-    d_min = np.min(dists)
-    d_max = np.max(dists)
-    
-    if d_max < 1e-10:
+    # Soft min: -log(sum(exp(-alpha*d))) / alpha approximates min
+    # Soft max: log(sum(exp(alpha*d))) / alpha approximates max
+    log_sum_exp_neg = np.log(np.sum(np.exp(-alpha_min * dists)))
+    soft_min = -log_sum_exp_neg / alpha_min
+    log_sum_exp_pos = np.log(np.sum(np.exp(alpha_max * dists)))
+    soft_max = log_sum_exp_pos / alpha_max
+    if soft_max < 1e-12:
         return 0.0
-    if d_min < 1e-10:
+    ratio = soft_min / soft_max
+    return -(ratio ** 2)
+
+def _neg_score_spherical_exact(x):
+    points = _spherical_to_cartesian(x)
+    return -_score(points)
+
+def _neg_score_cartesian(x, alpha_min=100.0, alpha_max=100.0):
+    """Negative soft score in Cartesian coordinates with centering."""
+    points = x.reshape(14, 3)
+    # Center to remove translational invariance
+    points = points - np.mean(points, axis=0)
+    dists = pdist(points, metric='euclidean')
+    if len(dists) == 0:
         return 0.0
-        
-    ratio = d_min / d_max
-    return ratio * ratio
+    log_sum_exp_neg = np.log(np.sum(np.exp(-alpha_min * dists)))
+    soft_min = -log_sum_exp_neg / alpha_min
+    log_sum_exp_pos = np.log(np.sum(np.exp(alpha_max * dists)))
+    soft_max = log_sum_exp_pos / alpha_max
+    if soft_max < 1e-12:
+        return 0.0
+    ratio = soft_min / soft_max
+    return -(ratio ** 2)
 
-def _objective_de(x_flat):
-    """
-    Objective function for Differential Evolution.
-    Minimizes negative score.
-    """
-    points = x_flat.reshape(14, 3)
-    score = _raw_score(points)
-    return -score
+def _neg_score_cartesian_exact(x):
+    points = x.reshape(14, 3)
+    points = points - np.mean(points, axis=0)
+    return -_score(points)
 
-def _objective_grad(x_flat):
-    """
-    Objective function for L-BFGS-B polishing.
-    Uses a smoothed approximation of the min/max to help gradients,
-    or just relies on the raw value if smoothing is too complex.
-    For L-BFGS-B, we can use the raw value, but it might stop early due to non-differentiability.
-    A common trick is to use a soft-min/soft-max.
-    However, given the small N (14), the raw value often works if we provide a good start.
-    Let's stick to the raw value but ensure we handle the gradient carefully if we were providing one.
-    Since L-BFGS-B estimates gradients if none are provided (or we can provide them), 
-    let's provide the analytical subgradient for the active pairs.
-    """
-    points = x_flat.reshape(14, 3)
-    dists = pdist(points)
-    d_min = np.min(dists)
-    d_max = np.max(dists)
-    
-    if d_max < 1e-10 or d_min < 1e-10:
-        return 1.0, np.zeros_like(x_flat)
-        
-    score = (d_min / d_max) ** 2
-    val = -score
-    
-    # Calculate gradient
-    # We need d(score)/d(points).
-    # score = (d_min/d_max)^2
-    # Let r = d_min/d_max. score = r^2.
-    # d(score) = 2r * dr
-    # dr = (d_max * dd_min - d_min * dd_max) / d_max^2
-    # dd_min is the gradient of the minimum distance.
-    # dd_max is the gradient of the maximum distance.
-    
-    # To get gradients of min and max, we need to know which pairs are active.
-    # For min: all pairs with dist == d_min (within eps).
-    # For max: all pairs with dist == d_max (within eps).
-    
-    # This is complex to implement robustly for every step in L-BFGS-B without significant overhead.
-    # Instead, we will use L-BFGS-B with finite difference gradients (default) or just run it 
-    # and hope it converges. Actually, providing a gradient is much faster.
-    
-    # Let's implement a simple subgradient.
-    # We need the pairwise differences.
-    D = points[:, None, :] - points[None, :, :]
-    D2 = np.sum(D * D, axis=2)
-    D2 = np.maximum(D2, 1e-30)
-    dists_mat = np.sqrt(D2)
-    
-    # Identify active min pairs
-    eps = 1e-5
-    min_pairs = np.argwhere(dists_mat < d_min + eps)
-    max_pairs = np.argwhere(dists_mat > d_max - eps)
-    
-    # Filter to i < j to avoid double counting and self-loops
-    min_pairs = [(i, j) for i, j in min_pairs if i < j]
-    max_pairs = [(i, j) for i, j in max_pairs if i < j]
-    
-    grad = np.zeros((14, 3))
-    
-    if len(min_pairs) > 0:
-        # Average gradient of the min distance
-        # d(dist_ij)/d(X_i) = (X_i - X_j) / dist_ij
-        # d(dist_ij)/d(X_j) = (X_j - X_i) / dist_ij
-        g_min = np.zeros((14, 3))
-        for i, j in min_pairs:
-            d_vec = points[i] - points[j]
-            d_val = np.linalg.norm(d_vec)
-            if d_val > 1e-10:
-                unit_vec = d_vec / d_val
-                g_min[i] += unit_vec
-                g_min[j] -= unit_vec
-        g_min /= len(min_pairs)
-        
-    else:
-        g_min = np.zeros((14, 3))
-        
-    if len(max_pairs) > 0:
-        g_max = np.zeros((14, 3))
-        for i, j in max_pairs:
-            d_vec = points[i] - points[j]
-            d_val = np.linalg.norm(d_vec)
-            if d_val > 1e-10:
-                unit_vec = d_vec / d_val
-                g_max[i] += unit_vec
-                g_max[j] -= unit_vec
-        g_max /= len(max_pairs)
-    else:
-        g_max = np.zeros((14, 3))
-        
-    # score = (d_min/d_max)^2
-    # dscore/dX = 2 * (d_min/d_max) * (1/d_max * dd_min/dX - d_min/d_max^2 * dd_max/dX)
-    # dscore/dX = 2 * d_min / d_max^2 * dd_min/dX - 2 * d_min^2 / d_max^3 * dd_max/dX
-    
-    coeff_min = 2.0 * d_min / (d_max * d_max)
-    coeff_max = 2.0 * (d_min * d_min) / (d_max * d_max * d_max)
-    
-    grad = coeff_min * g_min - coeff_max * g_max
-    
-    # We are minimizing -score, so gradient is -grad_score
-    grad_flat = (-grad).flatten()
-    
-    return val, grad_flat
+def _fibonacci_sphere(n_pts):
+    theta = np.zeros(n_pts)
+    phi = np.zeros(n_pts)
+    golden = np.pi * (3 - np.sqrt(5))
+    for i in range(n_pts):
+        theta[i] = np.arccos(1 - 2 * (i + 0.5) / n_pts)
+        phi[i] = golden * i
+    return np.concatenate([theta, phi])
 
-def _polish(points0, deadline):
-    """
-    Refine the points using L-BFGS-B.
-    """
-    x0 = points0.flatten()
-    
-    # Check deadline
-    if time.time() > deadline:
-        return points0
-    
-    try:
-        res = minimize(
-            lambda x: _objective_grad(x)[0],
-            x0,
-            jac=lambda x: _objective_grad(x)[1],
-            method='L-BFGS-B',
-            options={'maxiter': 500, 'ftol': 1e-12, 'gtol': 1e-10}
-        )
-        cand = res.x.reshape(14, 3)
-        return cand
-    except Exception:
-        return points0
+def _icosahedron_init():
+    t = (1 + np.sqrt(5)) / 2
+    verts = np.array([
+        [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
+        [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
+        [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]
+    ])
+    verts = verts / np.linalg.norm(verts, axis=1, keepdims=True)
+    np.random.seed(42)
+    extra = np.random.randn(2, 3)
+    extra = extra / np.linalg.norm(extra, axis=1, keepdims=True)
+    all_pts = np.vstack([verts, extra])
+    theta = np.arccos(np.clip(all_pts[:, 2], -1, 1))
+    phi = np.arctan2(all_pts[:, 1], all_pts[:, 0])
+    phi = np.mod(phi, 2 * np.pi)
+    return np.concatenate([theta, phi])
 
-def min_max_dist_dim3_14():
+def _dodecahedron_init():
+    """Dodecahedron has 20 vertices; take 14 of them."""
+    phi_g = (1 + np.sqrt(5)) / 2
+    inv_phi = 1.0 / phi_g
+    # Dodecahedron vertices
+    verts = []
+    # 8 vertices from cube
+    for sx in [-1, 1]:
+        for sy in [-1, 1]:
+            for sz in [-1, 1]:
+                verts.append([sx, sy, sz])
+    # 12 vertices from three rectangles
+    for s in [-1, 1]:
+        verts.append([0, s*inv_phi, s*phi_g])
+        verts.append([s*inv_phi, s*phi_g, 0])
+        verts.append([s*phi_g, 0, s*inv_phi])
+    verts = np.array(verts)
+    verts = verts / np.linalg.norm(verts, axis=1, keepdims=True)
+    # Take first 14
+    verts = verts[:14]
+    theta = np.arccos(np.clip(verts[:, 2], -1, 1))
+    phi_ang = np.arctan2(verts[:, 1], verts[:, 0])
+    phi_ang = np.mod(phi_ang, 2 * np.pi)
+    return np.concatenate([theta, phi_ang])
+
+def min_max_dist_dim3_14() -> np.ndarray:
     start_time = time.time()
-    deadline = start_time + _DEADLINE_SECONDS - _SAFETY_MARGIN
+    timeout = 600
+    deadline = start_time + timeout - 30  # safety margin
+    best_score = -1
+    best_points = None
+    best_spherical = None
+    best_cartesian = None
     
-    best_score = 0.0
-    best_points = np.random.default_rng(0).standard_normal((14, 3))
+    n = 14
+    dim_sph = 2 * n  # 28 dimensions
+    dim_cart = 3 * n  # 42 dimensions
     
-    # Define bounds for DE. 
-    # The problem is scale invariant. We can constrain the bounding box.
-    # A reasonable box is [-1, 1] in each dimension.
-    bounds = [(-1.0, 1.0)] * 42
+    # Generate initializations
+    inits_sph = []
+    inits_cart = []
     
-    # Run Differential Evolution
-    # maxiter and popsize control the effort.
-    # We will run it for as long as we have time, or until it converges.
+    # 1. Random uniform on sphere
+    for seed in range(40):
+        np.random.seed(seed)
+        theta = np.random.uniform(0, np.pi, n)
+        phi = np.random.uniform(0, 2 * np.pi, n)
+        inits_sph.append(np.concatenate([theta, phi]))
+        # Also add Cartesian version
+        pts = _spherical_to_cartesian(np.concatenate([theta, phi]))
+        inits_cart.append(pts.flatten())
+        
+    # 2. Fibonacci sphere
+    fib = _fibonacci_sphere(n)
+    inits_sph.append(fib)
+    inits_cart.append(_spherical_to_cartesian(fib).flatten())
     
-    # DE is stochastic. We can run multiple iterations if time permits, 
-    # but usually one long run is better.
+    # 3. Perturbed Fibonacci
+    for seed in range(10):
+        np.random.seed(100 + seed)
+        base = _fibonacci_sphere(n)
+        perturbation = np.random.randn(dim_sph) * 0.05
+        inits_sph.append(base + perturbation)
+        pts = _spherical_to_cartesian(base + perturbation)
+        inits_cart.append(pts.flatten())
     
-    # To use time effectively, we can update the best result periodically.
-    # However, DE's callback is tricky to use for early stopping in a single call.
-    # Instead, we will run DE with a generous maxiter, and rely on the deadline.
-    # If DE takes too long, we just return the best found so far.
+    # 4. Icosahedron-based
+    ico = _icosahedron_init()
+    inits_sph.append(ico)
+    inits_cart.append(_spherical_to_cartesian(ico).flatten())
     
-    # A better strategy: Run DE with a moderate number of iterations, then polish.
-    # If time remains, run DE again with a different seed or more iterations?
-    # DE is global, so one good run is usually sufficient.
+    # 5. Dodecahedron-based
+    dodec = _dodecahedron_init()
+    inits_sph.append(dodec)
+    inits_cart.append(_spherical_to_cartesian(dodec).flatten())
     
-    # Let's try to run DE with maxiter=100, popsize=15.
-    # This is roughly 1500 function evaluations. Each is fast (pdist of 14 points).
-    # 1500 evals should take < 1 second.
-    # We can afford many more.
+    # 6. Random Cartesian (centered)
+    for seed in range(20):
+        np.random.seed(200 + seed)
+        pts = np.random.randn(n, 3)
+        pts = pts - np.mean(pts, axis=0)
+        inits_cart.append(pts.flatten())
     
-    # Let's estimate time per eval.
-    # pdist(14,3) is very fast.
-    # Let's aim for ~50,000 to 100,000 evaluations in total.
-    
-    # We will loop, running DE with increasing maxiter, or just running DE once with high maxiter.
-    # Since DE is deterministic given the seed, we can just run it once with high maxiter.
-    # But if it gets stuck, we might want to restart.
-    
-    # Strategy:
-    # 1. Run DE with maxiter=200.
-    # 2. Polish the result.
-    # 3. If time remains, run DE again from the polished result? No, DE is global.
-    #    Maybe run DE with different seeds?
-    
-    # Let's run DE with a high maxiter and see how long it takes.
-    # If it finishes quickly, we can run more seeds.
-    
-    seeds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-    
-    for seed in seeds:
-        if time.time() > deadline - 10: # Leave time for polishing
+    # Phase 1: Multi-start Nelder-Mead on spherical coordinates with soft objective
+    for idx, init in enumerate(inits_sph):
+        if time.time() > deadline - 120:
             break
-            
-        # Run DE
-        # tol=1e-8, maxiter=100
         try:
-            res = differential_evolution(
-                _objective_de,
-                bounds,
-                seed=seed,
-                maxiter=50, # Keep it moderate, DE is slow per iter
-                popsize=15,
-                tol=1e-6,
-                polish=False # We will polish manually to control time
-            )
-            
-            cand_points = res.x.reshape(14, 3)
-            
-            # Polish
-            polished_points = _polish(cand_points, deadline)
-            
-            score = _raw_score(polished_points)
+            res = minimize(_neg_score_spherical, init, 
+                          method='Nelder-Mead',
+                          args=(100.0, 100.0),
+                          options={'xatol': 1e-8, 'fatol': 1e-8, 
+                                   'maxiter': 10000, 'adaptive': True})
+            score = -res.fun
             if score > best_score:
                 best_score = score
-                best_points = polished_points
-                
+                best_spherical = res.x.copy()
+                best_points = _spherical_to_cartesian(res.x)
+        except Exception:
+            continue
+    
+    # Phase 2: Multi-start on Cartesian coordinates with soft objective
+    for idx, init in enumerate(inits_cart):
+        if time.time() > deadline - 90:
+            break
+        try:
+            res = minimize(_neg_score_cartesian, init, 
+                          method='Nelder-Mead',
+                          args=(100.0, 100.0),
+                          options={'xatol': 1e-8, 'fatol': 1e-8, 
+                                   'maxiter': 10000, 'adaptive': True})
+            score = -res.fun
+            if score > best_score:
+                best_score = score
+                best_cartesian = res.x.copy()
+                best_points = res.x.reshape(14, 3)
+                best_points = best_points - np.mean(best_points, axis=0)
+                # Also update spherical for consistency
+                theta = np.arccos(np.clip(best_points[:, 2], -1, 1))
+                phi_ang = np.arctan2(best_points[:, 1], best_points[:, 0])
+                phi_ang = np.mod(phi_ang, 2 * np.pi)
+                best_spherical = np.concatenate([theta, phi_ang])
+        except Exception:
+            continue
+    
+    # Phase 3: Polish with tighter tolerances and higher alpha for sharper convergence
+    if best_spherical is not None and time.time() < deadline - 60:
+        try:
+            res = minimize(_neg_score_spherical, best_spherical,
+                          method='Nelder-Mead',
+                          args=(500.0, 500.0),
+                          options={'xatol': 1e-10, 'fatol': 1e-10,
+                                   'maxiter': 20000, 'adaptive': True})
+            score = -res.fun
+            if score > best_score:
+                best_score = score
+                best_spherical = res.x.copy()
+                best_points = _spherical_to_cartesian(res.x)
         except Exception:
             pass
-            
-    # If we still have time, do a final polish on the best points found
-    if time.time() < deadline - 5:
-        polished_best = _polish(best_points, deadline)
-        score = _raw_score(polished_best)
-        if score > best_score:
-            best_score = score
-            best_points = polished_best
-
-    # Ensure valid output
-    if best_points.shape != (14, 3) or not np.all(np.isfinite(best_points)):
-        # Fallback to a simple configuration
-        # 14 points on a sphere?
-        # Just return random if something went wrong
-        best_points = np.random.default_rng(123).standard_normal((14, 3))
-        
+    
+    # Phase 4: Final polish with exact (nonsmooth) objective for maximum precision
+    if best_spherical is not None and time.time() < deadline - 30:
+        try:
+            res = minimize(_neg_score_spherical_exact, best_spherical,
+                          method='Nelder-Mead',
+                          options={'xatol': 1e-12, 'fatol': 1e-12,
+                                   'maxiter': 30000, 'adaptive': True})
+            score = -res.fun
+            if score > best_score:
+                best_score = score
+                best_spherical = res.x.copy()
+                best_points = _spherical_to_cartesian(res.x)
+        except Exception:
+            pass
+    
+    # Phase 5: If we have a good Cartesian solution, try to polish it too
+    if best_cartesian is not None and time.time() < deadline - 15:
+        try:
+            res = minimize(_neg_score_cartesian_exact, best_cartesian,
+                          method='Nelder-Mead',
+                          options={'xatol': 1e-12, 'fatol': 1e-12,
+                                   'maxiter': 20000, 'adaptive': True})
+            score = -res.fun
+            if score > best_score:
+                best_score = score
+                best_cartesian = res.x.copy()
+                best_points = res.x.reshape(14, 3)
+                best_points = best_points - np.mean(best_points, axis=0)
+        except Exception:
+            pass
+    
+    if best_points is None:
+        # Fallback: return Fibonacci sphere
+        theta = np.zeros(n)
+        phi = np.zeros(n)
+        golden = np.pi * (3 - np.sqrt(5))
+        for i in range(n):
+            theta[i] = np.arccos(1 - 2 * (i + 0.5) / n)
+            phi[i] = golden * i
+        best_points = _spherical_to_cartesian(np.concatenate([theta, phi]))
+    
+    # Ensure finite and correct shape
+    best_points = np.array(best_points, dtype=np.float64)
+    if best_points.shape != (14, 3):
+        best_points = best_points.reshape(14, 3)
+    if not np.all(np.isfinite(best_points)):
+        # Last resort fallback
+        theta = np.zeros(n)
+        phi = np.zeros(n)
+        golden = np.pi * (3 - np.sqrt(5))
+        for i in range(n):
+            theta[i] = np.arccos(1 - 2 * (i + 0.5) / n)
+            phi[i] = golden * i
+        best_points = _spherical_to_cartesian(np.concatenate([theta, phi]))
+    
     return best_points
-
-if __name__ == "__main__":
-    pts = min_max_dist_dim3_14()
-    print(_raw_score(pts))

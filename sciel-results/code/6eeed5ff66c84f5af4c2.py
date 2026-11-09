@@ -1,0 +1,57 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.stats import norm
+import time
+
+
+def acquisition(mu, sigma, f_best, cost):
+    """
+    Cost-aware acquisition function blending Expected Improvement (EI)
+    and Probability of Improvement (PI), normalized before cost division.
+    
+    mu, sigma, f_best, cost: arrays of shape (2000,)
+    Returns: 2000 finite scores (higher = evaluate next)
+    """
+    # Track elapsed time for safety margin
+    t_start = time.time()
+    
+    # Ensure sigma is positive to avoid division issues
+    sigma_safe = np.maximum(sigma, 1e-10)
+    
+    # Compute z-score
+    z = (f_best - mu) / sigma_safe
+    
+    # Expected Improvement
+    ei = (f_best - mu) * norm.cdf(z) + sigma_safe * norm.pdf(z)
+    
+    # Probability of Improvement
+    pi = norm.cdf(z)
+    
+    # Normalize EI and PI to [0, 1] range for blending
+    # Use robust normalization: divide by max to avoid issues with very small values
+    ei_max = np.max(ei) if np.max(ei) > 0 else 1.0
+    pi_max = np.max(pi) if np.max(pi) > 0 else 1.0
+    
+    ei_norm = ei / ei_max
+    pi_norm = pi / pi_max
+    
+    # Blend EI and PI with equal weight
+    blended = 0.5 * ei_norm + 0.5 * pi_norm
+    
+    # Cost-aware: divide by cost (higher cost = lower score)
+    # Add small epsilon to avoid division by zero
+    cost_safe = np.maximum(cost, 1e-10)
+    scores = blended / cost_safe
+    
+    # Ensure all scores are finite
+    scores = np.where(np.isfinite(scores), scores, 0.0)
+    
+    # Check time - if we're getting close to the limit, return immediately
+    # The 300s limit is per evaluation, but we should be safe
+    t_elapsed = time.time() - t_start
+    if t_elapsed > 280:
+        return scores
+    
+    return scores
+# EVOLVE-BLOCK-END

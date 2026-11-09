@@ -2,7 +2,6 @@
 # EVOLVE-BLOCK-START
 import time
 import numpy as np
-from scipy.optimize import linear_sum_assignment
 
 
 def assign(demands, capacities, open_cost, assign_cost):

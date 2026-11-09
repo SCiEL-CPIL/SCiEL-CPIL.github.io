@@ -1,0 +1,110 @@
+"""Cost-aware acquisition using cost-normalized PI with adaptive UCB for rastrigin 2d."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from scipy.stats import norm
+
+# Deadline guard: keep a safety margin below the 330 s wall-clock limit.
+_START_TIME = time.time()
+_DEADLINE = 290.0  # seconds
+
+
+def _check_deadline():
+    """Return True if we are close to the wall-clock deadline."""
+    return (time.time() - _START_TIME) > (_DEADLINE - 5.0)
+
+
+def _pi(mu, sigma, f_best):
+    """Probability of Improvement: P(f(x) < f_best) for f(x) ~ N(mu, sigma^2)."""
+    sigma_safe = np.maximum(sigma, 1e-9)
+    z = (f_best - mu) / sigma_safe
+    return norm.cdf(z)
+
+
+def _expected_improvement(mu, sigma, f_best):
+    """Standard EI for minimization: E[max(f_best - f(x), 0)]."""
+    sigma_safe = np.maximum(sigma, 1e-9)
+    z = (f_best - mu) / sigma_safe
+    ei = (f_best - mu) * norm.cdf(z) + sigma_safe * norm.pdf(z)
+    return np.maximum(ei, 0.0)
+
+
+def _ucb_score(mu, sigma, beta):
+    """UCB score for minimization: -mu + beta * sigma (maximize this)."""
+    return -mu + beta * sigma
+
+
+def acquisition(mu, sigma, f_best, cost):
+    """
+    Cost-aware acquisition for minimizing rastrigin 2d.
+    
+    Combines cost-normalized Probability of Improvement (PI) as the primary
+    exploitation signal with an adaptive UCB exploration term that fades as
+    progress is made. PI directly measures P(improvement) which is robust to
+    Rastrigin's multi-modal structure, while UCB ensures sufficient exploration
+    early on.
+    
+    Parameters:
+    -----------
+    mu : array_like, shape (2000,)
+        GP mean predictions.
+    sigma : array_like, shape (2000,)
+        GP standard deviation predictions.
+    f_best : float
+        Best observed value so far.
+    cost : array_like, shape (2000,)
+        Cost of evaluating each candidate (1 + mean(x_scaled)).
+    
+    Returns:
+    --------
+    scores : ndarray, shape (2000,)
+        Acquisition scores; higher means evaluate next.
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=np.float64)
+    cost = np.asarray(cost, dtype=np.float64)
+
+    # Deadline guard: if we are near the wall-clock limit, return a safe
+    # exploitation-focused score immediately.
+    if _check_deadline():
+        cost_safe = np.maximum(cost, 1e-9)
+        fallback = -mu / cost_safe
+        fallback = np.where(np.isfinite(fallback), fallback, 0.0)
+        return fallback
+
+    # Ensure cost is positive
+    cost_safe = np.maximum(cost, 1e-9)
+    sigma_safe = np.maximum(sigma, 1e-9)
+
+    # Progress metric: 0 when f_best is large (early), 1 when f_best ~ 0 (late)
+    # Rastrigin 2d max value is around 40, so normalize by that
+    progress = float(np.clip(1.0 - f_best / 40.0, 0.0, 1.0))
+
+    # Primary signal: Probability of Improvement
+    pi = _pi(mu, sigma_safe, f_best)
+
+    # Adaptive UCB beta: higher early for exploration, lower late for exploitation
+    # Quadratic decay: starts at 1.5, ends at 0.1
+    beta = 0.1 + 1.4 * (1.0 - progress) ** 2
+
+    # UCB component for exploration
+    ucb = _ucb_score(mu, sigma_safe, beta)
+
+    # Normalize UCB to [0, 1] range for stable blending
+    ucb_min = np.min(ucb)
+    ucb_max = np.max(ucb)
+    ucb_range = ucb_max - ucb_min + 1e-9
+    ucb_norm = (ucb - ucb_min) / ucb_range
+
+    # Weight for UCB: fades out as progress is made
+    w_ucb = 0.4 * (1.0 - progress)
+
+    # Combine: PI as primary (normalized by cost), UCB as secondary exploration
+    # PI is already in [0,1], so the blend is well-scaled
+    scores = (pi + w_ucb * ucb_norm) / cost_safe
+
+    # Ensure finite scores
+    scores = np.where(np.isfinite(scores), scores, 0.0)
+
+    return scores
+# EVOLVE-BLOCK-END

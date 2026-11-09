@@ -1,133 +1,203 @@
-"""Packing 12 unit hexagons in minimal regular hexagon."""
+"""Combined approach: combinatorial grid search + continuous rotation refinement."""
 import math
 import time
+import numpy as np
+from itertools import combinations
 
 N = 12
 
 # EVOLVE-BLOCK-START
 def construct():
     start_time = time.time()
-    deadline = start_time + 135.0  # Safety margin before 150s kill
-    
+    deadline = start_time + 145.0  # Safety margin before 150s kill
+
     sqrt3 = math.sqrt(3.0)
-    
+
     # Generate all 19 centers of the side-3 hexagon cluster
     # Axial coordinates (q, r) with max(|q|, |r|, |q+r|) <= 2
-    # Using Flat-Top hexagon grid coordinates
     all_centers = []
     for q in range(-2, 3):
         for r in range(-2, 3):
             if abs(q + r) <= 2:
                 # Convert axial to cartesian (flat-top hexagons)
-                # x = 1.5 * q, y = sqrt(3) * (r + q/2)
                 x = 1.5 * q
                 y = sqrt3 * (r + q / 2.0)
                 all_centers.append((x, y, q, r))
-    
-    # We have 19 centers, need to choose 12
-    # The outer hexagon side length L must satisfy:
-    # For each inner hex center (cx, cy), the hexagon's vertices must be inside outer hex
-    # A unit hexagon centered at (cx,cy) with same orientation as outer has vertices at
-    # distance 1 from (cx,cy) in 6 directions
-    # The outer hexagon (side L, center at origin, pointy-top) contains point (px,py) iff:
-    # max(|px|/sqrt3, |py - px/sqrt3|/1.5, |py + px/sqrt3|/1.5) ... 
-    # Actually for a regular hexagon with side L, pointy-top, centered at origin:
-    # It's the intersection of 6 half-planes. The inradius is L*sqrt3/2.
-    # A point (x,y) is inside iff for all 6 directions, the projection is within inradius.
-    # Directions: 0, 60, 120, 180, 240, 300 degrees
-    # For pointy-top hex, the flat sides are at angles 30, 90, 150, 210, 270, 330
-    # Let me use: hexagon with vertices at angles 0,60,120,180,240,300 (flat-top)
-    # or vertices at 30,90,150,210,270,330 (pointy-top)
-    
-    # Let's use flat-top: vertices at (L*cos(60k), L*sin(60k)) for k=0..5
-    # The hexagon contains (x,y) iff max over k of |x*cos(60k) + y*sin(60k)| <= L*sqrt3/2
-    # No wait, that's for the inscribed circle. Let me think again.
-    
-    # For a regular hexagon with circumradius R (distance center to vertex = R):
-    # Vertices at R*(cos(60k), sin(60k))
-    # The hexagon is the intersection of 6 half-planes:
-    # For each edge, the half-plane containing the center
-    # Edge between vertices at angles 60k and 60(k+1): midpoint at angle 60k+30, distance R*cos(30)=R*sqrt3/2
-    # Half-plane: x*cos(60k+30) + y*sin(60k+30) <= R*sqrt3/2
-    # Side length s = R (for regular hexagon, side = circumradius)
-    # So R = L (side length)
-    # Inradius = L*sqrt3/2
-    
-    def hex_contains(L, px, py):
-        """Check if point (px,py) is inside regular hexagon of side L, flat-top, centered at origin."""
-        R = L  # circumradius = side length for regular hexagon
-        inradius = R * math.sqrt(3.0) / 2.0
-        for k in range(6):
-            angle = math.radians(60 * k + 30)
-            proj = px * math.cos(angle) + py * math.sin(angle)
-            if proj > inradius + 1e-10:
-                return False
-        return True
-    
-    def required_L(centers_subset):
-        """Find minimum L such that all unit hexagons at given centers fit inside outer hex of side L."""
-        # For each inner hex center, check all 6 vertices
-        # Unit hexagon vertices (flat-top, side 1): at angles 0,60,120,180,240,300, distance 1
-        min_L = 0.0
-        for (cx, cy, _, _) in centers_subset:
-            for k in range(6):
-                angle = math.radians(60 * k)
-                vx = cx + math.cos(angle)
-                vy = cy + math.sin(angle)
-                # Find minimum L such that (vx,vy) is in hex of side L
-                # Outer hex is flat-top (normals at 30,90,150,210,270,330)
-                # Condition: proj onto normal <= inradius = L * sqrt(3) / 2
-                max_proj = 0.0
-                for j in range(6):
-                    ang = math.radians(60 * j + 30)
-                    proj = vx * math.cos(ang) + vy * math.sin(ang)
-                    if proj > max_proj:
-                        max_proj = proj
-                L_needed = max_proj / (math.sqrt(3.0) / 2.0)
-                if L_needed > min_L:
-                    min_L = L_needed
-        return min_L
-    
-    # Try all subsets of size 12 from 19 centers
-    # C(19,12) = C(19,7) = 50388 - manageable
-    from itertools import combinations
-    
+
+    # Normal directions for flat-top outer hexagon
+    normal_angles = [math.radians(30 + 60 * j) for j in range(6)]
+    normal_cos = np.array([math.cos(a) for a in normal_angles])
+    normal_sin = np.array([math.sin(a) for a in normal_angles])
+
+    def min_L_for_hexagon(cx, cy, theta):
+        """Find the minimum L needed for a unit hexagon at (cx,cy) with rotation theta to fit in outer hex of side L."""
+        vertex_angles = [math.radians(60 * k) + theta for k in range(6)]
+        vx = cx + np.array([math.cos(a) for a in vertex_angles])
+        vy = cy + np.array([math.sin(a) for a in vertex_angles])
+
+        # Projection of each vertex onto each normal direction
+        projs = vx[:, np.newaxis] * normal_cos[np.newaxis, :] + vy[:, np.newaxis] * normal_sin[np.newaxis, :]
+        max_proj = np.max(projs)
+        return max_proj / (sqrt3 / 2.0)
+
+    def optimal_theta_for_hexagon(cx, cy):
+        """Find rotation theta that minimizes the required L for this hexagon."""
+        best_L = float('inf')
+        best_theta = 0.0
+        # Sample theta from 0 to 60 degrees (period is 60 degrees due to hexagonal symmetry)
+        for t_deg in range(0, 61, 1):
+            t = math.radians(t_deg)
+            L = min_L_for_hexagon(cx, cy, t)
+            if L < best_L:
+                best_L = L
+                best_theta = t
+        # Refine around best with finer steps
+        for _ in range(3):
+            step = 0.5 if _ == 0 else (0.1 if _ == 1 else 0.01)
+            lo = best_theta - step * 10
+            hi = best_theta + step * 10
+            for t_deg in np.arange(lo, hi + step, step):
+                t = math.radians(t_deg)
+                L = min_L_for_hexagon(cx, cy, t)
+                if L < best_L:
+                    best_L = L
+                    best_theta = t
+        return best_L, best_theta
+
+    # Small scale to ensure strict non-overlap
+    SCALE = 1.0000001
+
     best_L = float('inf')
     best_subset = None
-    
-    # Scaling factor to ensure strict non-overlap (gap > 0)
-    # The grid centers are at distance sqrt(3) apart.
-    # Scaling by 1.000001 creates a small gap.
-    SCALE = 1.000001
-    
-    for subset in combinations(range(19), 12):
+    best_thetas = None
+    best_cluster_angle = 0.0
+
+    # Search over cluster rotation angles with finer resolution
+    cluster_angles_to_try = []
+    # Coarse search every 2 degrees
+    for a_deg in range(0, 61, 2):
+        cluster_angles_to_try.append(math.radians(a_deg))
+    # Add specific promising angles
+    for extra_deg in [30, 15, 45, 10, 20, 25, 35, 40, 50, 55]:
+        cluster_angles_to_try.append(math.radians(extra_deg))
+
+    for cluster_angle in cluster_angles_to_try:
         if time.time() > deadline:
             break
-        # Scale centers for this subset to check L with gap
-        scaled_centers_subset = []
-        for i in subset:
-            x, y, _, _ = all_centers[i]
-            scaled_centers_subset.append((x * SCALE, y * SCALE, 0, 0))
+
+        # Rotate all centers by cluster_angle
+        ca = math.cos(cluster_angle)
+        sa = math.sin(cluster_angle)
+        rotated_centers = []
+        for x, y, q, r in all_centers:
+            rx = x * ca - y * sa
+            ry = x * sa + y * ca
+            rotated_centers.append((rx, ry, q, r))
+
+        # Precompute optimal theta for each center (independent of subset)
+        center_optimal = []
+        for i in range(19):
+            x, y, _, _ = rotated_centers[i]
+            L_h, theta_h = optimal_theta_for_hexagon(x * SCALE, y * SCALE)
+            center_optimal.append((L_h, theta_h))
+
+        # Try all subsets of size 12 from 19 centers
+        # Optimize: pre-sort by L to quickly prune
+        sorted_indices = sorted(range(19), key=lambda i: center_optimal[i][0])
         
-        L = required_L(scaled_centers_subset)
-        if L < best_L:
-            best_L = L
-            best_subset = subset
-    
+        for subset in combinations(range(19), 12):
+            if time.time() > deadline:
+                break
+            # L is the max over all hexagons in subset
+            L = max(center_optimal[i][0] for i in subset)
+            if L < best_L:
+                best_L = L
+                best_subset = subset
+                best_thetas = [center_optimal[i][1] for i in subset]
+                best_cluster_angle = cluster_angle
+
     if best_subset is None:
-        # Fallback: use first 12
+        # Fallback: use first 12 with no cluster rotation
+        best_cluster_angle = 0.0
+        rotated_centers = all_centers
+        center_optimal = []
+        for i in range(19):
+            x, y, _, _ = rotated_centers[i]
+            L_h, theta_h = optimal_theta_for_hexagon(x * SCALE, y * SCALE)
+            center_optimal.append((L_h, theta_h))
         best_subset = tuple(range(12))
-        scaled_centers_subset = []
-        for i in best_subset:
-            x, y, _, _ = all_centers[i]
-            scaled_centers_subset.append((x * SCALE, y * SCALE, 0, 0))
-        best_L = required_L(scaled_centers_subset)
-    
-    # Construct inner hexagons with scaled coordinates
+        best_thetas = [center_optimal[i][1] for i in best_subset]
+        best_L = max(center_optimal[i][0] for i in best_subset)
+
+    # Joint refinement: simultaneously optimize cluster angle and individual rotations
+    if time.time() < deadline - 10.0:
+        # Start from current best and do coordinate descent
+        cur_cluster_angle = best_cluster_angle
+        cur_thetas = list(best_thetas)
+        
+        for iteration in range(5):
+            if time.time() > deadline - 5.0:
+                break
+            
+            # Optimize cluster angle with fixed thetas
+            best_ca = cur_cluster_angle
+            best_ca_L = float('inf')
+            for delta_deg in [-5, -4, -3, -2, -1, -0.5, -0.2, 0, 0.2, 0.5, 1, 2, 3, 4, 5]:
+                test_ca = cur_cluster_angle + math.radians(delta_deg)
+                ca = math.cos(test_ca)
+                sa = math.sin(test_ca)
+                L_max = 0.0
+                for idx, i in enumerate(best_subset):
+                    x, y, _, _ = all_centers[i]
+                    rx = (x * ca - y * sa) * SCALE
+                    ry = (x * sa + y * ca) * SCALE
+                    L_h = min_L_for_hexagon(rx, ry, cur_thetas[idx])
+                    L_max = max(L_max, L_h)
+                if L_max < best_ca_L:
+                    best_ca_L = L_max
+                    best_ca = test_ca
+            
+            if best_ca != cur_cluster_angle:
+                cur_cluster_angle = best_ca
+            
+            # Optimize each theta individually with fixed cluster angle
+            ca = math.cos(cur_cluster_angle)
+            sa = math.sin(cur_cluster_angle)
+            for idx, i in enumerate(best_subset):
+                x, y, _, _ = all_centers[i]
+                rx = (x * ca - y * sa) * SCALE
+                ry = (x * sa + y * ca) * SCALE
+                L_h, theta_h = optimal_theta_for_hexagon(rx, ry)
+                cur_thetas[idx] = theta_h
+            
+            # Recompute L
+            ca = math.cos(cur_cluster_angle)
+            sa = math.sin(cur_cluster_angle)
+            L_new = 0.0
+            for idx, i in enumerate(best_subset):
+                x, y, _, _ = all_centers[i]
+                rx = (x * ca - y * sa) * SCALE
+                ry = (x * sa + y * ca) * SCALE
+                L_h = min_L_for_hexagon(rx, ry, cur_thetas[idx])
+                L_new = max(L_new, L_h)
+            
+            if L_new < best_L:
+                best_L = L_new
+                best_cluster_angle = cur_cluster_angle
+                best_thetas = list(cur_thetas)
+            else:
+                break
+
+    # Construct inner hexagons
     inner = []
-    for i in best_subset:
+    ca = math.cos(best_cluster_angle)
+    sa = math.sin(best_cluster_angle)
+    for idx, i in enumerate(best_subset):
         x, y, _, _ = all_centers[i]
-        inner.append([x * SCALE, y * SCALE, 0.0])
-    
+        # Rotate by cluster angle
+        rx = x * ca - y * sa
+        ry = x * sa + y * ca
+        inner.append([rx * SCALE, ry * SCALE, math.degrees(best_thetas[idx])])
+
     return inner, (0.0, 0.0), best_L, 0.0
 # EVOLVE-BLOCK-END

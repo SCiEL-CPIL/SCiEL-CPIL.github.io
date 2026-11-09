@@ -158,33 +158,38 @@ def _is_valid_fast(pts):
 def _generate_initial_points(rng):
     """
     Generate a set of points designed to minimize convex 7-gons.
-    Strategy: Place points in dense clusters near the corners and along edges
-    to minimize the number of points in convex position. Points that are close
-    together are less likely to form large convex polygons.
+    Strategy: Place points in very dense clusters near the 4 corners and
+    mid-edges to minimize the number of points in convex position.
     """
     pts = []
     
-    # Place points in tight clusters near the 4 corners
-    corners = [(0.08, 0.08), (0.92, 0.08), (0.08, 0.92), (0.92, 0.92)]
-    for cx, cy in corners:
-        for _ in range(8):  # 8 points per corner cluster
-            x = cx + rng.normal(0, 0.025)
-            y = cy + rng.normal(0, 0.025)
-            pts.append((x, y))
+    # 5 cluster centers: 4 corners + 1 center
+    centers = [
+        (0.05, 0.05), (0.95, 0.05), (0.05, 0.95), (0.95, 0.95),
+        (0.5, 0.5)
+    ]
     
-    # Place remaining 33 - 32 = 1 point near center
-    x = rng.uniform(0.45, 0.55)
-    y = rng.uniform(0.45, 0.55)
-    pts.append((x, y))
+    # Distribute 33 points: 7 per corner (28) + 5 in center
+    for i, (cx, cy) in enumerate(centers):
+        if i < 4:
+            n_pts = 7
+        else:
+            n_pts = 5
+        
+        for _ in range(n_pts):
+            # Very tight cluster
+            x = cx + rng.normal(0, 0.015)
+            y = cy + rng.normal(0, 0.015)
+            pts.append((x, y))
     
     pts = np.array(pts)
     pts = np.clip(pts, 0.01, 0.99)
     
     # Ensure validity
     attempts = 0
-    while not _is_valid_fast(pts) and attempts < 100:
+    while not _is_valid_fast(pts) and attempts < 200:
         # Perturb points slightly
-        pts += rng.normal(0, 0.003, (33, 2))
+        pts += rng.normal(0, 0.002, (33, 2))
         pts = np.clip(pts, 0.01, 0.99)
         attempts += 1
     
@@ -193,14 +198,17 @@ def _generate_initial_points(rng):
 def _hill_climb(pts, rng, time_limit):
     """
     Perform hill climbing to minimize the number of convex 7-gons.
+    Uses adaptive step sizes and multiple-point moves to escape local minima.
     """
     best_pts = pts.copy()
     best_c = _count_convex7_fast(best_pts)
     start_time = time.time()
     
     no_improve = 0
-    max_no_improve = 200
-    step_size = 0.08
+    max_no_improve = 300
+    step_size = 0.06
+    min_step = 0.005
+    max_step = 0.3
     
     while time.time() - start_time < time_limit and no_improve < max_no_improve:
         improved = False
@@ -212,7 +220,7 @@ def _hill_climb(pts, rng, time_limit):
         # Random new position within a neighborhood
         offset = rng.normal(0, step_size, 2)
         new_pts[i] = best_pts[i] + offset
-        new_pts[i] = np.clip(new_pts[i], 0.01, 0.99)
+        new_pts[i] = np.clip(new_pts[i], 0.005, 0.995)
         
         if _is_valid_fast(new_pts):
             c = _count_convex7_fast(new_pts)
@@ -222,10 +230,10 @@ def _hill_climb(pts, rng, time_limit):
                 improved = True
                 no_improve = 0
                 # Reduce step size on improvement
-                step_size *= 0.92
+                step_size = max(min_step, step_size * 0.9)
             elif c == best_c and best_c > 1:
                 # Accept neutral moves to explore
-                if rng.random() < 0.4:
+                if rng.random() < 0.3:
                     best_pts = new_pts
                     no_improve = 0
             else:
@@ -234,29 +242,48 @@ def _hill_climb(pts, rng, time_limit):
             no_improve += 1
         
         # If stuck, try a larger jump with multiple points
-        if not improved and no_improve % 5 == 0:
-            n_move = rng.integers(2, 5)
+        if not improved and no_improve % 3 == 0:
+            n_move = rng.integers(2, 6)
             idx = rng.choice(33, size=n_move, replace=False)
             new_pts = best_pts.copy()
             for i in idx:
-                offset = rng.normal(0, step_size * 1.5, 2)
+                offset = rng.normal(0, step_size * 2.0, 2)
                 new_pts[i] = best_pts[i] + offset
-                new_pts[i] = np.clip(new_pts[i], 0.01, 0.99)
+                new_pts[i] = np.clip(new_pts[i], 0.005, 0.995)
             if _is_valid_fast(new_pts):
                 c = _count_convex7_fast(new_pts)
                 if c < best_c:
                     best_c = c
                     best_pts = new_pts
                     no_improve = 0
-                    step_size *= 0.92
+                    step_size = max(min_step, step_size * 0.9)
                 elif c == best_c and best_c > 1:
-                    if rng.random() < 0.3:
+                    if rng.random() < 0.25:
                         best_pts = new_pts
                         no_improve = 0
         
         # Occasionally increase step size to escape local minima
-        if no_improve % 30 == 0:
-            step_size = min(0.25, step_size * 1.4)
+        if no_improve % 20 == 0:
+            step_size = min(max_step, step_size * 1.5)
+        
+        # Fine-tuning phase: if step size is very small, do precise adjustments
+        if step_size < 0.02 and no_improve > 50:
+            # Try very fine adjustments
+            i = rng.integers(0, 33)
+            new_pts = best_pts.copy()
+            offset = rng.normal(0, 0.003, 2)
+            new_pts[i] = best_pts[i] + offset
+            new_pts[i] = np.clip(new_pts[i], 0.005, 0.995)
+            if _is_valid_fast(new_pts):
+                c = _count_convex7_fast(new_pts)
+                if c < best_c:
+                    best_c = c
+                    best_pts = new_pts
+                    no_improve = 0
+                elif c == best_c and best_c > 1:
+                    if rng.random() < 0.2:
+                        best_pts = new_pts
+                        no_improve = 0
     
     return best_pts, best_c
 
@@ -278,10 +305,10 @@ def erdos_szekeres_problem7() -> np.ndarray:
     best_ever_c = best_c
     
     restart_count = 0
-    while time_left() > 45:
+    while time_left() > 30:
         # Run hill climbing for a chunk of time
-        chunk_time = min(40, time_left() - 45)
-        if chunk_time < 10:
+        chunk_time = min(35, time_left() - 30)
+        if chunk_time < 8:
             break
         best_pts, best_c = _hill_climb(best_pts, rng, chunk_time)
         
@@ -297,7 +324,7 @@ def erdos_szekeres_problem7() -> np.ndarray:
         
         # Restart with a fresh initial configuration
         restart_count += 1
-        if time_left() > 60:
+        if time_left() > 50:
             new_pts = _generate_initial_points(rng)
             new_c = _count_convex7_fast(new_pts)
             if new_c < best_ever_c:
@@ -310,6 +337,34 @@ def erdos_szekeres_problem7() -> np.ndarray:
                 # Continue from current best
                 best_pts = best_ever_pts.copy()
                 best_c = best_ever_c
+    
+    # Final polish: very fine-tuning with small step sizes
+    if time_left() > 15:
+        print("Starting final polish...")
+        polish_pts = best_ever_pts.copy()
+        polish_c = best_ever_c
+        polish_start = time.time()
+        
+        for _ in range(500):
+            if time.time() - polish_start > time_left() - 10:
+                break
+            
+            i = rng.integers(0, 33)
+            new_pts = polish_pts.copy()
+            offset = rng.normal(0, 0.002, 2)
+            new_pts[i] = polish_pts[i] + offset
+            new_pts[i] = np.clip(new_pts[i], 0.005, 0.995)
+            
+            if _is_valid_fast(new_pts):
+                c = _count_convex7_fast(new_pts)
+                if c < polish_c:
+                    polish_c = c
+                    polish_pts = new_pts
+                    if polish_c < best_ever_c:
+                        best_ever_c = polish_c
+                        best_ever_pts = polish_pts.copy()
+        
+        print(f"After polish: C={polish_c}, best_ever={best_ever_c}")
     
     return best_ever_pts
 # EVOLVE-BLOCK-END

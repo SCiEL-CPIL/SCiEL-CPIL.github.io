@@ -1,0 +1,387 @@
+"""Multi-objective optimizer on WFG4 with hypervolume-based island model."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+import sys
+
+
+class Optimizer:
+    """Hypervolume-based island model optimizer for WFG4 multi-objective optimization."""
+
+    def __init__(self, budget, dim, n_obj):
+        self.budget, self.dim, self.n_obj = budget, dim, n_obj
+
+    @staticmethod
+    def _fast_non_dominated_sort(F):
+        """Fast non-dominated sorting. Returns list of fronts (lists of indices)."""
+        n = len(F)
+        if n == 0:
+            return []
+        S = [[] for _ in range(n)]
+        nd = np.zeros(n, dtype=int)
+        fronts = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                if np.all(F[i] <= F[j]) and np.any(F[i] < F[j]):
+                    S[i].append(j)
+                    nd[j] += 1
+                elif np.all(F[j] <= F[i]) and np.any(F[j] < F[i]):
+                    S[j].append(i)
+                    nd[i] += 1
+        front0 = [i for i in range(n) if nd[i] == 0]
+        fronts.append(front0)
+        while front0:
+            next_front = []
+            for i in front0:
+                for j in S[i]:
+                    nd[j] -= 1
+                    if nd[j] == 0:
+                        next_front.append(j)
+            if next_front:
+                fronts.append(next_front)
+            front0 = next_front
+        return fronts
+
+    @staticmethod
+    def _crowding_distance(F, indices):
+        """Compute crowding distance for points at given indices."""
+        m = len(indices)
+        if m <= 2:
+            return np.full(m, np.inf)
+        dist = np.zeros(m)
+        n_obj = F.shape[1]
+        for k in range(n_obj):
+            vals = F[indices, k]
+            v_min, v_max = vals.min(), vals.max()
+            if v_max == v_min:
+                continue
+            order = np.argsort(vals)
+            dist[order[0]] = np.inf
+            dist[order[-1]] = np.inf
+            for idx in range(1, m - 1):
+                dist[order[idx]] += (vals[order[idx + 1]] - vals[order[idx - 1]]) / (v_max - v_min)
+        return dist
+
+    @staticmethod
+    def _hypervolume_3d(points, ref):
+        """Compute exact hypervolume for 3D points relative to reference point.
+        Points that are not strictly better than ref in all objectives are ignored."""
+        # Filter points strictly better than ref
+        valid = np.all(points < ref, axis=1)
+        pts = points[valid]
+        if len(pts) == 0:
+            return 0.0
+        
+        # Sort by first objective
+        pts = pts[np.argsort(pts[:, 0])]
+        n = len(pts)
+        
+        # For each point, compute the hypervolume contribution
+        # In 3D: for point i, its contribution is (ref[0] - pts[i,0]) * area in 2D
+        # where area is the rectangle in (f1, f2) plane not covered by later points
+        hv = 0.0
+        for i in range(n):
+            # The x-extent for this point
+            dx = ref[0] - pts[i, 0]
+            if i + 1 < n:
+                # Next point's f0
+                dx = min(dx, pts[i+1, 0] - pts[i, 0])
+                # Actually we need to be more careful
+                pass
+        
+        # Better approach: sweep line
+        # Sort by f0 ascending
+        # For each point, the contribution is (ref[0] - f0[i]) * (max of (ref[1]-f1, ref[2]-f2) not covered)
+        # This is getting complex. Let's use a simpler but exact method for 3D.
+        
+        # Exact 3D hypervolume via inclusion-exclusion is complex.
+        # Use the standard algorithm: sort by one objective, then for each point
+        # compute the 2D hypervolume of the "skyline" of remaining points.
+        
+        # Sort by f0
+        order = np.argsort(pts[:, 0])
+        pts_sorted = pts[order]
+        
+        hv = 0.0
+        for i in range(n):
+            f0 = pts_sorted[i, 0]
+            # The width in f0 direction
+            if i + 1 < n:
+                w0 = pts_sorted[i+1, 0] - f0
+            else:
+                w0 = ref[0] - f0
+            
+            # For the 2D part: consider all points j >= i
+            # The 2D hypervolume of points (f1[j], f2[j]) for j >= i with ref (ref[1], ref[2])
+            # But only the part where f0 is in [f0_i, f0_{i+1})
+            # Actually, since we sorted by f0, for points j >= i, they all have f0 >= f0_i
+            # The 2D hypervolume contribution is the area in (f1, f2) plane
+            # of the region dominated by at least one of points i..n-1, relative to ref[1:], ref[2:]
+            
+            # Collect all points from i onwards
+            sub_pts = pts_sorted[i:, 1:]
+            sub_ref = ref[1:]
+            
+            # 2D hypervolume
+            hv_2d = Optimizer._hypervolume_2d(sub_pts, sub_ref)
+            hv += w0 * hv_2d
+        
+        return hv
+
+    @staticmethod
+    def _hypervolume_2d(points, ref):
+        """Compute exact 2D hypervolume."""
+        # Filter valid points
+        valid = np.all(points < ref, axis=1)
+        pts = points[valid]
+        if len(pts) == 0:
+            return 0.0
+        
+        # Sort by f0
+        pts = pts[np.argsort(pts[:, 0])]
+        n = len(pts)
+        
+        hv = 0.0
+        max_f1 = -np.inf
+        for i in range(n):
+            f0 = pts[i, 0]
+            f1 = pts[i, 1]
+            if i + 1 < n:
+                w0 = pts[i+1, 0] - f0
+            else:
+                w0 = ref[0] - f0
+            
+            # The height is max(ref[1], f1 of any point with f0 >= current)
+            # Since sorted by f0, points from i onwards all have f0 >= f0_i
+            # The effective f1 bound is min(ref[1], min of f1[j] for j >= i where f1[j] < ref[1])
+            # Actually, the height is ref[1] - min(f1[j] for j >= i, f1[j] < ref[1])
+            # But we need the minimum f1 among all points from i to end that are < ref[1]
+            
+            # Pre-compute suffix minimum of f1
+            # For simplicity, compute on the fly
+            min_f1 = np.inf
+            for j in range(i, n):
+                if pts[j, 1] < ref[1]:
+                    min_f1 = min(min_f1, pts[j, 1])
+            
+            if min_f1 < ref[1]:
+                h1 = ref[1] - min_f1
+            else:
+                h1 = 0.0
+            
+            hv += w0 * h1
+        
+        return hv
+
+    def __call__(self, problem, bounds):
+        start_time = time.time()
+        deadline = start_time + 320.0  # Safety margin before 330s kill
+        rng = np.random.default_rng(0)
+        lo = np.array([b[0] for b in bounds])
+        hi = np.array([b[1] for b in bounds])
+        dim, n_obj = self.dim, self.n_obj
+        budget = self.budget
+
+        # Island model: partition into sub-regions based on objective weights
+        # For 3 objectives, use weight vectors pointing to different regions of the Pareto front
+        n_islands = 6
+        # Define weight vectors for each island (normalized to sum to 1)
+        # These guide the search toward different parts of the Pareto front
+        weights = np.array([
+            [0.7, 0.2, 0.1],  # Emphasize objective 0
+            [0.1, 0.7, 0.2],  # Emphasize objective 1
+            [0.1, 0.2, 0.7],  # Emphasize objective 2
+            [0.4, 0.4, 0.2],  # Balanced, slightly favor obj 2
+            [0.4, 0.2, 0.4],  # Balanced, slightly favor obj 0
+            [0.2, 0.4, 0.4],  # Balanced, slightly favor obj 1
+        ])
+
+        # Population per island
+        pop_per_island = max(10, budget // (n_islands * 5))
+        total_pop = pop_per_island * n_islands
+
+        # Initialize each island
+        islands = []
+        for k in range(n_islands):
+            # Initialize with points biased toward the weight direction
+            # Use a mixture of random and weight-directed initialization
+            X_k = lo + (hi - lo) * rng.random((pop_per_island, dim))
+            # Bias some points toward the weight direction
+            n_biased = pop_per_island // 3
+            if n_biased > 0:
+                # Create points that are "good" in the weighted sense
+                # By scaling toward the lower bounds in weighted proportion
+                for i in range(n_biased):
+                    scale = rng.random() * 0.5
+                    X_k[i] = lo + scale * (hi - lo)
+            
+            F_k = np.array([problem(x) for x in X_k])
+            islands.append({'X': X_k, 'F': F_k, 'weights': weights[k]})
+
+        used = total_pop
+
+        # DE parameters per island (varying mutation intensity)
+        F_CR_base = 0.8
+        CR = 0.9
+        K_base = 0.5
+
+        # Migration interval
+        migrate_every = 30
+
+        generation = 0
+
+        # Track all non-dominated points found so far for final selection
+        all_F = []
+        for island in islands:
+            all_F.append(island['F'])
+        all_F = np.vstack(all_F)
+        
+        # Initial non-dominated front
+        fronts = self._fast_non_dominated_sort(all_F)
+        if fronts:
+            front0_indices = fronts[0]
+            nd_count = len(front0_indices)
+        
+        while used < budget:
+            if time.time() > deadline:
+                break
+
+            generation += 1
+
+            for k in range(n_islands):
+                if used >= budget:
+                    break
+                if time.time() > deadline:
+                    break
+
+                island = islands[k]
+                X_k = island['X']
+                F_k = island['F']
+                w = island['weights']
+                pop_k = len(X_k)
+
+                # Non-dominated sorting within island
+                fronts = self._fast_non_dominated_sort(F_k)
+                front0 = fronts[0] if fronts else list(range(pop_k))
+
+                # Selection: pick parents from best front
+                if len(front0) < 2:
+                    parent_pool = list(range(pop_k))
+                else:
+                    parent_pool = front0
+
+                # Pick 3 distinct parents for DE mutation
+                if len(parent_pool) >= 3:
+                    p1, p2, p3 = rng.choice(parent_pool, size=3, replace=False)
+                else:
+                    p1 = rng.choice(parent_pool)
+                    p2 = rng.choice(parent_pool)
+                    p3 = rng.choice(parent_pool)
+
+                # DE mutation with weight-specific intensity
+                # Islands emphasizing a particular objective use higher mutation rate
+                # for that objective's direction
+                K_k = K_base * (1.0 + 0.5 * max(w))
+                v = X_k[p1] + K_k * (X_k[p2] - X_k[p3])
+
+                # DE crossover
+                jrand = rng.integers(dim)
+                trial = np.empty(dim)
+                for j in range(dim):
+                    if rng.random() < CR or j == jrand:
+                        trial[j] = v[j]
+                    else:
+                        trial[j] = X_k[p1][j]
+
+                trial = np.clip(trial, lo, hi)
+
+                # Evaluate
+                ft = problem(trial)
+                used += 1
+
+                # Weighted sum for selection bias
+                ws_trial = np.dot(ft, w)
+                ws_existing = np.dot(F_k, w)
+
+                # Decide replacement
+                # Check if trial dominates any existing point
+                dominated_by_trial = []
+                for i in range(pop_k):
+                    if np.all(ft <= F_k[i]) and np.any(ft < F_k[i]):
+                        dominated_by_trial.append(i)
+
+                if dominated_by_trial:
+                    # Replace the one with worst weighted sum among dominated
+                    worst_idx = dominated_by_trial[np.argmax(ws_existing[dominated_by_trial])]
+                    X_k[worst_idx] = trial
+                    F_k[worst_idx] = ft
+                else:
+                    # Check if trial is dominated by existing points
+                    dominates_trial = []
+                    for i in range(pop_k):
+                        if np.all(F_k[i] <= ft) and np.any(F_k[i] < ft):
+                            dominates_trial.append(i)
+
+                    if dominates_trial:
+                        # Trial is dominated; only replace if it has better weighted sum
+                        # than the worst in the island
+                        worst_idx = int(np.argmax(ws_existing))
+                        if ws_trial < ws_existing[worst_idx]:
+                            X_k[worst_idx] = trial
+                            F_k[worst_idx] = ft
+                    else:
+                        # Non-dominated: replace worst by weighted sum if trial is better
+                        worst_idx = int(np.argmax(ws_existing))
+                        if ws_trial < ws_existing[worst_idx]:
+                            X_k[worst_idx] = trial
+                            F_k[worst_idx] = ft
+                        elif len(fronts) > 1:
+                            # Also try to maintain diversity: replace worst crowding in worst front
+                            worst_front = fronts[-1]
+                            if worst_front and len(worst_front) > 1:
+                                cd = self._crowding_distance(F_k, worst_front)
+                                worst_pos = np.argmin(cd)
+                                candidate_idx = worst_front[worst_pos]
+                                # Only replace if trial is non-dominated and improves spread
+                                # Simple heuristic: replace if trial has lower weighted sum
+                                if ws_trial < ws_existing[candidate_idx]:
+                                    X_k[worst_idx] = trial
+                                    F_k[worst_idx] = ft
+
+                # Update island
+                island['X'] = X_k
+                island['F'] = F_k
+
+            # Migration: every migrate_every generations, swap best points between neighboring islands
+            if generation % migrate_every == 0:
+                for k in range(n_islands):
+                    neighbor = (k + 1) % n_islands
+                    # Find best point in island k by weighted sum
+                    F_k = islands[k]['F']
+                    w_k = islands[k]['weights']
+                    ws_k = np.dot(F_k, w_k)
+                    best_k = int(np.argmin(ws_k))
+                    
+                    F_n = islands[neighbor]['F']
+                    w_n = islands[neighbor]['weights']
+                    ws_n = np.dot(F_n, w_n)
+                    best_n = int(np.argmin(ws_n))
+                    
+                    # Swap if it improves
+                    if ws_k[best_k] < ws_n[best_n]:
+                        # Send best_k to neighbor, replace worst in neighbor
+                        worst_n = int(np.argmax(ws_n))
+                        islands[neighbor]['X'][worst_n] = islands[k]['X'][best_k]
+                        islands[neighbor]['F'][worst_n] = islands[k]['F'][best_k]
+                    elif ws_n[best_n] < ws_k[best_k]:
+                        worst_k = int(np.argmax(ws_k))
+                        islands[k]['X'][worst_k] = islands[neighbor]['X'][best_n]
+                        islands[k]['F'][worst_k] = islands[neighbor]['F'][best_n]
+
+        # Return the best set of points found
+        # Combine all islands and return
+        all_X = []
+        for island in islands:
+            all_X.append(island['X'])
+        return np.vstack(all_X)
+# EVOLVE-BLOCK-END

@@ -1,0 +1,56 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+_START_TIME = time.time()
+_TIMEOUT = 115.0
+_DEADLINE = _START_TIME + _TIMEOUT
+
+def select_next_node(current_node, depot, unvisited_nodes, rest_capacity, demands, distance_matrix):
+    # Deadline guard
+    if time.time() > _DEADLINE:
+        feasible = [n for n in unvisited_nodes if demands[n] <= rest_capacity]
+        if not feasible:
+            return 0
+        return int(feasible[np.argmin(distance_matrix[current_node, feasible])])
+
+    # Filter feasible nodes
+    feasible_mask = np.array([demands[n] <= rest_capacity for n in unvisited_nodes])
+    if not np.any(feasible_mask):
+        return 0
+    
+    feasible_nodes = unvisited_nodes[feasible_mask]
+    
+    # Distances
+    dists_current = distance_matrix[current_node, feasible_nodes]
+    dists_depot = distance_matrix[feasible_nodes, depot]
+    
+    # Heuristic Selection
+    if current_node == depot:
+        # Start with nearest neighbor to establish a direction
+        best_idx = np.argmin(dists_current)
+    else:
+        # Combined savings + regret heuristic
+        # Savings-based: minimize (dist to current - alpha * dist to depot)
+        # This favors nodes that are close to current but far from depot,
+        # encouraging long, efficient routes.
+        # Regret: prefer nodes with high demand (to reduce number of trips)
+        # and nodes that are far from depot (harder to serve later)
+        
+        alpha = 0.9
+        scores = dists_current - alpha * dists_depot
+        
+        # Add a small demand-based urgency component
+        # Higher demand nodes should be prioritized to reduce total trips
+        demand_arr = np.array([demands[n] for n in feasible_nodes], dtype=float)
+        max_demand = demand_arr.max() if len(demand_arr) > 0 else 1.0
+        if max_demand > 0:
+            demand_urgency = demand_arr / max_demand
+            # Subtract a small multiple of demand urgency to prioritize high-demand nodes
+            scores = scores - 0.1 * demand_urgency
+        
+        best_idx = np.argmin(scores)
+        
+    return int(feasible_nodes[best_idx])
+# EVOLVE-BLOCK-END

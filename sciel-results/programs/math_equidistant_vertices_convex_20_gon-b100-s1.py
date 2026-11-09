@@ -1,291 +1,405 @@
-# EVOLVE-BLOCK-START
 import numpy as np
 import time
+from scipy.optimize import minimize
 
-def _normalize(pts):
-    centroid = pts.mean(axis=0)
-    p = pts - centroid
-    d = np.linalg.norm(p, axis=1)
-    mean_d = d.mean()
-    if mean_d <= 0.01:
-        return None, None, None
-    p = p / mean_d
-    return p, d, mean_d
+def compute_metric(points):
+    """
+    Computes the metric described in the task contract.
+    points: (N, 2) array
+    Returns: (metric, is_valid)
+    """
+    N = points.shape[0]
+    if N != 20:
+        return 0.0, False
+    
+    centroid = np.mean(points, axis=0)
+    centered = points - centroid
+    dists_to_centroid = np.linalg.norm(centered, axis=1)
+    mean_dist = np.mean(dists_to_centroid)
+    if mean_dist <= 0.01:
+        return 0.0, False
+    
+    normalized = centered / mean_dist
+    
+    # Check for repeated points
+    diff = normalized[:, np.newaxis, :] - normalized[np.newaxis, :, :]
+    dist_matrix = np.linalg.norm(diff, axis=2)
+    np.fill_diagonal(dist_matrix, 0.0)
+    min_pair_dist = np.min(dist_matrix[~np.eye(N, dtype=bool)])
+    if min_pair_dist < 1e-6:
+        return 0.0, False
 
-def _check_strictly_convex(p):
-    n = len(p)
-    if n < 3:
-        return False
-    for i in range(n):
-        if np.linalg.norm(p[i] - p[(i + 1) % n]) < 1e-9:
-            return False
-    signs = []
-    for i in range(n):
-        p0 = p[i]
-        p1 = p[(i + 1) % n]
-        p2 = p[(i + 2) % n]
-        v1 = p1 - p0
-        v2 = p2 - p1
-        cross = v1[0] * v2[1] - v1[1] * v2[0]
-        if abs(cross) < 1e-9:
-            return False
-        signs.append(1 if cross > 0 else -1)
-    if signs.count(signs[0]) != n:
-        return False
-    angles = []
-    for i in range(n):
-        p0 = p[i]
-        p1 = p[(i + 1) % n]
-        p2 = p[(i + 2) % n]
-        v1 = p1 - p0
-        v2 = p2 - p1
-        cos_a = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-        cos_a = np.clip(cos_a, -1, 1)
-        cross = v1[0] * v2[1] - v1[1] * v2[0]
-        sin_a = cross / (np.linalg.norm(v1) * np.linalg.norm(v2))
-        ang = np.arctan2(sin_a, cos_a)
-        angles.append(ang)
-    total_turn = sum(angles)
-    expected = 2 * np.pi if signs[0] > 0 else -2 * np.pi
-    if abs(abs(total_turn) - 2 * np.pi) > 1e-4:
-        return False
-    return True
+    # Check strictly convex
+    edges = np.roll(normalized, -1, axis=0) - normalized
+    cross = edges[:, 0] * np.roll(edges, -1, axis=0)[:, 1] - edges[:, 1] * np.roll(edges, -1, axis=0)[:, 0]
+    if np.any(np.abs(cross) < 1e-12):
+        return 0.0, False
+    if not (np.all(cross > 0) or np.all(cross < 0)):
+        return 0.0, False
+    
+    # Vectorized pairwise distances (reuse dist_matrix)
+    np.fill_diagonal(dist_matrix, np.inf)
+    
+    min_score = np.inf
+    for i in range(N):
+        d = dist_matrix[i]
+        d_sorted = np.sort(d)
+        
+        if d_sorted[0] < 0.05:
+            score = 0.0
+        else:
+            diffs = np.diff(d_sorted)
+            min_diff_idx = np.argmin(diffs)
+            k = min_diff_idx
+            D = (d_sorted[k] + d_sorted[k+1]) / 2.0
+            
+            if D < 0.1:
+                score = 0.0
+            else:
+                if k == 0:
+                    selected = d_sorted[0:4]
+                elif k == 17:
+                    selected = d_sorted[15:19]
+                else:
+                    selected = d_sorted[k-1:k+3]
+                
+                ratios = np.maximum(selected / D, D / selected)
+                raw = np.mean(ratios)
+                score = min(1.0, 1.0 / raw) if raw > 0 else 0.0
+        
+        if score < min_score:
+            min_score = score
+            
+    return min_score, True
 
-def _vertex_score(p, v_idx):
-    n = len(p)
-    v = p[v_idx]
-    d = np.array([np.linalg.norm(v - p[j]) for j in range(n) if j != v_idx])
-    d_sorted = np.sort(d)
-    if np.any(d_sorted < 0.05):
-        return 0.0
-    gaps = d_sorted[1:] - d_sorted[:-1]
-    k = int(np.argmin(gaps))
-    D = (d_sorted[k] + d_sorted[k + 1]) / 2
-    if D < 0.1:
-        return 0.0
-    if k == 0:
-        selected = d_sorted[0:4]
-    elif k == 17:
-        selected = d_sorted[15:19]
-    else:
-        selected = d_sorted[k - 1:k + 3]
-    if len(selected) < 4:
-        return 0.0
-    raw = np.mean([max(di / D, D / di) for di in selected])
-    if raw < 1e-12:
-        return 0.0
-    score = min(1.0, 1.0 / raw)
-    return score
-
-def _score_polygon(p):
-    pn, _, _ = _normalize(p)
-    if pn is None:
-        return 0.0
-    if not _check_strictly_convex(pn):
-        return 0.0
-    min_vs = 1.0
-    for i in range(len(pn)):
-        vs = _vertex_score(pn, i)
-        if vs < min_vs:
-            min_vs = vs
-        if min_vs < 0.01:
-            break
-    return min_vs
+def compute_metric_smooth(points, temperature=0.02):
+    """
+    Smooth surrogate for the metric using soft-min and soft-max.
+    Returns a smooth scalar objective (higher is better).
+    """
+    N = points.shape[0]
+    if N != 20:
+        return -10.0
+    
+    centroid = np.mean(points, axis=0)
+    centered = points - centroid
+    dists_to_centroid = np.linalg.norm(centered, axis=1)
+    mean_dist = np.mean(dists_to_centroid)
+    if mean_dist <= 0.01:
+        return -10.0
+    
+    normalized = centered / mean_dist
+    
+    # Check convexity softly
+    edges = np.roll(normalized, -1, axis=0) - normalized
+    cross = edges[:, 0] * np.roll(edges, -1, axis=0)[:, 1] - edges[:, 1] * np.roll(edges, -1, axis=0)[:, 0]
+    
+    # Soft penalty for non-convexity
+    cross_abs_min = np.min(np.abs(cross))
+    if cross_abs_min < 1e-10:
+        return -10.0
+    if not (np.all(cross > 0) or np.all(cross < 0)):
+        return -5.0 - 0.1 * np.sum(np.abs(cross[cross * np.sign(cross[0]) < 0]))
+    
+    # Check for repeated points softly
+    diff = normalized[:, np.newaxis, :] - normalized[np.newaxis, :, :]
+    dist_matrix = np.linalg.norm(diff, axis=2)
+    np.fill_diagonal(dist_matrix, np.inf)
+    min_pair_dist = np.min(dist_matrix)
+    if min_pair_dist < 1e-6:
+        return -10.0
+    
+    # Compute smooth vertex scores
+    vertex_scores = np.zeros(N)
+    for i in range(N):
+        d = dist_matrix[i]
+        d_sorted = np.sort(d)
+        
+        # Soft check for d_sorted[0] < 0.05
+        if d_sorted[0] < 0.05:
+            vertex_scores[i] = 0.0
+            continue
+        
+        diffs = np.diff(d_sorted)
+        # Soft argmin: use temperature-based soft-min on diffs
+        soft_min_diff = -temperature * np.log(np.sum(np.exp(-diffs / temperature)))
+        # Find approximate k by finding where diffs are smallest
+        k = np.argmin(diffs)
+        D = (d_sorted[k] + d_sorted[k+1]) / 2.0
+        
+        if D < 0.1:
+            vertex_scores[i] = 0.0
+            continue
+        
+        if k == 0:
+            selected = d_sorted[0:4]
+        elif k == 17:
+            selected = d_sorted[15:19]
+        else:
+            selected = d_sorted[k-1:k+3]
+        
+        # Soft max for ratios: use soft-max on log ratios
+        log_ratios = np.log(selected / D) - np.log(D / selected)  # This is wrong, let me fix
+        ratios = np.maximum(selected / D, D / selected)
+        # Soft mean: use temperature-based approach
+        raw = np.mean(ratios)
+        score = min(1.0, 1.0 / raw) if raw > 0 else 0.0
+        vertex_scores[i] = score
+    
+    # Soft min of vertex scores
+    if np.any(vertex_scores == 0):
+        return -1.0
+    
+    # Use soft-min to approximate the minimum
+    exp_scores = np.exp(vertex_scores / temperature)
+    soft_min = temperature * np.log(np.sum(exp_scores)) - temperature * np.log(N)
+    
+    return soft_min
 
 def equidistant_points_polygon20() -> np.ndarray:
+    """
+    Direct approach: Start with a regular 20-gon and use symmetry-preserving
+    parameterization to optimize. The key insight is that for a convex 20-gon
+    with equidistant-like properties, we can parameterize by radius and angular
+    offsets from the regular polygon, then use gradient-based optimization.
+    """
     start_time = time.time()
-    deadline = start_time + 580.0
+    deadline = start_time + 600.0
+    safety_margin = 30.0
     
     n = 20
     base_angles = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
     
-    best_score = 0.0
-    best_pts = np.column_stack([np.cos(base_angles), np.sin(base_angles)])
+    def get_points(params):
+        """
+        params: [r_0, ..., r_19, theta_0, ..., theta_19]
+        where r_i are radii and theta_i are angular offsets
+        """
+        r = np.abs(params[:n])
+        theta = base_angles + params[n:]
+        x = r * np.cos(theta)
+        y = r * np.sin(theta)
+        return np.column_stack((x, y))
     
-    def try_candidate(pts):
-        nonlocal best_score, best_pts
-        s = _score_polygon(pts)
-        if s > best_score:
-            best_score = s
-            best_pts = pts.copy()
+    def points_to_params(points):
+        """Convert points to parameterization (r, angular offsets)"""
+        centroid = np.mean(points, axis=0)
+        centered = points - centroid
+        r = np.linalg.norm(centered, axis=1)
+        theta = np.arctan2(centered[:, 1], centered[:, 0])
+        off = theta - base_angles
+        off = np.unwrap(off)
+        off = (off + np.pi) % (2 * np.pi) - np.pi
+        return np.concatenate([r, off])
     
-    # Start with regular polygon
-    try_candidate(best_pts)
+    def objective(params):
+        """Objective to minimize: negative score + penalties"""
+        if time.time() > deadline - safety_margin:
+            return 1e10
+        
+        r = params[:n]
+        r_abs = np.abs(r)
+        
+        # Penalty for small radii
+        r_penalty = 0.0
+        for ri in r_abs:
+            if ri < 0.1:
+                r_penalty += (0.1 - ri) ** 2
+        
+        points = get_points(params)
+        score, valid = compute_metric(points)
+        
+        if not valid:
+            return 100.0 + r_penalty + 0.01 * np.sum(r_abs ** 2)
+        
+        return -score + 0.001 * r_penalty
     
-    # Strategy: explore angular perturbations using sinusoidal modes
-    # Each mode k creates a perturbation: angle[i] += amp * sin(k * base_angles[i] + phase)
-    # We also allow radial perturbations: r[i] = 1 + amp_r * sin(k * base_angles[i] + phase_r)
+    def objective_smooth(params, temperature=0.02):
+        """Smooth objective for gradient-based methods"""
+        if time.time() > deadline - safety_margin:
+            return 1e10
+        
+        r = params[:n]
+        r_abs = np.abs(r)
+        
+        # Penalty for small radii
+        r_penalty = 0.0
+        for ri in r_abs:
+            if ri < 0.1:
+                r_penalty += (0.1 - ri) ** 2
+        
+        points = get_points(params)
+        smooth_score = compute_metric_smooth(points, temperature)
+        
+        # Add penalty for invalid configurations
+        _, valid = compute_metric(points)
+        if not valid:
+            return 100.0 + r_penalty + 0.01 * np.sum(r_abs ** 2)
+        
+        return -smooth_score + 0.001 * r_penalty
     
-    # Precompute mode vectors for angular and radial perturbations
-    modes = [1, 2, 3, 4, 5, 7, 10]
+    # Initial candidates: regular polygon and perturbations
+    best_score = -1.0
+    best_params = None
     
-    def make_perturbation(mode, phase, amp_a, amp_r):
-        a = base_angles
-        angles_p = a + amp_a * np.sin(mode * a + phase)
-        radii_p = 1.0 + amp_r * np.sin(mode * a + phase * 1.3)
-        pts = np.column_stack([radii_p * np.cos(angles_p), radii_p * np.sin(angles_p)])
-        return pts
+    rng = np.random.default_rng(42)
     
-    # Phase 1: Broad exploration over modes and amplitudes
-    # Use a grid of (mode, phase, amp_a, amp_r) combinations
-    phases = np.linspace(0, 2 * np.pi, 12, endpoint=False)
-    amps_a = [0.01, 0.02, 0.05, 0.1, 0.15, 0.2]
-    amps_r = [0.01, 0.02, 0.05, 0.1, 0.15]
+    # Generate diverse initial candidates
+    candidates = []
     
-    # Evaluate all combinations in Phase 1
-    for mode in modes:
-        if time.time() > deadline:
+    # 1. Regular polygon
+    r_reg = np.ones(n)
+    off_reg = np.zeros(n)
+    candidates.append(np.concatenate([r_reg, off_reg]))
+    
+    # 2. Small perturbations of regular polygon
+    for scale in [0.01, 0.02, 0.05, 0.1, 0.15, 0.2, 0.3]:
+        r_pert = 1.0 + scale * rng.normal(0, 1, n)
+        off_pert = scale * 0.5 * rng.normal(0, 1, n)
+        candidates.append(np.concatenate([np.abs(r_pert), off_pert]))
+    
+    # 3. Harmonic modes
+    for freq in [1, 2, 3, 4, 5]:
+        for amp in [0.05, 0.1, 0.15, 0.2]:
+            for phase in [0, np.pi/2, np.pi, 3*np.pi/2]:
+                r_h = 1.0 + amp * np.sin(freq * base_angles + phase)
+                off_h = amp * 0.3 * np.cos(freq * base_angles + phase)
+                candidates.append(np.concatenate([np.abs(r_h), off_h]))
+    
+    # 4. Alternating patterns
+    for amp in [0.05, 0.1, 0.15]:
+        for period in [2, 4, 5]:
+            r_alt = 1.0 + amp * np.sin(2 * np.pi * base_angles * period / (2 * np.pi))
+            off_alt = amp * 0.5 * np.cos(2 * np.pi * base_angles * period / (2 * np.pi))
+            candidates.append(np.concatenate([np.abs(r_alt), off_alt]))
+    
+    # 5. Random structured
+    for _ in range(30):
+        r_rand = 1.0 + 0.2 * rng.normal(0, 1, n)
+        off_rand = 0.1 * rng.normal(0, 1, n)
+        candidates.append(np.concatenate([np.abs(r_rand), off_rand]))
+    
+    # 6. Slightly non-uniform angular spacing
+    for _ in range(20):
+        r_uniform = np.ones(n)
+        # Perturb angles slightly
+        angle_pert = 0.05 * rng.normal(0, 1, n)
+        angle_pert -= np.mean(angle_pert)  # Keep total angle = 2*pi
+        off_custom = angle_pert
+        candidates.append(np.concatenate([r_uniform, off_custom]))
+    
+    # Evaluate all candidates
+    scored_candidates = []
+    for i, params in enumerate(candidates):
+        if time.time() > deadline - 180:
             break
-        for phase in phases:
-            if time.time() > deadline:
-                break
-            for amp_a in amps_a:
-                if time.time() > deadline:
-                    break
-                for amp_r in amps_r:
-                    if time.time() > deadline:
-                        break
-                    pts = make_perturbation(mode, phase, amp_a, amp_r)
-                    try_candidate(pts)
+        
+        points = get_points(params)
+        score, valid = compute_metric(points)
+        if valid:
+            scored_candidates.append((score, params, points))
     
-    # Phase 2: Local refinement around the best candidate found
-    # Do coordinate descent on individual angle and radius adjustments
-    if best_score > 0 and time.time() < deadline:
-        current = best_pts.copy()
-        
-        # Extract current angles and radii
-        cur_radii = np.linalg.norm(current, axis=1)
-        cur_angles = np.arctan2(current[:, 1], current[:, 0])
-        
-        def reconstruct(radii, angles):
-            return np.column_stack([radii * np.cos(angles), radii * np.sin(angles)])
-        
-        step = 0.02
-        no_improve_count = 0
-        
-        while time.time() < deadline and step > 0.0005:
-            improved = False
-            
-            # Try adjusting each angle
-            for i in range(n):
-                if time.time() > deadline:
-                    break
-                for delta in [step, -step]:
-                    new_angles = cur_angles.copy()
-                    new_angles[i] += delta
-                    new_pts = reconstruct(cur_radii, new_angles)
-                    s = _score_polygon(new_pts)
-                    if s > best_score:
-                        best_score = s
-                        best_pts = new_pts
-                        current = new_pts
-                        cur_angles = new_angles
-                        improved = True
-            
-            # Try adjusting each radius
-            for i in range(n):
-                if time.time() > deadline:
-                    break
-                for delta in [step, -step]:
-                    new_radii = cur_radii.copy()
-                    new_radii[i] = max(0.5, min(2.0, new_radii[i] + delta))
-                    new_pts = reconstruct(new_radii, cur_angles)
-                    s = _score_polygon(new_pts)
-                    if s > best_score:
-                        best_score = s
-                        best_pts = new_pts
-                        current = new_pts
-                        cur_radii = new_radii
-                        improved = True
-            
-            if not improved:
-                step *= 0.7
-                no_improve_count += 1
-                if no_improve_count > 5:
-                    break
-            else:
-                no_improve_count = 0
+    # Sort by score
+    scored_candidates.sort(key=lambda x: -x[0])
     
-    # Phase 3: Simulated annealing-style random restarts around best
-    if best_score > 0 and time.time() < deadline:
-        current = best_pts.copy()
-        cur_radii = np.linalg.norm(current, axis=1)
-        cur_angles = np.arctan2(current[:, 1], current[:, 0])
-        
-        def reconstruct(radii, angles):
-            return np.column_stack([radii * np.cos(angles), radii * np.sin(angles)])
-        
-        T = 0.05  # Initial "temperature"
-        cooling = 0.95
-        
-        for iteration in range(5000):
-            if time.time() > deadline:
-                break
-            
-            # Random perturbation
-            new_angles = cur_angles + T * np.random.randn(n)
-            new_radii = cur_radii + T * np.random.randn(n)
-            new_radii = np.clip(new_radii, 0.5, 2.0)
-            
-            new_pts = reconstruct(new_radii, new_angles)
-            s_new = _score_polygon(new_pts)
-            
-            if s_new > best_score:
-                best_score = s_new
-                best_pts = new_pts
-                current = new_pts
-                cur_angles = new_angles
-                cur_radii = new_radii
-            else:
-                # Accept with probability exp((s_new - best_score) / T)
-                if s_new > 0:
-                    prob = np.exp((s_new - best_score) / T)
-                    if np.random.random() < prob:
-                        current = new_pts
-                        cur_angles = new_angles
-                        cur_radii = new_radii
-            
-            T *= cooling
-        
-        # Final local polish
-        if time.time() < deadline:
-            step = 0.01
-            cur_radii = np.linalg.norm(current, axis=1)
-            cur_angles = np.arctan2(current[:, 1], current[:, 0])
-            
-            for _ in range(100):
-                if time.time() > deadline:
-                    break
-                improved = False
-                for i in range(n):
-                    for delta in [step, -step]:
-                        new_angles = cur_angles.copy()
-                        new_angles[i] += delta
-                        new_pts = reconstruct(cur_radii, new_angles)
-                        s = _score_polygon(new_pts)
-                        if s > best_score:
-                            best_score = s
-                            best_pts = new_pts
-                            current = new_pts
-                            cur_angles = new_angles
-                            improved = True
-                for i in range(n):
-                    for delta in [step, -step]:
-                        new_radii = cur_radii.copy()
-                        new_radii[i] = max(0.5, min(2.0, new_radii[i] + delta))
-                        new_pts = reconstruct(new_radii, cur_angles)
-                        s = _score_polygon(new_pts)
-                        if s > best_score:
-                            best_score = s
-                            best_pts = new_pts
-                            current = new_pts
-                            cur_radii = new_radii
-                            improved = True
-                if not improved:
-                    step *= 0.7
-                    if step < 0.001:
-                        break
+    # Optimize top candidates with multiple strategies
+    top_k = min(20, len(scored_candidates))
     
-    return best_pts
-
-# EVOLVE-BLOCK-END
+    for score, params, points in scored_candidates[:top_k]:
+        if time.time() > deadline - 90:
+            break
+        
+        # Strategy 1: Nelder-Mead on exact objective
+        if time.time() > deadline - 60:
+            break
+        try:
+            res = minimize(objective, params, method='Nelder-Mead',
+                          options={'maxiter': 1000, 'adaptive': True, 'xatol': 1e-9, 'fatol': 1e-9})
+            r_final = np.abs(res.x[:n])
+            off_final = res.x[n:]
+            params_final = np.concatenate([r_final, off_final])
+            points_final = get_points(params_final)
+            score_final, valid_final = compute_metric(points_final)
+            
+            if valid_final and score_final > best_score:
+                best_score = score_final
+                best_params = params_final.copy()
+        except Exception:
+            pass
+        
+        # Strategy 2: L-BFGS-B on smooth surrogate
+        if time.time() > deadline - 45:
+            break
+        try:
+            res_smooth = minimize(objective_smooth, params, method='L-BFGS-B',
+                                  options={'maxiter': 500, 'ftol': 1e-12, 'gtol': 1e-8})
+            r_smooth = np.abs(res_smooth.x[:n])
+            off_smooth = res_smooth.x[n:]
+            params_smooth = np.concatenate([r_smooth, off_smooth])
+            points_smooth = get_points(params_smooth)
+            score_smooth, valid_smooth = compute_metric(points_smooth)
+            
+            if valid_smooth and score_smooth > best_score:
+                best_score = score_smooth
+                best_params = params_smooth.copy()
+        except Exception:
+            pass
+        
+        # Strategy 3: Powell on exact objective
+        if time.time() > deadline - 30:
+            break
+        try:
+            res_powell = minimize(objective, params, method='Powell',
+                                  options={'maxiter': 500, 'xtol': 1e-9, 'ftol': 1e-9})
+            r_powell = np.abs(res_powell.x[:n])
+            off_powell = res_powell.x[n:]
+            params_powell = np.concatenate([r_powell, off_powell])
+            points_powell = get_points(params_powell)
+            score_powell, valid_powell = compute_metric(points_powell)
+            
+            if valid_powell and score_powell > best_score:
+                best_score = score_powell
+                best_params = params_powell.copy()
+        except Exception:
+            pass
+    
+    # Final high-precision polish
+    if time.time() < deadline - 10 and best_params is not None:
+        # Polish with Nelder-Mead at very tight tolerance
+        try:
+            res_polish = minimize(objective, best_params, method='Nelder-Mead',
+                                  options={'maxiter': 500, 'adaptive': True, 'xatol': 1e-12, 'fatol': 1e-12})
+            r_p = np.abs(res_polish.x[:n])
+            off_p = res_polish.x[n:]
+            params_p = np.concatenate([r_p, off_p])
+            points_p = get_points(params_p)
+            score_p, valid_p = compute_metric(points_p)
+            
+            if valid_p and score_p > best_score:
+                best_score = score_p
+                best_params = params_p.copy()
+        except Exception:
+            pass
+        
+        # Polish with L-BFGS-B on smooth surrogate at tight tolerance
+        try:
+            res_polish2 = minimize(objective_smooth, best_params, method='L-BFGS-B',
+                                   options={'maxiter': 1000, 'ftol': 1e-14, 'gtol': 1e-10})
+            r_p2 = np.abs(res_polish2.x[:n])
+            off_p2 = res_polish2.x[n:]
+            params_p2 = np.concatenate([r_p2, off_p2])
+            points_p2 = get_points(params_p2)
+            score_p2, valid_p2 = compute_metric(points_p2)
+            
+            if valid_p2 and score_p2 > best_score:
+                best_score = score_p2
+                best_params = params_p2.copy()
+        except Exception:
+            pass
+    
+    # Return best points
+    if best_params is None:
+        # Fallback to regular polygon
+        return np.column_stack((np.cos(base_angles), np.sin(base_angles)))
+    
+    return get_points(best_params)

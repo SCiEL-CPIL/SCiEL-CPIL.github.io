@@ -1,0 +1,60 @@
+import time
+import sys
+import hashlib
+import struct
+
+# Global deadline guard
+_START_TIME = time.time()
+_DEADLINE = _START_TIME + 290.0  # Safety margin before 300s kill
+
+def priority(vector, n):
+    """
+    Prioritizes vectors based on the balance of their digit distribution.
+    
+    Heuristic:
+    Vectors where the counts of 0s, 1s, and 2s are as close to n/3 as possible
+    are considered 'balanced' or 'uniform'. Prioritizing these vectors helps
+    avoid the early formation of 3-term arithmetic progressions (cap set violations),
+    leading to larger final cap sets.
+    
+    This is combined with a deterministic hash to break ties and ensure diversity
+    among vectors with similar balance scores.
+    """
+    # Calculate counts of each digit
+    c0 = 0
+    c1 = 0
+    c2 = 0
+    for v in vector:
+        if v == 0:
+            c0 += 1
+        elif v == 1:
+            c1 += 1
+        else:
+            c2 += 1
+            
+    # Calculate the squared deviation from the ideal uniform distribution (n/3 for each)
+    # This measures how "unbalanced" the vector is.
+    # Lower deviation is better.
+    dev0 = c0 - n / 3.0
+    dev1 = c1 - n / 3.0
+    dev2 = c2 - n / 3.0
+    
+    balance_score = dev0*dev0 + dev1*dev1 + dev2*dev2
+    
+    # We want to maximize balance_score (favor less balanced/skewed vectors),
+    # as this reduces the chance of forming 3-term APs.
+    # Add a small deterministic hash to break ties.
+    
+    # Fast custom hash: FNV-1a style, deterministic and much faster than MD5
+    h = 2166136261
+    for i, val in enumerate(vector):
+        h = (h ^ (val + i)) * 16777619
+        h &= 0xFFFFFFFF
+    # Normalize hash to [0, 1) with high resolution
+    norm_h = (h % 10000000) / 10000000.0
+
+    # Primary: +balance_score (favor skewed vectors)
+    # Secondary: small fraction of hash for fine-grained tie-breaking
+    # Use a smaller hash weight so balance differences dominate, but hash provides
+    # fine ordering among vectors with similar balance
+    return balance_score + norm_h * 0.001

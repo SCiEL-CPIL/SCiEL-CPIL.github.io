@@ -1,0 +1,3 @@
+N_PW_SEARCH = 5
+G_range_search = np.arange(-N_PW_SEARCH, N_PW_SEARCH + 1)
+# ...

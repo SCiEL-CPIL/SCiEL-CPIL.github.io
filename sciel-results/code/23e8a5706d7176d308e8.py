@@ -1,0 +1,100 @@
+import numpy as np
+import time
+from collections import deque
+
+def priority(instance):
+    """
+    Score each activity for the serial schedule-generation scheme.
+    Higher priority (score) is scheduled first among eligible activities.
+
+    Design (refined within the CPM + resource-aware family):
+    1. Compute Critical Path Length (CPL): longest path from each activity to project end.
+       This is the primary, dominant priority signal.
+    2. Compute a resource-contention signal: max over resources of demand/capacity.
+       This favors activities that use scarce resources, reducing later blocking.
+    3. Small tie-break by duration for determinism.
+
+    The serial SGS benefits most from scheduling critical-path activities first;
+    the resource term is a small secondary signal to avoid wasting scarce capacity.
+    """
+    start_time = time.time()
+    DEADLINE = 140.0  # Safety margin before 150s kill
+
+    n = len(instance["durations"])
+    durations = np.asarray(instance["durations"], dtype=float)
+    demands = np.asarray(instance["demands"], dtype=float)
+    capacities = np.asarray(instance["capacities"], dtype=float)
+    preds = instance["predecessors"]
+
+    # Build successor list and in-degrees
+    successors = [[] for _ in range(n)]
+    in_degree = np.zeros(n, dtype=int)
+    for i in range(n):
+        for p in preds[i]:
+            successors[p].append(i)
+            in_degree[i] += 1
+
+    # Topological sort (Kahn's algorithm)
+    queue = deque()
+    for i in range(n):
+        if in_degree[i] == 0:
+            queue.append(i)
+
+    topo_order = []
+    while queue:
+        u = queue.popleft()
+        topo_order.append(u)
+        for v in successors[u]:
+            in_degree[v] -= 1
+            if in_degree[v] == 0:
+                queue.append(v)
+
+    if len(topo_order) != n:
+        # Fallback: just use durations as priority
+        return durations.copy()
+
+    # Compute Critical Path Length (CPL) - longest path from activity to project end
+    cpl = np.zeros(n, dtype=float)
+    for u in reversed(topo_order):
+        if not successors[u]:
+            cpl[u] = durations[u]
+        else:
+            cpl[u] = durations[u] + max(cpl[v] for v in successors[u])
+
+    # Check deadline
+    if time.time() - start_time > DEADLINE:
+        return cpl.copy()
+
+    # Compute resource-contention signal: max ratio of demand to capacity per activity.
+    # Favors activities that consume scarce resources (higher ratio = more constrained).
+    # Using max (not sum) gives a cleaner, less noisy signal.
+    res_ratio = np.zeros(n, dtype=float)
+    for i in range(n):
+        for j in range(len(capacities)):
+            if capacities[j] > 0 and demands[i][j] > 0:
+                r = demands[i][j] / capacities[j]
+                if r > res_ratio[i]:
+                    res_ratio[i] = r
+
+    # Check deadline
+    if time.time() - start_time > DEADLINE:
+        return cpl.copy()
+
+    # Normalize components
+    def normalize(arr):
+        mn, mx = arr.min(), arr.max()
+        if mx - mn < 1e-10:
+            return np.zeros_like(arr)
+        return (arr - mn) / (mx - mn)
+
+    cpl_norm = normalize(cpl)
+    res_norm = normalize(res_ratio)
+    dur_norm = normalize(durations)
+
+    # Combine scores:
+    # Primary: Critical Path Length (dominant signal)
+    # Secondary: Resource contention (small boost for scarce-resource users)
+    # Tertiary: Duration (small tie-break for determinism)
+    scores = 1.0 * cpl_norm + 0.10 * res_norm + 0.05 * dur_norm
+
+    return scores
