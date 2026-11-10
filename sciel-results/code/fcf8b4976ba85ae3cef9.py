@@ -1,0 +1,229 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import itertools
+import random
+import sys
+from collections import deque
+
+P = {'n': 12, 'm': 40}
+
+class Dinic:
+    def __init__(self, n):
+        self.n = n
+        self.graph = [[] for _ in range(n)]
+        self.level = [0] * n
+        self.iter = [0] * n
+
+    def add_edge(self, fr, to, cap):
+        self.graph[fr].append([to, cap, len(self.graph[to])])
+        self.graph[to].append([fr, 0, len(self.graph[fr]) - 1])
+
+    def bfs(self, s, t):
+        self.level = [-1] * self.n
+        self.level[s] = 0
+        q = deque([s])
+        while q:
+            v = q.popleft()
+            for e in self.graph[v]:
+                if e[1] > 0 and self.level[e[0]] < 0:
+                    self.level[e[0]] = self.level[v] + 1
+                    q.append(e[0])
+        return self.level[t] >= 0
+
+    def dfs(self, v, t, f):
+        if v == t:
+            return f
+        for i in range(self.iter[v], len(self.graph[v])):
+            self.iter[v] = i
+            e = self.graph[v][i]
+            if e[1] > 0 and self.level[v] < self.level[e[0]]:
+                d = self.dfs(e[0], t, min(f, e[1]))
+                if d > 0:
+                    e[1] -= d
+                    self.graph[e[0]][e[2]][1] += d
+                    return d
+        return 0
+
+    def max_flow(self, s, t):
+        flow = 0
+        INF = 10**18
+        while self.bfs(s, t):
+            self.iter = [0] * self.n
+            f = INF
+            while f > 0:
+                f = self.dfs(s, t, f)
+                if f == 0:
+                    break
+                flow += f
+        return flow
+
+def _generate_family(n, m, seed=42):
+    """
+    Generate a family of m distinct subsets of {0..n-1} that maximizes
+    the number of comparable (strict subset) pairs.
+    
+    Strategy: 
+    1. Model as Max Weight Closure on a DAG with Lagrangian relaxation for cardinality.
+    2. Use Dinic's Max-Flow to solve the Min-Cut for each Lagrange multiplier.
+    """
+    # Generate all subsets
+    all_subsets = []
+    for r in range(n + 1):
+        for comb in itertools.combinations(range(n), r):
+            all_subsets.append(frozenset(comb))
+            
+    N = len(all_subsets) # 4096
+    subset_to_idx = {s: i for i, s in enumerate(all_subsets)}
+    
+    # Weights: w_v = 2^{|v|} - 1
+    weights = [0] * N
+    for i, s in enumerate(all_subsets):
+        weights[i] = (1 << len(s)) - 1
+
+    # Build the dependency graph for Min-Cut
+    # Nodes 0..N-1 are subsets.
+    # Source N, Sink N+1.
+    # Total nodes N+2.
+    
+    def solve_closure(lam):
+        dinic = Dinic(N + 2)
+        s = N
+        t = N + 1
+        INF_CAP = 10**9
+        
+        # Add edges based on weights adjusted by lambda
+        for i in range(N):
+            w = weights[i] - lam
+            if w > 0:
+                dinic.add_edge(s, i, w)
+            else:
+                dinic.add_edge(i, t, -w)
+                
+        # Add infinite capacity edges for dependencies
+        # If v is selected, all its immediate subsets must be selected.
+        # Immediate subset: remove one element.
+        for i, s_set in enumerate(all_subsets):
+            if len(s_set) == 0:
+                continue
+            for elem in s_set:
+                # Create subset without elem
+                sub_list = list(s_set)
+                sub_list.remove(elem)
+                sub_frozen = frozenset(sub_list)
+                j = subset_to_idx[sub_frozen]
+                # Edge i -> j with INF capacity
+                dinic.add_edge(i, j, INF_CAP)
+                
+        max_flow = dinic.max_flow(s, t)
+        
+        # Determine the cut set
+        # Nodes reachable from s in the residual graph are in the closure S.
+        visited = [False] * (N + 2)
+        q = deque([s])
+        visited[s] = True
+        while q:
+            v = q.popleft()
+            for e in dinic.graph[v]:
+                if e[1] > 0 and not visited[e[0]]:
+                    visited[e[0]] = True
+                    q.append(e[0])
+                    
+        selected = [i for i in range(N) if visited[i]]
+        return selected
+
+    # Binary search for lambda
+    # We want size m=40.
+    # w_max is around 4095. w_min is 0.
+    # lambda range: [0, 5000]
+    
+    lo = 0.0
+    hi = 5000.0
+    best_set = []
+    
+    # We need to find a lambda that gives size close to m.
+    # Since the function is step-like, we check a few values.
+    
+    # First, find a range where size crosses m.
+    # Actually, we can just do a binary search on lambda to find the boundary.
+    
+    # Let's try to find the exact set.
+    # If we find a lambda where size == m, we are done.
+    # If not, we pick the one with size closest to m, and if there's a tie, higher score.
+    
+    # However, due to discrete weights, it's possible we skip m.
+    # In that case, the optimal down-set of size m is one of the sets generated by lambdas near the crossing.
+    
+    # Let's collect candidates.
+    candidates = []
+    
+    # Do a coarse search first
+    for _ in range(50):
+        mid = (lo + hi) / 2.0
+        sel = solve_closure(mid)
+        size = len(sel)
+        if size > m:
+            lo = mid
+        else:
+            hi = mid
+            candidates.append((mid, sel))
+            
+        if size == m:
+            break
+
+    # Refine around the crossing
+    # Check neighbors of the last few candidates
+    # Also check if we missed m.
+    
+    # Let's just evaluate the score of the candidates and also the "initial ball" just in case.
+    def count_comparable(family_idx):
+        family = [all_subsets[i] for i in family_idx]
+        count = 0
+        n_fam = len(family)
+        for i in range(n_fam):
+            for j in range(i + 1, n_fam):
+                if family[i] < family[j] or family[j] < family[i]:
+                    count += 1
+        return count
+
+    best_score = -1
+    best_family = []
+    
+    # Evaluate candidates
+    for lam, sel in candidates:
+        if len(sel) == m:
+            score = count_comparable(sel)
+            if score > best_score:
+                best_score = score
+                best_family = sel
+                
+    # If we didn't find exact m, we need to construct the optimal down-set of size m.
+    # The optimal down-set of size m is the one with the highest sum of weights among all down-sets of size m.
+    # This is exactly what the Lagrangian approach approximates.
+    # If we skipped m, we can try to adjust the set from a nearby lambda.
+    
+    # For robustness, if no candidate has size m, we can just use the "initial ball" (smallest m sets)
+    # which is a valid down-set.
+    if len(best_family) != m:
+        # Fallback: Initial ball (smallest by size, then lex)
+        sorted_subsets = sorted(all_subsets, key=lambda x: (len(x), x))
+        best_family = [subset_to_idx[s] for s in sorted_subsets[:m]]
+        best_score = count_comparable(best_family)
+
+    # Convert to lists of integers
+    result = [sorted(list(all_subsets[i])) for i in best_family]
+    return result, best_score
+
+def construct():
+    family, score = _generate_family(P['n'], P['m'])
+    # Ensure exactly m distinct subsets
+    assert len(family) == P['m'], f"Expected {P['m']} subsets, got {len(family)}"
+    # Ensure all are distinct
+    assert len(set(tuple(s) for s in family)) == P['m'], "Subsets are not distinct"
+    # Ensure all elements are integers in range
+    for s in family:
+        for x in s:
+            assert isinstance(x, int) and not isinstance(x, bool), f"Non-int element: {x}"
+            assert 0 <= x < P['n'], f"Element out of range: {x}"
+        assert len(s) == len(set(s)), "Duplicate elements in subset"
+    return family
+# EVOLVE-BLOCK-END

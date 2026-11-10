@@ -1,0 +1,302 @@
+import time
+import random
+import numpy as np
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 55.0  # Safety margin for 60s limit
+
+    N = 128
+    TARGET_MIN = 128
+    TARGET_MAX = 256
+    TARGET_SIZE = TARGET_MAX - TARGET_MIN + 1
+
+    # Precompute pair structures for fast updates
+    # pairs_by_sum[s] = list of (a, b) with a <= b, a+b=s
+    # pairs_with_x[x] = list of (other, sum_val) where x + other = sum_val, x != other
+    # Also need to handle x+x
+    
+    # Instead of complex precomputation, we stick to the O(|A|) update which is fast enough
+    # |A| is ~20-40. 40 * 129 targets is small.
+    
+    def get_cost(sums):
+        target_sums = sums[TARGET_MIN:TARGET_MAX+1]
+        gaps = np.sum(target_sums == 0)
+        if gaps > 0:
+            # Heavy penalty for gaps to ensure coverage first
+            return 1000000 + gaps * 1000 + np.max(target_sums)
+        
+        peak = np.max(target_sums)
+        # Use sum of squares as a tie-breaker to flatten the distribution
+        sq = np.sum(target_sums**2)
+        return peak * 1000 + sq
+
+    def apply_add(A, sums, x):
+        # Add x to A, update sums
+        for a in A:
+            s = a + x
+            if s <= 256:
+                sums[s] += 1
+        if 2*x <= 256:
+            sums[2*x] += 1
+        A.add(x)
+        
+    def apply_remove(A, sums, x):
+        # Remove x from A, update sums
+        for a in A:
+            if a == x:
+                continue
+            s = a + x
+            if s <= 256:
+                sums[s] -= 1
+        if 2*x <= 256:
+            sums[2*x] -= 1
+        A.remove(x)
+
+    def calculate_sums(A):
+        sums = np.zeros(257, dtype=np.int32)
+        A_list = list(A)
+        for i in range(len(A_list)):
+            for j in range(i, len(A_list)):
+                s = A_list[i] + A_list[j]
+                if s <= 256:
+                    sums[s] += 1
+        return sums
+
+    def greedy_init():
+        # Start with 128 (required for 256) and 0 (helps with 128)
+        A = set()
+        sums = np.zeros(257, dtype=np.int32)
+        
+        apply_add(A, sums, 128)
+        apply_add(A, sums, 0)
+        
+        candidates = [x for x in range(1, 128)]
+        random.shuffle(candidates)
+        
+        # Greedily add elements that reduce cost the most
+        # We want to cover all gaps first, then flatten.
+        for _ in range(15): # Add ~15 more elements
+            best_cand = None
+            best_cost = float('inf')
+            
+            # Sample candidates to speed up? 126 is small, check all.
+            for x in candidates:
+                apply_add(A, sums, x)
+                c = get_cost(sums)
+                apply_remove(A, sums, x)
+                
+                if c < best_cost:
+                    best_cost = c
+                    best_cand = x
+            
+            if best_cand is None:
+                break
+                
+            apply_add(A, sums, best_cand)
+            candidates.remove(best_cand)
+            
+            # Early stop if we have no gaps and low peak
+            if best_cost < 20000: # peak <= 1 or 2
+                break
+
+        return A, sums
+
+    def polish(A, sums, max_iters=1000, time_limit=5.0):
+        start_t = time.time()
+        current_cost = get_cost(sums)
+        improved = True
+        
+        while improved and time.time() - start_t < time_limit and max_iters > 0:
+            improved = False
+            max_iters -= 1
+            
+            A_list = list(A)
+            random.shuffle(A_list)
+            
+            # Try removing elements
+            for x in A_list:
+                if len(A) <= 1: continue
+                if x == 128: continue # 128 is critical for 256, rarely removable without breaking coverage
+                
+                apply_remove(A, sums, x)
+                new_cost = get_cost(sums)
+                
+                if new_cost <= current_cost:
+                    current_cost = new_cost
+                    improved = True
+                else:
+                    apply_add(A, sums, x)
+            
+            # Try swapping elements
+            if time.time() - start_t >= time_limit: break
+            
+            A_list = list(A)
+            random.shuffle(A_list)
+            
+            for x in A_list:
+                if x not in A: continue
+                if x == 128: continue
+                
+                candidates = [y for y in range(N+1) if y not in A and y != 128]
+                if not candidates: continue
+                
+                random.shuffle(candidates)
+                for y in candidates[:10]:
+                    apply_remove(A, sums, x)
+                    apply_add(A, sums, y)
+                    
+                    new_cost = get_cost(sums)
+                    
+                    if new_cost < current_cost:
+                        current_cost = new_cost
+                        improved = True
+                        x = y # Update x for subsequent swaps? No, we break inner loop.
+                        break
+                    else:
+                        apply_remove(A, sums, y)
+                        apply_add(A, sums, x)
+                        
+                    if time.time() - start_t >= time_limit: break
+                    
+        return A, sums, current_cost
+
+    best_A = None
+    best_cost = float('inf')
+    best_sums = None
+    
+    # 1. Greedy Initialization
+    A_greedy, sums_greedy = greedy_init()
+    cost_greedy = get_cost(sums_greedy)
+    
+    if cost_greedy < best_cost:
+        best_cost = cost_greedy
+        best_A = set(A_greedy)
+        best_sums = sums_greedy.copy()
+        
+    # Polish the greedy result
+    A_polished, sums_polished, cost_polished = polish(set(A_greedy), sums_greedy.copy())
+    if cost_polished < best_cost:
+        best_cost = cost_polished
+        best_A = set(A_polished)
+        best_sums = sums_polished.copy()
+
+    # 2. Simulated Annealing / Random Restarts
+    # Use the best found so far as a starting point for SA? Or random starts?
+    # Random starts with forced 128 often work well.
+    
+    num_restarts = 8
+    for r in range(num_restarts):
+        if time.time() > deadline - 10: break
+        
+        # Random initialization
+        # Size between 15 and 30
+        size = random.randint(15, 30)
+        A = set(random.sample(range(N+1), size))
+        
+        # Ensure 128 is in A
+        if 128 not in A:
+            A.remove(random.choice(list(A)))
+            A.add(128)
+            
+        sums = calculate_sums(A)
+        current_cost = get_cost(sums)
+        
+        if current_cost < best_cost:
+            best_cost = current_cost
+            best_A = set(A)
+            best_sums = sums.copy()
+            
+        # Simulated Annealing Parameters
+        T = 50.0
+        T_min = 0.1
+        cooling = 0.99
+        steps = 5000
+        
+        for step in range(steps):
+            if time.time() > deadline - 5:
+                break
+                
+            # Choose move
+            move_type = random.random()
+            
+            if move_type < 0.1:
+                # Add
+                candidates = [x for x in range(N+1) if x not in A]
+                if not candidates: continue
+                x = random.choice(candidates)
+                
+                apply_add(A, sums, x)
+                new_cost = get_cost(sums)
+                
+                if new_cost < current_cost or random.random() < np.exp((current_cost - new_cost) / T):
+                    current_cost = new_cost
+                    if current_cost < best_cost:
+                        best_cost = current_cost
+                        best_A = set(A)
+                        best_sums = sums.copy()
+                else:
+                    apply_remove(A, sums, x)
+                    
+            elif move_type < 0.2:
+                # Remove
+                if len(A) < 10: continue
+                x = random.choice(list(A))
+                if x == 128: continue
+                
+                apply_remove(A, sums, x)
+                new_cost = get_cost(sums)
+                
+                if new_cost < current_cost or random.random() < np.exp((current_cost - new_cost) / T):
+                    current_cost = new_cost
+                    if current_cost < best_cost:
+                        best_cost = current_cost
+                        best_A = set(A)
+                        best_sums = sums.copy()
+                else:
+                    apply_add(A, sums, x)
+                    
+            else:
+                # Swap
+                if len(A) == 0: continue
+                x = random.choice(list(A))
+                if x == 128:
+                    others = [a for a in A if a != 128]
+                    if not others: continue
+                    x = random.choice(others)
+                    
+                candidates = [y for y in range(N+1) if y not in A and y != 128]
+                if not candidates: continue
+                y = random.choice(candidates)
+                
+                apply_remove(A, sums, x)
+                apply_add(A, sums, y)
+                
+                new_cost = get_cost(sums)
+                
+                if new_cost < current_cost or random.random() < np.exp((current_cost - new_cost) / T):
+                    current_cost = new_cost
+                    if current_cost < best_cost:
+                        best_cost = current_cost
+                        best_A = set(A)
+                        best_sums = sums.copy()
+                else:
+                    apply_remove(A, sums, y)
+                    apply_add(A, sums, x)
+            
+            T *= cooling
+            if T < T_min:
+                break
+        
+        # Polish after SA
+        if time.time() < deadline - 5:
+            A_pol, sums_pol, cost_pol = polish(set(A), sums.copy(), max_iters=200, time_limit=2.0)
+            if cost_pol < best_cost:
+                best_cost = cost_pol
+                best_A = set(A_pol)
+                best_sums = sums_pol.copy()
+
+    if best_A is None:
+        return [128, 0, 64, 32, 16, 8, 4, 2, 1]
+        
+    return sorted(best_A)

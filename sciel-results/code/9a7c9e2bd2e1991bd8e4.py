@@ -1,0 +1,458 @@
+"""3-SAT solver with continuous relaxation + hybrid WalkSAT + restarts + deadline guard."""
+import random
+import time
+import math
+import numpy as np
+
+
+def solve(instance):
+    n, clauses = instance["n"], instance["instance_clauses"] if "instance_clauses" in instance else instance["clauses"]
+    start_time = time.time()
+    deadline = start_time + 290  # safety margin before 330s kill
+
+    # Preprocess: remove tautological clauses, dedupe
+    seen = set()
+    filtered_clauses = []
+    for c in clauses:
+        # Check for tautology (both x and -x in clause)
+        lits = set(c)
+        if any(-l in lits for l in lits):
+            continue
+        key = tuple(sorted(c))
+        if key not in seen:
+            seen.add(key)
+            filtered_clauses.append(c)
+    clauses = filtered_clauses
+
+    # Build clause index for efficiency
+    clause_count = len(clauses)
+    if clause_count == 0:
+        return [True] * n
+
+    # Variable occurrence counts for heuristics
+    var_pos = [[] for _ in range(n)]
+    var_neg = [[] for _ in range(n)]
+    # Precompute for each clause: list of (var, is_positive) for faster evaluation
+    clause_vars = []
+    for i, c in enumerate(clauses):
+        var_list = []
+        for l in c:
+            idx = abs(l) - 1
+            var_list.append((idx, l > 0))
+            if l > 0:
+                var_pos[idx].append(i)
+            else:
+                var_neg[idx].append(i)
+        clause_vars.append(var_list)
+
+    # Phase-seed initialization: count literal occurrences to bias initial assignment
+    lit_counts = [0] * n  # net count of positive - negative occurrences
+    for i, cv in enumerate(clause_vars):
+        for idx, is_pos in cv:
+            if is_pos:
+                lit_counts[idx] += 1
+            else:
+                lit_counts[idx] -= 1
+
+    def phase_seed():
+        """Initialize assignment using phase heuristic: set var to value that appears more often."""
+        return [lit_counts[i] >= 0 for i in range(n)]
+
+    # Continuous relaxation: solve a smooth energy landscape via gradient descent
+    # Energy: sum over clauses of -log(sum of exp(lit_values)) where lit_value = +x or -x
+    # This is a smooth surrogate for the max(0, 1 - clause_satisfaction) objective
+    def continuous_relaxation(init_assign, max_iter=2000, lr=0.1, deadline_check=None):
+        """Run gradient descent on continuous relaxation to get a good initial assignment."""
+        # Build literal sign matrix: for each clause, sign of each literal
+        # clause_signs[i] = list of +1 or -1 for each literal in clause i
+        clause_signs = []
+        for cv in clause_vars:
+            clause_signs.append([1 if is_pos else -1 for _, is_pos in cv])
+        
+        # Initialize x from assignment: x_i = 1 if True, -1 if False
+        x = np.array([1.0 if a else -1.0 for a in init_assign])
+        
+        # Precompute clause literal indices for vectorized ops
+        # For each clause, we need the indices and signs
+        clause_indices = []
+        for cv in clause_vars:
+            clause_indices.append([idx for idx, _ in cv])
+        
+        # Gradient descent with momentum
+        v = np.zeros(n)
+        momentum = 0.9
+        lr_schedule = 0.999  # decay
+        
+        for it in range(max_iter):
+            if deadline_check and deadline_check():
+                break
+                
+            # Compute gradient of energy E = sum_i -log(sum_j exp(s_ij * x_ij))
+            # dE/dx_k = sum over clauses i containing k: -s_ik * (exp(s_ik*x_k) / sum_j exp(s_ij*x_j))
+            # = -sum over clauses i containing k: s_ik * softmax_component
+            grad = np.zeros(n)
+            for ci in range(clause_count):
+                idxs = clause_indices[ci]
+                signs = clause_signs[ci]
+                # Compute exp(s*x) for each literal in this clause
+                vals = np.array([signs[j] * x[idxs[j]] for j in range(len(idxs))])
+                # Softmax-like: exp(v) / sum(exp(v))
+                max_val = np.max(vals)
+                exp_vals = np.exp(vals - max_val)
+                sum_exp = np.sum(exp_vals)
+                probs = exp_vals / sum_exp
+                # Gradient contribution: -s_j * prob_j for each literal j
+                for j in range(len(idxs)):
+                    grad[idxs[j]] -= signs[j] * probs[j]
+            
+            # Update with momentum
+            v = momentum * v - lr * grad
+            x = x + v
+            lr *= lr_schedule
+            
+            # Project to [-1, 1] (soft constraint)
+            np.clip(x, -1.0, 1.0, out=x)
+        
+        # Convert to boolean assignment
+        return [xi > 0 for xi in x]
+
+    # Run continuous relaxation from phase seed
+    relaxed_assign = continuous_relaxation(phase_seed(), max_iter=1000, lr=0.15,
+                                           deadline_check=lambda: time.time() > deadline - 270)
+    # Also try from inverted phase seed
+    inv_phase = [not v for v in phase_seed()]
+    relaxed_assign2 = continuous_relaxation(inv_phase, max_iter=1000, lr=0.15,
+                                            deadline_check=lambda: time.time() > deadline - 270)
+    
+    best_assignment = None
+    best_unsat_count = clause_count + 1
+
+    def count_unsat(assignment):
+        count = 0
+        for cv in clause_vars:
+            sat = False
+            for idx, is_pos in cv:
+                if assignment[idx] == is_pos:
+                    sat = True
+                    break
+            if not sat:
+                count += 1
+        return count
+
+    def satisfied(assignment, c):
+        for l in c:
+            idx = abs(l) - 1
+            if assignment[idx] == (l > 0):
+                return True
+        return False
+
+    # Phase 1: Try random restarts with WalkSAT using incremental clause tracking
+    rng = random.Random(42)
+    max_restarts = 5000
+    steps_per_restart = 8000
+    noise = 0.25  # probability of random flip
+
+    # Precompute for each variable: which clauses it appears in (for fast scoring)
+    # var_clause_map[var] = list of (clause_idx, sign) where sign = +1 if pos, -1 if neg
+    var_clause_map = [[] for _ in range(n)]
+    for i, cv in enumerate(clause_vars):
+        for idx, is_pos in cv:
+            var_clause_map[idx].append((i, 1 if is_pos else -1))
+
+    for restart in range(max_restarts):
+        if time.time() > deadline:
+            break
+
+        # Initialize assignment
+        if restart == 0:
+            assignment = phase_seed()
+        elif restart == 1:
+            assignment = relaxed_assign
+        elif restart == 2:
+            assignment = relaxed_assign2
+        elif restart == 3:
+            assignment = inv_phase
+        else:
+            # Perturb from best or random
+            if best_assignment is not None and rng.random() < 0.7:
+                assignment = best_assignment[:]
+                # Flip a few random variables
+                for _ in range(n // 4 + 1):
+                    assignment[rng.randint(0, n - 1)] = not assignment[rng.randint(0, n - 1)]
+            else:
+                assignment = [rng.random() < 0.5 for _ in range(n)]
+
+        # Build sat_count for each clause and track unsat clauses
+        sat_count = [0] * clause_count
+        unsat_clauses = []
+        for i, cv in enumerate(clause_vars):
+            cnt = 0
+            for idx, is_pos in cv:
+                if assignment[idx] == is_pos:
+                    cnt += 1
+            sat_count[i] = cnt
+            if cnt == 0:
+                unsat_clauses.append(i)
+
+        current_unsat = len(unsat_clauses)
+        if current_unsat == 0:
+            return assignment
+
+        if current_unsat < best_unsat_count:
+            best_unsat_count = current_unsat
+            best_assignment = assignment[:]
+
+        # WalkSAT loop
+        for step in range(steps_per_restart):
+            if time.time() > deadline:
+                break
+
+            if not unsat_clauses:
+                return assignment
+
+            # With some probability, do a random flip
+            if rng.random() < noise:
+                var = rng.randint(0, n - 1)
+                old_val = assignment[var]
+                assignment[var] = not old_val
+
+                # Update sat_count and unsat_clauses for affected clauses
+                new_unsat = []
+                for ci in var_pos[var]:
+                    old_sat = sat_count[ci]
+                    if old_val:
+                        new_sat = old_sat - 1
+                    else:
+                        new_sat = old_sat + 1
+                    sat_count[ci] = new_sat
+                    if new_sat == 0:
+                        new_unsat.append(ci)
+                
+                for ci in var_neg[var]:
+                    old_sat = sat_count[ci]
+                    if old_val:
+                        new_sat = old_sat + 1
+                    else:
+                        new_sat = old_sat - 1
+                    sat_count[ci] = new_sat
+                    if new_sat == 0:
+                        new_unsat.append(ci)
+                
+                # Rebuild unsat_clauses efficiently
+                new_unsat_set = set(new_unsat)
+                updated_unsat = []
+                for ci in unsat_clauses:
+                    if sat_count[ci] == 0:
+                        updated_unsat.append(ci)
+                for ci in new_unsat:
+                    if ci not in updated_unsat:
+                        updated_unsat.append(ci)
+                unsat_clauses = updated_unsat
+                continue
+
+            # Choose a random unsatisfied clause
+            clause_idx = unsat_clauses[rng.randint(0, len(unsat_clauses) - 1)]
+            clause = clauses[clause_idx]
+
+            # Score each variable in the clause: count how many other clauses it would satisfy
+            # Optimized: for each variable, count clauses where flipping it would reduce unsat count
+            best_var = -1
+            best_score = -1
+            for l in clause:
+                var = abs(l) - 1
+                target_val = (l > 0)
+                if assignment[var] != target_val:
+                    # Flipping would make this literal true
+                    # Count net benefit: clauses that become satisfied minus clauses that become unsatisfied
+                    # A clause becomes satisfied if sat_count was 0 and this literal makes it 1
+                    # A clause becomes unsatisfied if sat_count was 1 and this literal makes it 0
+                    affected = var_pos[var] if l > 0 else var_neg[var]
+                    score = 0
+                    for ci in affected:
+                        cnt = sat_count[ci]
+                        if cnt == 0:
+                            # This clause is currently unsat; flipping helps if this is the only unsat lit
+                            # But since we're in an unsat clause and this var is in it, 
+                            # if sat_count[ci]==0, flipping this var makes it 1 (satisfied)
+                            score += 1
+                        elif cnt == 1:
+                            # Flipping would make this clause unsat (lose 1 satisfied literal)
+                            score -= 1
+                else:
+                    # Variable already has target value; flipping would hurt
+                    # Count clauses that would become unsat
+                    affected = var_pos[var] if l > 0 else var_neg[var]
+                    score = 0
+                    for ci in affected:
+                        cnt = sat_count[ci]
+                        if cnt == 1:
+                            # Flipping would make this clause unsat
+                            score -= 1
+
+                if score > best_score:
+                    best_score = score
+                    best_var = var
+
+            if best_var >= 0:
+                var_to_flip = best_var
+            else:
+                l = clause[rng.randint(0, len(clause) - 1)]
+                var_to_flip = abs(l) - 1
+
+            # Apply the flip
+            old_val = assignment[var_to_flip]
+            assignment[var_to_flip] = not old_val
+
+            # Update sat_count and unsat_clauses for affected clauses
+            new_unsat = []
+            for ci in var_pos[var_to_flip]:
+                old_sat = sat_count[ci]
+                if old_val:
+                    new_sat = old_sat - 1
+                else:
+                    new_sat = old_sat + 1
+                sat_count[ci] = new_sat
+                if new_sat == 0:
+                    new_unsat.append(ci)
+            
+            for ci in var_neg[var_to_flip]:
+                old_sat = sat_count[ci]
+                if old_val:
+                    new_sat = old_sat + 1
+                else:
+                    new_sat = old_sat - 1
+                sat_count[ci] = new_sat
+                if new_sat == 0:
+                    new_unsat.append(ci)
+            
+            # Rebuild unsat_clauses
+            new_unsat_set = set(new_unsat)
+            updated_unsat = []
+            for ci in unsat_clauses:
+                if sat_count[ci] == 0:
+                    updated_unsat.append(ci)
+            for ci in new_unsat:
+                if ci not in updated_unsat:
+                    updated_unsat.append(ci)
+            unsat_clauses = updated_unsat
+
+            # Periodically check unsat count
+            if step % 500 == 0:
+                current_unsat = len(unsat_clauses)
+                if current_unsat < best_unsat_count:
+                    best_unsat_count = current_unsat
+                    best_assignment = assignment[:]
+
+    # Phase 2: Smooth penalty-based local search from best assignment
+    if best_assignment is not None:
+        assignment = best_assignment[:]
+        
+        # Rebuild sat_count from scratch for consistency
+        sat_count = [0] * clause_count
+        for i, cv in enumerate(clause_vars):
+            cnt = 0
+            for idx, is_pos in cv:
+                if assignment[idx] == is_pos:
+                    cnt += 1
+            sat_count[i] = cnt
+
+        # Smooth local search using soft penalty
+        # Objective: minimize sum of exp(-alpha * sat_count) for each clause
+        # This is smooth and differentiable in spirit
+        alpha = 5.0  # temperature parameter
+        max_iter = 50000
+        
+        for it in range(max_iter):
+            if time.time() > deadline:
+                break
+            
+            # Compute current penalty and identify unsat clauses
+            unsat_clauses = []
+            for i in range(clause_count):
+                if sat_count[i] == 0:
+                    unsat_clauses.append(i)
+            
+            if not unsat_clauses:
+                return assignment
+            
+            if len(unsat_clauses) < best_unsat_count:
+                best_unsat_count = len(unsat_clauses)
+                best_assignment = assignment[:]
+            
+            # Greedy: find variable flip that minimizes increase in penalty
+            # Limit search to variables in unsat clauses for efficiency
+            candidate_vars = set()
+            for ci in unsat_clauses[:50]:  # limit to 50 unsat clauses
+                for idx, is_pos in clause_vars[ci]:
+                    candidate_vars.add(idx)
+            
+            if not candidate_vars:
+                break
+            
+            best_var = -1
+            best_delta = float('inf')
+            
+            for var in list(candidate_vars)[:200]:  # limit candidates
+                old_val = assignment[var]
+                # Compute delta penalty if we flip var
+                delta = 0.0
+                for ci in var_pos[var]:
+                    cnt = sat_count[ci]
+                    if old_val:
+                        new_cnt = cnt - 1
+                    else:
+                        new_cnt = cnt + 1
+                    delta += math.exp(-alpha * max(0, new_cnt)) - math.exp(-alpha * max(0, cnt))
+                
+                for ci in var_neg[var]:
+                    cnt = sat_count[ci]
+                    if old_val:
+                        new_cnt = cnt + 1
+                    else:
+                        new_cnt = cnt - 1
+                    delta += math.exp(-alpha * max(0, new_cnt)) - math.exp(-alpha * max(0, cnt))
+                
+                if delta < best_delta:
+                    best_delta = delta
+                    best_var = var
+            
+            if best_var >= 0:
+                assignment[best_var] = not assignment[best_var]
+                # Update sat_count
+                for ci in var_pos[best_var]:
+                    if not assignment[best_var]:  # was True, now False
+                        sat_count[ci] -= 1
+                    else:
+                        sat_count[ci] += 1
+                for ci in var_neg[best_var]:
+                    if assignment[best_var]:  # was False, now True
+                        sat_count[ci] += 1
+                    else:
+                        sat_count[ci] -= 1
+                # Clamp
+                for ci in range(clause_count):
+                    sat_count[ci] = max(0, min(3, sat_count[ci]))
+            
+            # Early exit if no improvement possible
+            if best_delta >= 0 and len(unsat_clauses) > 0:
+                # Try a random perturbation
+                if rng.random() < 0.3:
+                    var = rng.randint(0, n - 1)
+                    assignment[var] = not assignment[var]
+                    for ci in var_pos[var]:
+                        if not assignment[var]:
+                            sat_count[ci] -= 1
+                        else:
+                            sat_count[ci] += 1
+                    for ci in var_neg[var]:
+                        if assignment[var]:
+                            sat_count[ci] += 1
+                        else:
+                            sat_count[ci] -= 1
+                    for ci in range(clause_count):
+                        sat_count[ci] = max(0, min(3, sat_count[ci]))
+
+    # Return best found or random
+    if best_assignment is not None:
+        return best_assignment
+    return [rng.random() < 0.5 for _ in range(n)]

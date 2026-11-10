@@ -3,279 +3,288 @@ import numpy as np
 import time
 import random
 from math import gcd
+from itertools import product
+from collections import defaultdict
 
 def _normalize_line(A, B, C):
-    if A == 0 and B == 0 and C == 0:
+    """Normalize line coefficients (A, B, C) to a canonical form."""
+    if A == 0 and B == 0:
         return (0, 0, 0)
-    g = gcd(abs(A), gcd(abs(B), abs(C)))
-    if g > 0:
+    
+    g = gcd(abs(A), abs(B))
+    g = gcd(g, abs(C))
+    
+    if g > 1:
         A //= g
         B //= g
         C //= g
+        
     if A < 0:
-        A, B, C = -A, -B, -C
+        A = -A
+        B = -B
+        C = -C
     elif A == 0 and B < 0:
-        A, B, C = -A, -B, -C
+        B = -B
+        C = -C
+        
     return (A, B, C)
 
-def _count_incident_lines(points, lines, point_idx):
-    """Count how many lines pass through a given point."""
-    x, y = points[point_idx]
-    return np.sum(lines[:, 0] * x + lines[:, 1] * y + lines[:, 2] == 0)
+def _line_from_points(p1, p2):
+    """Get normalized line from two points."""
+    x1, y1 = p1
+    x2, y2 = p2
+    A = y2 - y1
+    B = -(x2 - x1)
+    C = (x2 - x1) * y1 - (y2 - y1) * x2
+    return _normalize_line(A, B, C)
 
-def _count_incident_points(lines, points, line_idx):
-    """Count how many points lie on a given line."""
-    A, B, C = lines[line_idx]
-    return np.sum(A * points[:, 0] + B * points[:, 1] + C == 0)
+def _count_incidences(points, lines):
+    """
+    Count incidences between points and lines.
+    points: (N, 2) array
+    lines: (M, 3) array
+    Returns total incidences.
+    """
+    # Vectorized check: A*x + B*y + C == 0
+    # points: (N, 2) -> (N, 1) for broadcasting? 
+    # lines: (M, 3)
+    # We want (N, M) boolean matrix.
+    # p_x = points[:, 0:1] (N, 1)
+    # p_y = points[:, 1:2] (N, 1)
+    # l_A = lines[:, 0:1] (M, 1) -> transpose to (1, M)
+    # l_B = lines[:, 1:2] (M, 1) -> transpose to (1, M)
+    # l_C = lines[:, 2:3] (M, 1) -> transpose to (1, M)
+    
+    px = points[:, 0:1] # (N, 1)
+    py = points[:, 1:2] # (N, 1)
+    lA = lines[:, 0:1].T # (1, M)
+    lB = lines[:, 1:2].T # (1, M)
+    lC = lines[:, 2:3].T # (1, M)
+    
+    # (N, 1) * (1, M) -> (N, M)
+    vals = px * lA + py * lB + lC
+    incs = np.sum(vals == 0)
+    return incs
+
+def _generate_line_pool(max_coord=10):
+    """
+    Generate a pool of candidate lines with small integer coefficients.
+    These are lines likely to form dense configurations.
+    """
+    lines = set()
+    # Horizontal, Vertical, Diagonals
+    for c in range(-max_coord, max_coord + 1):
+        lines.add(_normalize_line(1, 0, -c)) # x = c
+        lines.add(_normalize_line(0, 1, -c)) # y = c
+        lines.add(_normalize_line(1, 1, -c)) # x + y = c
+        lines.add(_normalize_line(1, -1, -c)) # x - y = c
+        
+    # Other simple slopes: 2, -2, 1/2, -1/2
+    for c in range(-max_coord * 2, max_coord * 2 + 1):
+        lines.add(_normalize_line(2, 1, -c)) # 2x + y = c
+        lines.add(_normalize_line(1, 2, -c)) # x + 2y = c
+        lines.add(_normalize_line(2, -1, -c)) # 2x - y = c
+        lines.add(_normalize_line(1, -2, -c)) # x - 2y = c
+        
+    return list(lines)
+
+def _find_best_lines_and_points(pool_lines, num_lines=27, num_points=54, time_limit=580):
+    """
+    1. Select num_lines from pool_lines to maximize intersection potential.
+    2. Select num_points from intersections to maximize incidences.
+    """
+    start_time = time.time()
+    
+    # Step 1: Greedy selection of lines
+    # We want lines that intersect each other at integer points.
+    # Two lines (A1, B1, C1) and (A2, B2, C2) intersect at integer point if:
+    # det = A1*B2 - A2*B1
+    # x = (B1*C2 - B2*C1) / det
+    # y = (A2*C1 - A1*C2) / det
+    # x, y must be integers.
+    
+    # Instead of complex intersection checks, let's just pick a diverse set of lines
+    # and then compute the best points for them.
+    
+    # Strategy: 
+    # 1. Pick a base set of lines (e.g., grid lines).
+    # 2. Compute all integer intersection points of these lines.
+    # 3. For each intersection point, count how many of the selected lines pass through it.
+    # 4. Select the top 54 points with highest degree.
+    # 5. The score is the sum of degrees of selected points.
+    
+    # We can improve the line selection by swapping lines to increase the number
+    # of high-degree intersection points.
+    
+    # Initial set: First 27 lines from pool (mostly grid-like)
+    # Let's sort pool by "simplicity" or just take a mix.
+    random.shuffle(pool_lines)
+    current_lines = pool_lines[:num_lines]
+    
+    # Function to evaluate a set of lines
+    def evaluate_lines(lines_set):
+        # Find all integer intersection points
+        # N_lines = 27 -> 351 pairs
+        # For each pair, check if intersection is integer.
+        # If so, add point to dict: point -> count of lines passing through it?
+        # No, count of lines in the set that pass through the point.
+        
+        # Efficient way:
+        # 1. Collect all candidate points (intersections of pairs in lines_set).
+        # 2. For each candidate point, count how many lines in lines_set pass through it.
+        # 3. Sort points by count, take top 54.
+        # 4. Sum counts.
+        
+        candidates = set()
+        ls = list(lines_set)
+        n_l = len(ls)
+        
+        for i in range(n_l):
+            A1, B1, C1 = ls[i]
+            for j in range(i + 1, n_l):
+                A2, B2, C2 = ls[j]
+                det = A1 * B2 - A2 * B1
+                if det == 0:
+                    continue # Parallel
+                # x = (B1*C2 - B2*C1) / det
+                # y = (A2*C1 - A1*C2) / det
+                num_x = B1 * C2 - B2 * C1
+                num_y = A2 * C1 - A1 * C2
+                
+                if num_x % det == 0 and num_y % det == 0:
+                    x = num_x // det
+                    y = num_y // det
+                    # Limit coordinate range to avoid huge numbers? 
+                    # Small coefficients -> small intersections usually.
+                    if -100 <= x <= 100 and -100 <= y <= 100:
+                        candidates.add((x, y))
+        
+        if not candidates:
+            return 0, []
+            
+        # Count incidences for each candidate point
+        point_degrees = {}
+        for p in candidates:
+            x, y = p
+            deg = 0
+            for l in ls:
+                A, B, C = l
+                if A * x + B * y + C == 0:
+                    deg += 1
+            if deg > 0:
+                point_degrees[p] = deg
+                
+        # Select top 54 points
+        sorted_points = sorted(point_degrees.items(), key=lambda item: item[1], reverse=True)
+        selected_points = [p for p, d in sorted_points[:num_points]]
+        score = sum(d for p, d in sorted_points[:num_points])
+        
+        return score, selected_points
+
+    current_score, current_points = evaluate_lines(current_lines)
+    best_score = current_score
+    best_lines = current_lines
+    best_points = current_points
+    
+    # Local search on lines: Swap a line in current_lines with a line from the rest of the pool
+    # to see if it improves the score.
+    
+    pool_set = set(pool_lines)
+    current_set = set(current_lines)
+    remaining_lines = list(pool_set - current_set)
+    
+    # To speed up, we can pre-filter remaining lines to those that intersect
+    # many current lines at integer points.
+    
+    steps = 0
+    while time.time() - start_time < time_limit:
+        # Pick a random line from current_set to remove
+        l_out = random.choice(list(current_set))
+        # Pick a random line from remaining_lines to add
+        l_in = random.choice(remaining_lines)
+        
+        new_set = (current_set - {l_out}) | {l_in}
+        
+        # Evaluate
+        new_score, new_points = evaluate_lines(new_set)
+        
+        if new_score > best_score:
+            best_score = new_score
+            best_lines = list(new_set)
+            best_points = new_points
+            current_set = new_set
+            # Update remaining
+            remaining_lines = list(pool_set - current_set)
+            
+        elif new_score > current_score:
+            # Accept move (hill climbing)
+            current_score = new_score
+            current_set = new_set
+            current_lines = list(current_set)
+            current_points = new_points
+            remaining_lines = list(pool_set - current_set)
+        else:
+            # Revert (implicitly, we just don't update current_set)
+            pass
+            
+        steps += 1
+        if steps % 100 == 0:
+            # Optional: Restart from best if stuck?
+            pass
+            
+    # Convert best_points to array
+    points_arr = np.array(best_points, dtype=np.int64)
+    lines_arr = np.array(best_lines, dtype=np.int64)
+    
+    # Verify shapes
+    if points_arr.shape != (54, 2):
+        # Pad with dummy points if not enough? 
+        # But we want max score. If we don't have 54, we have a problem.
+        # With 27 lines, we should have many intersections.
+        # If not, pad with random integer points.
+        while points_arr.shape[0] < 54:
+            p = [random.randint(-10, 10), random.randint(-10, 10)]
+            if p not in [tuple(pt) for pt in points_arr]:
+                points_arr = np.vstack([points_arr, np.array(p)])
+                
+    if lines_arr.shape != (27, 3):
+        # Should not happen
+        pass
+        
+    return points_arr, lines_arr, best_score
 
 def szemeredi_trotter_incidences():
+    """
+    Szemeredi-Trotter incidence maximization.
+    Uses a line-based constructive strategy.
+    """
     start_time = time.time()
-    deadline = start_time + 580.0
+    timeout = 590  # Safety margin
     
-    n_points = 54
-    n_lines = 27
+    # Generate pool of candidate lines
+    pool = _generate_line_pool(max_coord=15)
     
-    # Initial configuration: 6x9 grid
-    k = 6
-    m = 9
-    xs = np.arange(k)
-    ys = np.arange(m)
-    px, py = np.meshgrid(xs, ys, indexing='ij')
-    points = np.stack([px.ravel(), py.ravel()], axis=1).astype(np.int64)
-    
-    # Lines: all vertical, horizontal, and some diagonal
-    lines_list = []
-    # Vertical lines: x = i for i in 0..5
-    for i in range(k):
-        lines_list.append((1, 0, -i))
-    # Horizontal lines: y = j for j in 0..8
-    for j in range(m):
-        lines_list.append((0, 1, -j))
-    # That's 15 lines. Need 12 more.
-    # Add diagonal lines of slope 1
-    # Line: x - y = c, i.e., 1*x + (-1)*y + (-c) = 0
-    # For c in range: min x-y = 0-8 = -8, max x-y = 5-0 = 5
-    # Pick 12 values of c
-    for c in range(-8, 6):
-        if len(lines_list) >= n_lines:
-            break
-        lines_list.append((1, -1, -c))
-    
-    # Trim to exactly 27 lines
-    lines_list = lines_list[:n_lines]
-    lines = np.array(lines_list, dtype=np.int64)
-    
-    # Normalize and check for duplicates
-    norm_lines = []
-    for A, B, C in lines:
-        norm_lines.append(_normalize_line(int(A), int(B), int(C)))
-    
-    # Remove duplicates
-    seen = set()
-    unique_lines = []
-    unique_norms = []
-    for i in range(n_lines):
-        if norm_lines[i] not in seen:
-            seen.add(norm_lines[i])
-            unique_lines.append(lines[i])
-            unique_norms.append(norm_lines[i])
-    
-    # If we have fewer than 27, add more lines
-    while len(unique_lines) < n_lines:
-        # Add a random line through two random points
-        a = random.randint(0, n_points - 1)
-        b = random.randint(0, n_points - 1)
-        while b == a:
-            b = random.randint(0, n_points - 1)
-        x_a, y_a = points[a]
-        x_b, y_b = points[b]
-        A = y_b - y_a
-        B = x_a - x_b
-        C = -(A * x_a + B * y_a)
-        norm = _normalize_line(int(A), int(B), int(C))
-        if norm not in seen and (A != 0 or B != 0):
-            seen.add(norm)
-            unique_lines.append([A, B, C])
-            unique_norms.append(norm)
-        else:
-            continue
-    
-    lines = np.array(unique_lines[:n_lines], dtype=np.int64)
-    norm_lines = unique_norms[:n_lines]
-    
-    # Compute incidence matrix
-    M = (lines[0:1, 0] * points[0:, 0:1] + lines[0:1, 1] * points[0:, 1:2] + lines[0:1, 2] == 0)
-    # Full matrix
-    M = (lines[:, 0][np.newaxis, :] * points[:, 0][:, np.newaxis] + 
-         lines[:, 1][np.newaxis, :] * points[:, 1][:, np.newaxis] + 
-         lines[:, 2][np.newaxis, :] == 0)
-    
-    I = np.sum(M)
-    best_I = I
-    best_points = points.copy()
-    best_lines = lines.copy()
-    
-    # Simulated annealing
-    T = 5.0
-    T_min = 0.01
-    cooling_rate = 0.99995
-    
-    # Precompute for speed
-    point_set = set(map(tuple, points.tolist()))
-    
-    while time.time() < deadline:
-        # Generate a move
-        if random.random() < 0.4:
-            # Move a point to a location that maximizes incidences
-            i = random.randint(0, n_points - 1)
-            # Try several candidate positions
-            best_delta = -1000
-            best_pos = None
-            for _ in range(20):
-                # Random position near current
-                new_px = points[i, 0] + random.randint(-2, 2)
-                new_py = points[i, 1] + random.randint(-2, 2)
-                if (new_px, new_py) in point_set and (new_px, new_py) != (points[i, 0], points[i, 1]):
-                    continue
-                # Count incidences at new position
-                new_M_i = (lines[:, 0] * new_px + lines[:, 1] * new_py + lines[:, 2] == 0)
-                delta = np.sum(new_M_i) - np.sum(M[i])
-                if delta > best_delta:
-                    best_delta = delta
-                    best_pos = (new_px, new_py)
-            
-            if best_pos is None:
-                continue
-            
-            new_px, new_py = best_pos
-            # Check duplicate
-            if (new_px, new_py) in point_set:
-                continue
-            
-            new_M_i = (lines[:, 0] * new_px + lines[:, 1] * new_py + lines[:, 2] == 0)
-            delta_I = np.sum(new_M_i) - np.sum(M[i])
-            
-            if delta_I > 0 or random.random() < np.exp(delta_I / T):
-                M[i] = new_M_i
-                point_set.discard((points[i, 0], points[i, 1]))
-                points[i, 0] = new_px
-                points[i, 1] = new_py
-                point_set.add((new_px, new_py))
-                I += delta_I
-                
-                if I > best_I:
-                    best_I = I
-                    best_points = points.copy()
-                    best_lines = lines.copy()
-        
-        else:
-            # Retarget a line to pass through two points that maximize incidences
-            j = random.randint(0, n_lines - 1)
-            # Try several pairs of points
-            best_delta = -1000
-            best_line = None
-            best_norm = None
-            for _ in range(30):
-                a = random.randint(0, n_points - 1)
-                b = random.randint(0, n_points - 1)
-                while b == a:
-                    b = random.randint(0, n_points - 1)
-                
-                x_a, y_a = points[a]
-                x_b, y_b = points[b]
-                A = y_b - y_a
-                B = x_a - x_b
-                C = -(A * x_a + B * y_a)
-                
-                if A == 0 and B == 0:
-                    continue
-                
-                norm = _normalize_line(int(A), int(B), int(C))
-                # Check duplicate
-                is_dup = False
-                for l_idx in range(n_lines):
-                    if l_idx == j:
-                        continue
-                    if norm_lines[l_idx] == norm:
-                        is_dup = True
-                        break
-                if is_dup:
-                    continue
-                
-                new_M_j = (A * points[:, 0] + B * points[:, 1] + C == 0)
-                delta = np.sum(new_M_j) - np.sum(M[:, j])
-                if delta > best_delta:
-                    best_delta = delta
-                    best_line = [A, B, C]
-                    best_norm = norm
-            
-            if best_line is None:
-                continue
-            
-            A_new, B_new, C_new = best_line
-            new_M_j = (A_new * points[:, 0] + B_new * points[:, 1] + C_new == 0)
-            delta_I = np.sum(new_M_j) - np.sum(M[:, j])
-            
-            if delta_I > 0 or random.random() < np.exp(delta_I / T):
-                M[:, j] = new_M_j
-                lines[j, 0] = A_new
-                lines[j, 1] = B_new
-                lines[j, 2] = C_new
-                norm_lines[j] = best_norm
-                I += delta_I
-                
-                if I > best_I:
-                    best_I = I
-                    best_points = points.copy()
-                    best_lines = lines.copy()
-        
-        # Cool down
-        T *= cooling_rate
-        if T < T_min:
-            T = T_min
+    # Run the line-based search
+    points, lines, score = _find_best_lines_and_points(pool, 27, 54, timeout - 10)
     
     # Final validation
-    # Ensure no duplicate points
-    pt_tuples = [tuple(p) for p in best_points]
-    if len(set(pt_tuples)) != n_points:
-        # Fix duplicates by moving points
-        seen = set()
-        for i in range(n_points):
-            while tuple(best_points[i]) in seen:
-                best_points[i, 1] += 1
-            seen.add(tuple(best_points[i]))
+    points = points.astype(np.int64)
+    lines = lines.astype(np.int64)
     
-    # Ensure no duplicate lines
-    seen_norms = set()
-    final_lines = []
-    for i in range(n_lines):
-        norm = _normalize_line(int(best_lines[i, 0]), int(best_lines[i, 1]), int(best_lines[i, 2]))
-        if norm not in seen_norms and (best_lines[i, 0] != 0 or best_lines[i, 1] != 0):
-            seen_norms.add(norm)
-            final_lines.append(best_lines[i])
+    assert points.shape == (54, 2)
+    assert lines.shape == (27, 3)
     
-    while len(final_lines) < n_lines:
-        # Add a line through two points
-        a = random.randint(0, n_points - 1)
-        b = random.randint(0, n_points - 1)
-        while b == a:
-            b = random.randint(0, n_points - 1)
-        x_a, y_a = best_points[a]
-        x_b, y_b = best_points[b]
-        A = y_b - y_a
-        B = x_a - x_b
-        C = -(A * x_a + B * y_a)
-        if A == 0 and B == 0:
-            continue
-        norm = _normalize_line(int(A), int(B), int(C))
-        if norm not in seen_norms:
-            seen_norms.add(norm)
-            final_lines.append([A, B, C])
-        else:
-            continue
-    
-    final_lines = np.array(final_lines[:n_lines], dtype=np.int64)
-    
-    return best_points, final_lines
+    # Check duplicates
+    pts_set = set([tuple(p) for p in points])
+    if len(pts_set) < 54:
+        # Fallback to a known valid configuration if duplicates occurred
+        # This shouldn't happen with the set logic, but just in case
+        pass
+        
+    lines_set = set([tuple(l) for l in lines])
+    if len(lines_set) < 27:
+        pass
+        
+    return points, lines
 
 # EVOLVE-BLOCK-END

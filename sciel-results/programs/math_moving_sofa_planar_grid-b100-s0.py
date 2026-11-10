@@ -217,8 +217,6 @@ def moving_sofa_2d() -> np.ndarray:
                                 break
                     if improved:
                         break
-                if improved:
-                    break
 
     if best_path is None:
         best_path = np.array([[0.0, 0.0, 0.0]], dtype=np.float64)

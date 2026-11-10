@@ -1,0 +1,187 @@
+import time
+import random
+
+def construct():
+    start_time = time.time()
+    DEADLINE = start_time + 110.0
+
+    def gen_graph(n, p, seed):
+        rng = random.Random(seed)
+        edges = []
+        for u in range(n):
+            for v in range(u + 1, n):
+                if rng.random() < p:
+                    edges.append((u, v))
+        return edges
+
+    def build_adj(n, edges):
+        adj = [0] * n
+        for u, v in edges:
+            adj[u] |= (1 << v)
+            adj[v] |= (1 << u)
+        return adj
+
+    def popcount(x):
+        return x.bit_count()
+
+    def max_clique_tomita(n, adj, mask, rng):
+        """
+        Find max clique in G[mask] using Tomita's algorithm (branch and bound).
+        """
+        best_clique = []
+
+        def expand(R, P):
+            nonlocal best_clique
+            if not P:
+                if len(R) > len(best_clique):
+                    best_clique = R[:]
+                return
+
+            pc = popcount(P)
+            if len(R) + pc <= len(best_clique):
+                return
+
+            # Pivot selection: find vertex in P with max degree in P
+            max_deg = -1
+            candidates = []
+            P_copy = P
+            while P_copy:
+                v_bit = P_copy & (-P_copy)
+                v = v_bit.bit_length() - 1
+                P_copy ^= v_bit
+                deg = popcount(P & adj[v])
+                if deg > max_deg:
+                    max_deg = deg
+                    candidates = [v]
+                elif deg == max_deg:
+                    candidates.append(v)
+
+            if not candidates:
+                return
+
+            u = rng.choice(candidates)
+            Q = P & ~adj[u]
+
+            while Q:
+                # Pick v from Q with max degree in P
+                max_v_deg = -1
+                v_candidates = []
+                Q_copy = Q
+                while Q_copy:
+                    v_bit = Q_copy & (-Q_copy)
+                    i = v_bit.bit_length() - 1
+                    Q_copy ^= v_bit
+                    deg = popcount(P & adj[i])
+                    if deg > max_v_deg:
+                        max_v_deg = deg
+                        v_candidates = [i]
+                    elif deg == max_v_deg:
+                        v_candidates.append(i)
+
+                if not v_candidates:
+                    break
+
+                v = rng.choice(v_candidates)
+
+                new_R = R + [v]
+                new_P = P & adj[v]
+                expand(new_R, new_P)
+
+                P &= ~(1 << v)
+                Q = Q & P
+
+        expand([], mask)
+        return best_clique
+
+    def greedy_clique_partition(n, adj, rng, deadline):
+        """
+        Greedy partition: repeatedly find max clique in remaining graph,
+        add it to partition, remove its edges.
+        """
+        rem_adj = adj[:]
+        cliques = []
+
+        while True:
+            if time.time() > deadline:
+                return None
+
+            # Check if any edges remain
+            has_edges = False
+            for i in range(n):
+                if rem_adj[i]:
+                    has_edges = True
+                    break
+            if not has_edges:
+                break
+
+            # Find vertex with max degree in remaining graph
+            max_deg = -1
+            best_v = -1
+            for i in range(n):
+                deg = popcount(rem_adj[i])
+                if deg > max_deg:
+                    max_deg = deg
+                    best_v = i
+
+            if best_v == -1:
+                break
+
+            # Find max clique containing best_v
+            common_mask = rem_adj[best_v]
+            clique_core = max_clique_tomita(n, rem_adj, common_mask, rng)
+            clique = clique_core + [best_v]
+
+            # Remove edges of this clique
+            for i in range(len(clique)):
+                for j in range(i + 1, len(clique)):
+                    u, v = clique[i], clique[j]
+                    rem_adj[u] &= ~(1 << v)
+                    rem_adj[v] &= ~(1 << u)
+
+            cliques.append(clique)
+
+        return cliques
+
+    def solve_instance(n, p, seed, time_limit):
+        edges = gen_graph(n, p, seed)
+        adj = build_adj(n, edges)
+
+        # Baseline: each edge as its own 2-clique
+        baseline = [[u, v] for u, v in edges]
+        best_cliques = baseline
+        best_count = len(baseline)
+
+        start = time.time()
+        attempt = 0
+        while time.time() < start + time_limit:
+            rng = random.Random(seed * 1000 + attempt)
+            result = greedy_clique_partition(n, adj, rng, DEADLINE)
+            if result is not None:
+                count = len(result)
+                if count < best_count:
+                    best_count = count
+                    best_cliques = result
+            attempt += 1
+
+        return best_cliques
+
+    # Time budget allocation
+    t1 = 15.0
+    t2 = 90.0
+
+    current = time.time()
+    remaining = DEADLINE - current
+    if t1 + t2 > remaining:
+        scale = remaining / (t1 + t2)
+        t1 *= scale
+        t2 *= scale
+
+    result1 = solve_instance(32, 0.6, 601, t1)
+
+    if time.time() > DEADLINE:
+        edges2 = gen_graph(64, 0.55, 602)
+        result2 = [[u, v] for u, v in edges2]
+    else:
+        result2 = solve_instance(64, 0.55, 602, t2)
+
+    return [result1, result2]

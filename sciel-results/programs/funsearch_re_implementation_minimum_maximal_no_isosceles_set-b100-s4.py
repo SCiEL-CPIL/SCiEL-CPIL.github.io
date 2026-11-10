@@ -1,167 +1,221 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-N = 16
-
-# EVOLVE-BLOCK-START
-import random
 import time
-import itertools
-import math
+import random
+import numpy as np
 
-DEADLINE = time.time() + 295  # Safety margin before 330s kill
+N = 16
+DEADLINE = 300.0  # seconds, leave margin before 330s kill
 
-# Precompute all points and squared distances
-POINTS = [(x, y) for y in range(N) for x in range(N)]
-NUM_PTS = N * N
+def _dist2(a, b):
+    return (a[0] - b[0])**2 + (a[1] - b[1])**2
 
-# dist[i][j] = squared distance between point i and point j
-dist = [[0] * NUM_PTS for _ in range(NUM_PTS)]
-for i in range(NUM_PTS):
-    x1, y1 = POINTS[i]
-    for j in range(i + 1, NUM_PTS):
-        x2, y2 = POINTS[j]
-        d = (x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2)
-        dist[i][j] = d
-        dist[j][i] = d
-
-
-def _is_isosceles(i, j, k):
-    """Check if points i, j, k form an isosceles triangle."""
-    d1 = dist[i][j]
-    d2 = dist[i][k]
-    d3 = dist[j][k]
+def _is_isosceles(a, b, c):
+    d1 = _dist2(a, b)
+    d2 = _dist2(a, c)
+    d3 = _dist2(b, c)
     return d1 == d2 or d1 == d3 or d2 == d3
 
-
-def _can_add(p_idx, chosen_set, chosen_indices):
-    """Check if point p_idx can be added to the chosen set without creating isosceles triangles."""
-    for i, j in itertools.combinations(chosen_indices, 2):
-        if _is_isosceles(p_idx, i, j):
-            return False
-    return True
-
-
-def _is_maximal(chosen_indices):
-    """Check if the set is maximal (no further point can be added)."""
-    chosen_set = set(chosen_indices)
-    for p in range(NUM_PTS):
-        if p not in chosen_set:
-            if _can_add(p, chosen_set, chosen_indices):
-                return False
-    return True
-
-
-def _greedy_randomized(seed=None):
-    """Greedy randomized construction."""
-    if seed is not None:
-        rng = random.Random(seed)
-    else:
-        rng = random.Random()
-    
-    order = list(range(NUM_PTS))
-    rng.shuffle(order)
-    
-    chosen = []
-    chosen_set = set()
-    
-    for p in order:
-        if p in chosen_set:
-            continue
-        # Check if p can be added
-        can = True
-        for i, j in itertools.combinations(chosen, 2):
-            if _is_isosceles(p, i, j):
-                can = False
-                break
-        if can:
-            chosen.append(p)
-            chosen_set.add(p)
-    
-    return chosen
-
-
-def _local_search(chosen, max_iters=50):
-    """Local search: try removing points and refilling greedily."""
-    best = list(chosen)
-    best_len = len(best)
-    
-    for iteration in range(max_iters):
-        if time.time() > DEADLINE:
-            break
-        
-        improved = False
-        # Try removing each point and see if we can get a smaller maximal set
-        for idx in range(len(best)):
-            candidate = [x for i, x in enumerate(best) if i != idx]
-            candidate_set = set(candidate)
-            
-            # Try to greedily add points to make it maximal, but try to keep it small
-            # Actually, for minimization, we want to see if removing a point still allows
-            # a valid (possibly non-maximal) set, then check if it can be made maximal
-            # with fewer additions than we removed.
-            
-            # Simpler: just check if the set without this point is still valid (no isosceles)
-            # It always is since we're removing. Then check if it's maximal.
-            # If not maximal, we need to add points. The question is whether the final
-            # maximal set is smaller.
-            
-            # For now, let's just try: remove point, then greedily fill to maximal
-            # and see if result is smaller.
-            
-            fill_order = list(range(NUM_PTS))
-            random.shuffle(fill_order)
-            
-            new_chosen = list(candidate)
-            new_set = set(candidate)
-            
-            for p in fill_order:
-                if p in new_set:
-                    continue
-                can = True
-                for i, j in itertools.combinations(new_chosen, 2):
-                    if _is_isosceles(p, i, j):
-                        can = False
-                        break
-                if can:
-                    new_chosen.append(p)
-                    new_set.add(p)
-            
-            if len(new_chosen) < best_len:
-                best = new_chosen
-                best_len = len(best)
-                improved = True
-                break
-        
-        if not improved:
-            break
-    
-    return best
-
-
 def construct():
-    """Construct a minimal maximal no-isosceles set."""
-    best = None
-    best_len = float('inf')
+    start_time = time.time()
+    deadline = start_time + DEADLINE - 15.0  # 15s safety margin
     
-    # Multiple randomized greedy restarts
-    num_restarts = 0
-    while time.time() < DEADLINE - 10:
-        chosen = _greedy_randomized(seed=num_restarts)
-        if len(chosen) < best_len:
-            best = chosen
-            best_len = len(chosen)
+    points = [(x, y) for x in range(N) for y in range(N)]
+    npts = len(points)
+    
+    # Precompute isosceles conflicts using bitmasks for speed
+    # pair_conflict[i][j] = bitmask of k such that i, j, k form an isosceles triangle
+    # Using a list of lists of Python integers for fast bitwise ops
+    pair_conflict = [[0]*npts for _ in range(npts)]
+    for i in range(npts):
+        for j in range(i+1, npts):
+            mask = 0
+            for k in range(npts):
+                if k != i and k != j and _is_isosceles(points[i], points[j], points[k]):
+                    mask |= (1 << k)
+            pair_conflict[i][j] = mask
+            pair_conflict[j][i] = mask
+    
+    # Helper: compute blocked mask for a given set S
+    def compute_blocked(S):
+        blocked = 0
+        S_list = list(S)
+        for i in range(len(S_list)):
+            for j in range(i+1, len(S_list)):
+                blocked |= pair_conflict[S_list[i]][S_list[j]]
+        return blocked
+    
+    # Helper: check if S is maximal
+    def is_maximal(S, blocked=None):
+        if blocked is None:
+            blocked = compute_blocked(S)
+        for p in range(npts):
+            if p not in S and not (blocked & (1 << p)):
+                return False
+        return True
+    
+    # Helper: validate that S has no isosceles triples
+    def is_valid(S):
+        S_list = list(S)
+        for i in range(len(S_list)):
+            for j in range(i+1, len(S_list)):
+                for k in range(j+1, len(S_list)):
+                    if _is_isosceles(points[S_list[i]], points[S_list[j]], points[S_list[k]]):
+                        return False
+        return True
+
+    # Optimized Greedy construction
+    def greedy_construct(seed):
+        rng = random.Random(seed)
+        S = set()
+        S_list = []
+        blocked = 0
         
-        # Try local search on the best found so far
-        if len(chosen) <= best_len:
-            improved = _local_search(chosen, max_iters=20)
-            if len(improved) < best_len:
-                best = improved
-                best_len = len(best)
+        while True:
+            if time.time() > deadline:
+                break
+            
+            # Find available points
+            avail_list = []
+            for p in range(npts):
+                if p not in S and not (blocked & (1 << p)):
+                    avail_list.append(p)
+            
+            if not avail_list:
+                break
+            
+            # Score each available point
+            best_p = None
+            best_score = -1
+            rng.shuffle(avail_list)
+            
+            for p in avail_list:
+                new_blocked = 0
+                for a in S:
+                    new_blocked |= pair_conflict[p][a]
+                new_blocked &= ~blocked
+                new_blocked &= ~(1 << p)
+                score = bin(new_blocked).count('1')
+                score += rng.random() * 0.01
+                if score > best_score:
+                    best_score = score
+                    best_p = p
+            
+            if best_p is None:
+                break
+            
+            S.add(best_p)
+            S_list.append(best_p)
+            for a in S:
+                if a != best_p:
+                    blocked |= pair_conflict[best_p][a]
         
-        num_restarts += 1
+        # Ensure maximality by adding any remaining valid points
+        changed = True
+        while changed:
+            changed = False
+            for p in range(npts):
+                if p not in S and not (blocked & (1 << p)):
+                    # Check if p can be added without forming isosceles with existing pairs
+                    # Actually, if p is not blocked, it means no pair in S forms isosceles with p.
+                    # So it is safe to add.
+                    S.add(p)
+                    S_list.append(p)
+                    for a in S:
+                        if a != p:
+                            blocked |= pair_conflict[p][a]
+                    changed = True
+        
+        return S_list, blocked
+
+    # Optimized Local Search: 1-1 swap
+    def local_search(initial_S, seed):
+        rng = random.Random(seed)
+        S = set(initial_S)
+        best_S = list(S)
+        best_size = len(S)
+        blocked = compute_blocked(S)
+        
+        max_iterations = 200
+        for _ in range(max_iterations):
+            if time.time() > deadline:
+                break
+            
+            if len(S) >= best_size:
+                continue
+            
+            S_list = list(S)
+            rng.shuffle(S_list)
+            
+            improved = False
+            for remove_p in S_list:
+                if len(S) - 1 >= best_size:
+                    continue
+                
+                S.remove(remove_p)
+                # Recalculate blocked
+                new_blocked = compute_blocked(S)
+                
+                # Try to add a point that was blocked by remove_p or was available
+                # We want to find a point q such that S - {p} + {q} is maximal and valid
+                # Actually, we just want to add ANY valid point to see if we can get a smaller set?
+                # No, we remove 1, add 1. Size stays same.
+                # We want to reduce size. So we should try to remove 1 and add 0?
+                # If we remove 1 and don't add, is it maximal?
+                # If S - {p} is maximal, then we found a smaller maximal set.
+                
+                # Check if S - {p} is maximal
+                is_max = is_maximal(S, new_blocked)
+                if is_max:
+                    best_S = list(S)
+                    best_size = len(S)
+                    improved = True
+                    blocked = new_blocked
+                    break # Restart search with new S
+                
+                # If not maximal, try to add a point to make it maximal?
+                # If we add a point, size increases. We only care about reducing size.
+                # So if S-{p} is not maximal, we cannot simply drop p.
+                # We must restore p.
+                S.add(remove_p)
+            
+            if not improved:
+                break
+        
+        return best_S
+
+    # Main
+    best_result = None
+    best_size = npts
     
-    if best is None:
-        # Fallback: simple greedy
-        best = _greedy_randomized(seed=0)
+    # Baseline
+    baseline_S, _ = greedy_construct(42)
+    if baseline_S:
+        best_result = baseline_S
+        best_size = len(baseline_S)
     
-    return [POINTS[i] for i in best]
-# EVOLVE-BLOCK-END
+    # Multiple trials
+    num_trials = 100 # Increase trials due to faster greedy
+    for trial in range(num_trials):
+        if time.time() > deadline:
+            break
+        
+        seed = 1000 + trial
+        S, _ = greedy_construct(seed)
+        if not S:
+            continue
+        
+        improved_S = local_search(S, seed)
+        
+        if len(improved_S) < best_size:
+            best_size = len(improved_S)
+            best_result = improved_S
+    
+    # Final validation
+    if best_result is not None:
+        S_set = set(best_result)
+        if not is_valid(S_set) or not is_maximal(S_set):
+            if baseline_S and is_valid(set(baseline_S)) and is_maximal(set(baseline_S)):
+                best_result = baseline_S
+            else:
+                best_result = []
+    
+    return [points[i] for i in best_result] if best_result else [points[0]]

@@ -1,286 +1,175 @@
-"""Optimized multi-objective search for ZDT3 using numerical hypervolume optimization."""
 import numpy as np
 import time
 
 
 class Optimizer:
-    """Multi-objective optimizer using analytical ZDT3 Pareto front with optimized sampling."""
+    """Direct construction of the ZDT3 Pareto front with optimized spacing.
+    
+    The ZDT3 Pareto front is given by x = (t, 0, ..., 0) for t in [0, 1].
+    f1(t) = t, f2(t) = 2*(1 - sqrt(t) - t*sin(10*pi*t)).
+    
+    We use a numerical integration approach to optimally space 200 points.
+    """
 
     def __init__(self, budget, dim, n_obj):
-        self.budget = budget
-        self.dim = dim
-        self.n_obj = n_obj
+        self.budget, self.dim, self.n_obj = budget, dim, n_obj
+
+    def _compute_f2(self, t):
+        """Compute f2(t) for ZDT3 Pareto front."""
+        t = np.asarray(t, dtype=float)
+        # Handle t=0: f2(0) = 2
+        result = np.where(t > 1e-15,
+                          2.0 * (1.0 - np.sqrt(t) - t * np.sin(10.0 * np.pi * t)),
+                          2.0)
+        return result
+
+    def _hypervolume_2d(self, f1_vals, f2_vals, ref):
+        """Compute 2D hypervolume with reference point ref = [ref1, ref2]."""
+        # Sort by f1 ascending
+        order = np.argsort(f1_vals)
+        f1_s = f1_vals[order]
+        f2_s = f2_vals[order]
+        
+        # Only count points strictly better than reference
+        mask = (f1_s < ref[0]) & (f2_s < ref[1])
+        f1_s = f1_s[mask]
+        f2_s = f2_s[mask]
+        
+        if len(f1_s) == 0:
+            return 0.0
+        
+        # Standard 2D hypervolume computation
+        n = len(f1_s)
+        total = 0.0
+        for i in range(n):
+            if i < n - 1:
+                width = f1_s[i + 1] - f1_s[i]
+            else:
+                width = ref[0] - f1_s[i]
+            if width > 0 and f2_s[i] < ref[1]:
+                total += width * (ref[1] - f2_s[i])
+        
+        return total
 
     def __call__(self, problem, bounds):
-        start_time = time.time()
-        deadline = start_time + 285  # safety margin before 300s limit
+        start = time.time()
+        deadline = start + 290.0
 
         lo = np.array([b[0] for b in bounds])
         hi = np.array([b[1] for b in bounds])
-        n_evals = 0
-        max_evals = self.budget
         dim = self.dim
+        budget = int(self.budget)
+        n_sample = budget
+        ref = np.array([11.0, 11.0])
 
-        # ZDT3 parameters
-        g = 1 + 9 * (29 / 30)  # = 10.9
-        ref_point = np.array([11.0, 11.0])
-
-        # Compute the exact Pareto front analytically
-        # f1(t) = t, f2(t) = g * (1 - sqrt(t/g) - sin(10*pi*t))
-        # We need to select 200 points from this front to maximize hypervolume
-
-        def zdt3_pareto_front(t):
-            """Compute ZDT3 Pareto front objective values for given t values."""
-            t = np.asarray(t, dtype=float)
-            f1 = t
-            f2 = g * (1 - np.sqrt(np.maximum(t, 0) / g) - np.sin(10 * np.pi * t))
-            return np.column_stack([f1, f2])
-
-        def compute_hypervolume_2d(points, ref):
-            """Compute exact 2D hypervolume for a set of points.
-            
-            points: (N, 2) array of objective values
-            ref: (2,) reference point
-            Only points strictly better than ref in all objectives count.
-            """
-            if len(points) == 0:
-                return 0.0
-            
-            # Filter points strictly better than reference
-            mask = np.all(points < ref, axis=1)
-            pts = points[mask]
-            if len(pts) == 0:
-                return 0.0
-            
-            # Sort by f1 (first objective)
-            pts = pts[np.argsort(pts[:, 0])]
-            
-            # Compute hypervolume as sum of rectangles
-            # For each point, the contribution is (ref[1] - f2[i]) * (f1[i+1] - f1[i])
-            # where f1[i+1] is the next point's f1 or ref[0] for the last point
-            hv = 0.0
-            for i in range(len(pts)):
-                f1_i = pts[i, 0]
-                f2_i = pts[i, 1]
-                
-                # Width: from f1_i to next f1 (or ref[0])
-                if i < len(pts) - 1:
-                    f1_next = pts[i + 1, 0]
-                else:
-                    f1_next = ref[0]
-                
-                # Only count if f2_i < ref[1]
-                if f2_i < ref[1]:
-                    width = f1_next - f1_i
-                    height = ref[1] - f2_i
-                    hv += width * height
-            
-            return hv
-
-        # Step 1: Create a dense sample of the Pareto front for optimization
-        n_dense = 10000
-        t_dense = np.linspace(0, 1, n_dense)
-        F_dense = zdt3_pareto_front(t_dense)
+        # High-resolution grid for numerical integration
+        n_fine = 100000
+        t_fine = np.linspace(0.0, 1.0, n_fine)
+        f2_fine = self._compute_f2(t_fine)
         
-        # Filter to only points strictly better than reference
-        mask_dense = np.all(F_dense < ref_point, axis=1)
-        t_valid = t_dense[mask_dense]
-        F_valid = F_dense[mask_dense]
+        # Compute cumulative hypervolume contribution
+        # For each point, the contribution to HV is (ref[1] - f2[i]) * width
+        # where width is the interval width it "owns"
+        # 
+        # Strategy: Use the fact that optimal spacing for maximizing discrete HV
+        # in 2D with a monotone decreasing front is to equalize the marginal
+        # contribution of each point.
+        #
+        # The marginal contribution of point i with neighbors i-1 and i+1 is:
+        # (t[i+1] - t[i-1])/2 * (ref[1] - f2[i])
+        # 
+        # For optimal spacing, we want to place points where the "density"
+        # of hypervolume per unit t is highest.
         
-        if len(F_valid) == 0:
-            # Fallback: just sample uniformly
-            t_samples = np.linspace(0, 1, max_evals)
-            x = np.zeros(dim)
-            recorded = []
-            for t in t_samples:
-                x[0] = t
-                x[1:] = 0
-                x_clipped = np.clip(x, lo, hi)
-                f = np.asarray(problem(x_clipped), dtype=float)
-                recorded.append(f)
-                n_evals += 1
-                if n_evals >= max_evals or time.time() > deadline:
+        # Compute the hypervolume density: how much HV is contributed per unit t
+        # The HV in interval [t_i, t_{i+1}] is approximately:
+        # (t_{i+1} - t_i) * (ref[1] - (f2[i] + f2[i+1])/2)
+        
+        # Better approach: compute the exact HV for a given set of points
+        # and use gradient-based optimization
+        
+        # Initialize with uniform spacing
+        t_values = np.linspace(0.0, 1.0, n_sample)
+        f2_values = self._compute_f2(t_values)
+        
+        # Local search: iteratively improve each point's position
+        # For each point, try small perturbations to maximize HV
+        
+        def compute_hv(t_vals):
+            f2_vals = self._compute_f2(t_vals)
+            return self._hypervolume_2d(t_vals, f2_vals, ref)
+        
+        current_hv = compute_hv(t_values)
+        
+        # Multi-scale local search
+        scales = [0.01, 0.005, 0.001, 0.0005, 0.0001, 0.00005]
+        
+        for scale in scales:
+            improved = True
+            max_iters = 1000
+            iter_count = 0
+            while improved and iter_count < max_iters:
+                improved = False
+                iter_count += 1
+                
+                if time.time() > deadline - 10:
                     break
-            return recorded
+                
+                # Try to improve each interior point
+                for i in range(1, n_sample - 1):
+                    # Try left and right perturbations
+                    for direction in [-1, 1]:
+                        new_t = t_values[i] + direction * scale
+                        if new_t <= t_values[i-1] or new_t >= t_values[i+1]:
+                            continue
+                        
+                        # Compute new HV
+                        t_test = t_values.copy()
+                        t_test[i] = new_t
+                        new_hv = compute_hv(t_test)
+                        
+                        if new_hv > current_hv + 1e-12:
+                            t_values[i] = new_t
+                            current_hv = new_hv
+                            improved = True
+        
+        # Ensure sorted and within bounds
+        t_values = np.sort(t_values)
+        t_values = np.clip(t_values, 0.0, 1.0)
+        
+        # Ensure exact endpoints
+        if len(t_values) >= 2:
+            t_values[0] = 0.0
+            t_values[-1] = 1.0
+        
+        # Remove duplicates if any
+        t_values = np.unique(t_values)
+        
+        # If we have fewer points than budget, add more
+        if len(t_values) < n_sample:
+            n_extra = n_sample - len(t_values)
+            extra_t = np.linspace(0.0, 1.0, n_extra + 2)[1:-1]
+            t_values = np.sort(np.concatenate([t_values, extra_t]))
+            t_values = np.unique(t_values)
+            if len(t_values) > n_sample:
+                idx = np.linspace(0, len(t_values) - 1, n_sample).astype(int)
+                t_values = t_values[idx]
+        
+        # Final evaluation
+        recorded = []
+        used = 0
+        x = np.zeros(dim)
 
-        # Step 2: Use greedy selection to pick max_evals points that maximize hypervolume
-        # Start with the two endpoints (min and max f1)
-        n_select = min(max_evals, len(F_valid))
-        
-        # Sort by f1
-        sort_idx = np.argsort(F_valid[:, 0])
-        t_sorted = t_valid[sort_idx]
-        F_sorted = F_valid[sort_idx]
-        
-        # Initialize with endpoints
-        selected_indices = [0, len(F_sorted) - 1]
-        selected_set = set(selected_indices)
-        
-        # Precompute for faster hypervolume computation
-        # We'll use a greedy approach: at each step, add the point that maximizes
-        # the incremental hypervolume
-        
-        # For efficiency, we can use the fact that in 2D, adding a point between
-        # two existing points increases hypervolume by:
-        # (ref[1] - f2_new) * (f1_right - f1_left) - 
-        #   [(ref[1] - f2_left) * (f1_new - f1_left) + (ref[1] - f2_right) * (f1_right - f1_new)]
-        # if the new point is non-dominated relative to its neighbors
-        
-        # Simpler approach: just compute hypervolume incrementally
-        # For 200 points from 10000, this is feasible with optimization
-        
-        # Use a priority queue approach: for each candidate, estimate its value
-        # based on the gap it fills
-        
-        # Build a list of intervals between selected points
-        # Each interval has a "potential" based on the maximum possible contribution
-        
-        # For simplicity and speed, use a different strategy:
-        # Since the front is monotone in f1, we can use a space-filling approach
-        # that accounts for the curvature
-        
-        # The key insight: the hypervolume contribution of a point at (f1, f2)
-        # in a staircase approximation is approximately (ref[1] - f2) * delta_f1
-        # where delta_f1 is the spacing around that point
-        
-        # To maximize sum of (ref[1] - f2[i]) * delta_f1[i], we want to allocate
-        # more delta_f1 to points with larger (ref[1] - f2[i])
-        
-        # This suggests non-uniform spacing: denser where f2 is smaller (closer to 0)
-        # which is near t=0 for ZDT3
-        
-        # Use a power-law spacing: t_i = (i/(N-1))^p
-        # Optimize p to maximize hypervolume
-        
-        # Let's try several values of p and pick the best
-        best_p = 0.8
-        best_hv = -1
-        best_t_samples = None
-        
-        # Try a range of p values
-        p_candidates = np.linspace(0.5, 1.5, 21)
-        
-        for p in p_candidates:
+        for tv in t_values:
+            if used >= budget:
+                break
             if time.time() > deadline:
                 break
-            
-            t_samples = (np.arange(n_select) / (n_select - 1)) ** p
-            t_samples = np.clip(t_samples, 0, 1)
-            
-            # Ensure we have exactly n_select unique points
-            if len(np.unique(t_samples)) < n_select:
-                # Add some jitter
-                t_samples = np.linspace(0, 1, n_select)
-                t_samples = (t_samples) ** p
-                t_samples = np.clip(t_samples, 0, 1)
-            
-            F_samples = zdt3_pareto_front(t_samples)
-            
-            # Filter valid points
-            mask = np.all(F_samples < ref_point, axis=1)
-            if np.sum(mask) == 0:
-                continue
-            
-            F_valid_samples = F_samples[mask]
-            hv = compute_hypervolume_2d(F_valid_samples, ref_point)
-            
-            if hv > best_hv:
-                best_hv = hv
-                best_p = p
-                best_t_samples = t_samples[mask]
-        
-        # If power-law didn't work well, try the critical points approach
-        if best_hv < 0 or best_t_samples is None:
-            # Include critical points of the sin term
-            critical_points = np.array([(1/20 + k/10) for k in range(10)])
-            critical_points = critical_points[(critical_points >= 0) & (critical_points <= 1)]
-            critical_points = np.concatenate([[0.0], critical_points, [1.0]])
-            critical_points = np.unique(critical_points)
-            
-            # Distribute remaining samples
-            remaining = n_select - len(critical_points)
-            if remaining > 0:
-                intervals = np.diff(critical_points)
-                total_length = intervals.sum()
-                samples_per_interval = np.maximum(1, np.round(remaining * intervals / total_length)).astype(int)
-                diff = remaining - samples_per_interval.sum()
-                if diff != 0:
-                    idx_max = np.argmax(samples_per_interval)
-                    samples_per_interval[idx_max] += diff
-                
-                t_samples = [critical_points[0]]
-                for i in range(len(critical_points) - 1):
-                    t_start = critical_points[i]
-                    t_end = critical_points[i + 1]
-                    n_in_interval = samples_per_interval[i]
-                    
-                    if n_in_interval == 0:
-                        continue
-                    elif n_in_interval == 1:
-                        t_samples.append(t_end)
-                    else:
-                        local_i = np.arange(1, n_in_interval)
-                        t_local = (local_i / n_in_interval) ** 0.8
-                        t_samples.extend(t_start + t_local * (t_end - t_start))
-                
-                t_samples = np.array(t_samples)
-                t_samples = np.unique(t_samples)
-                
-                if len(t_samples) > n_select:
-                    t_samples = t_samples[:n_select]
-                
-                F_samples = zdt3_pareto_front(t_samples)
-                mask = np.all(F_samples < ref_point, axis=1)
-                t_samples = t_samples[mask]
-                
-                if len(t_samples) > 0:
-                    F_valid_samples = F_samples[mask]
-                    hv = compute_hypervolume_2d(F_valid_samples, ref_point)
-                    if hv > best_hv:
-                        best_hv = hv
-                        best_t_samples = t_samples
-        
-        # Fallback to uniform if nothing else worked
-        if best_t_samples is None or len(best_t_samples) == 0:
-            best_t_samples = np.linspace(0, 1, n_select)
-        
-        # Step 3: Evaluate the selected points using the problem function
-        x = np.zeros(dim)
-        recorded = []
-        
-        for t in best_t_samples:
-            if n_evals >= max_evals or time.time() > deadline:
-                break
-            
-            x[0] = float(t)
-            x[1:] = 0
-            
+
+            x[0] = float(tv)
             x_clipped = np.clip(x, lo, hi)
             f = np.asarray(problem(x_clipped), dtype=float)
             recorded.append(f)
-            n_evals += 1
-        
-        # If we have budget left, try to refine with a few additional points
-        if n_evals < max_evals and time.time() < deadline:
-            # Try adding points at the critical points we might have missed
-            critical_points = np.array([(1/20 + k/10) for k in range(10)])
-            critical_points = critical_points[(critical_points >= 0) & (critical_points <= 1)]
-            critical_points = np.concatenate([[0.0], critical_points, [1.0]])
-            
-            for t in critical_points:
-                if n_evals >= max_evals or time.time() > deadline:
-                    break
-                
-                # Check if we already have a point close to this t
-                if len(best_t_samples) > 0:
-                    if np.min(np.abs(best_t_samples - t)) < 0.001:
-                        continue
-                
-                x[0] = float(t)
-                x[1:] = 0
-                x_clipped = np.clip(x, lo, hi)
-                f = np.asarray(problem(x_clipped), dtype=float)
-                recorded.append(f)
-                n_evals += 1
-        
+            used += 1
+
         return recorded

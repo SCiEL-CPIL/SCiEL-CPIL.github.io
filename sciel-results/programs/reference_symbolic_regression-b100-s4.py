@@ -1,51 +1,42 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
 import numpy as np
+import time
+
+_START_TIME = time.time()
 
 def equation(x: np.ndarray, params: np.ndarray) -> np.ndarray:
+    """
+    Recovers an unknown function using a product of two low-degree polynomials.
+    
+    The model is P(x) * Q(x) where P is degree 3 (4 params) and Q is degree 2 (3 params),
+    plus an additional linear term with 3 params to capture additive components.
+    This creates a non-convex but structured landscape that can fit functions with
+    sharper features than a pure linear basis.
+    """
     x = np.asarray(x, dtype=np.float64)
-    if x.ndim != 1:
-        x = x.flatten()
-        
-    p = np.asarray(params, dtype=np.float64)
+    p = params
     
-    if not np.all(np.isfinite(p)):
-        return np.zeros_like(x)
-        
-    # Strategy: Linear Basis Function Regression
-    # We map the 10 parameters to a fixed set of global basis functions.
-    # This makes the optimization problem convex (minimizing MSE of linear combination),
-    # allowing BFGS to converge reliably to the global optimum for the given basis,
-    # avoiding the local minima traps of non-linear basis parameters (like Gaussian centers/widths).
+    # Extract parameters
+    # p[0:4] -> P coefficients (degree 0..3)
+    # p[4:7] -> Q coefficients (degree 0..2)
+    # p[7:10] -> additive linear term coefficients (degree 0..2)
     
-    # Basis functions chosen to cover a wide range of potential shapes on [-2, 2]:
-    # p[0]: Constant (1)
-    # p[1]: Linear (x)
-    # p[2]: Quadratic (x^2)
-    # p[3]: Cubic (x^3)
-    # p[4]: Quartic (x^4)
-    # p[5]: Quintic (x^5)
-    # p[6]: Sextic (x^6)
-    # p[7]: Septic (x^7)
-    # p[8]: Sin(x)
-    # p[9]: Cos(x)
+    a0, a1, a2, a3 = p[0], p[1], p[2], p[3]
+    b0, b1, b2 = p[4], p[5], p[6]
+    c0, c1, c2 = p[7], p[8], p[9]
     
-    # Note: Higher order polynomials can be ill-conditioned, but BFGS with default 
-    # tolerances usually handles this well for small N=10. 
-    # We could use Chebyshev polynomials for better conditioning, but standard powers 
-    # are often sufficient if the target isn't extremely high-frequency.
-    # Let's stick to standard powers and trig for simplicity and broad coverage.
+    # Compute P(x) = a0 + a1*x + a2*x^2 + a3*x^3
+    x2 = x * x
+    x3 = x2 * x
+    P = a0 + a1 * x + a2 * x2 + a3 * x3
     
-    b0 = np.ones_like(x)
-    b1 = x
-    b2 = x**2
-    b3 = x**3
-    b4 = x**4
-    b5 = x**5
-    b6 = x**6
-    b7 = x**7
-    b8 = np.sin(x)
-    b9 = np.cos(x)
+    # Compute Q(x) = b0 + b1*x + b2*x^2
+    Q = b0 + b1 * x + b2 * x2
     
-    y = (p[0] * b0 + p[1] * b1 + p[2] * b2 + p[3] * b3 + p[4] * b4 + 
-         p[5] * b5 + p[6] * b6 + p[7] * b7 + p[8] * b8 + p[9] * b9)
-         
-    return y
+    # Additive term: c0 + c1*x + c2*x^2
+    add = c0 + c1 * x + c2 * x2
+    
+    return P * Q + add
+
+# EVOLVE-BLOCK-END

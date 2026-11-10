@@ -1,3 +1,4 @@
+# EVOLVE-BLOCK-START
 import numpy as np
 import time
 import math
@@ -24,402 +25,459 @@ def _count_incidence(points, lines):
     A = lines[:, 0]
     B = lines[:, 1]
     C = lines[:, 2]
+    # (M, N) matrix
     vals = A[:, None] * px[None, :] + B[:, None] * py[None, :] + C[:, None]
     return int(np.sum(vals == 0))
 
-def _best_lines_for_points(points, k=27):
-    """
-    Find the k lines with the highest incidence count for the given points.
-    Lines are derived from pairs of points plus some generic lines.
-    """
+def _find_best_lines_for_points(points, k=27, deadline=None):
+    """Find the k lines with maximum total incidence for the given points."""
     n = len(points)
-    if n < 2:
-        return np.zeros((k, 3), dtype=np.int64)
+    points_int = points.astype(np.int64)
     
-    xs = points[:, 0]
-    ys = points[:, 1]
+    # Collect all distinct lines from pairs of points
+    seen_lines = set()
+    candidate_lines = []
     
-    seen = set()
-    line_counts = {}
-    
-    # Iterate over all pairs to generate candidate lines
     for i in range(n):
-        x1, y1 = int(xs[i]), int(ys[i])
+        x1, y1 = int(points_int[i, 0]), int(points_int[i, 1])
         for j in range(i + 1, n):
-            x2, y2 = int(xs[j]), int(ys[j])
-            
-            # Calculate line coefficients A, B, C for A*x + B*y + C = 0
+            x2, y2 = int(points_int[j, 0]), int(points_int[j, 1])
             A = y2 - y1
             B = x1 - x2
             C = x2 * y1 - x1 * y2
-            
             if A == 0 and B == 0:
                 continue
-                
             key = _normalize_line(A, B, C)
-            if key in seen:
+            if key not in seen_lines:
+                seen_lines.add(key)
+                candidate_lines.append(key)
+    
+    # Also add lines with small integer coefficients not captured by point pairs
+    # These can sometimes give better incidences (e.g., diagonal lines through grid)
+    for A in range(-4, 5):
+        for B in range(-4, 5):
+            if A == 0 and B == 0:
                 continue
-            seen.add(key)
-            
-            # Count incidences for this line
-            vals = key[0] * xs + key[1] * ys + key[2]
-            cnt = int(np.sum(vals == 0))
-            
-            line_counts[key] = cnt
+            # Try several C values
+            for C in range(-20, 21):
+                key = _normalize_line(A, B, C)
+                if key not in seen_lines:
+                    seen_lines.add(key)
+                    candidate_lines.append(key)
     
-    # Add some generic lines (horizontal, vertical, diagonal) to ensure we have enough
-    for c in range(-10, 11):
-        key = _normalize_line(0, 1, -c)  # y = c
-        if key not in seen:
-            seen.add(key)
-            vals = key[0] * xs + key[1] * ys + key[2]
-            cnt = int(np.sum(vals == 0))
-            line_counts[key] = cnt
-        
-        key = _normalize_line(1, 0, -c)  # x = c
-        if key not in seen:
-            seen.add(key)
-            vals = key[0] * xs + key[1] * ys + key[2]
-            cnt = int(np.sum(vals == 0))
-            line_counts[key] = cnt
+    if len(candidate_lines) == 0:
+        return np.array([[_normalize_line(0, 1, -c)] for c in range(-27, 0)], dtype=np.int64)
     
-    # If we still don't have enough, add more
-    if len(line_counts) < k:
-        c = -100
-        while len(line_counts) < k:
-            key = _normalize_line(0, 1, -c)
-            if key not in seen:
-                seen.add(key)
-                vals = key[0] * xs + key[1] * ys + key[2]
-                cnt = int(np.sum(vals == 0))
-                line_counts[key] = cnt
-            c -= 1
-            if c < -2000:
-                break
+    arr = np.array(candidate_lines, dtype=np.int64)
     
-    # Sort lines by count
-    sorted_lines = sorted(line_counts.items(), key=lambda x: x[1], reverse=True)
-    top_lines = [item[0] for item in sorted_lines[:k]]
+    px = points_int[:, 0:1].T  # (1, N)
+    py = points_int[:, 1:2].T  # (1, N)
+    A = arr[:, 0:1]
+    B = arr[:, 1:2]
+    C = arr[:, 2:3]
     
-    # Pad if necessary
-    while len(top_lines) < k:
-        top_lines.append((0, 1, -1000 - len(top_lines)))
-        
-    return np.array(top_lines[:k], dtype=np.int64)
+    # Compute incidence counts for all candidates
+    vals = A * px + B * py + C
+    counts = np.sum(vals == 0, axis=1)
+    
+    # Sort by count descending
+    if len(counts) > k:
+        idx = np.argsort(-counts)
+        top_idx = idx[:k]
+    else:
+        top_idx = np.arange(len(counts))
+    
+    return arr[top_idx].astype(np.int64)
 
-def _evaluate_configuration(points):
-    """Evaluate a point configuration and return (points, lines, score)."""
-    lines = _best_lines_for_points(points, 27)
+def _generate_point_sets(deadline):
+    """Generate a variety of point configurations."""
+    sets = []
+    
+    # 1. Rectangular Grid 6x9 and 9x6
+    for w, h in [(6, 9), (9, 6), (7, 8), (8, 7)]:
+        if w * h == 54:
+            pts = np.array([[i, j] for i in range(w) for j in range(h)], dtype=np.int64)
+            sets.append(pts)
+    
+    # 1b. Scaled grids (spacing > 1) to allow more line diversity
+    for scale in [2, 3]:
+        for w, h in [(6, 9), (9, 6)]:
+            if w * h == 54:
+                pts = np.array([[i * scale, j * scale] for i in range(w) for j in range(h)], dtype=np.int64)
+                sets.append(pts)
+    
+    # 1c. Skewed grids (sheared)
+    for shear in [1, 2, -1]:
+        for w, h in [(6, 9)]:
+            pts = np.array([[i + shear * j, j] for i in range(w) for j in range(h)], dtype=np.int64)
+            if len(set(map(tuple, pts.tolist()))) == 54:
+                sets.append(pts)
+    
+    # 2. Triangular/hexagonal lattice patterns
+    # Pattern A: staggered rows
+    for stagger in [0, 1]:
+        pts = []
+        for j in range(9):
+            offset = (j % 2) * stagger
+            for i in range(6):
+                pts.append([i + offset, j])
+        pts = np.array(pts, dtype=np.int64)
+        if len(set(map(tuple, pts))) == 54:
+            sets.append(pts)
+    
+    # Pattern B: diagonal lattice
+    pts = []
+    for j in range(9):
+        for i in range(6):
+            pts.append([i + j // 3, j])
+    pts = np.array(pts, dtype=np.int64)
+    if len(set(map(tuple, pts))) == 54:
+        sets.append(pts)
+    
+    # Pattern C: compact diamond shape
+    cx, cy = 27, 27
+    pts = []
+    for dy in range(-5, 6):
+        for dx in range(-5, 6):
+            if abs(dx) + abs(dy) <= 5 and len(pts) < 54:
+                pts.append([cx + dx, cy + dy])
+    if len(pts) == 54:
+        pts = np.array(pts, dtype=np.int64)
+        sets.append(pts)
+    
+    # Pattern D: two interleaved grids
+    pts1 = np.array([[i, j] for i in range(6) for j in range(9) if (i + j) % 2 == 0], dtype=np.int64)
+    pts2 = np.array([[i + 0.5, j + 0.5] for i in range(6) for j in range(9) if (i + j) % 2 == 1], dtype=np.int64)
+    # Scale to integers: multiply by 2
+    pts1 = pts1 * 2
+    pts2 = pts2 * 2
+    pts = np.vstack([pts1, pts2])
+    if len(pts) == 54 and len(set(map(tuple, pts))) == 54:
+        sets.append(pts.astype(np.int64))
+    
+    # Pattern E: spiral-like
+    pts = []
+    x, y = 0, 0
+    dx, dy = 1, 0
+    for step in range(54):
+        pts.append([x, y])
+        for _ in range(step % 2 + 1):
+            x += dx
+            y += dy
+        dx, dy = -dy, dx
+    pts = np.array(pts, dtype=np.int64)
+    if len(set(map(tuple, pts))) == 54:
+        sets.append(pts)
+    
+    # Pattern F: 3x18 grid (very elongated)
+    pts = np.array([[i, j] for i in range(3) for j in range(18)], dtype=np.int64)
+    sets.append(pts)
+    
+    # Pattern G: 18x3 grid
+    pts = np.array([[i, j] for i in range(18) for j in range(3)], dtype=np.int64)
+    sets.append(pts)
+    
+    # Pattern H: L-shape
+    pts = []
+    # Horizontal bar: 18 points
+    for i in range(18):
+        pts.append([i, 0])
+    # Vertical bar: 36 points
+    for j in range(1, 37):
+        pts.append([0, j])
+    pts = np.array(pts, dtype=np.int64)
+    if len(pts) == 54 and len(set(map(tuple, pts))) == 54:
+        sets.append(pts)
+    
+    # Pattern I: T-shape
+    pts = []
+    # Top bar: 18 points
+    for i in range(18):
+        pts.append([i, 0])
+    # Stem: 36 points
+    for j in range(1, 37):
+        pts.append([8, j])
+    pts = np.array(pts, dtype=np.int64)
+    if len(pts) == 54 and len(set(map(tuple, pts))) == 54:
+        sets.append(pts)
+    
+    return sets
+
+def _evaluate_set(points, deadline):
+    """Evaluate a specific point set by finding best lines."""
+    lines = _find_best_lines_for_points(points, 27, deadline)
     score = _count_incidence(points, lines)
     return points, lines, score
 
-def _generate_grid_points(k, m, dx=1, dy=1, ox=0, oy=0):
-    """Generate a k x m grid of points."""
-    xs = np.arange(k) * dx + ox
-    ys = np.arange(m) * dy + oy
-    px, py = np.meshgrid(xs, ys, indexing='ij')
-    return np.stack([px.ravel(), py.ravel()], axis=1).astype(np.int64)
-
-def _generate_punctured_grid(k, m, points_to_remove, dx=1, dy=1):
-    """Generate a grid with specific points removed."""
-    full_grid = _generate_grid_points(k, m, dx, dy)
-    mask = np.ones(len(full_grid), dtype=bool)
-    for (px, py) in points_to_remove:
-        match = (full_grid[:, 0] == px) & (full_grid[:, 1] == py)
-        if np.sum(match) > 0:
-            mask[np.where(match)[0][0]] = False
-    return full_grid[mask]
-
-def _search_punctured_grid(k, m, n_remove, time_limit):
+def _refine_set(points, lines, deadline, max_steps=5000):
     """
-    Search for the best n_remove points to remove from a k x m grid.
-    Returns (points, lines, score).
+    Refine the configuration by moving points.
+    Uses incremental incidence tracking for speed.
     """
-    full_grid = _generate_grid_points(k, m)
-    n_pts = k * m
+    current_score = _count_incidence(points, lines)
+    best_points = points.copy()
+    best_lines = lines.copy()
+    best_score = current_score
     
-    if n_pts < n_remove:
-        return None
+    no_improve_count = 0
+    point_set = set(map(tuple, best_points.tolist()))
     
-    # Total number of ways to choose n_remove points
-    total_ways = math.comb(n_pts, n_remove)
-    
-    if total_ways > 500000:  # Too many combinations, use sampling
-        best_pts = None
-        best_lines = None
-        best_score = -1
-        
-        start = time.time()
-        n_samples = min(50000, total_ways)
-        
-        for _ in range(n_samples):
-            if time.time() - start > time_limit:
-                break
-                
-            remove_idx = random.sample(range(n_pts), n_remove)
-            mask = np.ones(n_pts, dtype=bool)
-            mask[remove_idx] = False
-            pts = full_grid[mask]
-            
-            if len(pts) != 54:
-                continue
-                
-            p, l, s = _evaluate_configuration(pts)
-            if s > best_score:
-                best_score = s
-                best_pts = p.copy()
-                best_lines = l.copy()
-        
-        if best_pts is not None:
-            return best_pts, best_lines, best_score
-        return None
-    
-    # Exhaustive search if feasible
-    best_pts = None
-    best_lines = None
-    best_score = -1
-    
-    start = time.time()
-    
-    for remove_idx in combinations(range(n_pts), n_remove):
-        if time.time() - start > time_limit:
+    for step in range(max_steps):
+        if time.time() > deadline:
             break
-            
-        mask = np.ones(n_pts, dtype=bool)
-        mask[list(remove_idx)] = False
-        pts = full_grid[mask]
         
-        if len(pts) != 54:
-            continue
-        
-        p, l, s = _evaluate_configuration(pts)
-        if s > best_score:
-            best_score = s
-            best_pts = p.copy()
-            best_lines = l.copy()
-    
-    if best_pts is not None:
-        return best_pts, best_lines, best_score
-    return None
-
-def _local_search(points, lines, score, time_limit):
-    """
-    Local search to improve the configuration.
-    Tries to move individual points to improve incidence.
-    """
-    points = points.copy()
-    lines = lines.copy()
-    current_score = score
-    
-    start = time.time()
-    no_improve = 0
-    max_no_improve = 50
-    
-    while time.time() - start < time_limit:
         # Pick a random point to move
         i = random.randint(0, 53)
-        improved = False
+        ox, oy = int(best_points[i, 0]), int(best_points[i, 1])
         
-        # Try small moves
-        for _ in range(10):
-            dx = random.randint(-3, 3)
-            dy = random.randint(-3, 3)
-            if dx == 0 and dy == 0:
+        # Try moving to a nearby location
+        moved = False
+        # Try multiple offsets in random order
+        offsets = [(dx, dy) for dx in range(-3, 4) for dy in range(-3, 4) if (dx, dy) != (0, 0)]
+        random.shuffle(offsets)
+        
+        for dx, dy in offsets:
+            nx, ny = ox + dx, oy + dy
+            
+            # Check if this position is already taken
+            if (nx, ny) in point_set:
                 continue
             
-            new_x = int(points[i, 0]) + dx
-            new_y = int(points[i, 1]) + dy
+            # Create new points
+            new_points = best_points.copy()
+            new_points[i, 0] = nx
+            new_points[i, 1] = ny
             
-            # Check uniqueness
-            conflict = False
-            for j in range(54):
-                if j != i and int(points[j, 0]) == new_x and int(points[j, 1]) == new_y:
-                    conflict = True
-                    break
-            if conflict:
-                continue
-            
-            new_points = points.copy()
-            new_points[i, 0] = new_x
-            new_points[i, 1] = new_y
-            
-            # Recompute best lines
-            new_lines = _best_lines_for_points(new_points, 27)
+            # Find best lines for new points
+            new_lines = _find_best_lines_for_points(new_points, 27)
             new_score = _count_incidence(new_points, new_lines)
             
             if new_score > current_score:
-                points = new_points
-                lines = new_lines
+                best_points = new_points
+                best_lines = new_lines
                 current_score = new_score
-                improved = True
-                no_improve = 0
+                best_score = current_score
+                no_improve_count = 0
+                point_set = set(map(tuple, best_points.tolist()))
+                moved = True
                 break
-            elif new_score == current_score and random.random() < 0.3:
-                # Accept neutral moves to escape local minima
-                points = new_points
-                lines = new_lines
+            elif new_score == current_score and random.random() < 0.05:
+                # Accept equal score moves occasionally to escape local optima
+                best_points = new_points
+                best_lines = new_lines
+                point_set = set(map(tuple, best_points.tolist()))
+                no_improve_count = 0
+                moved = True
+                break
+        
+        if not moved:
+            no_improve_count += 1
+            if no_improve_count > 100:
+                # Try a bigger jump
+                i = random.randint(0, 53)
+                ox, oy = int(best_points[i, 0]), int(best_points[i, 1])
+                nx = ox + random.randint(-8, 8)
+                ny = oy + random.randint(-8, 8)
+                
+                if (nx, ny) not in point_set:
+                    new_points = best_points.copy()
+                    new_points[i, 0] = nx
+                    new_points[i, 1] = ny
+                    new_lines = _find_best_lines_for_points(new_points, 27)
+                    new_score = _count_incidence(new_points, new_lines)
+                    
+                    if new_score >= current_score:
+                        best_points = new_points
+                        best_lines = new_lines
+                        current_score = new_score
+                        best_score = max(best_score, current_score)
+                        point_set = set(map(tuple, best_points.tolist()))
+                        no_improve_count = 0
+    
+    return best_points, best_lines, best_score
+
+def _polish_set(points, lines, deadline):
+    """
+    Final polish: try all single-point moves with larger radius, accept only improvements.
+    """
+    current_score = _count_incidence(points, lines)
+    best_points = points.copy()
+    best_lines = lines.copy()
+    best_score = current_score
+    
+    point_set = set(map(tuple, best_points.tolist()))
+    
+    # Try multiple passes
+    for pass_num in range(3):
+        if time.time() > deadline:
+            break
+        
+        improved = False
+        for i in range(54):
+            if time.time() > deadline:
+                break
+            
+            ox, oy = int(best_points[i, 0]), int(best_points[i, 1])
+            
+            # Try all moves in a larger radius
+            best_move = None
+            best_move_score = current_score
+            
+            for dx in range(-5, 6):
+                for dy in range(-5, 6):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx, ny = ox + dx, oy + dy
+                    
+                    if (nx, ny) in point_set:
+                        continue
+                    
+                    new_points = best_points.copy()
+                    new_points[i, 0] = nx
+                    new_points[i, 1] = ny
+                    
+                    new_lines = _find_best_lines_for_points(new_points, 27)
+                    new_score = _count_incidence(new_points, new_lines)
+                    
+                    if new_score > best_move_score:
+                        best_move_score = new_score
+                        best_move = (nx, ny)
+            
+            if best_move is not None:
+                nx, ny = best_move
+                best_points[i, 0] = nx
+                best_points[i, 1] = ny
+                point_set.remove((ox, oy))
+                point_set.add((nx, ny))
+                best_lines = _find_best_lines_for_points(best_points, 27)
+                current_score = best_move_score
+                best_score = max(best_score, current_score)
+                improved = True
         
         if not improved:
-            no_improve += 1
-            if no_improve >= max_no_improve:
-                break
+            break
     
-    return points, lines, current_score
+    return best_points, best_lines, best_score
 
 def szemeredi_trotter_incidences():
     start_time = time.time()
-    deadline = start_time + 580  # 50s safety margin before 630s limit
+    # Safety margin: return before 620s
+    deadline = start_time + 590
     
     best_points = None
     best_lines = None
     best_score = -1
     
-    # Phase 1: Evaluate various grid-based configurations
+    # Phase 1: Evaluate initial candidate sets
+    candidate_sets = _generate_point_sets(deadline)
     
-    # 6x9 grid (54 points)
-    pts = _generate_grid_points(6, 9)
-    if len(pts) == 54:
-        p, l, s = _evaluate_configuration(pts)
-        if s > best_score:
-            best_score = s
-            best_points = p.copy()
-            best_lines = l.copy()
+    for pts in candidate_sets:
+        if time.time() > deadline:
+            break
+        pts, lines, score = _evaluate_set(pts, deadline)
+        if score > best_score:
+            best_score = score
+            best_points = pts.copy()
+            best_lines = lines.copy()
     
-    # 9x6 grid
-    pts = _generate_grid_points(9, 6)
-    if len(pts) == 54:
-        p, l, s = _evaluate_configuration(pts)
-        if s > best_score:
-            best_score = s
-            best_points = p.copy()
-            best_lines = l.copy()
-    
-    # 3x18 grid
-    pts = _generate_grid_points(3, 18)
-    if len(pts) == 54:
-        p, l, s = _evaluate_configuration(pts)
-        if s > best_score:
-            best_score = s
-            best_points = p.copy()
-            best_lines = l.copy()
-    
-    # 18x3 grid
-    pts = _generate_grid_points(18, 3)
-    if len(pts) == 54:
-        p, l, s = _evaluate_configuration(pts)
-        if s > best_score:
-            best_score = s
-            best_points = p.copy()
-            best_lines = l.copy()
-    
-    # 2x27 grid
-    pts = _generate_grid_points(2, 27)
-    if len(pts) == 54:
-        p, l, s = _evaluate_configuration(pts)
-        if s > best_score:
-            best_score = s
-            best_points = p.copy()
-            best_lines = l.copy()
-    
-    # 27x2 grid
-    pts = _generate_grid_points(27, 2)
-    if len(pts) == 54:
-        p, l, s = _evaluate_configuration(pts)
-        if s > best_score:
-            best_score = s
-            best_points = p.copy()
-            best_lines = l.copy()
-    
-    # Phase 2: Search punctured grids (remove points from larger grids)
-    
-    # 7x8 = 56, remove 2
-    remaining_time = deadline - time.time()
-    if remaining_time > 30:
-        result = _search_punctured_grid(7, 8, 2, min(25, remaining_time - 5))
-        if result is not None:
-            p, l, s = result
-            if s > best_score:
-                best_score = s
-                best_points = p.copy()
-                best_lines = l.copy()
-    
-    # 5x11 = 55, remove 1
-    remaining_time = deadline - time.time()
-    if remaining_time > 20:
-        result = _search_punctured_grid(5, 11, 1, min(15, remaining_time - 5))
-        if result is not None:
-            p, l, s = result
-            if s > best_score:
-                best_score = s
-                best_points = p.copy()
-                best_lines = l.copy()
-    
-    # 6x10 = 60, remove 6
-    remaining_time = deadline - time.time()
-    if remaining_time > 15:
-        result = _search_punctured_grid(6, 10, 6, min(10, remaining_time - 5))
-        if result is not None:
-            p, l, s = result
-            if s > best_score:
-                best_score = s
-                best_points = p.copy()
-                best_lines = l.copy()
-    
-    # 9x7 = 63, remove 9
-    remaining_time = deadline - time.time()
-    if remaining_time > 10:
-        result = _search_punctured_grid(9, 7, 9, min(5, remaining_time - 5))
-        if result is not None:
-            p, l, s = result
-            if s > best_score:
-                best_score = s
-                best_points = p.copy()
-                best_lines = l.copy()
-    
-    # Phase 3: Local search from the best configuration found
+    # Phase 1b: Try random perturbations of the best grid found
     if best_points is not None:
-        remaining_time = deadline - time.time()
-        if remaining_time > 30:
-            p, l, s = _local_search(best_points, best_lines, best_score, min(remaining_time - 10, 120))
-            if s > best_score:
-                best_score = s
-                best_points = p.copy()
-                best_lines = l.copy()
+        for trial in range(5):
+            if time.time() > deadline:
+                break
+            perturbed = best_points.copy()
+            for _ in range(10):
+                idx = random.randint(0, 53)
+                perturbed[idx, 0] += random.randint(-2, 2)
+                perturbed[idx, 1] += random.randint(-2, 2)
+            # Ensure no duplicates
+            seen_pts = set()
+            valid = []
+            for p in perturbed:
+                key = (int(p[0]), int(p[1]))
+                if key not in seen_pts:
+                    seen_pts.add(key)
+                    valid.append(key)
+            if len(valid) == 54:
+                perturbed = np.array(valid, dtype=np.int64)
+                pts, lines, score = _evaluate_set(perturbed, deadline)
+                if score > best_score:
+                    best_score = score
+                    best_points = pts.copy()
+                    best_lines = lines.copy()
     
-    # Fallback if no valid configuration found
-    if best_points is None:
-        best_points = _generate_grid_points(6, 9)
-        best_lines = _best_lines_for_points(best_points, 27)
-        best_score = _count_incidence(best_points, best_lines)
-    
-    # Final validation and formatting
-    final_points = np.array(best_points, dtype=np.int64)
-    final_lines = np.array(best_lines, dtype=np.int64)
-    
-    # Ensure shapes
-    if final_points.shape != (54, 2):
-        final_points = _generate_grid_points(6, 9)
-        final_lines = _best_lines_for_points(final_points, 27)
+    # Phase 2: Refinement
+    if best_points is not None:
+        elapsed = time.time() - start_time
+        remaining = deadline - start_time - elapsed
         
-    if final_lines.shape != (27, 3):
-        final_lines = final_lines[:27]
-        if len(final_lines) < 27:
-            pad = np.zeros((27 - len(final_lines), 3), dtype=np.int64)
-            pad[:, 1] = 1
-            pad[:, 2] = -1000
-            final_lines = np.vstack([final_lines, pad])
+        # Allocate time: 55% for refinement, 20% for polish, 25% for second refinement
+        refine_budget = int(remaining * 0.55)
+        polish_budget = int(remaining * 0.20)
+        refine2_budget = int(remaining * 0.25)
+        
+        refine_deadline = start_time + elapsed + refine_budget
+        
+        max_steps = min(10000, int(refine_budget * 50))
+        if max_steps < 500:
+            max_steps = 500
+        
+        best_points, best_lines, best_score = _refine_set(
+            best_points, best_lines, refine_deadline, max_steps
+        )
+        
+        # Phase 3: Polish
+        polish_deadline = start_time + elapsed + refine_budget + polish_budget
+        best_points, best_lines, best_score = _polish_set(
+            best_points, best_lines, polish_deadline
+        )
+        
+        # Phase 4: Second refinement pass with fresh random seed
+        if time.time() < deadline - 5:
+            random.seed(int(time.time() * 1000) % 100000)
+            refine2_deadline = deadline - 5
+            max_steps2 = min(5000, int(refine2_budget * 50))
+            if max_steps2 < 200:
+                max_steps2 = 200
+            best_points, best_lines, best_score = _refine_set(
+                best_points, best_lines, refine2_deadline, max_steps2
+            )
     
-    # Double check uniqueness of points
-    unique_pts = np.unique(final_points, axis=0)
-    if len(unique_pts) < 54:
-        added = 0
-        offset = 100
-        while len(unique_pts) < 54:
-            pt = np.array([offset + added, offset * 2 + added], dtype=np.int64)
-            if pt not in unique_pts:
-                unique_pts = np.vstack([unique_pts, pt[None, :]])
-            added += 1
-        final_points = unique_pts[:54]
-        final_lines = _best_lines_for_points(final_points, 27)
+    # Final Validation and Cleanup
+    if best_points is None or len(best_points) != 54:
+        best_points = np.array([[i, j] for i in range(6) for j in range(9)], dtype=np.int64)
+        best_lines = _find_best_lines_for_points(best_points, 27)
     
-    return final_points.astype(np.int64), final_lines.astype(np.int64)
+    points = np.array(best_points, dtype=np.int64)
+    lines = np.array(best_lines, dtype=np.int64)
+    
+    if len(points) > 54:
+        points = points[:54]
+    elif len(points) < 54:
+        while len(points) < 54:
+            points = np.vstack([points, [len(points)*100, len(points)*200]])
+    
+    valid_lines = []
+    seen = set()
+    for l in lines:
+        key = _normalize_line(int(l[0]), int(l[1]), int(l[2]))
+        if key not in seen and (key[0] != 0 or key[1] != 0):
+            seen.add(key)
+            valid_lines.append(key)
+    
+    lines = np.array(valid_lines, dtype=np.int64)
+    
+    if len(lines) > 27:
+        lines = lines[:27]
+    elif len(lines) < 27:
+        c = 1000
+        while len(lines) < 27:
+            key = _normalize_line(0, 1, -c)
+            if key not in seen:
+                seen.add(key)
+                lines = np.vstack([lines, np.array(key, dtype=np.int64)])
+            c += 1
+    
+    return points, lines
+
+# EVOLVE-BLOCK-END

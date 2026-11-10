@@ -1,0 +1,164 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+
+TOL = 1e-7
+
+def squares_in_square10() -> tuple:
+    """
+    Place 10 axis-aligned squares with pairwise disjoint interiors inside the
+    unit square [0,1]^2 so as to MAXIMIZE the sum of their side lengths.
+
+    Returns:
+        centers: np.ndarray of shape (10, 2) with the (x, y) center of each square.
+        sides:   np.ndarray of shape (10,) with the side length of each square.
+    """
+    n = 10
+    t0 = time.time()
+    DEADLINE = t0 + 580.0  # Safety margin
+
+    def _is_feasible(centers, sides, tol=TOL):
+        cx = centers[:, 0]
+        cy = centers[:, 1]
+        s = sides
+        if np.any(~np.isfinite(centers)) or np.any(~np.isfinite(s)):
+            return False
+        if np.any(s <= 0):
+            return False
+        for i in range(n):
+            if cx[i] - s[i] / 2.0 < -tol or cx[i] + s[i] / 2.0 > 1.0 + tol:
+                return False
+            if cy[i] - s[i] / 2.0 < -tol or cy[i] + s[i] / 2.0 > 1.0 + tol:
+                return False
+        for i in range(n):
+            for j in range(i + 1, n):
+                t = (s[i] + s[j]) / 2.0 - tol
+                if abs(cx[i] - cx[j]) < t and abs(cy[i] - cy[j]) < t:
+                    return False
+        return True
+
+    def _penalty(centers, sides, tol=TOL):
+        cx = centers[:, 0]
+        cy = centers[:, 1]
+        s = sides
+        pen = 0.0
+        for i in range(n):
+            lo = min(cx[i] - s[i] / 2.0, cy[i] - s[i] / 2.0)
+            hi = max(cx[i] + s[i] / 2.0, cy[i] + s[i] / 2.0)
+            if lo < -tol:
+                pen += (lo + tol) ** 2
+            if hi > 1.0 + tol:
+                pen += (hi - 1.0 - tol) ** 2
+        for i in range(n):
+            for j in range(i + 1, n):
+                t = (s[i] + s[j]) / 2.0 - tol
+                dx = abs(cx[i] - cx[j])
+                dy = abs(cy[i] - cy[j])
+                if dx < t and dy < t:
+                    pen += (t - dx) ** 2 + (t - dy) ** 2
+        return pen
+
+    # --- Analytic Initialization: 3.0 Sum Layout ---
+    # 8 squares of side 0.25 (2 rows of 4)
+    # 2 squares of side 0.5 (1 row of 2)
+    centers = np.zeros((n, 2))
+    sides = np.zeros(n)
+    
+    # Bottom 2 rows: 4 squares each, side 0.25
+    for i in range(8):
+        col = i % 4
+        row = i // 4
+        side = 0.25
+        centers[i, 0] = (col + 0.5) * side
+        centers[i, 1] = (row + 0.5) * side
+        sides[i] = side
+        
+    # Top row: 2 squares, side 0.5
+    for i in range(2):
+        col = i
+        row = 2
+        side = 0.5
+        centers[i + 8, 0] = (col + 0.5) * side
+        centers[i + 8, 1] = (row + 0.5) * side
+        sides[i + 8] = side
+
+    # Verify feasibility of start
+    if not _is_feasible(centers, sides):
+        # Fallback to 2.5 layout if analytic fails (should not happen)
+        centers = np.zeros((n, 2))
+        sides = np.zeros(n)
+        for i in range(n):
+            col = i % 4
+            row = i // 4
+            side = 0.25
+            centers[i, 0] = (col + 0.5) * side
+            centers[i, 1] = (row + 0.5) * side
+            sides[i] = side
+
+    best_centers = centers.copy()
+    best_sides = sides.copy()
+    best_score = np.sum(sides)
+
+    # --- Local Search: Coordinate Descent ---
+    # We try to increase side lengths and adjust positions to maintain feasibility.
+    step = 0.01
+    max_iters = 10000
+    no_improve = 0
+    
+    for it in range(max_iters):
+        if time.time() > DEADLINE:
+            break
+        if no_improve > 500:
+            break
+            
+        improved = False
+        for i in range(n):
+            # Try to increase side length
+            new_side = best_sides[i] + step
+            if new_side > 1.0:
+                continue
+                
+            # Try to find a position for square i with new_side that is feasible
+            # Simple heuristic: try to keep center, or shift slightly
+            found_pos = False
+            # Try current center
+            trial_c = best_centers.copy()
+            trial_s = best_sides.copy()
+            trial_s[i] = new_side
+            if _is_feasible(trial_c, trial_s):
+                best_centers = trial_c
+                best_sides = trial_s
+                best_score = np.sum(best_sides)
+                improved = True
+                found_pos = True
+            else:
+                # Try small shifts in x and y
+                for dx in [-step, 0, step]:
+                    for dy in [-step, 0, step]:
+                        if dx == 0 and dy == 0:
+                            continue
+                        trial_c[i, 0] = best_centers[i, 0] + dx
+                        trial_c[i, 1] = best_centers[i, 1] + dy
+                        if _is_feasible(trial_c, trial_s):
+                            best_centers = trial_c
+                            best_sides = trial_s
+                            best_score = np.sum(best_sides)
+                            improved = True
+                            found_pos = True
+                            break
+                    if found_pos:
+                        break
+            
+            if found_pos:
+                no_improve = 0
+            else:
+                no_improve += 1
+
+        if not improved:
+            step *= 0.95
+            if step < 1e-5:
+                break
+
+    return best_centers.astype(np.float64), best_sides.astype(np.float64)
+
+# EVOLVE-BLOCK-END

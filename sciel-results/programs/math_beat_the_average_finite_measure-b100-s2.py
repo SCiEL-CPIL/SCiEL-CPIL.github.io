@@ -88,16 +88,6 @@ def _objective_general(params, n):
         
     return -P
 
-def _objective_pareto(params):
-    """
-    Objective for a distribution with a Pareto-like tail structure.
-    This is a specific parameterization that encourages heavy tails.
-    params: [log_alpha, log_beta, p0, p1, p2, ...]
-    Actually, let's stick to the general optimizer but use a specific initial guess
-    that mimics a Pareto tail.
-    """
-    pass # Placeholder, will use general objective
-
 def beat_the_average_measure() -> tuple[np.ndarray, np.ndarray]:
     start_time = time.time()
     deadline = start_time + 580.0 # Safety margin
@@ -120,8 +110,6 @@ def beat_the_average_measure() -> tuple[np.ndarray, np.ndarray]:
         best_weights = weights_2.copy()
         
     # 2. Optimize 3-point distribution
-    # Parameters: [a, b, p0, p1, p2]
-    # s = [0, a, b]
     def _objective_3point(params):
         a, b, p0, p1, p2 = params
         if a < 0 or b < 0 or a > b:
@@ -176,8 +164,6 @@ def beat_the_average_measure() -> tuple[np.ndarray, np.ndarray]:
             pass
 
     # 3. Optimize 4-point distribution
-    # Parameters: [a, b, c, p0, p1, p2, p3]
-    # s = [0, a, b, c]
     def _objective_4point(params):
         a, b, c, p0, p1, p2, p3 = params
         if a < 0 or b < 0 or c < 0 or a > b or b > c:
@@ -198,10 +184,6 @@ def beat_the_average_measure() -> tuple[np.ndarray, np.ndarray]:
         s0, s1, s2 = best_support
         w0, w1, w2 = best_weights
         guesses_4 = [
-            [s1, s2, s2*2.0, w0, w1, w2, 0.0], # Wait, weights must sum > 0
-            # Let's create valid guesses
-            [s1, s2, s2*1.5, w0, w1, w2, 0.0], # Invalid if w sum is 0? No, w0+w1+w2 > 0. But w3=0 might be bad.
-            # Let's just use random splits
             [s1*0.5, s1, s2, w0*0.5, w0*0.5, w1, w2],
             [s1, s2*0.5, s2, w0, w1*0.5, w1*0.5, w2],
             [s1, s2, s2*2.0, w0*0.8, w1, w2*0.5, w2*0.5],
@@ -243,19 +225,20 @@ def beat_the_average_measure() -> tuple[np.ndarray, np.ndarray]:
             pass
 
     # 4. Global Optimization with Differential Evolution for larger n
-    # This allows finding structures with more points, potentially heavy-tailed
-    for n in [8, 16, 32]:
-        if time.time() > deadline - 100: # Leave 100s for finishing
+    # Focus on heavy-tailed structures (Pareto/Log-normal-like)
+    for n in [8, 16, 32, 64]:
+        if time.time() > deadline - 100:
             break
             
-        bounds_s = [(0.0, 50.0)] * (n - 1)
+        bounds_s = [(0.0, 100.0)] * (n - 1)
         bounds_w = [(0.0, 1.0)] * n
         bounds = bounds_s + bounds_w
         
         # Initial population: mix of geometric decay (heavy tail) and random
         x0_list = []
+        rng = np.random.RandomState(42)
         
-        # Geometric decay guess
+        # Geometric decay guess (exponential tail)
         s_init = np.zeros(n)
         for i in range(1, n):
             s_init[i] = i * 1.0
@@ -263,16 +246,25 @@ def beat_the_average_measure() -> tuple[np.ndarray, np.ndarray]:
         w_init = w_init / w_init.sum()
         x0_list.append(np.concatenate([s_init[1:], w_init]))
         
-        # Another geometric with different rate
-        w_init2 = np.exp(-np.arange(n) * 0.2)
+        # Power-law-like tail (heavier)
+        w_init2 = 1.0 / (np.arange(n) + 1.0)**1.5
         w_init2 = w_init2 / w_init2.sum()
         x0_list.append(np.concatenate([s_init[1:], w_init2]))
         
+        # Log-normal-like spread
+        s_init_log = np.zeros(n)
+        s_init_log[1:] = np.exp(rng.uniform(0, 3, n-1))
+        s_init_log = np.sort(s_init_log)
+        w_init3 = np.exp(-0.5 * (np.log(s_init_log[1:] + 1e-6) - np.mean(np.log(s_init_log[1:] + 1e-6)))**2)
+        w_init3 = np.concatenate([[1.0], w_init3])
+        w_init3 = w_init3 / w_init3.sum()
+        x0_list.append(np.concatenate([s_init_log[1:], w_init3]))
+        
         # Random guesses
-        rng = np.random.RandomState(42)
-        for _ in range(10):
+        for _ in range(5):
             s_rand = np.zeros(n)
-            s_rand[1:] = rng.uniform(0, 50, n-1)
+            s_rand[1:] = rng.uniform(0, 100, n-1)
+            s_rand = np.sort(s_rand)
             w_rand = rng.dirichlet(np.ones(n))
             x0_list.append(np.concatenate([s_rand[1:], w_rand]))
             
@@ -284,7 +276,7 @@ def beat_the_average_measure() -> tuple[np.ndarray, np.ndarray]:
                 bounds, 
                 args=(n,),
                 seed=42,
-                maxiter=100,
+                maxiter=150,
                 popsize=15,
                 tol=1e-5,
                 polish=False,
@@ -300,7 +292,6 @@ def beat_the_average_measure() -> tuple[np.ndarray, np.ndarray]:
                 w_sum = w.sum()
                 if w_sum > 0:
                     w = w / w_sum
-                # Sort support and weights
                 order = np.argsort(s)
                 s = s[order]
                 w = w[order]
@@ -328,7 +319,7 @@ def beat_the_average_measure() -> tuple[np.ndarray, np.ndarray]:
                 x0, 
                 args=(n,),
                 method='Nelder-Mead', 
-                options={'maxiter': 2000, 'xatol': 1e-8, 'fatol': 1e-10}
+                options={'maxiter': 5000, 'xatol': 1e-10, 'fatol': 1e-12}
             )
             P_val = -res.fun
             if P_val > best_P:

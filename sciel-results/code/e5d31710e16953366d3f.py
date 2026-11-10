@@ -1,0 +1,549 @@
+"""HP lattice protein folding on the square lattice."""
+# EVOLVE-BLOCK-START
+import random
+import time
+
+_DEADLINE = time.time() + 175.0
+
+
+def _neighbours(point):
+    """Yield the 4 unit-step neighbours of a 2D point (tuple)."""
+    x, y = point
+    return [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
+
+
+def _compute_energy(sequence, chain):
+    """Compute the negative number of non-adjacent H-H contacts."""
+    where = {p: i for i, p in enumerate(chain)}
+    contacts = 0
+    for i, p in enumerate(chain):
+        if sequence[i] == 'H':
+            x, y = p
+            for q in ((x+1, y), (x-1, y), (x, y+1), (x, y-1)):
+                j = where.get(q)
+                if j is not None and abs(j - i) > 1 and sequence[j] == 'H':
+                    contacts += 1
+    return -contacts // 2
+
+
+def _greedy_grow(sequence, dimension, rng, temperature=0.0):
+    """
+    Randomized greedy chain growth.
+    Prefer sites that create new H-H contacts, then sites with more free space.
+    """
+    start = (0, 0)
+    chain = [start]
+    occupied = {start: 0}
+    n = len(sequence)
+
+    for i in range(1, n):
+        last = chain[-1]
+        lx, ly = last
+        options = []
+        for site in ((lx+1, ly), (lx-1, ly), (lx, ly+1), (lx, ly-1)):
+            if site in occupied:
+                continue
+            sx, sy = site
+            gain = 0
+            if sequence[i] == 'H':
+                for q in ((sx+1, sy), (sx-1, sy), (sx, sy+1), (sx, sy-1)):
+                    j = occupied.get(q)
+                    if j is not None and j < i - 1 and sequence[j] == 'H':
+                        gain += 1
+            free = 0
+            for q in ((sx+1, sy), (sx-1, sy), (sx, sy+1), (sx, sy-1)):
+                if q not in occupied:
+                    free += 1
+            score = gain * 10.0 + free * 0.1 + rng.random() * temperature
+            options.append((score, site))
+
+        if not options:
+            return None
+
+        best_score, best_site = max(options, key=lambda x: x[0])
+        occupied[best_site] = i
+        chain.append(best_site)
+
+    return chain
+
+
+def _greedy_grow_biased(sequence, dimension, rng, temperature=0.0):
+    """
+    Greedy growth with center bias for compactness in later stages.
+    """
+    start = (0, 0)
+    chain = [start]
+    occupied = {start: 0}
+    n = len(sequence)
+
+    for i in range(1, n):
+        last = chain[-1]
+        lx, ly = last
+        options = []
+        
+        # Compute center of mass for bias
+        if i > n * 0.2:
+            cx = sum(p[0] for p in chain) / len(chain)
+            cy = sum(p[1] for p in chain) / len(chain)
+        else:
+            cx, cy = 0, 0
+
+        for site in ((lx+1, ly), (lx-1, ly), (lx, ly+1), (lx, ly-1)):
+            if site in occupied:
+                continue
+            sx, sy = site
+            gain = 0
+            if sequence[i] == 'H':
+                for q in ((sx+1, sy), (sx-1, sy), (sx, sy+1), (sx, sy-1)):
+                    j = occupied.get(q)
+                    if j is not None and j < i - 1 and sequence[j] == 'H':
+                        gain += 1
+            free = 0
+            for q in ((sx+1, sy), (sx-1, sy), (sx, sy+1), (sx, sy-1)):
+                if q not in occupied:
+                    free += 1
+            
+            center_bias = 0.0
+            if i > n * 0.2:
+                dist = abs(sx - cx) + abs(sy - cy)
+                center_bias = -dist * 0.3
+
+            score = gain * 10.0 + free * 0.1 + center_bias + rng.random() * temperature
+            options.append((score, site))
+
+        if not options:
+            return None
+
+        best_score, best_site = max(options, key=lambda x: x[0])
+        occupied[best_site] = i
+        chain.append(best_site)
+
+    return chain
+
+
+def _greedy_grow_from_fixed(suffix_seq, start_pos, prefix, full_sequence, rng, temperature=0.0):
+    """
+    Greedy growth for suffix, with proper access to full sequence for H checks.
+    """
+    if not suffix_seq:
+        return []
+
+    # Build occupied set from prefix with their global indices
+    occupied = {p: i for i, p in enumerate(prefix)}
+    chain = [start_pos]
+
+    for i, res in enumerate(suffix_seq):
+        global_idx = len(prefix) + i
+        last = chain[-1]
+        lx, ly = last
+        options = []
+        for site in ((lx+1, ly), (lx-1, ly), (lx, ly+1), (lx, ly-1)):
+            if site in occupied:
+                continue
+            sx, sy = site
+            gain = 0
+            if res == 'H':
+                for q in ((sx+1, sy), (sx-1, sy), (sx, sy+1), (sx, sy-1)):
+                    j = occupied.get(q)
+                    if j is not None and j < global_idx - 1 and full_sequence[j] == 'H':
+                        gain += 1
+            free = 0
+            for q in ((sx+1, sy), (sx-1, sy), (sx, sy+1), (sx, sy-1)):
+                if q not in occupied:
+                    free += 1
+            score = gain * 10.0 + free * 0.1 + rng.random() * temperature
+            options.append((score, site))
+
+        if not options:
+            return None
+
+        best_score, best_site = max(options, key=lambda x: x[0])
+        occupied[best_site] = global_idx
+        chain.append(best_site)
+
+    return chain[1:]
+
+
+def _regrow_sa(sequence, chain, rng, max_iters=2000, start_temp=3.0, cool_rate=0.997):
+    """
+    Simulated annealing using regrow moves: pick a split point, regrow the suffix.
+    """
+    n = len(sequence)
+    if n < 4:
+        return chain, _compute_energy(sequence, chain)
+
+    current_energy = _compute_energy(sequence, chain)
+    best_chain = list(chain)
+    best_energy = current_energy
+    temp = start_temp
+    no_improve = 0
+
+    for it in range(max_iters):
+        if time.time() > _DEADLINE - 10:
+            break
+        if temp < 0.05:
+            break
+
+        # Pick a random split point (keep at least 3 residues in prefix, 2 in suffix)
+        min_split = 3
+        max_split = max(min_split, n - 3)
+        if max_split <= min_split:
+            break
+        split = rng.randint(min_split, max_split)
+
+        prefix = chain[:split]
+        suffix_seq = sequence[split:]
+
+        # Regrow suffix from the end of prefix
+        new_suffix = _greedy_grow_from_fixed(suffix_seq, prefix[-1], prefix, sequence, rng, temperature=temp)
+        if new_suffix is None:
+            temp *= cool_rate
+            no_improve += 1
+            continue
+
+        new_chain = prefix + new_suffix
+        new_energy = _compute_energy(sequence, new_chain)
+
+        delta = new_energy - current_energy
+        if delta < 0 or (temp > 0 and rng.random() < (10 ** (-delta / max(temp, 0.1)))):
+            chain = new_chain
+            current_energy = new_energy
+            if current_energy < best_energy:
+                best_energy = current_energy
+                best_chain = list(chain)
+                no_improve = 0
+            else:
+                no_improve += 1
+        else:
+            no_improve += 1
+
+        temp *= cool_rate
+
+        if no_improve > 300:
+            break
+
+    return best_chain, best_energy
+
+
+def _local_improve(sequence, chain, rng, max_moves=5000):
+    """
+    Improve conformation via local moves: kink flips and short regrows.
+    """
+    n = len(chain)
+    if n < 3:
+        return chain, _compute_energy(sequence, chain)
+
+    occupied = {p: i for i, p in enumerate(chain)}
+    current_energy = _compute_energy(sequence, chain)
+    best_chain = list(chain)
+    best_energy = current_energy
+    no_improve_count = 0
+
+    for _ in range(max_moves):
+        if time.time() > _DEADLINE - 5:
+            break
+
+        move_type = rng.random()
+        improved = False
+
+        if move_type < 0.5:
+            # Kink flip: try to move residue i to a neighbor that maintains connectivity
+            i = rng.randint(1, n - 2)
+            p = chain[i]
+            prev, nxt = chain[i-1], chain[i+1]
+            px, py = prev
+            nx, ny = nxt
+
+            candidates = []
+            for np in ((px+1, py), (px-1, py), (px, py+1), (px, py-1)):
+                if np == p:
+                    continue
+                if abs(np[0]-nx) + abs(np[1]-ny) != 1:
+                    continue
+                if np in occupied and occupied[np] != i:
+                    continue
+                candidates.append(np)
+
+            if candidates:
+                np = rng.choice(candidates)
+                # Perform move
+                del occupied[p]
+                chain[i] = np
+                occupied[np] = i
+                new_energy = _compute_energy(sequence, chain)
+
+                if new_energy < current_energy:
+                    current_energy = new_energy
+                    if new_energy < best_energy:
+                        best_energy = new_energy
+                        best_chain = list(chain)
+                    no_improve_count = 0
+                    improved = True
+                else:
+                    # Revert
+                    del occupied[np]
+                    chain[i] = p
+                    occupied[p] = i
+                    no_improve_count += 1
+
+        else:
+            # Short regrow: regrow last 3-5 residues
+            length = rng.randint(3, min(5, n-3))
+            split = n - length
+            prefix = chain[:split]
+            suffix_seq = sequence[split:]
+
+            new_suffix = _greedy_grow_from_fixed(suffix_seq, prefix[-1], prefix, sequence, rng, temperature=0.5)
+            if new_suffix is not None:
+                new_chain = prefix + new_suffix
+                new_energy = _compute_energy(sequence, new_chain)
+
+                if new_energy < current_energy:
+                    # Update occupied set
+                    occupied = {p: i for i, p in enumerate(new_chain)}
+                    chain = new_chain
+                    current_energy = new_energy
+                    if new_energy < best_energy:
+                        best_energy = new_energy
+                        best_chain = list(chain)
+                    no_improve_count = 0
+                    improved = True
+                else:
+                    no_improve_count += 1
+
+        if not improved:
+            no_improve_count += 1
+
+        if no_improve_count > 500:
+            break
+
+    return best_chain, best_energy
+
+
+def _simulated_annealing_full(sequence, chain, rng, iterations=5000, start_temp=5.0, cool_rate=0.999):
+    """
+    Full simulated annealing with various move types.
+    """
+    n = len(chain)
+    if n < 4:
+        return chain, _compute_energy(sequence, chain)
+
+    occupied = {p: i for i, p in enumerate(chain)}
+    current_energy = _compute_energy(sequence, chain)
+    best_chain = list(chain)
+    best_energy = current_energy
+    temp = start_temp
+    no_improve = 0
+
+    for it in range(iterations):
+        if time.time() > _DEADLINE - 15:
+            break
+        if temp < 0.01:
+            break
+
+        move_type = rng.random()
+        accepted = False
+
+        if move_type < 0.4:
+            # Kink flip
+            i = rng.randint(1, n - 2)
+            p = chain[i]
+            prev, nxt = chain[i-1], chain[i+1]
+            px, py = prev
+            nx, ny = nxt
+
+            candidates = []
+            for np in ((px+1, py), (px-1, py), (px, py+1), (px, py-1)):
+                if np == p:
+                    continue
+                if abs(np[0]-nx) + abs(np[1]-ny) != 1:
+                    continue
+                if np in occupied and occupied[np] != i:
+                    continue
+                candidates.append(np)
+
+            if candidates:
+                np = rng.choice(candidates)
+                del occupied[p]
+                chain[i] = np
+                occupied[np] = i
+                new_energy = _compute_energy(sequence, chain)
+
+                delta = new_energy - current_energy
+                if delta < 0 or (temp > 0 and rng.random() < (10 ** (-delta / max(temp, 0.1)))):
+                    current_energy = new_energy
+                    accepted = True
+                else:
+                    del occupied[np]
+                    chain[i] = p
+                    occupied[p] = i
+
+        elif move_type < 0.7:
+            # Single residue move (if possible)
+            i = rng.randint(1, n - 2)
+            p = chain[i]
+            prev, nxt = chain[i-1], chain[i+1]
+            px, py = prev
+            nx, ny = nxt
+
+            # Find valid positions that are neighbors of both prev and nxt
+            valid_positions = set()
+            for np in ((px+1, py), (px-1, py), (px, py+1), (px, py-1)):
+                if abs(np[0]-nx) + abs(np[1]-ny) == 1:
+                    valid_positions.add(np)
+
+            if valid_positions:
+                np = rng.choice(list(valid_positions))
+                if np != p and (np not in occupied or occupied[np] == i):
+                    del occupied[p]
+                    chain[i] = np
+                    occupied[np] = i
+                    new_energy = _compute_energy(sequence, chain)
+
+                    delta = new_energy - current_energy
+                    if delta < 0 or (temp > 0 and rng.random() < (10 ** (-delta / max(temp, 0.1)))):
+                        current_energy = new_energy
+                        accepted = True
+                    else:
+                        del occupied[np]
+                        chain[i] = p
+                        occupied[p] = i
+
+        else:
+            # Regrow suffix
+            min_split = max(3, n - 8)
+            max_split = max(min_split, n - 2)
+            if max_split > min_split:
+                split = rng.randint(min_split, max_split)
+                prefix = chain[:split]
+                suffix_seq = sequence[split:]
+
+                new_suffix = _greedy_grow_from_fixed(suffix_seq, prefix[-1], prefix, sequence, rng, temperature=temp)
+                if new_suffix is not None:
+                    new_chain = prefix + new_suffix
+                    new_energy = _compute_energy(sequence, new_chain)
+
+                    delta = new_energy - current_energy
+                    if delta < 0 or (temp > 0 and rng.random() < (10 ** (-delta / max(temp, 0.1)))):
+                        chain = new_chain
+                        occupied = {p: i for i, p in enumerate(chain)}
+                        current_energy = new_energy
+                        accepted = True
+
+        if accepted:
+            if current_energy < best_energy:
+                best_energy = current_energy
+                best_chain = list(chain)
+                no_improve = 0
+            else:
+                no_improve += 1
+        else:
+            no_improve += 1
+
+        temp *= cool_rate
+
+        if no_improve > 200:
+            # Restart from best
+            chain = list(best_chain)
+            occupied = {p: i for i, p in enumerate(chain)}
+            current_energy = best_energy
+            temp = max(temp, 1.0)
+            no_improve = 0
+
+    return best_chain, best_energy
+
+
+def fold(sequence, dimension):
+    """
+    Fold the sequence using a portfolio of greedy growths with different random seeds
+    and temperatures, plus regrow-SA and local improvement. Keep the best within the time budget.
+    """
+    rng = random.Random(42)
+    best_chain = None
+    best_energy = 0  # We want to minimize energy (more negative is better)
+
+    n = len(sequence)
+
+    # Adaptive time allocation based on sequence length
+    if n < 30:
+        greedy_time = 35.0
+        sa_time = 55.0
+        local_time = 25.0
+        full_sa_time = 25.0
+    elif n < 60:
+        greedy_time = 25.0
+        sa_time = 45.0
+        local_time = 20.0
+        full_sa_time = 35.0
+    else:
+        greedy_time = 15.0
+        sa_time = 35.0
+        local_time = 15.0
+        full_sa_time = 50.0
+
+    # Phase 1: Multiple greedy restarts with varying temperatures
+    # Mix standard and center-biased growth
+    phase1_end = time.time() + greedy_time
+    for attempt in range(10000):
+        if time.time() > phase1_end:
+            break
+
+        temp = rng.uniform(0.0, 3.0)
+        # Alternate between standard and biased growth
+        if attempt % 2 == 0:
+            chain = _greedy_grow(sequence, dimension, rng, temperature=temp)
+        else:
+            chain = _greedy_grow_biased(sequence, dimension, rng, temperature=temp)
+        
+        if chain is None:
+            continue
+
+        energy = _compute_energy(sequence, chain)
+        if best_chain is None or energy < best_energy:
+            best_chain = chain
+            best_energy = energy
+
+    # Phase 2: Multiple regrow-SA passes with different parameters
+    if best_chain is not None:
+        phase2_end = time.time() + sa_time
+        for sa_pass in range(4):
+            if time.time() > phase2_end:
+                break
+            remaining_time = phase2_end - time.time()
+            if remaining_time < 5.0:
+                break
+
+            start_temp = 3.0 - sa_pass * 0.3
+            cool_rate = 0.998 - sa_pass * 0.0005
+            sa_chain, sa_energy = _regrow_sa(
+                sequence, best_chain, rng, max_iters=8000, 
+                start_temp=start_temp, cool_rate=cool_rate)
+            if sa_energy < best_energy:
+                best_chain = sa_chain
+                best_energy = sa_energy
+
+    # Phase 3: Full simulated annealing
+    if best_chain is not None:
+        phase3_end = time.time() + full_sa_time
+        fa_chain, fa_energy = _simulated_annealing_full(
+            sequence, best_chain, rng, iterations=15000,
+            start_temp=5.0, cool_rate=0.9995)
+        if fa_energy < best_energy:
+            best_chain = fa_chain
+            best_energy = fa_energy
+
+    # Phase 4: Local improvement on the best found
+    if best_chain is not None:
+        phase4_end = time.time() + local_time
+        improved_chain, improved_energy = _local_improve(
+            sequence, best_chain, rng, max_moves=10000)
+        if improved_energy < best_energy:
+            best_chain = improved_chain
+            best_energy = improved_energy
+
+    # Fallback: straight line
+    if best_chain is None:
+        best_chain = [(i, 0) for i in range(n)]
+
+    return [list(p) for p in best_chain]
+# EVOLVE-BLOCK-END

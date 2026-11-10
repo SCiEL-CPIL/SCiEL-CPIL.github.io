@@ -1,7 +1,7 @@
 # EVOLVE-BLOCK-START
 import numpy as np
 import time
-from scipy.optimize import minimize, differential_evolution
+from scipy.optimize import minimize
 
 
 def _hex_vertices(cx, cy, s, a_deg):
@@ -100,9 +100,6 @@ def _compute_min_enclosing_hex(inner_data, angle_deg):
     """
     Compute the minimum side length of a regular hexagon with given angle
     that contains all vertices of the inner hexagons, centered at origin.
-    Uses the fact that for a hexagon centered at origin with side s and angle a,
-    a point p is inside if |p · n_k| <= s * sqrt(3)/2 for all 6 normals n_k.
-    So s >= max over all vertices and all k of |p · n_k| / (sqrt(3)/2).
     """
     a_rad = np.deg2rad(angle_deg)
     normals = []
@@ -123,38 +120,8 @@ def _compute_min_enclosing_hex(inner_data, angle_deg):
     return side
 
 
-def _smooth_side(inner_data, angle_deg, tau=0.01):
-    """
-    Smooth surrogate for the minimum enclosing hexagon side using log-sum-exp.
-    This makes the objective differentiable for gradient-based optimizers.
-    """
-    a_rad = np.deg2rad(angle_deg)
-    normals = []
-    for k in range(6):
-        ang = a_rad + np.deg2rad(30 + 60 * k)
-        normals.append([np.cos(ang), np.sin(ang)])
-    normals = np.array(normals)
-    
-    all_projs = []
-    for i in range(len(inner_data)):
-        x, y, a = inner_data[i]
-        v = _hex_vertices(x, y, 1.0, a)
-        for p in v:
-            projs = np.abs(p @ normals.T)
-            all_projs.append(projs)
-    
-    all_projs = np.concatenate(all_projs)
-    # soft max via log-sum-exp
-    m = np.max(all_projs)
-    if m < 1e-10:
-        return 0.0
-    logsumexp = m + np.log(np.sum(np.exp((all_projs - m) / tau))) * tau
-    side = logsumexp / (np.sqrt(3) / 2)
-    return side
-
-
-def _build_inner(r1, r2, gangle, ring2_angles):
-    """Build inner hexagons with given parameters."""
+def _build_inner_hexagonal(r1, r2, gangle, ring2_angles):
+    """Build inner hexagons in a hexagonal lattice arrangement."""
     inner = []
     # Center
     inner.append([0.0, 0.0, gangle])
@@ -173,61 +140,143 @@ def _build_inner(r1, r2, gangle, ring2_angles):
     return np.array(inner)
 
 
-def _optimize_configuration(r1_init, r2_init, gangle_init, ring2_angles, deadline):
+def _build_inner_6fold_sym(r1, r2, gangle):
+    """
+    Build 11 hexagons with 6-fold rotational symmetry:
+    - 1 at center
+    - 6 at radius r1, angles 0, 60, ..., 300
+    - 4 at radius r2, angles 30, 90, 150, 210, 270, 330 minus two opposite ones
+    Actually for 6-fold symmetry with 11 total: center + 6 in ring1 + 4 in ring2
+    doesn't have 6-fold symmetry. Let's use: center + 6 in ring1 at 60-deg intervals,
+    and 4 in ring2 at 30, 150, 210, 330 (which breaks 6-fold).
+    
+    Alternative: Use 6-fold symmetric placement where ring2 has 6 hexagons too,
+    but that's 13 total. For 11, we need to break symmetry slightly.
+    
+    Let's instead optimize the 4 ring2 angles as parameters with 6-fold constraint:
+    ring2 angles are 30 + 60*k for k in {0,1,3,4} or similar.
+    """
+    inner = []
+    # Center
+    inner.append([0.0, 0.0, gangle])
+    # First ring: 6 hexagons
+    for k in range(6):
+        ang = np.deg2rad(60 * k)
+        x = r1 * np.cos(ang)
+        y = r1 * np.sin(ang)
+        inner.append([x, y, gangle])
+    # Second ring: 4 hexagons at 30+60k for k in [0, 1, 3, 4]
+    # This gives angles: 30, 90, 210, 270
+    ring2_angles = [30, 90, 210, 270]
+    for ang_deg in ring2_angles:
+        ang = np.deg2rad(ang_deg)
+        x = r2 * np.cos(ang)
+        y = r2 * np.sin(ang)
+        inner.append([x, y, gangle])
+    return np.array(inner)
+
+
+def _build_inner_grid(r1, r2, gangle, ring2_angles):
+    """Build inner hexagons in a grid-like arrangement."""
+    inner = []
+    # Center
+    inner.append([0.0, 0.0, gangle])
+    # First ring: 6 hexagons at 60-degree intervals
+    for k in range(6):
+        ang = np.deg2rad(60 * k)
+        x = r1 * np.cos(ang)
+        y = r1 * np.sin(ang)
+        inner.append([x, y, gangle])
+    # Second ring: 4 hexagons at specified angles
+    for ang_deg in ring2_angles:
+        ang = np.deg2rad(ang_deg)
+        x = r2 * np.cos(ang)
+        y = r2 * np.sin(ang)
+        inner.append([x, y, gangle])
+    return np.array(inner)
+
+
+def _optimize_configuration(r1_init, r2_init, gangle_init, ring2_angles, deadline, build_func):
     """Optimize r1, r2, gangle for a given ring2 angle configuration."""
     
     def objective(params):
         r1, r2, gangle = params
-        if r1 < 0.5 or r2 < 1.0 or r1 > 10 or r2 > 15:
+        if r1 < 0.1 or r2 < 0.5 or r1 > 20 or r2 > 20:
             return 1000.0
-        inner = _build_inner(r1, r2, gangle, ring2_angles)
+        inner = build_func(r1, r2, gangle, ring2_angles)
         outer = np.array([0.0, 0.0, gangle])
         side = _compute_min_enclosing_hex(inner, gangle)
         if not _valid(inner, outer, side):
-            return side + 1000.0
+            return side + 500.0
         return side
+    
+    best_result = None
+    best_side = float('inf')
     
     try:
         res = minimize(
             objective,
             [r1_init, r2_init, gangle_init],
             method='Powell',
-            options={'maxiter': 2000, 'xatol': 1e-8, 'fatol': 1e-8}
+            options={'maxiter': 3000, 'xatol': 1e-9, 'fatol': 1e-9}
         )
-        if res.fun < 100:  # valid solution
+        if res.fun < 200:  # valid solution
             r1, r2, gangle = res.x
-            inner = _build_inner(r1, r2, gangle, ring2_angles)
+            inner = build_func(r1, r2, gangle, ring2_angles)
             outer = np.array([0.0, 0.0, gangle])
             side = _compute_min_enclosing_hex(inner, gangle)
             if _valid(inner, outer, side):
-                return inner, outer, side
+                best_result = (inner, outer, side)
+                best_side = side
     except Exception:
         pass
     
-    # Try BFGS with smooth surrogate as a second pass
+    # Try Nelder-Mead as a second approach
     try:
-        def smooth_objective(params):
-            r1, r2, gangle = params
-            if r1 < 0.5 or r2 < 1.0 or r1 > 10 or r2 > 15:
-                return 1000.0
-            inner = _build_inner(r1, r2, gangle, ring2_angles)
-            outer = np.array([0.0, 0.0, gangle])
-            side_smooth = _smooth_side(inner, gangle, tau=0.01)
-            # Check validity and add penalty if invalid
-            side_exact = _compute_min_enclosing_hex(inner, gangle)
-            if not _valid(inner, outer, side_exact):
-                return side_smooth + 500.0
-            return side_smooth
-        
         res2 = minimize(
-            smooth_objective,
+            objective,
             [r1_init, r2_init, gangle_init],
-            method='BFGS',
-            options={'maxiter': 1000, 'gtol': 1e-8}
+            method='Nelder-Mead',
+            options={'maxiter': 5000, 'xatol': 1e-9, 'fatol': 1e-9}
         )
-        if res2.fun < 100:
+        if res2.fun < 200:
             r1, r2, gangle = res2.x
-            inner = _build_inner(r1, r2, gangle, ring2_angles)
+            inner = build_func(r1, r2, gangle, ring2_angles)
+            outer = np.array([0.0, 0.0, gangle])
+            side = _compute_min_enclosing_hex(inner, gangle)
+            if _valid(inner, outer, side) and side < best_side:
+                best_result = (inner, outer, side)
+                best_side = side
+    except Exception:
+        pass
+    
+    return best_result
+
+
+def _optimize_free_positions(positions_init, gangle, deadline):
+    """
+    Optimize free positions of 11 hexagons (all with same orientation gangle).
+    positions_init: (11, 2) array of (x, y) for each hexagon.
+    """
+    def objective(params):
+        pos = params[:22].reshape(11, 2)
+        inner = np.column_stack([pos, np.full(11, gangle)])
+        outer = np.array([0.0, 0.0, gangle])
+        side = _compute_min_enclosing_hex(inner, gangle)
+        if not _valid(inner, outer, side):
+            return side + 500.0
+        return side
+    
+    try:
+        res = minimize(
+            objective,
+            positions_init.flatten(),
+            method='Powell',
+            options={'maxiter': 5000, 'xatol': 1e-9, 'fatol': 1e-9}
+        )
+        if res.fun < 200:
+            pos = res.x[:22].reshape(11, 2)
+            inner = np.column_stack([pos, np.full(11, gangle)])
             outer = np.array([0.0, 0.0, gangle])
             side = _compute_min_enclosing_hex(inner, gangle)
             if _valid(inner, outer, side):
@@ -243,24 +292,26 @@ def hexagon_packing_11():
     Constructs a packing of 11 disjoint unit regular hexagons inside a larger regular hexagon.
     Returns (inner, outer, side) where inner is (11,3), outer is (3,), side is float.
     """
-    deadline = time.time() + 590.0  # safety margin
+    deadline = time.time() + 600.0  # safety margin before 630s kill
     
     best_result = None
     best_side = float('inf')
     
     # Try multiple ring2 angle configurations
     ring2_configs = [
-        [30, 150, 210, 330],   # 30 + 60k for k=0,2,3,5
-        [0, 120, 180, 300],    # 0 + 60k for k=0,2,3,5
-        [60, 180, 240, 0],     # 60 + 60k for k=0,2,3,5
-        [90, 210, 270, 30],    # 90 + 60k for k=0,2,3,5
-        [150, 270, 330, 90],   # 150 + 60k for k=0,2,3,5
-        [30, 90, 150, 210],    # consecutive 60-degree spacing
+        [30, 150, 210, 330],
+        [0, 120, 180, 300],
+        [60, 180, 240, 300],
+        [90, 210, 270, 30],
+        [150, 270, 330, 90],
+        [30, 90, 150, 210],
+        [60, 120, 240, 300],
+        [0, 60, 180, 240],
     ]
     
     # Initial guesses for each configuration
     for ring2_angles in ring2_configs:
-        if time.time() > deadline - 30:
+        if time.time() > deadline - 60:
             break
         
         initial_guesses = [
@@ -271,53 +322,60 @@ def hexagon_packing_11():
             [3.0, 5.0, 0.0],
             [2.2, 4.2, 15.0],
             [2.8, 4.8, 45.0],
+            [2.5, 5.0, 0.0],
+            [2.5, 5.0, 30.0],
         ]
         
         for guess in initial_guesses:
-            if time.time() > deadline - 30:
+            if time.time() > deadline - 60:
                 break
             
-            result = _optimize_configuration(guess[0], guess[1], guess[2], ring2_angles, deadline)
+            result = _optimize_configuration(guess[0], guess[1], guess[2], ring2_angles, deadline, _build_inner_hexagonal)
             if result is not None:
                 inner, outer, side = result
                 if side < best_side:
                     best_side = side
                     best_result = (inner, outer, side)
     
+    # Try free position optimization from the best structured result
+    if best_result is not None and time.time() < deadline - 30:
+        inner, outer, side = best_result
+        gangle = inner[0, 2]
+        pos_init = inner[:, :2].copy()
+        
+        result = _optimize_free_positions(pos_init, gangle, deadline)
+        if result is not None:
+            inner2, outer2, side2 = result
+            if side2 < best_side:
+                best_side = side2
+                best_result = (inner2, outer2, side2)
+    
     # If we found a good result, do a final high-precision polish pass
     if best_result is not None and time.time() < deadline - 20:
         inner, outer, side = best_result
-        # Extract current parameters for polish
-        # Re-optimize from the best found with tighter tolerance
-        ring2_angles_best = ring2_configs[0]  # Use first config as polish base
-        # Try to polish with BFGS from the best point
+        gangle = inner[0, 2]
+        pos_init = inner[:, :2].copy()
+        
+        # Polish with tighter tolerance
+        def polish_objective(params):
+            pos = params[:22].reshape(11, 2)
+            inner_p = np.column_stack([pos, np.full(11, gangle)])
+            outer_p = np.array([0.0, 0.0, gangle])
+            side_p = _compute_min_enclosing_hex(inner_p, gangle)
+            if not _valid(inner_p, outer_p, side_p):
+                return side_p + 500.0
+            return side_p
+        
         try:
-            # We need to extract r1, r2, gangle from the best inner
-            # For now, just re-run optimization with the best as initial
-            r1_est = np.sqrt(inner[1, 0]**2 + inner[1, 1]**2)  # distance to first ring hex
-            r2_est = np.sqrt(inner[7, 0]**2 + inner[7, 1]**2)  # distance to second ring hex
-            gangle_est = inner[0, 2]
-            
-            def polish_objective(params):
-                r1, r2, gangle = params
-                if r1 < 0.5 or r2 < 1.0 or r1 > 10 or r2 > 15:
-                    return 1000.0
-                inner_p = _build_inner(r1, r2, gangle, ring2_angles_best)
-                outer_p = np.array([0.0, 0.0, gangle])
-                side_p = _compute_min_enclosing_hex(inner_p, gangle)
-                if not _valid(inner_p, outer_p, side_p):
-                    return side_p + 1000.0
-                return side_p
-            
             res_polish = minimize(
                 polish_objective,
-                [r1_est, r2_est, gangle_est],
+                pos_init.flatten(),
                 method='Powell',
-                options={'maxiter': 5000, 'xatol': 1e-10, 'fatol': 1e-10}
+                options={'maxiter': 10000, 'xatol': 1e-10, 'fatol': 1e-10}
             )
-            if res_polish.fun < 100:
-                r1, r2, gangle = res_polish.x
-                inner_p = _build_inner(r1, r2, gangle, ring2_angles_best)
+            if res_polish.fun < 200:
+                pos = res_polish.x[:22].reshape(11, 2)
+                inner_p = np.column_stack([pos, np.full(11, gangle)])
                 outer_p = np.array([0.0, 0.0, gangle])
                 side_p = _compute_min_enclosing_hex(inner_p, gangle)
                 if _valid(inner_p, outer_p, side_p) and side_p < best_side:
@@ -326,83 +384,28 @@ def hexagon_packing_11():
         except Exception:
             pass
     
-    # Use differential evolution for broader exploration if time permits
-    if time.time() < deadline - 60:
-        for ring2_angles in ring2_configs[:3]:
-            if time.time() > deadline - 30:
-                break
-            
-            def de_objective(params):
-                r1, r2, gangle = params
-                if r1 < 0.5 or r2 < 1.0 or r1 > 10 or r2 > 15:
-                    return 1000.0
-                inner = _build_inner(r1, r2, gangle, ring2_angles)
-                outer = np.array([0.0, 0.0, gangle])
-                side = _compute_min_enclosing_hex(inner, gangle)
-                if not _valid(inner, outer, side):
-                    return side + 1000.0
-                return side
-            
-            try:
-                bounds = [(1.5, 4.0), (3.0, 7.0), (0.0, 60.0)]
-                res_de = differential_evolution(
-                    de_objective,
-                    bounds=bounds,
-                    maxiter=200,
-                    popsize=15,
-                    tol=1e-8,
-                    seed=42,
-                    polish=True
-                )
-                if res_de.fun < 100:
-                    r1, r2, gangle = res_de.x
-                    inner_de = _build_inner(r1, r2, gangle, ring2_angles)
-                    outer_de = np.array([0.0, 0.0, gangle])
-                    side_de = _compute_min_enclosing_hex(inner_de, gangle)
-                    if _valid(inner_de, outer_de, side_de) and side_de < best_side:
-                        best_side = side_de
-                        best_result = (inner_de, outer_de, side_de)
-            except Exception:
-                pass
-    
-    # Also try a simple grid-based search as fallback
+    # Fallback to a known valid arrangement if nothing else works
     if best_result is None:
-        # Try fixed angle=0 and search r1, r2 on a grid
-        for gangle in [0.0, 30.0, 60.0]:
-            for r1 in np.arange(2.0, 3.5, 0.1):
-                if time.time() > deadline - 10:
-                    break
-                for r2 in np.arange(3.5, 6.0, 0.1):
-                    for ring2_angles in ring2_configs[:3]:
-                        inner = _build_inner(r1, r2, gangle, ring2_angles)
-                        outer = np.array([0.0, 0.0, gangle])
-                        side = _compute_min_enclosing_hex(inner, gangle)
-                        if _valid(inner, outer, side) and side < best_side:
-                            best_side = side
-                            best_result = (inner, outer, side)
+        inner_hex_data = np.array(
+            [
+                [0, 0, 0],
+                [-2.5, 0, 0],
+                [2.5, 0, 0],
+                [-1.25, 2.17, 0],
+                [1.25, 2.17, 0],
+                [-1.25, -2.17, 0],
+                [1.25, -2.17, 0],
+                [-3.75, 2.17, 0],
+                [3.75, 2.17, 0],
+                [-3.75, -2.17, 0],
+                [3.75, -2.17, 0],
+            ]
+        )
+        outer_hex_data = np.array([0, 0, 0])
+        outer_hex_side_length = 8.0
+        return inner_hex_data, outer_hex_data, outer_hex_side_length
     
-    if best_result is not None:
-        return best_result
-    
-    # Fallback to the seed arrangement
-    inner_hex_data = np.array(
-        [
-            [0, 0, 0],
-            [-2.5, 0, 0],
-            [2.5, 0, 0],
-            [-1.25, 2.17, 0],
-            [1.25, 2.17, 0],
-            [-1.25, -2.17, 0],
-            [1.25, -2.17, 0],
-            [-3.75, 2.17, 0],
-            [3.75, 2.17, 0],
-            [-3.75, -2.17, 0],
-            [3.75, -2.17, 0],
-        ]
-    )
-    outer_hex_data = np.array([0, 0, 0])
-    outer_hex_side_length = 8.0
-    return inner_hex_data, outer_hex_data, outer_hex_side_length
+    return best_result
 
 
 # EVOLVE-BLOCK-END

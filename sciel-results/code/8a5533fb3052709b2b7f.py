@@ -1,0 +1,6 @@
+# line_id[:, x] for all critical x: line_id[:, crit_idx] is shape (50, n_crit)
+# line_id[:, p] is shape (50,)
+# conflict = (line_id[:, crit_idx] == line_id[:, p][:, None])  # shape (50, n_crit)
+# one_mask_crit = one_mask[crit_idx]  # shape (n_crit, 50)
+# ok = np.any(one_mask_crit.T & ~conflict, axis=0)  # shape (n_crit,)
+# can_add = ok.all()

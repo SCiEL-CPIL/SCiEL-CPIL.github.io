@@ -1,0 +1,356 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+from scipy.optimize import differential_evolution, minimize
+import time
+
+def equidistant_points_polygon20() -> np.ndarray:
+    """
+    Build a convex 20-gon maximizing minimum vertex score.
+    Uses edge-length + exterior-angle representation (guarantees convexity),
+    initialized via Fourier perturbation of regular polygon.
+    Global search: differential evolution. Local refinement: Nelder-Mead.
+    """
+    n = 20
+    start_time = time.time()
+    deadline = start_time + 590.0  # safety margin before 630s kill
+
+    def _time_ok(remaining=10.0):
+        return time.time() < deadline - remaining
+
+    def _regular_polygon():
+        angles = np.linspace(0, 2*np.pi, n, endpoint=False)
+        return np.column_stack([np.cos(angles), np.sin(angles)])
+
+    def _normalize(points):
+        centroid = np.mean(points, axis=0)
+        pts = points - centroid
+        dists = np.linalg.norm(pts, axis=1)
+        mean_d = np.mean(dists)
+        if mean_d <= 0.01:
+            return None
+        return pts / mean_d
+
+    def _is_strictly_convex(points, tol=1e-12):
+        """Check strict convexity: all cross products same sign, nonzero."""
+        p0 = points
+        p1 = np.roll(points, -1, axis=0)
+        p2 = np.roll(points, -2, axis=0)
+        e1 = p1 - p0
+        e2 = p2 - p1
+        cross = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+        if np.any(np.abs(cross) < tol):
+            return False
+        if np.any(cross > 0) and np.any(cross < 0):
+            return False
+        # No repeated points
+        for i in range(n):
+            for j in range(i + 1, n):
+                if np.linalg.norm(points[i] - points[j]) < 1e-10:
+                    return False
+        return True
+
+    def _vertex_score(v_idx, polygon):
+        v = polygon[v_idx]
+        dists = np.sqrt(np.sum((polygon - v) ** 2, axis=1))
+        mask = np.ones(n, dtype=bool)
+        mask[v_idx] = False
+        d = np.sort(dists[mask])  # 19 distances
+
+        if d[0] < 0.05:
+            return 0.0
+
+        diffs = np.diff(d)
+        k = int(np.argmin(diffs))
+        D = (d[k] + d[k + 1]) / 2.0
+        if D < 0.1:
+            return 0.0
+
+        if k == 0:
+            sel = d[0:4]
+        elif k == 17:
+            sel = d[15:19]
+        else:
+            sel = d[k - 1:k + 3]
+
+        with np.errstate(divide='ignore', invalid='ignore'):
+            ratios = np.maximum(sel / D, D / sel)
+        raw = np.mean(ratios)
+        if raw <= 0:
+            return 0.0
+        return min(1.0, 1.0 / raw)
+
+    def _min_vertex_score(polygon):
+        scores = np.array([_vertex_score(i, polygon) for i in range(n)])
+        return float(np.min(scores))
+
+    def _soft_min(scores, beta=50.0):
+        """Differentiable approximation of min."""
+        m = np.min(scores)
+        return m - np.log(np.mean(np.exp(-beta * (scores - m)))) / beta
+
+    def _closure_error(edges, angles):
+        """Sum of edge vectors should be zero for a closed polygon."""
+        # angles are exterior angles; turning angle at vertex i is angles[i]
+        # Edge direction: start at 0, accumulate exterior angles
+        directions = np.zeros(n)
+        for i in range(1, n):
+            directions[i] = directions[i - 1] + angles[i - 1]
+        # Normalize directions
+        ex = edges * np.cos(directions)
+        ey = edges * np.sin(directions)
+        cx = np.sum(ex)
+        cy = np.sum(ey)
+        return cx * cx + cy * cy
+
+    def _edges_angles_to_polygon(edges, angles):
+        """Convert edge lengths and exterior angles to (n,2) polygon."""
+        # Start at origin, first edge along x-axis
+        directions = np.zeros(n)
+        for i in range(1, n):
+            directions[i] = directions[i - 1] + angles[i - 1]
+        ex = edges * np.cos(directions)
+        ey = edges * np.sin(directions)
+        # Cumulative sum gives vertices (starting from 0)
+        xs = np.concatenate([[0.0], np.cumsum(ex)])
+        ys = np.concatenate([[0.0], np.cumsum(ey)])
+        # Drop the last point (should equal first for closed polygon)
+        polygon = np.column_stack([xs[:n], ys[:n]])
+        return polygon
+
+    def _fourier_init():
+        """Initialize edges/angles from a slightly perturbed regular polygon."""
+        # Start with regular polygon
+        angles_reg = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        pts = np.column_stack([np.cos(angles_reg), np.sin(angles_reg)])
+        
+        # Compute edge lengths and exterior angles from regular polygon
+        edges = np.zeros(n)
+        ext_angles = np.zeros(n)
+        for i in range(n):
+            p0 = pts[i]
+            p1 = pts[(i + 1) % n]
+            p2 = pts[(i + 2) % n]
+            e1 = p1 - p0
+            e2 = p2 - p1
+            edges[i] = np.linalg.norm(e1)
+            # Exterior angle: angle from e1 to e2
+            cross = e1[0] * e2[1] - e1[1] * e2[0]
+            dot = np.dot(e1, e2)
+            ext_angles[i] = np.arctan2(cross, dot)
+            if ext_angles[i] < 0:
+                ext_angles[i] += 2 * np.pi
+        
+        # Add small Fourier perturbation to radii, then recompute
+        # Actually, let's just add small noise to edges and angles
+        rng = np.random.RandomState(42)
+        edges_pert = edges * (1.0 + 0.05 * rng.randn(n))
+        angles_pert = ext_angles + 0.02 * rng.randn(n)
+        # Ensure angles are positive and sum to 2*pi
+        angles_pert = np.maximum(angles_pert, 0.1)
+        angles_pert = angles_pert / np.sum(angles_pert) * 2 * np.pi
+        edges_pert = np.maximum(edges_pert, 0.1)
+        
+        return edges_pert, angles_pert
+
+    def _params_to_polygon(params):
+        """params: first n are edges, next n are exterior angles."""
+        edges = params[:n]
+        angles = params[n:]
+        # Ensure positivity
+        edges = np.maximum(edges, 0.05)
+        angles = np.maximum(angles, 0.05)
+        # Normalize angles to sum to 2*pi
+        angle_sum = np.sum(angles)
+        if angle_sum > 0:
+            angles = angles / angle_sum * 2 * np.pi
+        else:
+            angles = np.full(n, 2 * np.pi / n)
+        polygon = _edges_angles_to_polygon(edges, angles)
+        return polygon
+
+    def _score_from_params(params):
+        """Compute score from edge/angle params, with closure penalty."""
+        polygon = _params_to_polygon(params)
+        norm_pts = _normalize(polygon)
+        if norm_pts is None:
+            return -1000.0
+        if not _is_strictly_convex(norm_pts):
+            return -1000.0
+        # Closure error penalty
+        edges = params[:n]
+        angles = params[n:]
+        angles = np.maximum(angles, 0.05)
+        angle_sum = np.sum(angles)
+        if angle_sum > 0:
+            angles = angles / angle_sum * 2 * np.pi
+        closure = _closure_error(edges, angles)
+        if closure > 1e-4:
+            return -1000.0 + closure  # Heavy penalty
+        scores = np.array([_vertex_score(i, norm_pts) for i in range(n)])
+        # Use soft-min for smoothness in optimization
+        return _soft_min(scores, beta=50.0)
+
+    def _hard_min_score(params):
+        """True minimum vertex score (for final evaluation)."""
+        polygon = _params_to_polygon(params)
+        norm_pts = _normalize(polygon)
+        if norm_pts is None:
+            return 0.0
+        if not _is_strictly_convex(norm_pts):
+            return 0.0
+        edges = params[:n]
+        angles = params[n:]
+        angles = np.maximum(angles, 0.05)
+        angle_sum = np.sum(angles)
+        if angle_sum > 0:
+            angles = angles / angle_sum * 2 * np.pi
+        closure = _closure_error(edges, angles)
+        if closure > 1e-3:
+            return 0.0
+        scores = np.array([_vertex_score(i, norm_pts) for i in range(n)])
+        return float(np.min(scores))
+
+    # Initialize
+    edges_init, angles_init = _fourier_init()
+    init_params = np.concatenate([edges_init, angles_init])
+
+    # Get regular polygon score as baseline
+    reg_pts = _regular_polygon()
+    reg_norm = _normalize(reg_pts)
+    best_score = _min_vertex_score(reg_norm) if reg_norm is not None else 0.0
+    best_params = init_params.copy()
+    best_polygon = reg_norm.copy() if reg_norm is not None else reg_pts
+
+    # Define objective for DE (minimize negative soft-min score)
+    def objective(params):
+        s = _score_from_params(params)
+        if s < 0:
+            return 1000.0 - s
+        return -s
+
+    # Bounds for DE
+    # Edges: 0.05 to 3.0
+    # Angles: 0.05 to 1.0 (will be normalized to sum 2*pi)
+    bounds = [(0.05, 3.0)] * n + [(0.05, 1.0)] * n
+
+    # Round 1: Differential Evolution
+    if _time_ok(60):
+        try:
+            result = differential_evolution(
+                objective,
+                bounds,
+                maxiter=300,
+                popsize=20,
+                tol=1e-7,
+                seed=42,
+                polish=True,
+                init='sobol'
+            )
+            if result.fun < 0:
+                cand_params = result.x
+                cand_score = _hard_min_score(cand_params)
+                if cand_score > best_score:
+                    best_score = cand_score
+                    best_params = cand_params
+                    cand_poly = _params_to_polygon(cand_params)
+                    cand_norm = _normalize(cand_poly)
+                    if cand_norm is not None and _is_strictly_convex(cand_norm):
+                        best_polygon = cand_norm
+        except Exception:
+            pass
+
+    # Round 2: Nelder-Mead refinement from best params
+    if _time_ok(30):
+        try:
+            res_nm = minimize(
+                objective,
+                best_params,
+                method='Nelder-Mead',
+                options={'maxiter': 5000, 'xatol': 1e-10, 'fatol': 1e-10, 'adaptive': True}
+            )
+            refine_params = res_nm.x
+            refine_score = _hard_min_score(refine_params)
+            if refine_score > best_score:
+                best_score = refine_score
+                best_params = refine_params
+                refine_poly = _params_to_polygon(refine_params)
+                refine_norm = _normalize(refine_poly)
+                if refine_norm is not None and _is_strictly_convex(refine_norm):
+                    best_polygon = refine_norm
+        except Exception:
+            pass
+
+    # Round 3: Another DE with different seed if time permits
+    if _time_ok(90):
+        try:
+            result2 = differential_evolution(
+                objective,
+                bounds,
+                maxiter=200,
+                popsize=25,
+                tol=1e-7,
+                seed=123,
+                polish=True,
+                init='latinhypercube'
+            )
+            if result2.fun < 0:
+                cand_params2 = result2.x
+                cand_score2 = _hard_min_score(cand_params2)
+                if cand_score2 > best_score:
+                    best_score = cand_score2
+                    best_params = cand_params2
+                    cand_poly2 = _params_to_polygon(cand_params2)
+                    cand_norm2 = _normalize(cand_poly2)
+                    if cand_norm2 is not None and _is_strictly_convex(cand_norm2):
+                        best_polygon = cand_norm2
+            # Refine again
+            if _time_ok(20):
+                res_nm2 = minimize(
+                    objective,
+                    best_params,
+                    method='Nelder-Mead',
+                    options={'maxiter': 3000, 'xatol': 1e-10, 'fatol': 1e-10, 'adaptive': True}
+                )
+                refine_params2 = res_nm2.x
+                refine_score2 = _hard_min_score(refine_params2)
+                if refine_score2 > best_score:
+                    best_score = refine_score2
+                    best_params = refine_params2
+                    refine_poly2 = _params_to_polygon(refine_params2)
+                    refine_norm2 = _normalize(refine_poly2)
+                    if refine_norm2 is not None and _is_strictly_convex(refine_norm2):
+                        best_polygon = refine_norm2
+        except Exception:
+            pass
+
+    # Round 4: Final fine-tuning with very tight Nelder-Mead
+    if _time_ok(15):
+        try:
+            res_final = minimize(
+                objective,
+                best_params,
+                method='Nelder-Mead',
+                options={'maxiter': 2000, 'xatol': 1e-12, 'fatol': 1e-12, 'adaptive': True}
+            )
+            final_params = res_final.x
+            final_score = _hard_min_score(final_params)
+            if final_score > best_score:
+                best_score = final_score
+                best_params = final_params
+                final_poly = _params_to_polygon(final_params)
+                final_norm = _normalize(final_poly)
+                if final_norm is not None and _is_strictly_convex(final_norm):
+                    best_polygon = final_norm
+        except Exception:
+            pass
+
+    # Final validation and return
+    final_norm = _normalize(best_polygon)
+    if final_norm is None or not _is_strictly_convex(final_norm):
+        # Fallback to regular polygon
+        angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        final_norm = _normalize(np.column_stack([np.cos(angles), np.sin(angles)]))
+
+    return final_norm
+
+# EVOLVE-BLOCK-END

@@ -108,14 +108,15 @@ def _complex_gradient(z):
     return gz
 
 
-def _conjugate_gradient_complex_sphere(c0, maxiter=400, tol=1e-13, deadline=None):
+def _conjugate_gradient_complex_sphere(c0, maxiter=400, tol=1e-14, deadline=None):
     """
     Conjugate gradient on the complex unit sphere, exploiting rotational symmetry.
+    Uses backtracking line search with Armijo condition.
     """
     z = _real_to_complex(c0)
     z_norm = np.linalg.norm(z)
     if z_norm < 1e-14:
-        return None
+        return c0.copy(), _objective(c0)
     z = z / z_norm
 
     f_curr = _complex_objective(z)
@@ -134,39 +135,56 @@ def _conjugate_gradient_complex_sphere(c0, maxiter=400, tol=1e-13, deadline=None
     best_f = f_curr
     best_g_norm = s_norm
 
+    c1 = 1e-4
+    rho = 0.5
+    max_ls = 30
+
     for i in range(maxiter):
         if deadline is not None and time.time() > deadline - 10.0:
             break
 
-        f_start = f_curr
+        g_dir = np.vdot(g_tan, s).real
+        if g_dir >= 0:
+            # Gradient is not decreasing in direction s, restart
+            s = -g_tan
+            s_norm = np.linalg.norm(s)
+            if s_norm < 1e-15:
+                break
+            s = s / s_norm
+            g_dir = np.vdot(g_tan, s).real
 
-        def f_of_t(t):
-            ct = np.cos(t)
-            st = np.sin(t)
-            z_new = ct * y_curr + st * s
-            return _complex_objective(z_new)
-
-        # Simple line search: try a few step sizes
+        t = 1.0
         best_t = 0.0
         best_f_t = f_curr
-        for trial_t in [0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 3.0]:
-            if trial_t > np.pi:
+        
+        for ls_iter in range(max_ls):
+            if deadline is not None and time.time() > deadline - 5.0:
                 break
-            ct = np.cos(trial_t)
-            st = np.sin(trial_t)
+            ct = np.cos(t)
+            st = np.sin(t)
             z_trial = ct * y_curr + st * s
             f_trial = _complex_objective(z_trial)
-            if f_trial < best_f_t:
+
+            if f_trial <= f_curr + c1 * t * g_dir:
+                best_t = t
                 best_f_t = f_trial
-                best_t = trial_t
+                break
+
+            t *= rho
 
         if best_t == 0.0:
+            # Fallback: take a small step
             best_t = 0.01
+            ct = np.cos(best_t)
+            st = np.sin(best_t)
+            z_trial = ct * y_curr + st * s
+            best_f_t = _complex_objective(z_trial)
 
         z_new = np.cos(best_t) * y_curr + np.sin(best_t) * s
         f_new = _complex_objective(z_new)
 
         if f_new >= f_curr:
+            # If we didn't improve, try a tiny step
             z_new = y_curr + 0.001 * s
             z_new = z_new / np.linalg.norm(z_new)
             f_new = _complex_objective(z_new)
@@ -226,7 +244,7 @@ def _conjugate_gradient_complex_sphere(c0, maxiter=400, tol=1e-13, deadline=None
     c_out = _complex_to_real(best_z)
     c_out = _project_to_sphere(c_out)
     if c_out is None:
-        return c0.copy(), f_curr
+        return c0.copy(), _objective(c0)
     return c_out, float(_objective(c_out))
 
 
@@ -242,31 +260,34 @@ def _optimize_from(c0, deadline):
     def jac(x):
         return _gradient(x)
 
+    def sphere_constraint(x):
+        return np.dot(x, x) - 1.0
+
     best_c = c.copy()
     best_val = fun(c)
 
-    # 1. L-BFGS-B
+    # 1. SLSQP with explicit sphere constraint
     try:
-        res = minimize(fun, c, jac=jac, method="L-BFGS-B",
-                       options={"maxiter": 200, "maxfun": 1500,
-                                "ftol": 1e-16, "gtol": 1e-10})
+        res = minimize(fun, c, jac=jac, method="SLSQP",
+                       constraints=[{'type': 'eq', 'fun': sphere_constraint}],
+                       options={"maxiter": 200, "ftol": 1e-16, "gtol": 1e-10})
         if res.fun < best_val:
             best_val = res.fun
             best_c = res.x.copy()
     except Exception:
         pass
 
-    if time.time() > deadline - 10.0:
+    if time.time() > deadline - 15.0:
         proj = _project_to_sphere(best_c)
         if proj is not None:
             return proj, float(_objective(proj))
         return None
 
-    # 2. Complex CG from L-BFGS-B result
+    # 2. Complex CG from SLSQP result
     c_cg_init = _project_to_sphere(best_c)
     if c_cg_init is not None:
         try:
-            cg_c, cg_val = _conjugate_gradient_complex_sphere(c_cg_init, maxiter=200, tol=1e-12, deadline=deadline)
+            cg_c, cg_val = _conjugate_gradient_complex_sphere(c_cg_init, maxiter=300, tol=1e-13, deadline=deadline)
             if cg_val < best_val:
                 best_val = cg_val
                 best_c = cg_c.copy()
@@ -279,12 +300,12 @@ def _optimize_from(c0, deadline):
             return proj, float(_objective(proj))
         return None
 
-    # 3. Second L-BFGS-B pass with tighter tolerance
+    # 3. Second SLSQP pass with tighter tolerance
     if time.time() < deadline - 5.0:
         try:
-            res2 = minimize(fun, best_c, jac=jac, method="L-BFGS-B",
-                            options={"maxiter": 150, "maxfun": 1000,
-                                     "ftol": 1e-16, "gtol": 1e-12})
+            res2 = minimize(fun, best_c, jac=jac, method="SLSQP",
+                            constraints=[{'type': 'eq', 'fun': sphere_constraint}],
+                            options={"maxiter": 100, "ftol": 1e-18, "gtol": 1e-12})
             if res2.fun < best_val:
                 best_val = res2.fun
                 best_c = res2.x.copy()
@@ -296,7 +317,7 @@ def _optimize_from(c0, deadline):
         c_cg_final = _project_to_sphere(best_c)
         if c_cg_final is not None:
             try:
-                cg_c_final, cg_val_final = _conjugate_gradient_complex_sphere(c_cg_final, maxiter=150, tol=1e-14, deadline=deadline)
+                cg_c_final, cg_val_final = _conjugate_gradient_complex_sphere(c_cg_final, maxiter=200, tol=1e-14, deadline=deadline)
                 if cg_val_final < best_val:
                     best_val = cg_val_final
                     best_c = cg_c_final.copy()
@@ -390,6 +411,206 @@ def _make_seeds(rng, n_seeds):
         elif i == 22:
             c[_K + 10] = 1.0
             c[_K - 10] = 1.0
+        elif i == 23:
+            for m in range(-_K, _K + 1):
+                am = abs(m)
+                if am >= 5:
+                    c[m + _K] = (-1) ** m * rng.standard_normal()
+        elif i == 24:
+            for m in range(-_K, _K + 1):
+                c[m + _K] = np.cos(np.pi * m / (2.0 * _K))
+        elif i == 25:
+            for m in range(-_K, _K + 1):
+                c[m + _K] = np.sin(np.pi * m / (2.0 * _K))
+        elif i == 26:
+            c[_K] = 0.8
+            c[_K + 10] = 0.6
+            c[_K - 10] = 0.6
+        elif i == 27:
+            for m in range(-_K, _K + 1, 2):
+                c[m + _K] = rng.standard_normal()
+        elif i == 28:
+            for m in range(-_K + 1, _K + 1, 2):
+                c[m + _K] = rng.standard_normal()
+        elif i == 29:
+            for m in range(-_K, _K + 1):
+                c[m + _K] = np.exp(-0.1 * m * m) * rng.standard_normal()
+        elif i == 30:
+            phase = rng.uniform(0, 2 * np.pi)
+            for m in range(-_K, _K + 1):
+                c[m + _K] = np.cos(phase + 0.3 * m)
+        elif i == 31:
+            # New: emphasize m=±10 with small m=0
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K] = 0.1
+        elif i == 32:
+            # New: m=±10 dominant with m=±8
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 8] = 0.5
+            c[_K - 8] = 0.5
+        elif i == 33:
+            # New: m=±10, ±8, ±6
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 8] = 0.6
+            c[_K - 8] = 0.6
+            c[_K + 6] = 0.3
+            c[_K - 6] = 0.3
+        elif i == 34:
+            # New: alternating high m
+            for m in range(-_K, _K + 1):
+                am = abs(m)
+                if am >= 7:
+                    c[m + _K] = (-1) ** (am // 2) * (1.0 if am % 2 == 0 else 0.5)
+        elif i == 35:
+            # New: smooth decay from m=10
+            for m in range(-_K, _K + 1):
+                am = abs(m)
+                c[m + _K] = np.exp(-0.3 * (10 - am))
+        elif i == 36:
+            # New: peak at m=±10
+            for m in range(-_K, _K + 1):
+                am = abs(m)
+                c[m + _K] = np.exp(-0.5 * (10 - am) ** 2 / 5.0)
+        elif i == 37:
+            # New: m=±10 and m=±2
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 2] = 0.7
+            c[_K - 2] = 0.7
+        elif i == 38:
+            # New: m=±10 and m=±4
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 4] = 0.7
+            c[_K - 4] = 0.7
+        elif i == 39:
+            # New: m=±10 and m=±6
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 6] = 0.7
+            c[_K - 6] = 0.7
+        elif i == 40:
+            # New: m=±10 and m=±9
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 9] = 0.7
+            c[_K - 9] = 0.7
+        elif i == 41:
+            # New: random high-m only
+            for m in range(-_K, _K + 1):
+                am = abs(m)
+                if am >= 7:
+                    c[m + _K] = rng.standard_normal()
+        elif i == 42:
+            # New: random with m=±10 boosted
+            c[:] = rng.standard_normal(_NC)
+            c[_K + 10] *= 2.0
+            c[_K - 10] *= 2.0
+        elif i == 43:
+            # New: cosine window centered at m=10
+            for m in range(-_K, _K + 1):
+                am = abs(m)
+                c[m + _K] = 0.5 * (1 + np.cos(np.pi * (am - 10) / 2.0))
+        elif i == 44:
+            # New: m=±10 with phase shift
+            c[_K + 10] = np.cos(0.3)
+            c[_K - 10] = np.sin(0.3)
+            c[_K + 8] = np.cos(0.6)
+            c[_K - 8] = np.sin(0.6)
+        elif i == 45:
+            # New: all high m with random phases
+            for m in range(-_K, _K + 1):
+                am = abs(m)
+                if am >= 6:
+                    c[m + _K] = np.cos(rng.uniform(0, 2 * np.pi))
+        elif i == 46:
+            # New: m=±10, ±9, ±8 with decreasing weights
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 9] = 0.8
+            c[_K - 9] = 0.8
+            c[_K + 8] = 0.6
+            c[_K - 8] = 0.6
+        elif i == 47:
+            # New: m=±10 and m=±1
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 1] = 0.5
+            c[_K - 1] = 0.5
+        elif i == 48:
+            # New: m=±10 and m=±3
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 3] = 0.5
+            c[_K - 3] = 0.5
+        elif i == 49:
+            # New: m=±10 and m=±5
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 5] = 0.5
+            c[_K - 5] = 0.5
+        elif i == 50:
+            # New: m=±10 and m=±7
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 7] = 0.5
+            c[_K - 7] = 0.5
+        elif i == 51:
+            # New: m=±10 and m=±4
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 4] = 0.8
+            c[_K - 4] = 0.8
+        elif i == 52:
+            # New: m=±10 and m=±6
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 6] = 0.8
+            c[_K - 6] = 0.8
+        elif i == 53:
+            # New: m=±10 and m=±8
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 8] = 0.8
+            c[_K - 8] = 0.8
+        elif i == 54:
+            # New: m=±10 and m=±9
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[_K + 9] = 0.8
+            c[_K - 9] = 0.8
+        elif i == 55:
+            # New: all modes with weight ~ 1/(1+|m|)
+            for m in range(-_K, _K + 1):
+                am = abs(m)
+                c[m + _K] = 1.0 / (1.0 + am * 0.5)
+        elif i == 56:
+            # New: all modes with weight ~ 1/(1+|m-10|)
+            for m in range(-_K, _K + 1):
+                am = abs(m)
+                c[m + _K] = 1.0 / (1.0 + abs(10 - am) * 0.5)
+        elif i == 57:
+            # New: m=±10 with small random perturbation
+            c[_K + 10] = 1.0
+            c[_K - 10] = 1.0
+            c[:] += 0.05 * rng.standard_normal(_NC)
+        elif i == 58:
+            # New: m=±10, ±9 with random signs
+            c[_K + 10] = rng.choice([-1, 1])
+            c[_K - 10] = rng.choice([-1, 1])
+            c[_K + 9] = 0.7 * rng.choice([-1, 1])
+            c[_K - 9] = 0.7 * rng.choice([-1, 1])
+        elif i == 59:
+            # New: m=±10, ±8, ±6 with random signs
+            c[_K + 10] = rng.choice([-1, 1])
+            c[_K - 10] = rng.choice([-1, 1])
+            c[_K + 8] = 0.7 * rng.choice([-1, 1])
+            c[_K - 8] = 0.7 * rng.choice([-1, 1])
+            c[_K + 6] = 0.4 * rng.choice([-1, 1])
+            c[_K - 6] = 0.4 * rng.choice([-1, 1])
         else:
             c[:] = rng.standard_normal(_NC)
             c[_K] += 0.5
@@ -404,15 +625,16 @@ def _make_seeds(rng, n_seeds):
 
 def rudin_problem10() -> np.ndarray:
     start = time.time()
-    deadline = start + 610.0
+    deadline = start + 620.0
     rng = np.random.default_rng(42)
 
-    seeds = _make_seeds(rng, 24)
+    seeds = _make_seeds(rng, 60)
     best_c = None
     best_val = np.inf
 
+    # Phase 1: Optimize from structured seeds
     for i, c0 in enumerate(seeds):
-        if time.time() > deadline - 20.0:
+        if time.time() > deadline - 80.0:
             break
         try:
             out = _optimize_from(c0, deadline)
@@ -425,9 +647,9 @@ def rudin_problem10() -> np.ndarray:
             best_val = val
             best_c = c.copy()
 
-    # Random restarts
+    # Phase 2: Random restarts with time budget
     n_extra = 0
-    while time.time() < deadline - 30.0:
+    while time.time() < deadline - 50.0:
         c0 = rng.standard_normal(_NC)
         nrm = np.linalg.norm(c0)
         if nrm < 1e-14:
@@ -444,6 +666,19 @@ def rudin_problem10() -> np.ndarray:
             best_val = val
             best_c = c.copy()
         n_extra += 1
+
+    # Phase 3: Final polish from best solution
+    if best_c is not None and time.time() < deadline - 5.0:
+        try:
+            c_cg_final = _project_to_sphere(best_c)
+            if c_cg_final is not None:
+                cg_c_final, cg_val_final = _conjugate_gradient_complex_sphere(
+                    c_cg_final, maxiter=300, tol=1e-14, deadline=deadline)
+                if cg_val_final < best_val:
+                    best_val = cg_val_final
+                    best_c = cg_c_final.copy()
+        except Exception:
+            pass
 
     if best_c is None:
         best_c = np.ones(_NC, dtype=np.float64)

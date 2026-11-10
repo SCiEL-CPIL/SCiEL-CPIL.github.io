@@ -1,0 +1,241 @@
+import time
+import math
+import random
+import numpy as np
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 145.0
+
+    def sieve(n):
+        is_prime = bytearray(b'\x01') * (n + 1)
+        if n >= 0:
+            is_prime[0] = 0
+        if n >= 1:
+            is_prime[1] = 0
+        for i in range(2, int(n**0.5) + 1):
+            if is_prime[i]:
+                is_prime[i*i::i] = bytearray(len(is_prime[i*i::i]))
+        return [i for i in range(2, n+1) if is_prime[i]]
+
+    primes = sieve(500000)
+    prime_set_global = set(primes)
+    prime_index = {p: i for i, p in enumerate(primes)}
+
+    def tau_perp_fast(prime_factors):
+        k = len(prime_factors)
+        if k == 0:
+            return 0
+        
+        # Build all divisors with their prime masks
+        # divs[i] = (value, mask)
+        divs = [(1, 0)]
+        for i, p in enumerate(prime_factors):
+            bit = 1 << i
+            current_len = len(divs)
+            for j in range(current_len):
+                val, mask = divs[j]
+                divs.append((val * p, mask | bit))
+        
+        # Sort by value
+        divs.sort(key=lambda x: x[0])
+        
+        # Count coprime adjacent pairs using numpy
+        masks = np.array([d[1] for d in divs], dtype=np.int64)
+        adjacent_and = masks[:-1] & masks[1:]
+        score = int(np.sum(adjacent_and == 0))
+        return score
+
+    def tau_perp_fast2(prime_factors):
+        """Even faster: precompute masks, use vectorized sort"""
+        k = len(prime_factors)
+        if k == 0:
+            return 0
+        
+        # Generate all 2^k masks and their corresponding values
+        # Use iterative approach
+        values = [1]
+        masks = [0]
+        for i, p in enumerate(prime_factors):
+            bit = 1 << i
+            current_len = len(values)
+            for j in range(current_len):
+                values.append(values[j] * p)
+                masks.append(masks[j] | bit)
+        
+        # Sort by value, keep masks
+        order = np.argsort(values, kind='stable')
+        sorted_masks = np.array(masks, dtype=np.int64)[order]
+        
+        adjacent_and = sorted_masks[:-1] & sorted_masks[1:]
+        score = int(np.sum(adjacent_and == 0))
+        return score
+
+    # Initialize with first 15 primes
+    max_k = 15
+    current_primes = list(primes[:max_k])
+    current_prod = 1
+    for p in current_primes:
+        current_prod *= p
+        
+    best_n = current_prod
+    best_score = tau_perp_fast(current_primes)
+    current_score = best_score
+
+    def check_time():
+        return time.time() < deadline - 10.0
+
+    # Local search with strategic prime swaps
+    improved = True
+    no_improvement_count = 0
+    max_no_improvement = 12
+    iteration = 0
+
+    while improved and check_time():
+        improved = False
+        iteration += 1
+        current_prime_set = set(current_primes)
+        
+        # Try swaps: replace one prime with another
+        # Focus on replacing larger primes first (more room for alternatives)
+        indices = list(range(len(current_primes)))
+        random.shuffle(indices)
+        
+        for idx in indices:
+            if not check_time():
+                break
+                
+            p_old = current_primes[idx]
+            
+            # p_new * (current_prod / p_old) <= 10^18
+            # p_new <= 10^18 * p_old / current_prod
+            max_p_new = (10**18 * p_old) // current_prod
+            
+            if max_p_new < 2:
+                continue
+            
+            # Find candidate primes
+            # We want primes that are NOT in current set and <= max_p_new
+            # Strategy: try small primes (for density) and some large ones
+            candidates = []
+            for p_new in primes:
+                if p_new in current_prime_set:
+                    continue
+                if p_new > max_p_new:
+                    break
+                candidates.append(p_new)
+            
+            if not candidates:
+                continue
+            
+            # Test a strategic subset
+            test_candidates = []
+            n_cand = len(candidates)
+            if n_cand > 100:
+                # Smallest 40, some middle, largest 20
+                test_candidates.extend(candidates[:40])
+                mid_start = n_cand // 2
+                test_candidates.extend(candidates[mid_start:mid_start+20])
+                test_candidates.extend(candidates[-20:])
+            elif n_cand > 50:
+                test_candidates.extend(candidates[:30])
+                test_candidates.extend(candidates[-15:])
+            else:
+                test_candidates = candidates
+            
+            best_candidate = None
+            best_candidate_score = current_score
+            
+            for p_new in test_candidates:
+                if p_new in current_prime_set:
+                    continue
+                if p_new * current_prod > 10**18 * p_old:
+                    continue
+                
+                new_primes = current_primes.copy()
+                new_primes[idx] = p_new
+                
+                s_new = tau_perp_fast(new_primes)
+                
+                if s_new > best_candidate_score:
+                    best_candidate_score = s_new
+                    best_candidate = p_new
+            
+            if best_candidate is not None and best_candidate_score > current_score:
+                current_primes[idx] = best_candidate
+                current_prod = (current_prod // p_old) * best_candidate
+                current_score = best_candidate_score
+                if current_score > best_score:
+                    best_score = current_score
+                    best_n = current_prod
+                improved = True
+                no_improvement_count = 0
+                break
+        
+        # If no improvement, try perturbations
+        if not improved:
+            no_improvement_count += 1
+            
+            if no_improvement_count >= max_no_improvement:
+                if check_time() and time.time() < deadline - 25.0:
+                    # Random restart with perturbation
+                    attempts = 0
+                    while attempts < 30 and check_time():
+                        attempts += 1
+                        perturbed = list(primes[:max_k])
+                        n_replacements = random.randint(1, 5)
+                        for _ in range(n_replacements):
+                            idx = random.randint(0, max_k - 1)
+                            prod_without = 1
+                            for j, p in enumerate(perturbed):
+                                if j != idx:
+                                    prod_without *= p
+                            max_p = (10**18) // prod_without
+                            valid = [p for p in primes if p not in set(perturbed) and p <= max_p]
+                            if valid:
+                                # Weight toward smaller primes
+                                if len(valid) > 50:
+                                    perturbed[idx] = valid[random.randint(0, min(49, len(valid)-1))]
+                                else:
+                                    perturbed[idx] = random.choice(valid)
+                        
+                        prod = 1
+                        for p in perturbed:
+                            prod *= p
+                        if prod <= 10**18:
+                            s = tau_perp_fast(perturbed)
+                            if s > best_score:
+                                best_score = s
+                                best_n = prod
+                                current_primes = perturbed
+                                current_score = s
+                                current_prod = prod
+                                improved = True
+                                no_improvement_count = 0
+                                break
+                
+                if not improved:
+                    break
+            else:
+                # Small random perturbation
+                if check_time() and time.time() < deadline - 20.0:
+                    idx = random.randint(0, len(current_primes) - 1)
+                    p_old = current_primes[idx]
+                    max_p_new = (10**18 * p_old) // current_prod
+                    valid = [p for p in primes if p not in set(current_primes) and p <= max_p_new]
+                    if valid:
+                        p_new = random.choice(valid)
+                        new_primes = current_primes.copy()
+                        new_primes[idx] = p_new
+                        s_new = tau_perp_fast(new_primes)
+                        # Accept equal or better to escape plateaus
+                        if s_new >= current_score:
+                            current_primes = new_primes
+                            current_prod = (current_prod // p_old) * p_new
+                            current_score = s_new
+                            if current_score > best_score:
+                                best_score = current_score
+                                best_n = current_prod
+                            no_improvement_count = 0
+
+    return best_n

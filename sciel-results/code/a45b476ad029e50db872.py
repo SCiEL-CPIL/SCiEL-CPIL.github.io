@@ -1,0 +1,457 @@
+"""Optimized approach: Prime-factor-based conflict detection + multi-swap local search + branch-and-bound."""
+# EVOLVE-BLOCK-START
+import time
+from math import gcd, isqrt
+from fractions import Fraction
+import numpy as np
+from itertools import combinations
+
+def _is_prime(n):
+    if n < 2:
+        return False
+    if n < 4:
+        return True
+    if n % 2 == 0:
+        return False
+    if n < 9:
+        return True
+    if n % 3 == 0:
+        return False
+    if n < 25:
+        return True
+    if n % 5 == 0:
+        return False
+    if n < 49:
+        return True
+    if n % 7 == 0:
+        return False
+    if n < 121:
+        return True
+    i = 11
+    while i <= isqrt(n):
+        if n % i == 0:
+            return False
+        i += 2
+    return True
+
+def _get_prime_factors(n):
+    """Return list of unique prime factors of n."""
+    factors = []
+    d = 2
+    while d * d <= n:
+        if n % d == 0:
+            factors.append(d)
+            while n % d == 0:
+                n //= d
+        d += 1
+    if n > 1:
+        factors.append(n)
+    return factors
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 140  # Safety margin
+    
+    N = 512
+    
+    # Precompute values and prime factors for all numbers 1..511
+    values = [Fraction(0)] * N
+    float_values = [0.0] * N
+    prime_factors = [[] for _ in range(N)]
+    is_prime_arr = [False] * N
+    
+    for a in range(1, N):
+        values[a] = Fraction(1, N - a)
+        float_values[a] = 1.0 / (N - a)
+        prime_factors[a] = _get_prime_factors(a)
+        is_prime_arr[a] = _is_prime(a)
+        
+    # Identify primes
+    primes = [a for a in range(1, N) if is_prime_arr[a]]
+    
+    # Initialize with all primes
+    selected = set(primes)
+    
+    # Build mapping: prime -> list of selected elements that have this prime as a factor
+    prime_to_selected = {}
+    for b in selected:
+        for p in prime_factors[b]:
+            if p not in prime_to_selected:
+                prime_to_selected[p] = []
+            prime_to_selected[p].append(b)
+    
+    # Marker array to track which elements are currently in conflict
+    conflict_mark = [0] * N
+    conflict_iter = 0
+    
+    def find_conflicts(candidates):
+        """Find all selected elements that conflict with candidates. Returns list."""
+        nonlocal conflict_iter
+        conflict_iter += 1
+        conflict_list = []
+        for c in candidates:
+            for p in prime_factors[c]:
+                if p in prime_to_selected:
+                    for b in prime_to_selected[p]:
+                        if conflict_mark[b] != conflict_iter:
+                            conflict_mark[b] = conflict_iter
+                            conflict_list.append(b)
+        return conflict_list
+    
+    def apply_move(add_candidates, remove_elements):
+        """Apply a move: remove elements, add candidates. Update prime_to_selected."""
+        for b in remove_elements:
+            for p in prime_factors[b]:
+                if p in prime_to_selected:
+                    lst = prime_to_selected[p]
+                    for idx, val in enumerate(lst):
+                        if val == b:
+                            lst.pop(idx)
+                            break
+                    if not lst:
+                        del prime_to_selected[p]
+        for c in add_candidates:
+            for p in prime_factors[c]:
+                if p not in prime_to_selected:
+                    prime_to_selected[p] = []
+                prime_to_selected[p].append(c)
+        selected.difference_update(remove_elements)
+        selected.update(add_candidates)
+    
+    def get_score():
+        return sum(values[a] for a in selected)
+    
+    current_score = get_score()
+    
+    # 1-for-k move search with prime-factor-based conflict detection
+    improved = True
+    while improved:
+        if time.time() > deadline:
+            break
+            
+        improved = False
+        best_gain = Fraction(0)
+        best_add = None
+        best_remove = None
+        best_float_gain = 0.0
+        
+        for c in range(1, N):
+            if c in selected:
+                continue
+            
+            conflict_list = find_conflicts([c])
+            
+            float_cost = sum(float_values[b] for b in conflict_list)
+            float_gain = float_values[c] - float_cost
+            
+            if float_gain <= best_float_gain - 1e-15:
+                continue
+            
+            conflict_cost = sum(values[b] for b in conflict_list)
+            gain = values[c] - conflict_cost
+            
+            if gain > best_gain:
+                best_gain = gain
+                best_float_gain = float_gain
+                best_add = [c]
+                best_remove = list(conflict_list)
+        
+        if best_add is not None:
+            apply_move(best_add, best_remove)
+            current_score += best_gain
+            improved = True
+    
+    # 2-for-k move search
+    if time.time() < deadline - 15:
+        composites = [a for a in range(1, N) if not is_prime_arr[a] and a > 1]
+        composites.sort(key=lambda x: float_values[x], reverse=True)
+        top_composites = composites[:80]
+        
+        improved = True
+        while improved:
+            if time.time() > deadline - 5:
+                break
+                
+            improved = False
+            best_gain = Fraction(0)
+            best_add = None
+            best_remove = None
+            best_float_gain = 0.0
+            
+            for i in range(len(top_composites)):
+                c1 = top_composites[i]
+                if c1 in selected:
+                    continue
+                for j in range(i + 1, len(top_composites)):
+                    c2 = top_composites[j]
+                    if c2 in selected:
+                        continue
+                    if gcd(c1, c2) != 1:
+                        continue
+                    
+                    conflict_list = find_conflicts([c1, c2])
+                    
+                    float_cost = sum(float_values[b] for b in conflict_list)
+                    float_gain = float_values[c1] + float_values[c2] - float_cost
+                    
+                    if float_gain <= best_float_gain - 1e-15:
+                        continue
+                    
+                    conflict_cost = sum(values[b] for b in conflict_list)
+                    gain = values[c1] + values[c2] - conflict_cost
+                    
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_float_gain = float_gain
+                        best_add = [c1, c2]
+                        best_remove = list(conflict_list)
+            
+            if best_add is not None:
+                apply_move(best_add, best_remove)
+                current_score += best_gain
+                improved = True
+    
+    # 3-for-k move search
+    if time.time() < deadline - 10:
+        composites = [a for a in range(1, N) if not is_prime_arr[a] and a > 1]
+        composites.sort(key=lambda x: float_values[x], reverse=True)
+        top_composites = composites[:50]
+        
+        improved = True
+        while improved:
+            if time.time() > deadline - 5:
+                break
+                
+            improved = False
+            best_gain = Fraction(0)
+            best_add = None
+            best_remove = None
+            best_float_gain = 0.0
+            
+            for i in range(len(top_composites)):
+                c1 = top_composites[i]
+                if c1 in selected:
+                    continue
+                for j in range(i + 1, len(top_composites)):
+                    c2 = top_composites[j]
+                    if c2 in selected:
+                        continue
+                    if gcd(c1, c2) != 1:
+                        continue
+                    for k in range(j + 1, len(top_composites)):
+                        c3 = top_composites[k]
+                        if c3 in selected:
+                            continue
+                        if gcd(c1, c3) != 1 or gcd(c2, c3) != 1:
+                            continue
+                        
+                        conflict_list = find_conflicts([c1, c2, c3])
+                        
+                        float_cost = sum(float_values[b] for b in conflict_list)
+                        float_gain = float_values[c1] + float_values[c2] + float_values[c3] - float_cost
+                        
+                        if float_gain <= best_float_gain - 1e-15:
+                            continue
+                        
+                        conflict_cost = sum(values[b] for b in conflict_list)
+                        gain = values[c1] + values[c2] + values[c3] - conflict_cost
+                        
+                        if gain > best_gain:
+                            best_gain = gain
+                            best_float_gain = float_gain
+                            best_add = [c1, c2, c3]
+                            best_remove = list(conflict_list)
+            
+            if best_add is not None:
+                apply_move(best_add, best_remove)
+                current_score += best_gain
+                improved = True
+    
+    # Final pass of 1-for-k to clean up
+    if time.time() < deadline - 5:
+        improved = True
+        while improved:
+            if time.time() > deadline - 1:
+                break
+            improved = False
+            best_gain = Fraction(0)
+            best_add = None
+            best_remove = None
+            best_float_gain = 0.0
+            
+            for c in range(1, N):
+                if c in selected:
+                    continue
+                conflict_list = find_conflicts([c])
+                
+                float_cost = sum(float_values[b] for b in conflict_list)
+                float_gain = float_values[c] - float_cost
+                
+                if float_gain <= best_float_gain - 1e-15:
+                    continue
+                
+                conflict_cost = sum(values[b] for b in conflict_list)
+                gain = values[c] - conflict_cost
+                if gain > best_gain:
+                    best_gain = gain
+                    best_float_gain = float_gain
+                    best_add = [c]
+                    best_remove = list(conflict_list)
+            
+            if best_add is not None:
+                apply_move(best_add, best_remove)
+                current_score += best_gain
+                improved = True
+    
+    # Branch-and-bound global optimization pass
+    if time.time() < deadline - 20:
+        # Build conflict graph as adjacency bitmasks for fast operations
+        # Use numpy uint64 for 512-bit masks (need 8 uint64s)
+        # But for simplicity, use Python sets for now
+        
+        # Identify candidate elements: those not in selected that could improve
+        # Focus on high-value elements
+        all_elements = list(range(1, N))
+        all_elements.sort(key=lambda x: float_values[x], reverse=True)
+        
+        # Precompute conflict sets for all elements
+        conflict_sets = [set() for _ in range(N)]
+        for a in range(1, N):
+            for b in range(a + 1, N):
+                if gcd(a, b) != 1:
+                    conflict_sets[a].add(b)
+                    conflict_sets[b].add(a)
+        
+        # Branch and bound: try to find a better independent set
+        # We'll do a limited search focusing on replacing some selected elements
+        
+        # Strategy: For each "expensive" selected element (high value), consider removing it
+        # and seeing if we can add multiple cheaper elements that don't conflict
+        
+        # First, get the current best solution
+        best_solution = set(selected)
+        best_score = current_score
+        
+        # Try removing each selected element and doing local search from there
+        selected_list = list(selected)
+        selected_list.sort(key=lambda x: float_values[x], reverse=True)
+        
+        # Only try removing top 20 most valuable elements to save time
+        for elem_to_remove in selected_list[:20]:
+            if time.time() > deadline - 5:
+                break
+            
+            # Temporarily remove elem_to_remove
+            temp_selected = set(selected)
+            temp_selected.discard(elem_to_remove)
+            
+            # Update prime_to_selected temporarily
+            temp_prime_to_selected = {}
+            for b in temp_selected:
+                for p in prime_factors[b]:
+                    if p not in temp_prime_to_selected:
+                        temp_prime_to_selected[p] = []
+                    temp_prime_to_selected[p].append(b)
+            
+            # Do local search from this state
+            temp_conflict_mark = [0] * N
+            temp_conflict_iter = 0
+            
+            def temp_find_conflicts(candidates):
+                nonlocal temp_conflict_iter
+                temp_conflict_iter += 1
+                conflict_list = []
+                for c in candidates:
+                    for p in prime_factors[c]:
+                        if p in temp_prime_to_selected:
+                            for b in temp_prime_to_selected[p]:
+                                if temp_conflict_mark[b] != temp_conflict_iter:
+                                    temp_conflict_mark[b] = temp_conflict_iter
+                                    conflict_list.append(b)
+                return conflict_list
+            
+            def temp_apply_move(add_candidates, remove_elements):
+                for b in remove_elements:
+                    for p in prime_factors[b]:
+                        if p in temp_prime_to_selected:
+                            lst = temp_prime_to_selected[p]
+                            for idx, val in enumerate(lst):
+                                if val == b:
+                                    lst.pop(idx)
+                                    break
+                            if not lst:
+                                del temp_prime_to_selected[p]
+                for c in add_candidates:
+                    for p in prime_factors[c]:
+                        if p not in temp_prime_to_selected:
+                            temp_prime_to_selected[p] = []
+                        temp_prime_to_selected[p].append(c)
+                temp_selected.difference_update(remove_elements)
+                temp_selected.update(add_candidates)
+            
+            # Do 1-for-k local search
+            temp_improved = True
+            while temp_improved and time.time() < deadline - 5:
+                temp_improved = False
+                temp_best_gain = Fraction(0)
+                temp_best_add = None
+                temp_best_remove = None
+                temp_best_float_gain = 0.0
+                
+                for c in range(1, N):
+                    if c in temp_selected:
+                        continue
+                    
+                    temp_conflict_list = temp_find_conflicts([c])
+                    
+                    temp_float_cost = sum(float_values[b] for b in temp_conflict_list)
+                    temp_float_gain = float_values[c] - temp_float_cost
+                    
+                    if temp_float_gain <= temp_best_float_gain - 1e-15:
+                        continue
+                    
+                    temp_conflict_cost = sum(values[b] for b in temp_conflict_list)
+                    temp_gain = values[c] - temp_conflict_cost
+                    
+                    if temp_gain > temp_best_gain:
+                        temp_best_gain = temp_gain
+                        temp_best_float_gain = temp_float_gain
+                        temp_best_add = [c]
+                        temp_best_remove = list(temp_conflict_list)
+                
+                if temp_best_add is not None:
+                    temp_apply_move(temp_best_add, temp_best_remove)
+                    temp_improved = True
+            
+            # Check if we found a better solution
+            temp_score = sum(values[a] for a in temp_selected)
+            if temp_score > best_score:
+                best_score = temp_score
+                best_solution = set(temp_selected)
+        
+        # Apply the best solution found
+        if best_solution != selected:
+            # Clear current selection
+            selected.clear()
+            prime_to_selected.clear()
+            # Add best solution
+            selected.update(best_solution)
+            for b in selected:
+                for p in prime_factors[b]:
+                    if p not in prime_to_selected:
+                        prime_to_selected[p] = []
+                    prime_to_selected[p].append(b)
+            current_score = best_score
+    
+    # Final Verification
+    result = list(selected)
+    for a in result:
+        if a < 1 or a > 511:
+            raise ValueError(f"Out of range: {a}")
+    for i in range(len(result)):
+        for j in range(i + 1, len(result)):
+            if gcd(result[i], result[j]) != 1:
+                raise ValueError(f"Not coprime: {result[i]}, {result[j]}")
+    
+    return result
+# EVOLVE-BLOCK-END

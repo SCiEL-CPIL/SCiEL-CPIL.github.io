@@ -1,0 +1,6 @@
+def obj_and_grad(c):
+    ...
+    c_norm = norm_func(c)
+    val, grad = _objective_and_grad(c_norm)
+    ...
+    return val, grad

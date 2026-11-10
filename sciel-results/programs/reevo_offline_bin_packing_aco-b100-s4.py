@@ -1,121 +1,113 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-# EVOLVE-BLOCK-START
 import numpy as np
 import time
+from scipy.optimize import linear_sum_assignment
 
 def heuristics(demands, capacity):
     """
-    Computes the heuristic matrix for the ant colony optimization.
+    Heuristic matrix for ACO bin packing: attractiveness of placing item j after item i.
     
-    Strategy: Combine the structural idea of favoring large items (product)
-    with a refinement that strongly penalizes loose fits (squared inverse waste).
-    
-    The heuristic encourages:
-    1. Pairing items that fit together.
-    2. Among fitting pairs, preferring those with larger product (large items).
-    3. Among those, strongly preferring those that fill the bin more completely.
-       We use a squared inverse waste term: 1 / (1 - sum/capacity)^2
-       This creates a sharp peak for tight fits, which is critical for
-       minimizing bin count in bin packing.
+    Uses a maximum weight matching approach with smooth complementarity scoring:
+    1. Compute smooth complementarity scores (soft-min of waste) for all feasible pairs
+    2. Find optimal disjoint pairs via maximum weight matching
+    3. Boost matched pairs with a smooth, tightness-dependent factor
+    4. Apply inverse-gap penalty to strongly discourage wasteful pairings
     """
     start_time = time.time()
-    
-    # Convert to numpy array for vectorized operations
+
     d = np.asarray(demands, dtype=np.float64)
     n = len(d)
-    
+
     if n == 0:
         return np.empty((0, 0))
-        
-    # Calculate sums to check if items fit together
+
+    # Pairwise sums and products
     sums = d[:, None] + d[None, :]
-    
-    # Calculate products to measure "compatibility" (favoring large-large pairs)
     products = d[:, None] * d[None, :]
-    
-    # Condition: items must fit together
+
+    # Feasibility mask
     fits = sums <= capacity
-    
-    # Calculate waste: how much space is left in the bin
-    # waste = capacity - sum, normalized by capacity
-    # For fitting pairs, sum <= capacity, so waste >= 0
-    # We want to penalize large waste.
-    # Let's use a term that goes to infinity as waste -> 0? No, we want high score for tight fits.
-    # So we want a term that is large when sum is close to capacity.
-    
-    # Let fill_ratio = sum / capacity. Range [0, 1] for fitting pairs.
-    # We want a function f(fill_ratio) that increases with fill_ratio.
-    # Previous attempt: product * fill_ratio. Score 1.0192.
-    # Inspiration 1: product. Score 1.0063.
-    # Inspiration 2: fill_ratio. Score 1.0000.
-    # Cell finding: "Sharper decay for waste (squared inverse) strongly prioritizes tight fits... Measured: 1.026 -> 1.032"
-    # Wait, the cell finding says 1.026 -> 1.032, which is an improvement (higher score is better? No, task says "lower is better" for raw value, but "search score is seed/value, so 1.0 equals seed... above 1.0 is improvement").
-    # So higher search score is better.
-    # The cell finding says "1.026 -> 1.032", which is an improvement.
-    # The strategy was "squared inverse waste".
-    # Let's interpret "waste" as (capacity - sum).
-    # Inverse waste: 1 / (capacity - sum).
-    # Squared inverse waste: 1 / (capacity - sum)^2.
-    # This would be large when sum is close to capacity.
-    # However, if sum == capacity, it's infinity. We need to handle that.
-    # Also, we must ensure the term is well-behaved.
-    
-    # Let's try combining product with a sharp tightness term.
-    # Tightness term: 1 / (capacity - sum + epsilon)^2
-    # This heavily favors pairs that almost fill the bin.
-    
-    # Calculate the tightness term
-    # For fitting pairs, capacity - sum >= 0.
-    # Add a small epsilon to avoid division by zero.
-    epsilon = 1e-6
-    waste = capacity - sums
-    # Only compute for fitting pairs to avoid negative waste issues
-    # For non-fitting pairs, waste is negative, but we mask them out anyway.
-    
-    # To avoid numerical issues, we can compute the term safely.
-    # tightness = 1 / (waste + epsilon)^2
-    # But for non-fitting pairs, waste < 0, so waste + epsilon might be negative or small positive.
-    # We will mask these out later.
-    
-    # Let's compute the raw tightness for all pairs
-    # We need to be careful with division by zero or negative numbers.
-    # Since we only care about fitting pairs, we can set waste to a large number for non-fitting pairs
-    # to make the tightness term small (1e-9 level).
-    
-    # Actually, simpler: compute the term only where fits is True.
-    # But vectorized operations are faster.
-    # Let's use np.where to handle the denominator safely.
-    
-    # For fitting pairs: denom = capacity - sum + epsilon
-    # For non-fitting pairs: denom = 1.0 (so tightness = 1, which will be masked to 1e-9 later)
-    
-    safe_waste = np.where(fits, waste + epsilon, 1.0)
-    tightness = 1.0 / (safe_waste ** 2)
-    
-    # Combine product and tightness
-    # H = product * tightness
-    # For fitting pairs, this is (d_i * d_j) / (capacity - d_i - d_j + epsilon)^2
-    # For non-fitting pairs, this is (d_i * d_j) * 1.0, but we mask to 1e-9.
-    
-    raw_scores = products * tightness
-    
-    # Apply the fit condition
-    H = np.where(fits, raw_scores, 1e-9)
-    
-    # Ensure no non-finite values
+
+    # Waste = capacity - sum (non-negative where fits)
+    waste = np.where(fits, capacity - sums, 1.0)
+
+    # Smooth complementarity: use soft-min to smoothly penalize waste
+    # Higher score when waste is small (tight fit)
+    # Use log-sum-exp style smooth min: soft_min(x, y) ≈ -log(exp(-x/t) + exp(-y/t))
+    # Here we want a smooth function that is high when waste is low
+    # Complementarity = 1 / (1 + waste^alpha) with smooth alpha
+    alpha = 2.0
+    complementarity = 1.0 / (1.0 + waste ** alpha)
+
+    # Base score: product scaled by complementarity
+    base_scores = products * complementarity
+
+    # Mask non-fitting pairs
+    base_scores = np.where(fits, base_scores, 0.0)
+
+    # Sanitize base scores
+    if not np.all(np.isfinite(base_scores)):
+        base_scores = np.where(np.isfinite(base_scores), base_scores, 0.0)
+
+    # Normalize base scores to [0, 1] range for stable matching
+    max_base = base_scores.max()
+    if max_base > 0:
+        base_scores_norm = base_scores / max_base
+    else:
+        base_scores_norm = base_scores
+
+    # Find maximum weight matching of disjoint pairs
+    matching_weights = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            if fits[i, j]:
+                matching_weights[i, j] = base_scores_norm[i, j]
+                matching_weights[j, i] = base_scores_norm[i, j]
+
+    # Find optimal assignment (minimizes negative = maximizes positive)
+    row_ind, col_ind = linear_sum_assignment(-matching_weights)
+
+    # Build set of matched pairs with their weights
+    matched_pairs = {}
+    for r, c in zip(row_ind, col_ind):
+        if r != c and matching_weights[r, c] > 0:
+            matched_pairs[(r, c)] = matching_weights[r, c]
+            matched_pairs[(c, r)] = matching_weights[r, c]
+
+    # Construct final heuristic with smooth, tightness-dependent boost
+    # Boost factor depends on how tight the pair is: tighter pairs get higher boost
+    # Use smooth interpolation: boost = 1 + max_boost * tightness^beta
+    max_boost = 8.0
+    beta = 1.5
+    H = base_scores.copy()
+    for (i, j), w in matched_pairs.items():
+        # Tightness is w (normalized base score, higher = tighter)
+        boost_factor = 1.0 + max_boost * (w ** beta)
+        H[i, j] = base_scores[i, j] * boost_factor
+
+    # Apply inverse-gap penalty: strongly penalize pairs that leave lots of space
+    # This encourages the ACO to prefer pairs that nearly fill the bin
+    # Penalty: multiply by (1 + waste / capacity)^(-gamma) where gamma > 1
+    gamma = 3.0
+    gap_penalty = (1.0 + waste / capacity) ** (-gamma)
+    H = H * gap_penalty
+
+    # Ensure non-fitting pairs are very low
+    H = np.where(fits, H, 1e-9)
+
+    # Sanitize: replace any non-finite values
     if not np.all(np.isfinite(H)):
-        # If any non-finite values exist, replace them with 1e-9
         H = np.where(np.isfinite(H), H, 1e-9)
-    
-    # Ensure shape is correct
+
+    # Ensure all values are positive (as per task requirements)
+    H = np.maximum(H, 1e-9)
+
+    # Shape check
     if H.shape != (n, n):
         raise ValueError("Wrong shape")
-    
+
     # Time guard
     elapsed = time.time() - start_time
-    if elapsed > 325:
-        # Safety margin: if we're close to the limit, return immediately
-        pass
-    
+    if elapsed > 290:
+        return H
+
     return H
-# EVOLVE-BLOCK-END

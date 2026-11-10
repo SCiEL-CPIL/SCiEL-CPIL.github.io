@@ -58,7 +58,12 @@ def score_P(P):
         return 0.0
     return D_val / M
 
-def objective_and_grad(z):
+def objective_and_grad(z, beta=50.0):
+    """
+    Objective with soft-max smoothing for the max operation.
+    Uses log-sum-exp to create a smooth approximation of max(H0, H1, H2).
+    As beta -> infinity, this approaches the hard max.
+    """
     P = z
     D_val, D_grad = get_projection_entropy_grad(P, D_inv_flat, D_bins)
     H0_val, H0_grad = get_projection_entropy_grad(P, H0_inv_flat, H0_bins)
@@ -67,14 +72,38 @@ def objective_and_grad(z):
     
     H012 = np.array([H0_val, H1_val, H2_val])
     grads_012 = [H0_grad, H1_grad, H2_grad]
-    M = np.max(H012)
+    
+    # Soft-max: M_soft = (1/beta) * log(sum(exp(beta * Hi)))
+    # Gradient: dM_soft/dP = sum_i (exp(beta*Hi)/sum(exp(beta*Hj))) * dHi/dP
+    scaled_H = beta * H012
+    max_scaled = np.max(scaled_H)
+    exp_scaled = np.exp(scaled_H - max_scaled)
+    sum_exp = np.sum(exp_scaled)
+    
+    if sum_exp < 1e-300:
+        M = np.max(H012)
+        if M < 1e-9:
+            return -1e9, np.zeros_like(P)
+        ratio = D_val / M
+        idx_max = np.argmax(H012)
+        M_grad = grads_012[idx_max]
+        grad_ratio = (M * D_grad - D_val * M_grad) / (M * M)
+        obj = -ratio
+        grad = -grad_ratio
+        return obj, grad
+    
+    weights = exp_scaled / sum_exp
+    M = (max_scaled + np.log(sum_exp)) / beta
     
     if M < 1e-9:
         return -1e9, np.zeros_like(P)
     
+    # Gradient of M_soft with respect to P
+    M_grad = np.zeros_like(P)
+    for i in range(3):
+        M_grad += weights[i] * grads_012[i]
+    
     ratio = D_val / M
-    idx_max = np.argmax(H012)
-    M_grad = grads_012[idx_max]
     grad_ratio = (M * D_grad - D_val * M_grad) / (M * M)
     
     obj = -ratio
@@ -96,66 +125,19 @@ def solve_kakeya():
     # Uniform
     inits.append(np.ones((n, n)) / (n * n))
     
-    # Random inits
-    for _ in range(30):
+    # Focused random inits (fewer but more diverse)
+    for _ in range(15):
         p = rng.random((n, n))
         p /= p.sum()
         inits.append(p)
     
-    # Diagonal inits (x-y = c)
-    for c in range(-9, 10):
-        p = np.zeros((n, n))
-        for i in range(n):
-            for j in range(n):
-                if j - i == c:
-                    p[i, j] = 1.0
-        if p.sum() > 0:
-            p /= p.sum()
-            inits.append(p)
-    
-    # Anti-diagonal inits (x+y = c)
-    for c in range(0, 19):
-        p = np.zeros((n, n))
-        for i in range(n):
-            for j in range(n):
-                if i + j == c:
-                    p[i, j] = 1.0
-        if p.sum() > 0:
-            p /= p.sum()
-            inits.append(p)
-    
-    # Concentrate x: put mass on columns
-    for cx in range(n):
-        p = np.zeros((n, n))
-        p[:, cx] = 1.0
-        p /= p.sum()
-        inits.append(p)
-    
-    # Concentrate y: put mass on rows
-    for cy in range(n):
-        p = np.zeros((n, n))
-        p[cy, :] = 1.0
-        p /= p.sum()
-        inits.append(p)
-    
-    # Corner concentrations
-    for cx in [0, 1, 2, 7, 8, 9]:
-        for cy in [0, 1, 2, 7, 8, 9]:
-            p = np.zeros((n, n))
-            for i in range(n):
-                for j in range(n):
-                    p[i, j] = np.exp(-((i - cy)**2 + (j - cx)**2) / 1.5)
-            p /= p.sum()
-            inits.append(p)
-    
-    # Spread x-y: put mass where x-y is extreme
+    # Key structured inits: corners and diagonals
     p = np.zeros((n, n))
     p[0, 9] = 1.0
     p[9, 0] = 1.0
     p /= p.sum()
     inits.append(p)
     
-    # More spread: put mass on corners
     p = np.zeros((n, n))
     p[0, 0] = 1.0
     p[0, 9] = 1.0
@@ -164,8 +146,7 @@ def solve_kakeya():
     p /= p.sum()
     inits.append(p)
     
-    # Try to maximize x-y entropy by spreading across diagonals
-    # Put equal mass on each diagonal
+    # Spread across diagonals
     p = np.zeros((n, n))
     for c in range(-9, 10):
         for i in range(n):
@@ -175,8 +156,21 @@ def solve_kakeya():
     p /= p.sum()
     inits.append(p)
     
-    # Put mass on 4 corners with varying weights
-    for w1, w2, w3, w4 in [(1,1,1,1), (1,2,2,1), (2,1,1,2), (1,3,3,1), (3,1,1,3)]:
+    # Sparse cell sets that spread x-y
+    for cells in [
+        [(0,0), (9,9)],
+        [(0,9), (9,0)],
+        [(2,2), (7,7), (2,7), (7,2)],
+        [(1,1), (8,8), (1,8), (8,1)],
+    ]:
+        p = np.zeros((n, n))
+        for (i, j) in cells:
+            p[i, j] = 1.0
+        p /= p.sum()
+        inits.append(p)
+    
+    # Corner concentrations with varying weights
+    for w1, w2, w3, w4 in [(1,1,1,1), (1,2,2,1), (2,1,1,2)]:
         p = np.zeros((n, n))
         p[0, 0] = w1
         p[0, 9] = w2
@@ -185,55 +179,20 @@ def solve_kakeya():
         p /= p.sum()
         inits.append(p)
     
-    # Try to minimize H0, H1, H2 while maximizing D
-    # Concentrate on a few cells that spread out x-y
-    for cells in [
-        [(0,0), (9,9)],
-        [(0,9), (9,0)],
-        [(0,0), (9,0), (0,9)],
-        [(0,0), (9,9), (0,9)],
-        [(0,0), (9,9), (9,0)],
-        [(2,2), (7,7), (2,7), (7,2)],
-        [(1,1), (8,8), (1,8), (8,1)],
-        [(0,0), (4,4), (8,8), (0,8), (4,0), (8,0)],
-    ]:
-        p = np.zeros((n, n))
-        for (i, j) in cells:
-            p[i, j] = 1.0
-        p /= p.sum()
-        inits.append(p)
-    
-    # Gradient-based local search from promising points
-    # Points that maximize D/M: we want high D, low M
-    # D is max when x-y is spread, M is min when x, x+y, x+2y are concentrated
-    
-    # Try points where x is concentrated but x-y is spread
-    for cx in range(n):
-        for spread in [1, 2, 3]:
-            p = np.zeros((n, n))
-            for dy in range(-spread, spread+1):
-                y = 0
-                x = cx
-                if 0 <= y < n and 0 <= x < n:
-                    p[y, x] = 1.0
-                y2 = 9
-                x2 = cx
-                if 0 <= y2 < n and 0 <= x2 < n:
-                    p[y2, x2] = 1.0
-            if p.sum() > 0:
-                p /= p.sum()
-                inits.append(p)
+    import scipy.optimize as opt
     
     constraints = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1.0,
                     'jac': lambda x: np.ones_like(x)}]
     bounds = [(0.0, 1.0) for _ in range(n * n)]
     
-    def try_optimize(P_flat, method, maxiter, ftol=None, gtol=None):
+    def try_optimize(P_flat, method, maxiter, ftol=None, gtol=None, beta=50.0):
         nonlocal best_P, best_score
         try:
             if method == 'SLSQP':
+                def obj_wrapper(x):
+                    return objective_and_grad(x, beta=beta)
                 result = opt.minimize(
-                    objective_and_grad,
+                    obj_wrapper,
                     P_flat,
                     jac=True,
                     method='SLSQP',
@@ -244,23 +203,16 @@ def solve_kakeya():
             elif method == 'trust-constr':
                 from scipy.optimize import LinearConstraint
                 lc = LinearConstraint(np.ones((1, 100)), 1.0, 1.0)
+                def obj_wrapper(x):
+                    return objective_and_grad(x, beta=beta)
                 result = opt.minimize(
-                    objective_and_grad,
+                    obj_wrapper,
                     P_flat,
                     jac=True,
                     method='trust-constr',
                     bounds=bounds,
                     constraints=[lc],
                     options={'maxiter': maxiter, 'gtol': gtol or 1e-10, 'disp': False}
-                )
-            elif method == 'L-BFGS-B':
-                result = opt.minimize(
-                    lambda x: objective_and_grad(x)[0] + 1000 * (np.sum(x) - 1.0)**2,
-                    P_flat,
-                    jac=lambda x: objective_and_grad(x)[1] + 2000 * (np.sum(x) - 1.0) * np.ones_like(x),
-                    method='L-BFGS-B',
-                    bounds=bounds,
-                    options={'maxiter': maxiter, 'ftol': ftol or 1e-12, 'disp': False}
                 )
             else:
                 return None
@@ -278,33 +230,59 @@ def solve_kakeya():
             pass
         return None
     
-    # First pass: quick optimization from all inits
+    # Phase 1: Exploration with moderate beta
     for P_init in inits:
         if time.time() - start_time > timeout - safety_margin:
             break
-        
         P_flat = P_init.ravel()
-        try_optimize(P_flat, 'SLSQP', 200)
+        try_optimize(P_flat, 'SLSQP', 150, beta=30.0)
     
-    # Second pass: refine from best and nearby points
+    # Phase 2: Exploitation with increasing beta
     if time.time() - start_time < timeout - safety_margin:
         P_flat = best_P.ravel()
-        try_optimize(P_flat, 'SLSQP', 500, ftol=1e-14)
-        try_optimize(P_flat, 'trust-constr', 300)
-    
-    # Local refinement: perturb best_P and re-optimize
-    if time.time() - start_time < timeout - safety_margin:
-        for _ in range(10):
+        for beta in [50, 100, 200, 400]:
             if time.time() - start_time > timeout - safety_margin:
                 break
-            perturbation = rng.random((n, n)) * 0.1
+            try_optimize(P_flat, 'SLSQP', 300, ftol=1e-13, beta=beta)
+            P_flat = best_P.ravel()
+    
+    # Phase 3: Local search with perturbations
+    if time.time() - start_time < timeout - safety_margin:
+        num_perturb = 50
+        for _ in range(num_perturb):
+            if time.time() - start_time > timeout - safety_margin:
+                break
+            # Adaptive perturbation size based on current score
+            pert_size = 0.05 if best_score > 2.0 else 0.1
+            perturbation = rng.random((n, n)) * pert_size
             P_pert = best_P + perturbation
             P_pert = np.clip(P_pert, 0, None)
             s = P_pert.sum()
             if s > 0:
                 P_pert /= s
                 P_flat = P_pert.ravel()
-                try_optimize(P_flat, 'SLSQP', 300)
+                try_optimize(P_flat, 'SLSQP', 200, beta=100.0)
+    
+    # Phase 4: Final high-precision polish
+    if time.time() - start_time < timeout - safety_margin:
+        P_flat = best_P.ravel()
+        try_optimize(P_flat, 'SLSQP', 800, ftol=1e-15, beta=500.0)
+        if time.time() - start_time < timeout - safety_margin:
+            try_optimize(P_flat, 'trust-constr', 400, beta=500.0)
+    
+    # Phase 5: Very fine-tuning with tiny perturbations
+    if time.time() - start_time < timeout - safety_margin:
+        for _ in range(20):
+            if time.time() - start_time > timeout - safety_margin:
+                break
+            perturbation = rng.random((n, n)) * 0.01
+            P_pert = best_P + perturbation
+            P_pert = np.clip(P_pert, 0, None)
+            s = P_pert.sum()
+            if s > 0:
+                P_pert /= s
+                P_flat = P_pert.ravel()
+                try_optimize(P_flat, 'SLSQP', 200, ftol=1e-14, beta=500.0)
     
     best_P = np.clip(best_P, 0, None)
     s = best_P.sum()

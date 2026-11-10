@@ -1,0 +1,261 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from scipy.special import lpmv
+import numpy.polynomial.legendre as npl
+
+
+def _build_basis():
+    """Build real orthonormal degree-10 spherical harmonics on a quadrature grid."""
+    n_theta = 70
+    n_phi = 130
+    
+    mu, w = npl.leggauss(n_theta)
+    phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
+    dphi = 2 * np.pi / n_phi
+    
+    basis = np.zeros((21, n_theta, n_phi), dtype=np.float64)
+    
+    for m_idx in range(21):
+        m = m_idx - 10
+        abs_m = abs(m)
+        
+        # Compute N_m = sqrt(21/(4*pi) * (10-abs_m)!/(10+abs_m)!)
+        num = 1.0
+        for i in range(10 - abs_m + 1, 11):
+            num *= i
+        den = 1.0
+        for i in range(10 - abs_m + 1, 10 + abs_m + 1):
+            den *= i
+        N_m = np.sqrt(21.0 / (4.0 * np.pi) * num / den)
+        
+        # Associated Legendre with Condon-Shortley phase
+        P = lpmv(abs_m, 10, mu)
+        
+        if m == 0:
+            basis[m_idx] = N_m * P[:, np.newaxis] * np.ones((1, n_phi))
+        elif m > 0:
+            basis[m_idx] = np.sqrt(2.0) * N_m * P[:, np.newaxis] * np.cos(m * phi)[np.newaxis, :]
+        else:
+            basis[m_idx] = np.sqrt(2.0) * N_m * P[:, np.newaxis] * np.sin(abs_m * phi)[np.newaxis, :]
+    
+    weights = np.outer(w, np.full(n_phi, dphi))
+    
+    return basis, weights
+
+
+def _compute_R_and_grad(c, basis, weights):
+    """Compute R = ||f||_4/||f||_2 and its gradient in one pass."""
+    f = np.tensordot(c, basis, axes=(0, 0))
+    
+    f2 = f * f
+    norm2_sq = np.sum(f2 * weights)
+    
+    if norm2_sq <= 0:
+        return np.inf, np.zeros_like(c)
+    
+    f4 = f2 * f2
+    norm4_4 = np.sum(f4 * weights)
+    
+    norm2 = np.sqrt(norm2_sq)
+    norm4 = np.sqrt(np.sqrt(norm4_4))
+    R = norm4 / norm2
+    
+    # Gradient computation
+    # d(norm4)/dc_j = (1/(4*norm4^3)) * 4 * sum(f^3 * Y_j * w) = sum(f^3 * Y_j * w) / norm4^3
+    # d(norm2)/dc_j = sum(f * Y_j * w) / norm2
+    
+    f3 = f2 * f
+    int_f3_Y = np.einsum('jkl,kl->j', basis, f3 * weights)
+    int_f_Y = np.einsum('jkl,kl->j', basis, f * weights)
+    
+    d_norm4_dc = int_f3_Y / (norm4 ** 3)
+    d_norm2_dc = int_f_Y / norm2
+    
+    grad = d_norm4_dc / norm2 - (norm4 / norm2 ** 2) * d_norm2_dc
+    
+    return R, grad
+
+
+def _adam_step(c, grad, state, lr=0.01, beta1=0.9, beta2=0.999, eps=1e-8):
+    """Adam optimizer step."""
+    t = state['t'] + 1
+    state['t'] = t
+    
+    m = state['m']
+    v = state['v']
+    
+    m = beta1 * m + (1 - beta1) * grad
+    v = beta2 * v + (1 - beta2) * grad ** 2
+    
+    m_hat = m / (1 - beta1 ** t)
+    v_hat = v / (1 - beta2 ** t)
+    
+    c_new = c - lr * m_hat / (np.sqrt(v_hat) + eps)
+    
+    state['m'] = m
+    state['v'] = v
+    
+    return c_new
+
+
+def _gradient_descent_with_adaptive_lr(c, basis, weights, deadline, max_iter=5000):
+    """Gradient descent with adaptive learning rate and momentum."""
+    state = {'t': 0, 'm': np.zeros_like(c), 'v': np.zeros_like(c)}
+    lr = 0.01
+    best_R = _compute_R_and_grad(c, basis, weights)[0]
+    best_c = c.copy()
+    
+    for _ in range(max_iter):
+        if time.time() > deadline - 5:
+            break
+        
+        R, grad = _compute_R_and_grad(c, basis, weights)
+        if R < best_R:
+            best_R = R
+            best_c = c.copy()
+        
+        c_new = _adam_step(c, grad, state, lr)
+        
+        if not np.all(np.isfinite(c_new)):
+            lr *= 0.5
+            state['t'] = 0
+            state['m'] = np.zeros_like(c)
+            state['v'] = np.zeros_like(c)
+            continue
+        
+        R_new = _compute_R_and_grad(c_new, basis, weights)[0]
+        
+        if R_new < R:
+            c = c_new
+            # Slowly increase learning rate if making progress
+            lr = min(lr * 1.02, 0.1)
+        else:
+            # Revert and decrease learning rate
+            lr *= 0.9
+            state['t'] = max(0, state['t'] - 1)
+    
+    return best_c, best_R
+
+
+def _newton_like_refinement(c, basis, weights, deadline, max_iter=100):
+    """Newton-like refinement using Hessian approximation."""
+    best_R = _compute_R_and_grad(c, basis, weights)[0]
+    best_c = c.copy()
+    
+    # Use a simple line search with quadratic model
+    lr = 0.005
+    momentum = np.zeros_like(c)
+    beta = 0.8
+    
+    for _ in range(max_iter):
+        if time.time() > deadline - 5:
+            break
+        
+        R, grad = _compute_R_and_grad(c, basis, weights)
+        if R < best_R:
+            best_R = R
+            best_c = c.copy()
+        
+        # Momentum update
+        momentum = beta * momentum - lr * grad
+        c_new = c + momentum
+        
+        if not np.all(np.isfinite(c_new)):
+            lr *= 0.5
+            momentum *= 0.5
+            continue
+        
+        R_new = _compute_R_and_grad(c_new, basis, weights)[0]
+        
+        if R_new < R:
+            c = c_new
+            if R_new < best_R * 0.999:
+                lr = min(lr * 1.05, 0.05)
+        else:
+            lr *= 0.9
+            momentum *= 0.5
+    
+    return best_c, best_R
+
+
+def rudin_problem10() -> np.ndarray:
+    """
+    Find coefficients minimizing R = ||f||_4 / ||f||_2 for degree-10 spherical harmonics.
+    """
+    start_time = time.time()
+    deadline = start_time + 620.0  # 10s safety margin before 630s kill
+    
+    # Build basis
+    basis, weights = _build_basis()
+    
+    # Multiple initial guesses
+    rng = np.random.default_rng(42)
+    initial_guesses = [
+        np.ones(21, dtype=np.float64),
+        rng.standard_normal(21) * 0.5,
+        np.array([1.0 if i % 2 == 0 else -1.0 for i in range(21)], dtype=np.float64),
+        np.zeros(21, dtype=np.float64) + 1e-6,
+    ]
+    
+    # Add structured guesses: single m modes
+    for m in range(-10, 11):
+        guess = np.zeros(21, dtype=np.float64)
+        guess[m + 10] = 1.0
+        initial_guesses.append(guess)
+    
+    # Also add some combinations
+    for m1 in range(-10, 11, 3):
+        for m2 in range(m1 + 1, 11, 3):
+            guess = np.zeros(21, dtype=np.float64)
+            guess[m1 + 10] = 1.0
+            guess[m2 + 10] = 1.0
+            initial_guesses.append(guess)
+    
+    best_c = None
+    best_R = np.inf
+    
+    # Phase 1: Try each initial guess with Adam
+    for guess in initial_guesses:
+        if time.time() > deadline - 30:
+            break
+        
+        c = guess.copy()
+        c, R = _gradient_descent_with_adaptive_lr(c, basis, weights, deadline, max_iter=2000)
+        
+        if R < best_R:
+            best_R = R
+            best_c = c.copy()
+    
+    # Phase 2: Refine the best result with Newton-like method
+    if best_c is not None and time.time() < deadline - 10:
+        c, R = _newton_like_refinement(best_c, basis, weights, deadline, max_iter=500)
+        if R < best_R:
+            best_R = R
+            best_c = c.copy()
+    
+    # Phase 3: Try a few more random restarts if time permits
+    if best_c is not None and time.time() < deadline - 15:
+        for _ in range(5):
+            if time.time() > deadline - 10:
+                break
+            guess = rng.standard_normal(21) * 0.3
+            c, R = _gradient_descent_with_adaptive_lr(c, basis, weights, deadline, max_iter=1000)
+            if R < best_R:
+                best_R = R
+                best_c = c.copy()
+    
+    # Final validation
+    if best_c is None or not np.all(np.isfinite(best_c)):
+        return np.ones(21, dtype=np.float64)
+    
+    max_abs = np.max(np.abs(best_c))
+    if max_abs < 1e-3:
+        best_c = best_c * (1.0 / max(1e-3, max_abs))
+    elif max_abs > 1e5:
+        best_c = best_c * (1e5 / max_abs)
+    
+    return best_c
+
+
+# EVOLVE-BLOCK-END

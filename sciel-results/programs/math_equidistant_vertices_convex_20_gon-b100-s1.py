@@ -72,7 +72,7 @@ def compute_metric(points):
             
     return min_score, True
 
-def compute_metric_smooth(points, temperature=0.02):
+def compute_metric_smooth(points, temperature=0.05):
     """
     Smooth surrogate for the metric using soft-min and soft-max.
     Returns a smooth scalar objective (higher is better).
@@ -121,28 +121,40 @@ def compute_metric_smooth(points, temperature=0.02):
             continue
         
         diffs = np.diff(d_sorted)
-        # Soft argmin: use temperature-based soft-min on diffs
-        soft_min_diff = -temperature * np.log(np.sum(np.exp(-diffs / temperature)))
-        # Find approximate k by finding where diffs are smallest
-        k = np.argmin(diffs)
-        D = (d_sorted[k] + d_sorted[k+1]) / 2.0
+        # Soft argmin via softmax weights
+        exp_diffs = np.exp(-diffs / temperature)
+        softmax_weights = exp_diffs / np.sum(exp_diffs)
+        
+        # Weighted D using soft argmin
+        D_values = (d_sorted[:-1] + d_sorted[1:]) / 2.0
+        D = np.sum(softmax_weights * D_values)
         
         if D < 0.1:
             vertex_scores[i] = 0.0
             continue
         
-        if k == 0:
-            selected = d_sorted[0:4]
-        elif k == 17:
-            selected = d_sorted[15:19]
-        else:
-            selected = d_sorted[k-1:k+3]
+        # Soft selection of 4 distances around soft k
+        # Use weighted average of ratios over all possible 4-distance windows
+        # Weighted by softmax of how close each window is to the soft k
+        num_windows = 16  # k=0..15 maps to windows
+        window_ratios = np.zeros(num_windows)
+        for k_idx in range(num_windows):
+            if k_idx == 0:
+                selected = d_sorted[0:4]
+            elif k_idx == 15:
+                selected = d_sorted[15:19]
+            else:
+                selected = d_sorted[k_idx-1:k_idx+3]
+            ratios = np.maximum(selected / D, D / selected)
+            window_ratios[k_idx] = np.mean(ratios)
         
-        # Soft max for ratios: use soft-max on log ratios
-        log_ratios = np.log(selected / D) - np.log(D / selected)  # This is wrong, let me fix
-        ratios = np.maximum(selected / D, D / selected)
-        # Soft mean: use temperature-based approach
-        raw = np.mean(ratios)
+        # Weight windows by softmax of negative distance to soft k
+        soft_k = np.sum(softmax_weights * np.arange(16))
+        k_indices = np.arange(16)
+        window_weights = np.exp(-(k_indices - soft_k)**2 / (2 * temperature * 10))
+        window_weights /= np.sum(window_weights)
+        
+        raw = np.sum(window_weights * window_ratios)
         score = min(1.0, 1.0 / raw) if raw > 0 else 0.0
         vertex_scores[i] = score
     
@@ -214,7 +226,7 @@ def equidistant_points_polygon20() -> np.ndarray:
         
         return -score + 0.001 * r_penalty
     
-    def objective_smooth(params, temperature=0.02):
+    def objective_smooth(params, temperature=0.05):
         """Smooth objective for gradient-based methods"""
         if time.time() > deadline - safety_margin:
             return 1e10
@@ -396,6 +408,64 @@ def equidistant_points_polygon20() -> np.ndarray:
                 best_params = params_p2.copy()
         except Exception:
             pass
+        
+        # Additional polish: coordinate descent on the bottleneck vertex
+        if time.time() < deadline - 5:
+            points_cur = get_points(best_params)
+            for _ in range(3):
+                if time.time() > deadline - 5:
+                    break
+                # Find the bottleneck vertex
+                centroid = np.mean(points_cur, axis=0)
+                centered = points_cur - centroid
+                mean_dist = np.mean(np.linalg.norm(centered, axis=1))
+                normalized = centered / mean_dist
+                dist_matrix = np.linalg.norm(normalized[:, np.newaxis, :] - normalized[np.newaxis, :, :], axis=2)
+                np.fill_diagonal(dist_matrix, np.inf)
+                
+                vertex_scores = []
+                for i in range(n):
+                    d = dist_matrix[i]
+                    d_sorted = np.sort(d)
+                    if d_sorted[0] < 0.05:
+                        vertex_scores.append(0.0)
+                        continue
+                    diffs = np.diff(d_sorted)
+                    k = np.argmin(diffs)
+                    D = (d_sorted[k] + d_sorted[k+1]) / 2.0
+                    if D < 0.1:
+                        vertex_scores.append(0.0)
+                        continue
+                    if k == 0:
+                        selected = d_sorted[0:4]
+                    elif k == 17:
+                        selected = d_sorted[15:19]
+                    else:
+                        selected = d_sorted[k-1:k+3]
+                    ratios = np.maximum(selected / D, D / selected)
+                    raw = np.mean(ratios)
+                    vertex_scores.append(min(1.0, 1.0/raw) if raw > 0 else 0.0)
+                
+                bottleneck = np.argmin(vertex_scores)
+                if vertex_scores[bottleneck] >= 0.999:
+                    break
+                
+                # Try small perturbations of the bottleneck vertex
+                best_local = best_score
+                for dr in [-0.01, -0.005, 0.005, 0.01]:
+                    for dtheta in [-0.01, -0.005, 0.005, 0.01]:
+                        params_test = best_params.copy()
+                        params_test[bottleneck] += dr
+                        params_test[n + bottleneck] += dtheta
+                        points_test = get_points(params_test)
+                        score_test, valid_test = compute_metric(points_test)
+                        if valid_test and score_test > best_local:
+                            best_local = score_test
+                            best_params = params_test.copy()
+                            points_cur = points_test
+                
+                if best_local > best_score:
+                    best_score = best_local
     
     # Return best points
     if best_params is None:

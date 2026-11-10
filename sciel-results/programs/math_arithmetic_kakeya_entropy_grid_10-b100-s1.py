@@ -1,6 +1,6 @@
 import numpy as np
 import time
-from scipy.optimize import minimize
+from scipy.optimize import minimize, minimize_scalar
 
 # Precompute the value arrays for the four slopes
 _N = 10
@@ -24,6 +24,12 @@ _N_H0 = _h0_vals.max() + 1
 _N_H1 = _h1_vals.max() + 1
 _N_H2 = _h2_vals.max() + 1
 
+# Precompute masks for fast entropy computation
+_d_mask = _d_vals  # bin indices
+_h0_mask = _h0_vals
+_h1_mask = _h1_vals
+_h2_mask = _h2_vals
+
 def _entropy_from_counts(counts):
     """Compute Shannon entropy in bits from a count array."""
     probs = counts[counts > 1e-15]
@@ -31,18 +37,17 @@ def _entropy_from_counts(counts):
         return 0.0
     return -np.sum(probs * np.log2(probs))
 
-def _compute_ratio(P):
-    P = np.clip(P, 0, None)
-    s = P.sum()
-    if s <= 1e-15:
-        return 0.0
-    w = P.flatten()
-    
-    # Compute pooled probabilities for each slope
-    d_probs = np.bincount(_d_vals, weights=w, minlength=_N_D)
-    h0_probs = np.bincount(_h0_vals, weights=w, minlength=_N_H0)
-    h1_probs = np.bincount(_h1_vals, weights=w, minlength=_N_H1)
-    h2_probs = np.bincount(_h2_vals, weights=w, minlength=_N_H2)
+def _score_fast_impl(w):
+    """Fast score computation assuming w is a flat array of non-negative weights summing to 1."""
+    # Use add.at for pooled probabilities - faster than bincount for small arrays
+    d_probs = np.zeros(_N_D)
+    np.add.at(d_probs, _d_vals, w)
+    h0_probs = np.zeros(_N_H0)
+    np.add.at(h0_probs, _h0_vals, w)
+    h1_probs = np.zeros(_N_H1)
+    np.add.at(h1_probs, _h1_vals, w)
+    h2_probs = np.zeros(_N_H2)
+    np.add.at(h2_probs, _h2_vals, w)
     
     D = _entropy_from_counts(d_probs)
     H0 = _entropy_from_counts(h0_probs)
@@ -55,6 +60,14 @@ def _compute_ratio(P):
         return 0.0
         
     return D / M
+
+def _compute_ratio(P):
+    P = np.clip(P, 0, None)
+    s = P.sum()
+    if s <= 1e-15:
+        return 0.0
+    w = P.flatten() / s
+    return _score_fast_impl(w)
 
 def arithmetic_kakeya_distribution() -> np.ndarray:
     n = _N
@@ -78,22 +91,7 @@ def arithmetic_kakeya_distribution() -> np.ndarray:
     
     def _score_fast(P_flat):
         """Fast score computation assuming P_flat is already normalized and non-negative."""
-        d_probs = np.bincount(_d_vals, weights=P_flat, minlength=_N_D)
-        h0_probs = np.bincount(_h0_vals, weights=P_flat, minlength=_N_H0)
-        h1_probs = np.bincount(_h1_vals, weights=P_flat, minlength=_N_H1)
-        h2_probs = np.bincount(_h2_vals, weights=P_flat, minlength=_N_H2)
-        
-        D = _entropy_from_counts(d_probs)
-        H0 = _entropy_from_counts(h0_probs)
-        H1 = _entropy_from_counts(h1_probs)
-        H2 = _entropy_from_counts(h2_probs)
-        
-        M = max(H0, H1, H2)
-        
-        if M <= 1e-9:
-            return 0.0
-            
-        return D / M
+        return _score_fast_impl(P_flat)
     
     def _log_softmax_params_to_prob(params):
         """Convert unconstrained params to probability via log-sum-exp."""
@@ -121,10 +119,14 @@ def arithmetic_kakeya_distribution() -> np.ndarray:
     def _negative_ratio_smooth(params, temperature=0.5):
         """Smooth objective using soft-max for M."""
         probs = _log_softmax_params_to_prob(params)
-        d_probs = np.bincount(_d_vals, weights=probs, minlength=_N_D)
-        h0_probs = np.bincount(_h0_vals, weights=probs, minlength=_N_H0)
-        h1_probs = np.bincount(_h1_vals, weights=probs, minlength=_N_H1)
-        h2_probs = np.bincount(_h2_vals, weights=probs, minlength=_N_H2)
+        d_probs = np.zeros(_N_D)
+        np.add.at(d_probs, _d_vals, probs)
+        h0_probs = np.zeros(_N_H0)
+        np.add.at(h0_probs, _h0_vals, probs)
+        h1_probs = np.zeros(_N_H1)
+        np.add.at(h1_probs, _h1_vals, probs)
+        h2_probs = np.zeros(_N_H2)
+        np.add.at(h2_probs, _h2_vals, probs)
         
         D = _entropy_from_counts(d_probs)
         H0 = _entropy_from_counts(h0_probs)
@@ -139,7 +141,7 @@ def arithmetic_kakeya_distribution() -> np.ndarray:
         return -D / M
     
     # Multi-start with different initializations
-    num_restarts = 20
+    num_restarts = 30
     time_per_restart = (timeout - safety_margin - 60) / num_restarts  # reserve 60s for polish
     
     for r in range(num_restarts):
@@ -167,6 +169,22 @@ def arithmetic_kakeya_distribution() -> np.ndarray:
             current_P = np.zeros((n, n))
             for i in range(n):
                 current_P[i, n-1-i] = 1.0 / n
+        elif r == 5:
+            # Concentrate on x+2y=0 line (y=0, x=0) and x+2y=27 (y=9, x=9)
+            current_P = np.zeros((n, n))
+            current_P[0, 0] = 0.5
+            current_P[9, 9] = 0.5
+        elif r == 6:
+            # Spread over x+2y=const lines
+            current_P = np.zeros((n, n))
+            for y in range(n):
+                for x in range(n):
+                    val = x + 2*y
+                    current_P[y, x] = 1.0 / (n*n)
+            # Boost cells with extreme x+2y values
+            current_P[0, 0] *= 3
+            current_P[9, 9] *= 3
+            current_P = _normalize(current_P)
         else:
             # Perturb best found
             current_P = best_P + np.random.normal(0, 0.1, (n, n))
@@ -185,7 +203,7 @@ def arithmetic_kakeya_distribution() -> np.ndarray:
         
         while time.time() - local_start < local_time_limit:
             # Try a few random moves per iteration
-            for _ in range(5):
+            for _ in range(8):
                 if time.time() - local_start >= local_time_limit:
                     break
                     
@@ -234,8 +252,8 @@ def arithmetic_kakeya_distribution() -> np.ndarray:
             current_P_norm = current_P_clipped / current_P_clipped.sum()
             log_params = np.log(current_P_norm.flatten())
             
-            # Try smooth objective with decreasing temperature
-            for temp in [1.0, 0.5, 0.2, 0.1]:
+            # Try smooth objective with decreasing temperature - more aggressive schedule
+            for temp in [1.0, 0.5, 0.3, 0.15, 0.08, 0.04]:
                 if time.time() - start_time > timeout - safety_margin - 20:
                     break
                     
@@ -245,7 +263,7 @@ def arithmetic_kakeya_distribution() -> np.ndarray:
                         log_params,
                         args=(temp,),
                         method='L-BFGS-B',
-                        options={'maxiter': 500, 'ftol': 1e-12, 'gtol': 1e-8}
+                        options={'maxiter': 1000, 'ftol': 1e-14, 'gtol': 1e-10}
                     )
                     
                     if result.success or result.fun < -current_score:
@@ -259,12 +277,56 @@ def arithmetic_kakeya_distribution() -> np.ndarray:
                             if current_score > best_score:
                                 best_score = current_score
                                 best_P = current_P.copy()
+                            # Update log_params for next temperature
+                            current_P_clipped = np.clip(current_P, 1e-15, None)
+                            current_P_norm = current_P_clipped / current_P_clipped.sum()
+                            log_params = np.log(current_P_norm.flatten())
                 except Exception:
                     pass
         
-        # Phase 3: Fine-grained hill climbing polish
+        # Phase 3: Coordinate descent polish
         if time.time() - start_time < timeout - safety_margin - 10:
+            coord_time_limit = min(10, time_per_restart * 0.25)
+            coord_start = time.time()
             step_size = 0.05
+            
+            improved = True
+            while improved and time.time() - coord_start < coord_time_limit:
+                improved = False
+                for i in range(n):
+                    for j in range(n):
+                        if time.time() - coord_start >= coord_time_limit:
+                            break
+                        # Try small perturbations
+                        for delta in [step_size, -step_size, step_size*0.5, -step_size*0.5]:
+                            new_P = current_P.copy()
+                            new_P[i, j] += delta
+                            
+                            if new_P[i, j] < -1e-9:
+                                continue
+                                
+                            new_P = np.clip(new_P, 0, None)
+                            s = new_P.sum()
+                            if s <= 1e-9:
+                                continue
+                            new_P = new_P / s
+                            
+                            new_score = _score_fast(new_P.flatten())
+                            
+                            if new_score > current_score:
+                                current_P = new_P
+                                current_score = new_score
+                                improved = True
+                                if current_score > best_score:
+                                    best_score = current_score
+                                    best_P = current_P.copy()
+                step_size *= 0.7
+                if step_size < 0.001:
+                    break
+            
+        # Phase 4: Fine-grained random hill climbing polish
+        if time.time() - start_time < timeout - safety_margin - 5:
+            step_size = 0.03
             polish_time_limit = min(10, time_per_restart * 0.2)
             polish_start = time.time()
             
@@ -292,7 +354,7 @@ def arithmetic_kakeya_distribution() -> np.ndarray:
                     if current_score > best_score:
                         best_score = current_score
                         best_P = current_P.copy()
-                    step_size *= 0.95
+                    step_size *= 0.96
                 else:
                     step_size *= 0.98
                     if step_size < 0.001:
@@ -302,7 +364,7 @@ def arithmetic_kakeya_distribution() -> np.ndarray:
     if time.time() - start_time < timeout - safety_margin:
         final_P = best_P.copy()
         final_score = best_score
-        step_size = 0.02
+        step_size = 0.015
         final_start = time.time()
         final_limit = timeout - safety_margin - (time.time() - start_time)
         
@@ -334,11 +396,37 @@ def arithmetic_kakeya_distribution() -> np.ndarray:
                 else:
                     no_improve += 1
                     step_size *= 0.97
-                    if no_improve > 100 or step_size < 0.0005:
+                    if no_improve > 150 or step_size < 0.0003:
                         break
             
             if final_score > best_score:
                 best_P = final_P
                 best_score = final_score
+        
+        # Final scipy polish with very tight tolerances
+        if time.time() - final_start < final_limit - 5:
+            try:
+                final_P_clipped = np.clip(final_P, 1e-15, None)
+                final_P_norm = final_P_clipped / final_P_clipped.sum()
+                log_params = np.log(final_P_norm.flatten())
+                
+                result = minimize(
+                    _negative_ratio_smooth,
+                    log_params,
+                    args=(0.02,),
+                    method='L-BFGS-B',
+                    options={'maxiter': 2000, 'ftol': 1e-15, 'gtol': 1e-12}
+                )
+                
+                if result.success or result.fun < -final_score:
+                    opt_params = result.x
+                    opt_P = _log_softmax_params_to_prob(opt_params).reshape(n, n)
+                    opt_score = _compute_ratio(opt_P)
+                    
+                    if opt_score > final_score:
+                        best_P = opt_P
+                        best_score = opt_score
+            except Exception:
+                pass
     
     return best_P

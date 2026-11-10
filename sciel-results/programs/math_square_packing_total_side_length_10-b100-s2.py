@@ -1,7 +1,6 @@
-# EVOLVE-BLOCK-START
 import numpy as np
 import time
-import random
+from scipy.optimize import minimize
 
 def _is_valid(centers, sides, tol=1e-7):
     """Check if the packing is valid."""
@@ -25,8 +24,6 @@ def _is_valid(centers, sides, tol=1e-7):
     # Check no overlaps
     for i in range(n):
         for j in range(i+1, n):
-            # Overlap if |cx_i - cx_j| < (s_i + s_j)/2 AND |cy_i - cy_j| < (s_i + s_j)/2
-            # Valid if NOT overlapping, i.e., |cx_i - cx_j| >= (s_i + s_j)/2 - tol OR |cy_i - cy_j| >= (s_i + s_j)/2 - tol
             dx = abs(centers[i, 0] - centers[j, 0])
             dy = abs(centers[i, 1] - centers[j, 1])
             min_dx = (sides[i] + sides[j])/2 - tol
@@ -36,293 +33,352 @@ def _is_valid(centers, sides, tol=1e-7):
     return True
 
 def _objective(centers, sides):
-    """Objective: sum of side lengths."""
+    """Return sum of sides if valid, else a large penalty."""
+    n = len(sides)
+    tol = 1e-7
+    
+    # Check bounds
+    for i in range(n):
+        cx, cy = centers[i]
+        s = sides[i]
+        if cx - s/2 < -tol or cx + s/2 > 1 + tol:
+            return -1e6
+        if cy - s/2 < -tol or cy + s/2 > 1 + tol:
+            return -1e6
+        if s <= 0:
+            return -1e6
+    
+    # Check overlaps
+    for i in range(n):
+        for j in range(i+1, n):
+            dx = abs(centers[i, 0] - centers[j, 0])
+            dy = abs(centers[i, 1] - centers[j, 1])
+            min_dx = (sides[i] + sides[j])/2 - tol
+            min_dy = (sides[i] + sides[j])/2 - tol
+            if dx < min_dx and dy < min_dy:
+                return -1e6
+    
     return np.sum(sides)
 
-def _local_search(centers, sides, rng, max_iters=10000, tol=1e-7):
+def _smooth_penalty(centers, sides, beta=50.0):
     """
-    Perform local search with simulated annealing.
-    Returns best valid configuration found.
+    Smooth surrogate for the constraint violations.
+    Uses soft-min (log-sum-exp) to approximate the minimum separation.
+    Returns a scalar penalty that is 0 when all constraints are satisfied (approximately).
     """
     n = len(sides)
-    current_centers = centers.copy()
-    current_sides = sides.copy()
-    current_val = _objective(current_centers, current_sides)
+    penalty = 0.0
     
-    best_centers = current_centers.copy()
-    best_sides = current_sides.copy()
-    best_val = current_val
-    
-    if not _is_valid(current_centers, current_sides, tol):
-        return best_centers, best_sides, best_val
-
-    T = 0.01 # Initial temperature
-    cooling_rate = 0.999
-    min_T = 1e-6
-    
-    for it in range(max_iters):
-        if T < min_T:
-            break
+    # Overlap penalty
+    for i in range(n):
+        for j in range(i+1, n):
+            dx = abs(centers[i, 0] - centers[j, 0])
+            dy = abs(centers[i, 1] - centers[j, 1])
+            t = (sides[i] + sides[j])/2
             
-        # Generate a neighbor
-        neighbor_centers = current_centers.copy()
-        neighbor_sides = current_sides.copy()
+            gap_x = dx - t
+            gap_y = dy - t
+            
+            # Soft min of gap_x and gap_y
+            # We want to penalize when min(gap_x, gap_y) < 0
+            # min(a, b) approx = -1/beta * log(exp(-beta*a) + exp(-beta*b))
+            # If min < 0, penalty > 0.
+            
+            # To avoid overflow in exp, we use the stable log-sum-exp formula:
+            # log(exp(x) + exp(y)) = m + log(exp(x-m) + exp(y-m)) where m = max(x,y)
+            # Here we have log(exp(-beta*gap_x) + exp(-beta*gap_y))
+            # Let a = -beta*gap_x, b = -beta*gap_y
+            # m = max(a, b) = -beta * min(gap_x, gap_y)
+            
+            m = min(gap_x, gap_y)
+            
+            # If m is very large positive, gaps are large, penalty is negligible
+            if m > 100 / beta:
+                continue
+                
+            # Calculate log(exp(-beta*gap_x) + exp(-beta*gap_y))
+            # = -beta*m + log(exp(-beta*(gap_x - m)) + exp(-beta*(gap_y - m)))
+            
+            # Note: gap_x - m >= 0 and gap_y - m >= 0
+            # So -beta*(gap_x - m) <= 0, no overflow
+            
+            val = -beta * m + np.log(np.exp(-beta * (gap_x - m)) + np.exp(-beta * (gap_y - m)))
+            penalty += val / beta
+    
+    # Boundary penalties
+    for i in range(n):
+        s = sides[i]
+        # Gaps to boundaries:
+        # Left: cx - s/2
+        # Right: 1 - cx - s/2
+        # Bottom: cy - s/2
+        # Top: 1 - cy - s/2
         
-        # Pick a random square to perturb
-        idx = rng.integers(0, n)
+        gaps = [
+            centers[i, 0] - s/2,
+            1 - centers[i, 0] - s/2,
+            centers[i, 1] - s/2,
+            1 - centers[i, 1] - s/2
+        ]
         
-        # Perturb center
-        noise = 0.01
-        neighbor_centers[idx, 0] += rng.uniform(-noise, noise)
-        neighbor_centers[idx, 1] += rng.uniform(-noise, noise)
+        # We want to penalize if any gap < 0.
+        # Use soft-min of all gaps.
+        m = min(gaps)
         
-        # Perturb side
-        side_noise = 0.01
-        neighbor_sides[idx] += rng.uniform(-side_noise, side_noise)
-        
-        # Ensure side is positive and within bounds roughly
-        neighbor_sides[idx] = max(0.001, min(1.0, neighbor_sides[idx]))
-        
-        # Ensure center allows square to be inside [0,1]
-        s = neighbor_sides[idx]
-        min_cx = s/2
-        max_cx = 1 - s/2
-        min_cy = s/2
-        max_cy = 1 - s/2
-        
-        neighbor_centers[idx, 0] = np.clip(neighbor_centers[idx, 0], min_cx, max_cx)
-        neighbor_centers[idx, 1] = np.clip(neighbor_centers[idx, 1], min_cy, max_cy)
-        
-        # Check validity
-        if not _is_valid(neighbor_centers, neighbor_sides, tol):
-            # Reject invalid moves
-            T *= cooling_rate
+        if m > 100 / beta:
             continue
             
-        neighbor_val = _objective(neighbor_centers, neighbor_sides)
+        # log(sum(exp(-beta * gap)))
+        # = -beta*m + log(sum(exp(-beta*(gap - m))))
         
-        # Simulated annealing acceptance
-        delta = neighbor_val - current_val
-        if delta > 0 or rng.random() < np.exp(delta / T):
-            current_centers = neighbor_centers
-            current_sides = neighbor_sides
-            current_val = neighbor_val
-            
-            if current_val > best_val:
-                best_val = current_val
-                best_centers = current_centers.copy()
-                best_sides = current_sides.copy()
-                
-        T *= cooling_rate
+        gaps_arr = np.array(gaps)
+        val = -beta * m + np.log(np.sum(np.exp(-beta * (gaps_arr - m))))
+        penalty += val / beta
         
-    return best_centers, best_sides, best_val
+    return penalty
 
-def _generate_initial_config(n=10, method='grid'):
-    """Generate an initial configuration."""
-    if method == 'grid':
-        # 4x3 grid, but we have 10 squares.
-        # Use 4 columns, 3 rows.
-        # Fill 10 squares.
-        # To maximize sum, maybe make them all 0.25?
-        # Or vary sizes?
-        # Let's start with uniform 0.25.
-        centers = np.zeros((n, 2))
-        sides = np.full(n, 0.25)
-        
-        # Place them in a grid pattern
-        # 4 cols, 3 rows
-        # Indices 0-3 in row 0, 4-7 in row 1, 8-9 in row 2
+def _generate_initial_configs():
+    """Generate several diverse initial configurations."""
+    configs = []
+    
+    # Config 1: Standard 3.0 packing (2 large, 8 small)
+    centers = np.zeros((10, 2))
+    sides = np.zeros(10)
+    sides[0] = 0.5; centers[0] = [0.25, 0.25]
+    sides[1] = 0.5; centers[1] = [0.75, 0.25]
+    for i in range(8):
+        sides[i+2] = 0.25
+        row = i // 4
+        col = i % 4
+        centers[i+2] = [0.125 + col*0.25, 0.625 + row*0.25]
+    configs.append((centers, sides))
+    
+    # Config 2: 5x2 Grid (10 squares of 0.2)
+    centers = np.zeros((10, 2))
+    sides = np.zeros(10)
+    for i in range(10):
+        row = i // 5
+        col = i % 5
+        sides[i] = 0.2
+        centers[i] = [0.1 + col*0.2, 0.1 + row*0.2]
+    configs.append((centers, sides))
+    
+    # Config 3: Random Greedy
+    rng = np.random.RandomState(42)
+    centers = np.zeros((10, 2))
+    sides = np.zeros(10)
+    # Sort by size descending? No, just place them.
+    # Let's try a simple random placement and then a quick repair
+    for i in range(10):
+        sides[i] = 0.2 + rng.random()*0.1
+        centers[i] = [rng.uniform(sides[i]/2, 1-sides[i]/2), rng.uniform(sides[i]/2, 1-sides[i]/2)]
+    configs.append((centers, sides))
+    
+    # Config 4: One large, rest small
+    centers = np.zeros((10, 2))
+    sides = np.zeros(10)
+    sides[0] = 0.6
+    centers[0] = [0.3, 0.3]
+    for i in range(1, 10):
+        sides[i] = 0.2
+        # Place around the large one
+        angle = 2 * np.pi * i / 9
+        r = 0.4
+        cx = 0.5 + r * np.cos(angle)
+        cy = 0.5 + r * np.sin(angle)
+        # Clamp
+        cx = np.clip(cx, sides[i]/2, 1-sides[i]/2)
+        cy = np.clip(cy, sides[i]/2, 1-sides[i]/2)
+        centers[i] = [cx, cy]
+    configs.append((centers, sides))
+    
+    return configs
+
+def _local_search_smooth(centers, sides, time_limit=10.0, beta_start=10.0, beta_end=100.0):
+    """
+    Uses scipy.optimize.minimize with a smooth penalty function.
+    We minimize -sum(sides) + penalty(centers, sides).
+    """
+    start_time = time.time()
+    n = len(sides)
+    
+    # Flatten variables: [cx0, cy0, s0, cx1, cy1, s1, ...]
+    x0 = np.zeros(3 * n)
+    for i in range(n):
+        x0[3*i] = centers[i, 0]
+        x0[3*i+1] = centers[i, 1]
+        x0[3*i+2] = sides[i]
+    
+    best_x = x0.copy()
+    best_score = _objective(centers, sides)
+    
+    if best_score < 0:
+        return centers, sides, best_score
+    
+    def unpack(x):
+        c = np.zeros((n, 2))
+        s = np.zeros(n)
         for i in range(n):
-            col = i % 4
-            row = i // 4
-            cx = (col + 0.5) * 0.25
-            cy = (row + 0.5) * 0.25
-            centers[i, 0] = cx
-            centers[i, 1] = cy
-        return centers, sides
-        
-    elif method == 'heuristic':
-        # Try a known good packing structure
-        # e.g. 1 large square (0.5) and 9 small ones (0.25)?
-        # Large at (0.25, 0.25).
-        # Remaining space: 
-        #   x in [0.5, 1], y in [0, 1] (width 0.5, height 1) -> 4 squares of 0.25
-        #   x in [0, 0.5], y in [0.5, 1] (width 0.5, height 0.5) -> 4 squares of 0.25? No, 0.5x0.5 fits 4 of 0.25.
-        # Total: 1 large (0.5) + 8 small (0.25) = 9 squares.
-        # We need 10.
-        # Maybe 2 large (0.5) and 8 small (0.25)?
-        # 2 large take 0.5x0.5 each. Total area 0.5.
-        # 8 small take 0.25x0.25 each. Total area 8 * 0.0625 = 0.5.
-        # Total area 1.0. Perfect tiling?
-        # Layout:
-        #   Large 1 at (0.25, 0.25)
-        #   Large 2 at (0.75, 0.25)
-        #   Top half y in [0.5, 1]:
-        #     x in [0, 0.5]: 4 small squares of 0.25
-        #     x in [0.5, 1]: 4 small squares of 0.25
-        # This is 2 + 8 = 10 squares.
-        # Sum of sides: 2*0.5 + 8*0.25 = 1.0 + 2.0 = 3.0.
-        # This is better than 2.5!
-        
-        centers = np.zeros((n, 2))
-        sides = np.zeros(n)
-        
-        # 2 Large
-        centers[0] = [0.25, 0.25]
-        sides[0] = 0.5
-        centers[1] = [0.75, 0.25]
-        sides[1] = 0.5
-        
-        # 8 Small
-        # Top-left quadrant (x:0-0.5, y:0.5-1.0)
-        # 4 squares of 0.25
-        for k in range(4):
-            col = k % 2
-            row = k // 2
-            cx = (col + 0.5) * 0.25
-            cy = 0.5 + (row + 0.5) * 0.25
-            centers[2+k, 0] = cx
-            centers[2+k, 1] = cy
-            sides[2+k] = 0.25
+            c[i, 0] = x[3*i]
+            c[i, 1] = x[3*i+1]
+            s[i] = x[3*i+2]
+        return c, s
+    
+    def make_objective(beta):
+        def obj(x):
+            if time.time() - start_time > time_limit:
+                return 1e6
+            c, s = unpack(x)
             
-        # Top-right quadrant (x:0.5-1.0, y:0.5-1.0)
-        # 4 squares of 0.25
-        for k in range(4):
-            col = k % 2
-            row = k // 2
-            cx = 0.5 + (col + 0.5) * 0.25
-            cy = 0.5 + (row + 0.5) * 0.25
-            centers[6+k, 0] = cx
-            centers[6+k, 1] = cy
-            sides[6+k] = 0.25
+            # Hard constraints for bounds to keep search space sane
+            if np.any(s < 0.01) or np.any(s > 1.0):
+                return 1e6
             
-        return centers, sides
-
-    else:
-        return _generate_initial_config(n, 'grid')
+            pen = _smooth_penalty(c, s, beta=beta)
+            val = -np.sum(s) + pen
+            return val
+        return obj
+    
+    # Run multiple steps with increasing beta (annealing the smoothness)
+    betas = np.linspace(beta_start, beta_end, 5)
+    
+    for beta in betas:
+        if time.time() - start_time > time_limit:
+            break
+        
+        obj = make_objective(beta)
+        
+        try:
+            res = minimize(obj, x0, method='L-BFGS-B', options={'maxiter': 200, 'disp': False})
+            if res.success or res.fun < obj(x0):
+                x0 = res.x
+        except Exception:
+            pass
+        
+        # Update best
+        c, s = unpack(x0)
+        # Clip sides to be positive
+        s = np.clip(s, 0.01, 1.0)
+        # Clip centers
+        for i in range(n):
+            c[i, 0] = np.clip(c[i, 0], s[i]/2, 1 - s[i]/2)
+            c[i, 1] = np.clip(c[i, 1], s[i]/2, 1 - s[i]/2)
+        
+        score = _objective(c, s)
+        if score > best_score:
+            best_score = score
+            best_x = x0.copy()
+            
+    c, s = unpack(best_x)
+    return c, s, best_score
 
 def squares_in_square10() -> tuple:
     """
     Returns:
         centers: np.ndarray of shape (10, 2)
         sides:   np.ndarray of shape (10,)
+    
+    Uses a hybrid approach:
+    1. Generate diverse initial configurations.
+    2. Use smooth optimization (L-BFGS-B with soft-min penalty) to refine.
+    3. Track the best valid solution found.
     """
-    n = 10
-    tol = 1e-7
-    start_time = time.time()
-    deadline = 600 # seconds
+    deadline = time.time() + 600  # Safety margin
     
     best_centers = None
     best_sides = None
-    best_val = -1.0
+    best_score = -np.inf
     
-    rng = np.random.default_rng(42)
+    configs = _generate_initial_configs()
     
-    # Try different initial configurations and local search
-    # 1. Heuristic (2 large, 8 small)
-    c_init, s_init = _generate_initial_config(n, 'heuristic')
-    if _is_valid(c_init, s_init, tol):
-        bc, bs, bv = _local_search(c_init, s_init, rng, max_iters=50000, tol=tol)
-        if bv > best_val:
-            best_val = bv
-            best_centers = bc
-            best_sides = bs
-            
-    # Check time
-    if time.time() - start_time > deadline - 60:
-        if best_centers is not None:
-            return best_centers, best_sides
-        # Fallback to grid
-        c_grid, s_grid = _generate_initial_config(n, 'grid')
-        return c_grid, s_grid
-
-    # 2. Grid baseline
-    c_init, s_init = _generate_initial_config(n, 'grid')
-    bc, bs, bv = _local_search(c_init, s_init, rng, max_iters=50000, tol=tol)
-    if bv > best_val:
-        best_val = bv
-        best_centers = bc
-        best_sides = bs
-        
-    # Check time
-    if time.time() - start_time > deadline - 60:
-        if best_centers is not None:
-            return best_centers, best_sides
-        c_grid, s_grid = _generate_initial_config(n, 'grid')
-        return c_grid, s_grid
-
-    # 3. Random restarts with local search
-    # Try to find even better packings
-    max_restarts = 20
-    for r in range(max_restarts):
-        if time.time() - start_time > deadline - 30:
+    # Add some random perturbations of the best config found so far
+    rng = np.random.RandomState(123)
+    
+    for idx, (centers, sides) in enumerate(configs):
+        if time.time() > deadline - 30:
             break
             
-        # Random initial config
-        c_rand = np.random.uniform(0.1, 0.9, (n, 2))
-        s_rand = np.random.uniform(0.1, 0.4, n)
+        # Run smooth local search
+        time_left = deadline - time.time() - 30
+        if time_left < 5:
+            break
+            
+        c_new, s_new, score_new = _local_search_smooth(
+            centers, sides, 
+            time_limit=min(20.0, time_left / 2), 
+            beta_start=5.0, 
+            beta_end=50.0
+        )
         
-        # Quick validity check and repair
-        # Just run local search, it will handle invalid starts by rejecting moves
-        # But we need a valid start to start the annealing loop properly?
-        # My _local_search rejects invalid neighbors, so if start is invalid, it does nothing.
-        # So we need a valid start.
-        
-        # Let's try to construct a valid random start by placing squares greedily
-        c_valid = np.zeros((n, 2))
-        s_valid = np.zeros(n)
-        
-        # Place 1 large
-        s_valid[0] = 0.5
-        c_valid[0] = [0.25, 0.25]
-        
-        # Place 1 large
-        s_valid[1] = 0.5
-        c_valid[1] = [0.75, 0.25]
-        
-        # Place 8 small
-        for k in range(2, n):
-            s_valid[k] = 0.25
-            # Try to place in top half
-            # Randomly pick from top-left or top-right quadrant
-            if k < 6:
-                # Top-left
-                col = (k-2) % 2
-                row = (k-2) // 2
-                c_valid[k, 0] = (col + 0.5) * 0.25
-                c_valid[k, 1] = 0.5 + (row + 0.5) * 0.25
-            else:
-                # Top-right
-                col = (k-6) % 2
-                row = (k-6) // 2
-                c_valid[k, 0] = 0.5 + (col + 0.5) * 0.25
-                c_valid[k, 1] = 0.5 + (row + 0.5) * 0.25
+        if score_new > best_score:
+            best_score = score_new
+            best_centers = c_new.copy()
+            best_sides = s_new.copy()
+            
+        # If we found a good solution, try to perturb it and refine again
+        if best_score > 3.0 and time.time() < deadline - 60:
+            c_pert = best_centers + rng.normal(0, 0.02, (10, 2))
+            s_pert = best_sides * (1 + rng.normal(0, 0.05, 10))
+            s_pert = np.clip(s_pert, 0.05, 0.6)
+            for i in range(10):
+                c_pert[i, 0] = np.clip(c_pert[i, 0], s_pert[i]/2, 1 - s_pert[i]/2)
+                c_pert[i, 1] = np.clip(c_pert[i, 1], s_pert[i]/2, 1 - s_pert[i]/2)
                 
-        # Add some noise
-        for i in range(n):
-            c_valid[i, 0] += rng.uniform(-0.05, 0.05)
-            c_valid[i, 1] += rng.uniform(-0.05, 0.05)
-            s_valid[i] += rng.uniform(-0.05, 0.05)
-            s_valid[i] = max(0.01, s_valid[i])
+            c_new, s_new, score_new = _local_search_smooth(
+                c_pert, s_pert, 
+                time_limit=min(20.0, deadline - time.time() - 30), 
+                beta_start=10.0, 
+                beta_end=100.0
+            )
             
-        # Clip to bounds
-        for i in range(n):
-            s = s_valid[i]
-            c_valid[i, 0] = np.clip(c_valid[i, 0], s/2, 1-s/2)
-            c_valid[i, 1] = np.clip(c_valid[i, 1], s/2, 1-s/2)
-            
-        if _is_valid(c_valid, s_valid, tol):
-            bc, bs, bv = _local_search(c_valid, s_valid, rng, max_iters=20000, tol=tol)
-            if bv > best_val:
-                best_val = bv
-                best_centers = bc
-                best_sides = bs
-
-    if best_centers is None:
-        # Fallback
-        c_grid, s_grid = _generate_initial_config(n, 'grid')
-        return c_grid, s_grid
+            if score_new > best_score:
+                best_score = score_new
+                best_centers = c_new.copy()
+                best_sides = s_new.copy()
+                
+    # Final polish with Nelder-Mead on the best solution
+    if best_centers is not None and time.time() < deadline - 10:
+        def nm_objective(x):
+            c = np.zeros((10, 2))
+            s = np.zeros(10)
+            for i in range(10):
+                c[i, 0] = x[3*i]
+                c[i, 1] = x[3*i+1]
+                s[i] = x[3*i+2]
+            if np.any(s < 0.01) or np.any(s > 1.0):
+                return 1e6
+            # Use a hard penalty for NM to be safe
+            if not _is_valid(c, s):
+                return 1e6
+            return -np.sum(s)
         
+        x0 = np.zeros(30)
+        for i in range(10):
+            x0[3*i] = best_centers[i, 0]
+            x0[3*i+1] = best_centers[i, 1]
+            x0[3*i+2] = best_sides[i]
+            
+        try:
+            res = minimize(nm_objective, x0, method='Nelder-Mead', options={'maxiter': 500, 'xatol': 1e-8, 'fatol': 1e-8})
+            if res.fun < -best_score: # i.e., -sum(s) < -best_score => sum(s) > best_score
+                c = np.zeros((10, 2))
+                s = np.zeros(10)
+                for i in range(10):
+                    c[i, 0] = res.x[3*i]
+                    c[i, 1] = res.x[3*i+1]
+                    s[i] = res.x[3*i+2]
+                if _is_valid(c, s):
+                    score = np.sum(s)
+                    if score > best_score:
+                        best_score = score
+                        best_centers = c
+                        best_sides = s
+        except Exception:
+            pass
+
     return best_centers, best_sides
 
-# EVOLVE-BLOCK-END
+if __name__ == "__main__":
+    centers, sides = squares_in_square10()
+    print("Score:", np.sum(sides))
+    print("Valid:", _is_valid(centers, sides))

@@ -1,6 +1,7 @@
 # EVOLVE-BLOCK-START
 import numpy as np
 import time
+from numpy.lib.stride_tricks import sliding_window_view
 
 
 def _rotation_matrix(yaw_deg, pitch_deg, roll_deg):
@@ -19,11 +20,8 @@ def _rotation_matrix(yaw_deg, pitch_deg, roll_deg):
 
 def _in_corridor_vec(x, y, z):
     """Vectorized corridor check. Returns bool array."""
-    # Region 1: x<=0, 0<=y<=1, 0<=z<=1
     r1 = (x <= 0) & (y >= 0) & (y <= 1) & (z >= 0) & (z <= 1)
-    # Region 2: 0<=x<=1, 0<=y<=5, 0<=z<=1
     r2 = (x >= 0) & (x <= 1) & (y >= 0) & (y <= 5) & (z >= 0) & (z <= 1)
-    # Region 3: 0<=x<=1, 5<=y<=6, z>=0
     r3 = (x >= 0) & (x <= 1) & (y >= 5) & (y <= 6) & (z >= 0)
     return r1 | r2 | r3
 
@@ -44,24 +42,30 @@ def _densify_path(full_path):
     return np.array(densified)
 
 
-def _evaluate_path_fast(path):
-    """
-    Fast vectorized evaluation of the path.
-    Returns the surviving volume (count of 4x4x4 blocks * 0.05^3).
-    """
-    start = np.array([-3.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-    end = np.array([0.0, 6.0, 7.0, 90.0, 90.0, 90.0])
-    full_path = np.vstack([start, path, end])
-    densified = _densify_path(full_path)
-    
-    # Grid
+def _build_grid():
+    """Build the grid of points once."""
     x_grid = np.linspace(-4, 0, 81)
     y_grid = np.linspace(0, 1, 21)
     z_grid = np.linspace(0, 1, 21)
     X, Y, Z = np.meshgrid(x_grid, y_grid, z_grid, indexing='ij')
     points = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
-    N = len(points)
+    return points
+
+
+def _evaluate_path_fast(path, points=None):
+    """
+    Fast vectorized evaluation of the path.
+    Returns the surviving volume (count of 4x4x4 blocks * 0.05^3).
+    """
+    if points is None:
+        points = _build_grid()
     
+    start = np.array([-3.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    end = np.array([0.0, 6.0, 7.0, 90.0, 90.0, 90.0])
+    full_path = np.vstack([start, path, end])
+    densified = _densify_path(full_path)
+    
+    N = len(points)
     alive = np.ones(N, dtype=bool)
     
     # Check at first pose
@@ -117,9 +121,9 @@ def _evaluate_path_fast(path):
             alive_idx = np.where(alive)[0]
             alive[alive_idx[~new_alive]] = False
         
-        # Rotation
+        # Rotation - single axis
         if abs(dyaw) > 1e-12 and abs(dpitch) < 1e-12 and abs(droll) < 1e-12:
-            p_rot = p_z.copy() if abs(dz) > 1e-12 else prev.copy()
+            p_rot = prev.copy()
             p_rot[0] = curr[0]
             p_rot[1] = curr[1]
             p_rot[2] = curr[2]
@@ -134,7 +138,7 @@ def _evaluate_path_fast(path):
                 alive_idx = np.where(alive)[0]
                 alive[alive_idx[~new_alive]] = False
         elif abs(dpitch) > 1e-12 and abs(dyaw) < 1e-12 and abs(droll) < 1e-12:
-            p_rot = p_z.copy() if abs(dz) > 1e-12 else prev.copy()
+            p_rot = prev.copy()
             p_rot[0] = curr[0]
             p_rot[1] = curr[1]
             p_rot[2] = curr[2]
@@ -149,7 +153,7 @@ def _evaluate_path_fast(path):
                 alive_idx = np.where(alive)[0]
                 alive[alive_idx[~new_alive]] = False
         elif abs(droll) > 1e-12 and abs(dyaw) < 1e-12 and abs(dpitch) < 1e-12:
-            p_rot = p_z.copy() if abs(dz) > 1e-12 else prev.copy()
+            p_rot = prev.copy()
             p_rot[0] = curr[0]
             p_rot[1] = curr[1]
             p_rot[2] = curr[2]
@@ -164,7 +168,7 @@ def _evaluate_path_fast(path):
                 alive_idx = np.where(alive)[0]
                 alive[alive_idx[~new_alive]] = False
         else:
-            # Multiple axes changing - check final pose
+            # Multiple axes or complex - check final pose
             R_rot = _rotation_matrix(curr[3], curr[4], curr[5])
             placed_rot = points[alive] @ R_rot.T + curr[:3]
             new_alive = _in_corridor_vec(placed_rot[:, 0], placed_rot[:, 1], placed_rot[:, 2])
@@ -172,11 +176,7 @@ def _evaluate_path_fast(path):
             alive[alive_idx[~new_alive]] = False
     
     # Count 4x4x4 blocks
-    # Reshape alive to (81, 21, 21)
     alive_3d = alive.reshape(81, 21, 21)
-    # Count blocks where all 4x4x4 points survive
-    # Use sliding window view
-    from numpy.lib.stride_tricks import sliding_window_view
     blocks = sliding_window_view(alive_3d, (4, 4, 4))
     all_survive = np.all(blocks, axis=(3, 4, 5))
     count = np.sum(all_survive)
@@ -227,8 +227,8 @@ def _seed_path():
         [0.836463078, 6.03765479, 0.0528267196, 90.1967295, 15.9298717, 4.48186113],
         [0.804731182, 6.04627379, 0.0625195903, 90.2336098, 18.6990514, 5.14505668],
         [0.788296376, 6.05202369, 0.0675622892, 90.2479959, 20.1264906, 5.47138803],
-        [0.778474876, 6.05538925, 0.0706050032, 90.2577268, 20.9723911, 5.66341348],
-        [0.770888811, 6.05788046, 0.0730068444, 90.2657676, 21.6229248, 5.80874653],
+        [0.778474876, 6.05538925, 0.0706050032, 90.2577268, 21.6229248, 5.80874653],
+        [0.770888811, 6.05788046, 0.0730068444, 90.2657676, 22.1532161, 5.92642676],
         [0.764648333, 6.0599328, 0.0749383027, 90.2726388, 22.1532161, 5.92642676],
         [0.748753549, 6.06467644, 0.0801606053, 90.2892425, 23.4927925, 6.21910882],
         [0.737683416, 6.06785126, 0.0838714978, 90.3001161, 24.4180728, 6.42046395],
@@ -288,60 +288,81 @@ def _seed_path():
     ], dtype=np.float64)
 
 
+def _hill_climb(path, points, time_limit, rng, sigma_pos=0.02, sigma_ang=0.5, n_trials=15):
+    """
+    Hill climbing optimization with adaptive step size.
+    """
+    best_path = path.copy()
+    best_score = _evaluate_path_fast(best_path, points)
+    no_improve_count = 0
+    
+    while time.time() < time_limit:
+        idx = rng.integers(0, len(best_path))
+        trial_pose = best_path[idx].copy()
+        
+        # Perturb position and angles
+        trial_pose[0] += rng.normal(0, sigma_pos)
+        trial_pose[1] += rng.normal(0, sigma_pos)
+        trial_pose[2] += rng.normal(0, sigma_pos)
+        trial_pose[3] += rng.normal(0, sigma_ang)
+        trial_pose[4] += rng.normal(0, sigma_ang)
+        trial_pose[5] += rng.normal(0, sigma_ang)
+        
+        test_path = best_path.copy()
+        test_path[idx] = trial_pose
+        trial_score = _evaluate_path_fast(test_path, points)
+        
+        if trial_score > best_score:
+            best_path = test_path
+            best_score = trial_score
+            no_improve_count = 0
+            # Slightly increase step size on success
+            sigma_pos *= 1.02
+            sigma_ang *= 1.02
+        else:
+            no_improve_count += 1
+            # Decrease step size on failure
+            sigma_pos *= 0.98
+            sigma_ang *= 0.98
+        
+        # If stuck for too long, try a bigger jump
+        if no_improve_count > 50:
+            sigma_pos = max(sigma_pos, 0.05)
+            sigma_ang = max(sigma_ang, 1.0)
+            no_improve_count = 0
+    
+    return best_path, best_score
+
+
 def moving_sofa_3d_path() -> np.ndarray:
     """
-    The 3D moving sofa problem: find the largest-volume rigid 3D shape that can
-    travel through an L-shaped 3D corridor of unit cross-section that has two
-    90-degree turns - one in the X-Y plane and one in the Y-Z plane (a 3D
-    generalisation of the classical 2D moving sofa problem).
-    
-    This implementation uses local search to refine the seed path, maximizing
-    the surviving volume computed by the evaluator.
-    
-    Returns:
-        path: np.ndarray of shape (k, 6), each row a pose
-            (x, y, z, yaw_deg, pitch_deg, roll_deg).
+    The 3D moving sofa problem: model-and-optimize approach.
+    Uses seed path followed by adaptive hill climbing.
     """
     t_start = time.time()
-    deadline = t_start + 600.0  # 600s limit, leave 30s margin
+    deadline = t_start + 600.0  # 30s margin for safety
     
-    best_path = _seed_path()
-    best_score = _evaluate_path_fast(best_path)
-    
-    # Local search with random perturbations
+    points = _build_grid()
     rng = np.random.default_rng(42)
-    step_size = 0.01
-    max_iter = 5000
     
-    for i in range(max_iter):
-        if time.time() > deadline - 30:
-            break
-        
-        # Randomly perturb a few poses
-        n_perturb = rng.integers(1, 4)
-        indices = rng.choice(len(best_path), size=n_perturb, replace=False)
-        
-        new_path = best_path.copy()
-        for idx in indices:
-            # Perturb position and angles
-            new_path[idx, 0] += rng.normal(0, step_size)
-            new_path[idx, 1] += rng.normal(0, step_size)
-            new_path[idx, 2] += rng.normal(0, step_size)
-            new_path[idx, 3] += rng.normal(0, step_size * 5)  # angles in degrees
-            new_path[idx, 4] += rng.normal(0, step_size * 5)
-            new_path[idx, 5] += rng.normal(0, step_size * 5)
-        
-        new_score = _evaluate_path_fast(new_path)
-        
-        if new_score > best_score:
-            best_path = new_path
-            best_score = new_score
-            # Reduce step size on improvement
-            step_size *= 0.9
-        else:
-            # Increase step size occasionally
-            if i % 100 == 0:
-                step_size *= 1.1
+    # Start with the seed path
+    best_path = _seed_path()
+    best_score = _evaluate_path_fast(best_path, points)
+    
+    # Phase 1: Moderate hill climbing
+    time_limit_1 = t_start + 200
+    best_path, best_score = _hill_climb(best_path, points, time_limit_1, rng, 
+                                         sigma_pos=0.03, sigma_ang=0.8, n_trials=15)
+    
+    # Phase 2: Fine-tuning with smaller steps
+    time_limit_2 = t_start + 400
+    best_path, best_score = _hill_climb(best_path, points, time_limit_2, rng,
+                                         sigma_pos=0.01, sigma_ang=0.3, n_trials=15)
+    
+    # Phase 3: Very fine polish
+    time_limit_3 = deadline - 10
+    best_path, best_score = _hill_climb(best_path, points, time_limit_3, rng,
+                                         sigma_pos=0.005, sigma_ang=0.1, n_trials=15)
     
     return best_path
 

@@ -217,7 +217,7 @@ def improve_configuration(lines, candidate_points, time_limit, seed=42):
     1. Replace a line with a line through a pair of current points.
     2. Replace a line with a random line from a small coefficient range.
     3. Rebuild: greedily re-select all 27 lines from current points.
-    4. Swap a point: replace one of the 54 points with a better candidate.
+    4. Re-optimize points for current lines (always accept if better).
     """
     random.seed(seed)
     current_lines = lines.copy()
@@ -324,27 +324,15 @@ def improve_configuration(lines, candidate_points, time_limit, seed=42):
                 no_improve += 1
                 
         elif move_type < 0.85:
-            # Swap a point: try to replace one point with a better candidate
-            pt_idx = random.randint(0, 53)
-            old_pt = current_points[pt_idx].copy()
-            
-            # Find a candidate point that might be better
-            # Sample a random candidate and check if it has more incidences
-            cand_idx = random.randint(0, len(candidate_points)-1)
-            new_pt = candidate_points[cand_idx].copy()
-            
-            # Check if new_pt is already in current_points
-            if any(np.array_equal(current_points[i], new_pt) for i in range(54)):
-                continue
-            
-            # Temporarily replace
-            current_points[pt_idx] = new_pt
-            new_I = count_incidences(current_points, current_lines)
+            # Re-optimize points for current lines
+            new_points, _ = get_best_points_for_lines(current_lines, candidate_points)
+            new_I = count_incidences(new_points, current_lines)
             
             delta_I = new_I - current_I
             
             if delta_I > 0 or random.random() < np.exp(delta_I / T):
                 current_I = new_I
+                current_points = new_points
                 if current_I > best_I:
                     best_I = current_I
                     best_lines = current_lines.copy()
@@ -353,7 +341,6 @@ def improve_configuration(lines, candidate_points, time_limit, seed=42):
                 else:
                     no_improve += 1
             else:
-                current_points[pt_idx] = old_pt
                 no_improve += 1
                 
         else:
@@ -392,6 +379,111 @@ def improve_configuration(lines, candidate_points, time_limit, seed=42):
         T = max(T, min_T)
         
     return best_lines, best_points, best_I
+
+def polish_configuration(points, lines, candidate_points, time_limit):
+    """
+    Final polish: local search that tries small perturbations.
+    Focuses on high-incidence lines and points.
+    """
+    random.seed(999)
+    current_points = points.copy()
+    current_lines = lines.copy()
+    current_I = count_incidences(current_points, current_lines)
+    
+    best_points = current_points.copy()
+    best_lines = current_lines.copy()
+    best_I = current_I
+    
+    start_time = time.time()
+    
+    # Compute incidence counts per line and per point
+    def compute_line_counts(pts, lns):
+        P = pts.astype(np.int64)
+        L = lns.astype(np.int64)
+        px = P[:, 0].reshape(-1, 1)
+        py = P[:, 1].reshape(-1, 1)
+        A = L[:, 0].reshape(1, -1)
+        B = L[:, 1].reshape(1, -1)
+        C = L[:, 2].reshape(1, -1)
+        vals = A * px + B * py + C
+        return np.sum(vals == 0, axis=0)
+    
+    def compute_point_counts(pts, lns):
+        P = pts.astype(np.int64)
+        L = lns.astype(np.int64)
+        px = P[:, 0].reshape(-1, 1)
+        py = P[:, 1].reshape(-1, 1)
+        A = L[:, 0].reshape(1, -1)
+        B = L[:, 1].reshape(1, -1)
+        C = L[:, 2].reshape(1, -1)
+        vals = A * px + B * py + C
+        return np.sum(vals == 0, axis=1)
+    
+    while time.time() - start_time < time_limit:
+        # Try replacing a low-incidence line with a line through two high-incidence points
+        line_counts = compute_line_counts(current_points, current_lines)
+        point_counts = compute_point_counts(current_points, current_lines)
+        
+        # Find the line with lowest count
+        worst_line_idx = np.argmin(line_counts)
+        
+        # Find two points with high counts
+        # Sort points by count, pick from top half
+        sorted_pt_idx = np.argsort(point_counts)[::-1]
+        top_half = sorted_pt_idx[:27]
+        
+        # Try several pairs from top half
+        tried = False
+        for _ in range(20):
+            p1_idx, p2_idx = random.sample(list(top_half), 2)
+            p1 = current_points[p1_idx]
+            p2 = current_points[p2_idx]
+            dx = p2[0] - p1[0]
+            dy = p2[1] - p1[1]
+            A = dy
+            B = -dx
+            C = dx * p1[1] - dy * p1[0]
+            
+            new_line = normalize_line(int(A), int(B), int(C))
+            if new_line is None:
+                continue
+            
+            new_line_tup = tuple(new_line)
+            if any(tuple(l) == new_line_tup for l in current_lines):
+                continue
+            
+            old_line = current_lines[worst_line_idx].copy()
+            current_lines[worst_line_idx] = new_line
+            new_I = count_incidences(current_points, current_lines)
+            
+            if new_I > best_I:
+                best_I = new_I
+                best_lines = current_lines.copy()
+                best_points = current_points.copy()
+            else:
+                current_lines[worst_line_idx] = old_line
+            
+            tried = True
+            if new_I > current_I:
+                current_I = new_I
+                break
+        
+        if not tried:
+            break
+        
+        # Re-optimize points
+        new_points, _ = get_best_points_for_lines(current_lines, candidate_points)
+        new_I = count_incidences(new_points, current_lines)
+        if new_I >= current_I:
+            current_points = new_points
+            current_I = new_I
+            if current_I > best_I:
+                best_I = current_I
+                best_lines = current_lines.copy()
+                best_points = current_points.copy()
+    
+    return best_lines, best_points, best_I
+
 
 def szemeredi_trotter_incidences():
     deadline = time.time() + 580  # 20s margin for safety
@@ -462,7 +554,17 @@ def szemeredi_trotter_incidences():
         best_lines_global = lines
     else:
         best_lines_global = np.array(unique_lines[:27], dtype=np.int64)
-        
+    
+    # Final polish pass
+    if time.time() < deadline - 10:
+        polish_time = min(30, deadline - time.time() - 10)
+        if polish_time > 5:
+            pl, pp, pi = polish_configuration(best_points_global, best_lines_global, candidate_points, polish_time)
+            if pi > best_I_global:
+                best_I_global = pi
+                best_points_global = pp.copy()
+                best_lines_global = pl.copy()
+    
     return best_points_global, best_lines_global
 
 # EVOLVE-BLOCK-END
