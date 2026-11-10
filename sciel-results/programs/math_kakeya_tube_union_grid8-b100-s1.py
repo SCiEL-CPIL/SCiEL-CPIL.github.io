@@ -1,172 +1,206 @@
+# EVOLVE-BLOCK-START
 import numpy as np
+import scipy.optimize as opt
 import time
-from scipy.optimize import minimize
-
-def _get_breakpoints(X, N=8):
-    """
-    Calculate all c in (0, 1) where the order of endpoints changes.
-    """
-    breakpoints = set([0.0, 1.0])
-    for i in range(N):
-        for j in range(i + 1, N):
-            denom = i - j
-            # L_i = L_j
-            c1 = N * (X[j] - X[i]) / denom
-            if 0.0 < c1 < 1.0:
-                breakpoints.add(c1)
-            # L_i = R_j
-            c2 = N * (X[j] + 1.0 / N - X[i]) / denom
-            if 0.0 < c2 < 1.0:
-                breakpoints.add(c2)
-            # R_i = L_j
-            c3 = N * (X[j] - X[i] - 1.0 / N) / denom
-            if 0.0 < c3 < 1.0:
-                breakpoints.add(c3)
-            # R_i = R_j
-            c4 = N * (X[j] - X[i]) / denom
-            if 0.0 < c4 < 1.0:
-                breakpoints.add(c4)
-    return sorted(breakpoints)
-
-def _compute_1d_cost_squared(X, N=8):
-    """
-    Compute integral of (Union Length)^2 over c in [0, 1].
-    """
-    if not np.all(np.isfinite(X)):
-        return 1e10
-        
-    breakpoints = _get_breakpoints(X, N)
-    
-    total_integral = 0.0
-    
-    for k in range(len(breakpoints) - 1):
-        c_start = breakpoints[k]
-        c_end = breakpoints[k + 1]
-        if c_end <= c_start:
-            continue
-            
-        c_mid = 0.5 * (c_start + c_end)
-        
-        # Calculate union length and its derivative (slope) at c_mid
-        # Since order is fixed, L(c) is linear.
-        # We can calculate L at c_mid and L at c_mid + epsilon to get slope?
-        # Or derive analytically.
-        # Let's just evaluate L at c_mid and c_mid + 1e-6 to get slope numerically for robustness,
-        # or better, since N is small, we can find the active intervals.
-        
-        # Endpoints at c_mid
-        Ls = [X[i] + (i / N) * c_mid for i in range(N)]
-        Rs = [X[i] + (i / N) * c_mid + 1.0 / N for i in range(N)]
-        
-        # Merge intervals
-        intervals = sorted(zip(Ls, Rs))
-        merged = []
-        cur_l, cur_r = intervals[0]
-        for l, r in intervals[1:]:
-            if l > cur_r:
-                merged.append((cur_l, cur_r))
-                cur_l, cur_r = l, r
-            else:
-                cur_r = max(cur_r, r)
-        merged.append((cur_l, cur_r))
-        
-        # Calculate L(c_mid)
-        L_mid = sum(r - l for l, r in merged)
-        
-        # Calculate slope
-        # The left boundary of the union is min of lefts of merged components?
-        # No, the merged components are disjoint.
-        # The total length is sum of (r_m - l_m).
-        # Each l_m is of form X_i + (i/N)c. Slope is i/N.
-        # Each r_m is of form X_j + (j/N)c + 1/N. Slope is j/N.
-        # So slope of each component length is (slope_r - slope_l).
-        
-        # We need to identify which i and j form the boundaries of each merged component.
-        # This is tricky to do robustly with just values.
-        # Let's use numerical differentiation with a small step, ensuring we stay in the interval.
-        delta_c = 1e-6
-        c_plus = c_mid + delta_c
-        if c_plus > c_end:
-            c_plus = c_mid
-            delta_c = 0
-            slope = 0
-        else:
-            Ls_p = [X[i] + (i / N) * c_plus for i in range(N)]
-            Rs_p = [X[i] + (i / N) * c_plus + 1.0 / N for i in range(N)]
-            intervals_p = sorted(zip(Ls_p, Rs_p))
-            merged_p = []
-            cur_l, cur_r = intervals_p[0]
-            for l, r in intervals_p[1:]:
-                if l > cur_r:
-                    merged_p.append((cur_l, cur_r))
-                    cur_l, cur_r = l, r
-                else:
-                    cur_r = max(cur_r, r)
-            merged_p.append((cur_l, cur_r))
-            L_plus = sum(r - l for l, r in merged_p)
-            slope = (L_plus - L_mid) / delta_c
-            
-        # Integrate (L_mid + slope * (c - c_mid))^2 from c_start to c_end
-        # Let u = c - c_mid. Limits: c_start - c_mid to c_end - c_mid.
-        # Since c_mid is midpoint, limits are -h to h, where h = (c_end - c_start)/2.
-        h = (c_end - c_start) / 2.0
-        
-        # Integral of (A u + B)^2 du from -h to h
-        # = [ (A u + B)^3 / (3A) ] ... wait
-        # = \int_{-h}^h (A^2 u^2 + 2AB u + B^2) du
-        # = 2 A^2 h^3 / 3 + 0 + 2 B^2 h
-        
-        A = slope
-        B = L_mid
-        integral_segment = (2.0 * A * A * h**3) / 3.0 + 2.0 * B * B * h
-        
-        total_integral += integral_segment
-        
-    return total_integral
 
 def kakeya_needle_3d8() -> np.ndarray:
-    start_time = time.time()
-    deadline = start_time + 550
-    
+    """
+    Three-dimensional discrete Kakeya needle problem with grid parameter N = 8.
+    Returns base positions for 64 tubes.
+    """
     N = 8
+    start_time = time.time()
+    time_limit = 600.0
+    margin = 60.0
     
-    # Initial guesses
-    inits = [
-        np.zeros(N),
-        np.arange(N) / N,
-        -np.arange(N) / N,
-        np.random.default_rng(12345).uniform(-0.5, 0.5, N),
-        np.array([0, 0, 0, 0, 0.5, 0.5, 0.5, 0.5]) / N, # Clustered
-    ]
-    
-    best_X = None
-    best_cost = float('inf')
-    
-    for init in inits:
-        if time.time() > deadline - 30:
-            break
-            
-        try:
-            # Use Nelder-Mead for small N
-            res = minimize(_compute_1d_cost_squared, init, method='Nelder-Mead', 
-                           options={'maxiter': 5000, 'xatol': 1e-10, 'fatol': 1e-10})
-            if res.fun < best_cost:
-                best_cost = res.fun
-                best_X = res.x.copy()
-        except Exception as e:
-            pass
-    
-    if best_X is None:
-        best_X = np.zeros(N)
+    # 1D Union Length Function
+    # x: array of 8 base positions
+    # c: scalar height
+    # Intervals: [x[i] + c*i/N, x[i] + 1/N + c*i/N]
+    def union_length_1d(x, c):
+        # Create intervals
+        i = np.arange(N)
+        starts = x + c * i / N
+        ends = starts + 1.0 / N
         
-    # Construct the 64x2 array
+        # Sort by start
+        idx = np.argsort(starts)
+        starts = starts[idx]
+        ends = ends[idx]
+        
+        # Compute union length using sweep line
+        length = 0.0
+        curr_start = starts[0]
+        curr_end = ends[0]
+        for i in range(1, N):
+            if starts[i] <= curr_end:
+                curr_end = max(curr_end, ends[i])
+            else:
+                length += curr_end - curr_start
+                curr_start = starts[i]
+                curr_end = ends[i]
+        length += curr_end - curr_start
+        return length
+
+    def get_breakpoints(x):
+        """
+        Find all c in [0,1] where the ordering of interval endpoints changes.
+        """
+        # Endpoint intercepts: x[i] for starts, x[i] + 1/N for ends
+        intercepts = np.empty(2 * N, dtype=np.float64)
+        intercepts[:N] = x
+        intercepts[N:] = x + 1.0 / N
+        
+        # Endpoint slopes: i/N for both start and end of interval i
+        slopes = np.arange(N, dtype=np.float64) / N
+        ep_slopes = np.concatenate([slopes, slopes])
+        
+        # Find all c values where two endpoints are equal
+        i_idx, j_idx = np.triu_indices(2 * N, k=1)
+        da = intercepts[j_idx] - intercepts[i_idx]
+        db = ep_slopes[i_idx] - ep_slopes[j_idx]
+        
+        valid = np.abs(db) > 1e-12
+        c_vals = da[valid] / db[valid]
+        
+        # Filter to [0, 1]
+        c_vals = c_vals[(c_vals >= 0.0) & (c_vals <= 1.0)]
+        
+        # Add boundaries and sort
+        breakpoints = np.concatenate([[0.0], c_vals, [1.0]])
+        breakpoints = np.unique(np.sort(breakpoints))
+        return breakpoints
+
+    def coupled_volume(X, Y):
+        """
+        Compute the exact volume of the union of tubes.
+        V = integral_0^1 L_x(c) * L_y(c) dc
+        """
+        bx = get_breakpoints(X)
+        by = get_breakpoints(Y)
+        
+        # Merge breakpoints
+        b = np.unique(np.concatenate([bx, by]))
+        
+        if len(b) < 2:
+            return 0.0
+            
+        total_vol = 0.0
+        for k in range(len(b) - 1):
+            c1 = b[k]
+            c2 = b[k + 1]
+            if c2 <= c1:
+                continue
+                
+            # Evaluate lengths at endpoints
+            lx1 = union_length_1d(X, c1)
+            lx2 = union_length_1d(X, c2)
+            ly1 = union_length_1d(Y, c1)
+            ly2 = union_length_1d(Y, c2)
+            
+            # Integrate product of two linear functions over [c1, c2]
+            # f(u) = (1-u)lx1 + u lx2
+            # g(u) = (1-u)ly1 + u ly2
+            # u = (c - c1) / (c2 - c1)
+            # Integral = (c2 - c1) * integral_0^1 f(u)g(u) du
+            # f(u)g(u) = lx1*ly1 + u(lx2*ly1 + lx1*ly2 - 2*lx1*ly1) + u^2(lx1*ly1 - lx2*ly1 - lx1*ly2 + lx2*ly2)
+            # Let A = lx1, B = lx2 - lx1, C = ly1, D = ly2 - ly1
+            # f = A + Bu, g = C + Du
+            # fg = AC + (AD+BC)u + BD u^2
+            # Int = AC + (AD+BC)/2 + BD/3
+            
+            A = lx1
+            B = lx2 - lx1
+            C = ly1
+            D = ly2 - ly1
+            
+            integral = A * C + (A * D + B * C) / 2.0 + B * D / 3.0
+            total_vol += (c2 - c1) * integral
+            
+        return total_vol
+
+    # Initial guess: Keich construction
+    pos = int(np.log2(N))
+    j_terms = np.arange(1, pos + 1)
+    keich = np.empty(N, dtype=np.float64)
+    for idx in range(N):
+        eps = np.array(list(str(bin(idx))[2:]), dtype=int)
+        eps = np.pad(eps, (pos - len(eps), 0), "constant")
+        keich[idx] = np.sum((1 - j_terms) * eps * (2.0 ** -j_terms) / pos)
+    
+    x0 = keich.copy()
+    y0 = keich.copy()
+    p0 = np.concatenate([x0, y0])
+    
+    # Objective wrapper for 16D vector
+    def objective(p):
+        X = p[:N]
+        Y = p[N:]
+        return coupled_volume(X, Y)
+    
+    # Multi-restart optimization
+    rng_init = np.random.default_rng(42)
+    initial_points = [p0.copy()]
+    
+    # Add perturbations
+    for _ in range(10):
+        perturbed = p0 + rng_init.normal(0, 0.05, size=2*N)
+        initial_points.append(perturbed)
+        
+    # Add diverse starts
+    initial_points.append(np.linspace(0, 1, 2*N))
+    initial_points.append(rng_init.uniform(-0.5, 1.5, size=2*N))
+    
+    best_p = p0.copy()
+    best_val = objective(p0)
+    
+    for p_init in initial_points:
+        if time.time() - start_time > time_limit - margin:
+            break
+        
+        try:
+            res = opt.minimize(objective, p_init, method='Nelder-Mead',
+                               options={'maxiter': 20000, 'xatol': 1e-8, 'fatol': 1e-8, 'adaptive': True})
+            
+            val = res.fun
+            if val < best_val:
+                best_val = val
+                best_p = res.x.copy()
+        except Exception:
+            continue
+            
+    # Final polish with tighter tolerance if time permits
+    if time.time() - start_time < time_limit - margin:
+        try:
+            res_polish = opt.minimize(objective, best_p, method='Nelder-Mead',
+                                      options={'maxiter': 10000, 'xatol': 1e-10, 'fatol': 1e-10, 'adaptive': True})
+            
+            val = res_polish.fun
+            if val < best_val:
+                best_val = val
+                best_p = res_polish.x.copy()
+        except Exception:
+            pass
+            
+    x_opt = best_p[:N]
+    y_opt = best_p[N:]
+    
+    # Construct positions
     i_grid, j_grid = np.meshgrid(np.arange(N), np.arange(N), indexing="ij")
     i_flat = i_grid.flatten()
     j_flat = j_grid.flatten()
     
-    base_x = best_X[i_flat]
-    base_y = best_X[j_flat]
+    base_x = x_opt[i_flat]
+    base_y = y_opt[j_flat]
     
     positions = np.stack([base_x, base_y], axis=1)
     
+    # Sanity check
+    if not np.all(np.isfinite(positions)):
+        base_x = keich[i_flat]
+        base_y = keich[j_flat]
+        positions = np.stack([base_x, base_y], axis=1)
+        
     return positions
+
+# EVOLVE-BLOCK-END

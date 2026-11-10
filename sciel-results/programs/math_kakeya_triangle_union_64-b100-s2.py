@@ -14,9 +14,9 @@ def kakeya_needle_2d_positions64() -> np.ndarray:
 
     This implementation uses:
     1. The Keich construction as seed.
-    2. A vectorized union-area evaluation (vectorized over y) for speed.
-    3. L-BFGS-B local refinement with multiple restarts.
-    4. A coordinate-descent polishing step to escape shallow local minima.
+    2. A smooth log-sum-exp surrogate for the union area to enable efficient gradient-based optimization.
+    3. L-BFGS-B local refinement on the smooth surrogate.
+    4. A final exact-metric polish phase with coordinate descent and L-BFGS-B on the true piecewise-linear objective.
     5. A strict wall-clock guard so the function returns within 630 s.
     """
     n = 64
@@ -32,87 +32,124 @@ def kakeya_needle_2d_positions64() -> np.ndarray:
 
     a = np.arange(1, n + 1) / n  # shape (64,)
 
-    # Precompute y-grid and w for a coarse objective (used during optimization)
-    # Use 500 heights for a good trade-off between fidelity and speed.
-    num_h = 500
-    ys = (np.arange(num_h) + 0.5) / num_h          # shape (500,)
-    ws = (1.0 - ys) / n                             # shape (500,)
+    # Precompute y-grid for the smooth surrogate (coarse for speed during main optimization)
+    num_h_smooth = 200
+    ys_smooth = (np.arange(num_h_smooth) + 0.5) / num_h_smooth
+    ws_smooth = (1.0 - ys_smooth) / n
 
-    def union_area_fast(x):
+    def union_area_exact(x, num_h=2000):
         """
-        Vectorized union-area over the coarse y-grid.
+        Exact union-area over a y-grid.
         x: shape (64,)
         Returns scalar area estimate (mean union length over y).
         """
-        # Ls[y, i] = x[i] + a[i] * ys[y]  ->  shape (500, 64)
-        Ls = x[None, :] + a[None, :] * ys[:, None]  # (500, 64)
-        # Sort along axis=1
-        sorted_Ls = np.sort(Ls, axis=1)             # (500, 64)
-        diffs = np.diff(sorted_Ls, axis=1)          # (500, 63)
-        # extensions[y, k] = min(ws[y], diffs[y, k])
-        extensions = np.minimum(ws[:, None], diffs) # (500, 63)
-        union_lens = ws + extensions.sum(axis=1)    # (500,)
-        return union_lens.mean()
-
-    def union_area_fine(x, num_h_fine=2000):
-        """Higher-resolution area (used for final polishing checks)."""
-        ys_f = (np.arange(num_h_fine) + 0.5) / num_h_fine
-        ws_f = (1.0 - ys_f) / n
-        Ls = x[None, :] + a[None, :] * ys_f[:, None]
+        ys = (np.arange(num_h) + 0.5) / num_h
+        ws = (1.0 - ys) / n
+        Ls = x[None, :] + a[None, :] * ys[:, None]
         sorted_Ls = np.sort(Ls, axis=1)
         diffs = np.diff(sorted_Ls, axis=1)
-        extensions = np.minimum(ws_f[:, None], diffs)
-        union_lens = ws_f + extensions.sum(axis=1)
+        extensions = np.minimum(ws[:, None], diffs)
+        union_lens = ws + extensions.sum(axis=1)
         return union_lens.mean()
 
-    def objective(x):
-        return union_area_fast(x)
+    def union_area_smooth(x, beta=100.0):
+        """
+        Smooth surrogate for union area using log-sum-exp to approximate min(L_j+1 - L_j, w).
+        The union length at height y is: w + sum_k min(d_k, w) where d_k = L_{(k+1)} - L_{(k)}.
+        We approximate min(d, w) = -max(w-d, 0) = -softplus(w-d, beta) ... wait, that's not quite right.
+        Actually, min(d, w) is a concave function of d. We want a smooth approximation.
+        min(d, w) ≈ - (1/beta) * log(1 + exp(-beta*(d - w))) + w * (1 - sigmoid(beta*(d-w)))? 
+        Simpler: min(d, w) = (d + w - |d - w|) / 2.
+        |d - w| ≈ (1/beta) * log(1 + exp(2*beta*|d-w|/2))? No, softplus approximation for |z| is (1/beta)*log(1+exp(2*beta*z)) - z for z>0... 
+        Let's use: min(d, w) ≈ w - softplus(w - d, beta) where softplus(z) = log(1+exp(z))/beta... no.
+        Standard softplus: sp(z) = log(1+exp(z)). Then min(d,w) = d - max(d-w, 0) = d - sp(d-w).
+        So min(d, w) ≈ d - (1/beta)*sp(beta*(d-w)).
+        This is smooth and differentiable.
+        """
+        Ls = x[None, :] + a[None, :] * ys_smooth[:, None]
+        sorted_Ls = np.sort(Ls, axis=1)
+        diffs = np.diff(sorted_Ls, axis=1)
+        
+        # min(d, w) ≈ d - softplus(d - w) / beta
+        # To avoid overflow in exp, we can use a stable softplus.
+        # softplus(z) = max(z, 0) + log(1 + exp(-|z|))
+        def softplus(z):
+            return np.where(z > 20, z, np.log1p(np.exp(z)))
+        
+        z = beta * (diffs - ws_smooth[:, None])
+        sp_z = softplus(z) / beta
+        min_dw = diffs - sp_z
+        
+        # Clip to be non-negative just in case of numerical issues, though mathematically it should be >= 0
+        min_dw = np.maximum(min_dw, 0)
+        
+        union_lens = ws_smooth + min_dw.sum(axis=1)
+        return union_lens.mean()
+
+    def objective_smooth(x):
+        return union_area_smooth(x, beta=50.0)
 
     # ---- Optimization with time guard ----
     start_time = time.time()
     max_time = 620.0  # leave 10 s safety margin
 
     best_x = seed_positions.copy()
-    best_area = objective(best_x)
+    best_area_exact = union_area_exact(best_x, num_h=500)
 
     np.random.seed(42)
 
-    # Restart list: seed + perturbations + random
+    # Restart list: seed + perturbations
     restarts = [seed_positions.copy()]
-    for _ in range(8):
-        restarts.append(seed_positions + np.random.normal(0, 0.03, n))
-    for _ in range(6):
+    for _ in range(10):
+        restarts.append(seed_positions + np.random.normal(0, 0.05, n))
+    for _ in range(5):
         restarts.append(np.random.uniform(-0.5, 1.5, n))
 
+    # Phase 1: Optimize smooth surrogate
     for idx, x0 in enumerate(restarts):
-        if time.time() - start_time > max_time - 15:
+        if time.time() - start_time > max_time - 60:
             break
         try:
-            res = minimize(objective, x0, method='L-BFGS-B',
-                           options={'maxiter': 500, 'ftol': 1e-12, 'disp': False})
-            if res.fun < best_area:
-                best_area = res.fun
+            res = minimize(objective_smooth, x0, method='L-BFGS-B',
+                           options={'maxiter': 1000, 'ftol': 1e-12, 'disp': False})
+            # Evaluate exact area for the candidate
+            exact_area = union_area_exact(res.x, num_h=500)
+            if exact_area < best_area_exact:
+                best_area_exact = exact_area
                 best_x = res.x
         except Exception:
             pass
 
-    # ---- Coordinate-descent polish on the coarse objective ----
-    if time.time() - start_time < max_time - 10:
+    # Phase 2: Polish with exact metric using L-BFGS-B (it will struggle with kinks but can still move)
+    if time.time() - start_time < max_time - 20:
+        def objective_exact_fast(x):
+            return union_area_exact(x, num_h=1000)
+        
+        try:
+            res_fine = minimize(objective_exact_fast, best_x, method='L-BFGS-B',
+                                options={'maxiter': 200, 'ftol': 1e-10, 'disp': False})
+            if res_fine.fun < best_area_exact:
+                best_area_exact = res_fine.fun
+                best_x = res_fine.x
+        except Exception:
+            pass
+
+    # Phase 3: Coordinate descent on exact metric
+    if time.time() - start_time < max_time - 5:
         x = best_x.copy()
-        step = 0.02
-        for _ in range(200):  # cap on outer iterations
-            if time.time() - start_time > max_time - 5:
+        step = 0.01
+        for _ in range(100):
+            if time.time() - start_time > max_time - 2:
                 break
             improved = False
             for i in range(n):
-                if time.time() - start_time > max_time - 5:
+                if time.time() - start_time > max_time - 2:
                     break
-                best_val = objective(x)
+                best_val = union_area_exact(x, num_h=500)
                 best_delta = 0.0
-                # try ± step, ± step/2, ± step/4
                 for delta in (step, -step, step/2, -step/2, step/4, -step/4):
                     x[i] += delta
-                    val = objective(x)
+                    val = union_area_exact(x, num_h=500)
                     x[i] -= delta
                     if val < best_val - 1e-14:
                         best_val = val
@@ -122,23 +159,10 @@ def kakeya_needle_2d_positions64() -> np.ndarray:
                     improved = True
             if not improved:
                 break
-            step *= 0.7
-        if objective(x) < best_area:
-            best_area = objective(x)
+            step *= 0.8
+        final_area = union_area_exact(x, num_h=500)
+        if final_area < best_area_exact:
+            best_area_exact = final_area
             best_x = x
-
-    # ---- Final fine-grid polish using L-BFGS-B on the higher-resolution objective ----
-    if time.time() - start_time < max_time - 5:
-        def objective_fine(x):
-            return union_area_fine(x, num_h_fine=2000)
-        
-        try:
-            res_fine = minimize(objective_fine, best_x, method='L-BFGS-B',
-                                options={'maxiter': 100, 'ftol': 1e-10, 'disp': False})
-            if res_fine.fun < best_area:
-                best_area = res_fine.fun
-                best_x = res_fine.x
-        except Exception:
-            pass
 
     return np.array(best_x, dtype=np.float64)

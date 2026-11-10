@@ -4,9 +4,14 @@ import time
 
 def hexagon_packing_11():
     start_time = time.time()
-    deadline = start_time + 600 - 10  # Safety margin
+    deadline = start_time + 600 - 30  # Safety margin
 
-    # Helper to get vertices of a hexagon
+    # Precompute base normals for unit hexagon (flat-top orientation)
+    # Vertices at 0, 60, 120, 180, 240, 300 degrees
+    # Normals at 30, 90, 150, 210, 270, 330 degrees
+    base_angles = np.deg2rad(np.arange(30, 360, 60))
+    base_normals = np.column_stack((np.cos(base_angles), np.sin(base_angles)))  # (6, 2)
+
     def hex_vertices(cx, cy, s, a_deg):
         a_rad = np.deg2rad(a_deg)
         angles = a_rad + np.deg2rad(np.arange(0, 360, 60))
@@ -15,102 +20,156 @@ def hexagon_packing_11():
             cy + s * np.sin(angles)
         ))
 
-    # Helper to check if two hexagons are separated
-    def is_separated(hex1, hex2):
-        # hex1, hex2 are (6,2) arrays of vertices
-        # Check 12 normals: 6 from hex1, 6 from hex2
-        # Normal for edge i of a hexagon (flat top, s=1)
-        # Edge 0: between v0 and v1. Midpoint...
-        # Actually, just use the normals of the unit hexagon rotated.
-        # Unit hex normals (flat top) are at 30, 90, 150, 210, 270, 330 degrees.
-        normals = []
-        base_angles = np.deg2rad(np.arange(30, 360, 60))
-        for ang in base_angles:
-            normals.append(np.array([np.cos(ang), np.sin(ang)]))
-        
-        # For each pair of normals (n from hex1, n from hex2)
-        # Project all vertices of hex1 and hex2 onto n
-        # Check if intervals are apart by > 1e-6
-        
-        # We can just check the 6 normals of hex1 and 6 normals of hex2
-        # Actually, if they are separated, they are separated on SOME normal.
-        # It is sufficient to check the normals of hex1? 
-        # No, if hex2 is rotated, its normals are different.
-        # But the set of all edge normals of both hexes covers all potential separating lines.
-        
-        # Efficient check:
-        # For each normal n in the 12 normals:
-        #   min1 = min(dot(v, n) for v in hex1)
-        #   max1 = max(dot(v, n) for v in hex1)
-        #   min2 = min(dot(v, n) for v in hex2)
-        #   max2 = max(dot(v, n) for v in hex2)
-        #   if max1 < min2 - 1e-6 or max2 < min1 - 1e-6:
-        #       return True (separated)
-        
-        # If no normal separates them, they intersect.
-        
-        # Optimization: Pre-compute projections?
-        # For a single pair, this is fast enough.
-        
-        for n in normals:
-            p1 = hex1 @ n
-            p2 = hex2 @ n
+    def get_normals(a_deg):
+        """Get the 6 edge normals for a hexagon with given angle."""
+        a_rad = np.deg2rad(a_deg)
+        c, s = np.cos(a_rad), np.sin(a_rad)
+        R = np.array([[c, -s], [s, c]])
+        return base_normals @ R.T
+
+    def is_separated(v1, v2, n1, n2):
+        """
+        Check if two hexagons are separated.
+        v1, v2: (6, 2) vertex arrays
+        n1, n2: (6, 2) normal arrays for each hexagon
+        Returns True if separated (valid), False if intersecting (invalid).
+        """
+        for i in range(6):
+            n = n1[i]
+            p1 = v1 @ n
+            p2 = v2 @ n
+            if p1.max() < p2.min() - 1e-6 or p2.max() < p1.min() - 1e-6:
+                return True
+        for i in range(6):
+            n = n2[i]
+            p1 = v1 @ n
+            p2 = v2 @ n
             if p1.max() < p2.min() - 1e-6 or p2.max() < p1.min() - 1e-6:
                 return True
         return False
 
     def get_min_side(positions, angles):
-        # positions: (11, 2)
-        # angles: (11,)
-        # Outer hexagon centered at (0,0) with side S, flat-top (angle 0)
-        # Normals of outer hexagon: 30, 90, ...
-        outer_normals = []
-        base_angles = np.deg2rad(np.arange(30, 360, 60))
-        for ang in base_angles:
-            outer_normals.append(np.array([np.cos(ang), np.sin(ang)]))
-        outer_normals = np.array(outer_normals)
+        """
+        Compute the minimum side length of the outer hexagon.
+        positions: (11, 2)
+        angles: (11,)
+        """
+        outer_normals = base_normals  # (6, 2)
         
-        max_proj = 0
+        max_proj = 0.0
         for i in range(11):
-            verts = hex_vertices(positions[i][0], positions[i][1], 1.0, angles[i])
-            # Project onto outer normals
-            projs = verts @ outer_normals.T
+            verts = hex_vertices(positions[i, 0], positions[i, 1], 1.0, angles[i])
+            projs = verts @ outer_normals.T  # (6, 6)
             max_proj = max(max_proj, np.max(projs))
-            
-        # max_proj is the max distance from center to a vertex in any normal direction
+        
         # Apothem = S * sqrt(3) / 2
         # max_proj <= Apothem
         # S >= 2 * max_proj / sqrt(3)
         S = 2 * max_proj / np.sqrt(3)
         return S
 
-    def objective(x):
+    def smooth_max(vals, beta=100.0):
+        """Smooth approximation of max using log-sum-exp."""
+        m = np.max(vals)
+        if m < -500:
+            return m
+        return m + np.log(np.sum(np.exp((vals - m) * beta)) / len(vals)) / beta
+
+    def get_min_side_smooth(positions, angles, beta=100.0):
+        """
+        Smooth version of get_min_side using log-sum-exp for max.
+        """
+        outer_normals = base_normals  # (6, 2)
+        
+        all_projs = []
+        for i in range(11):
+            verts = hex_vertices(positions[i, 0], positions[i, 1], 1.0, angles[i])
+            projs = verts @ outer_normals.T  # (6, 6)
+            all_projs.append(projs.flatten())
+        
+        all_projs = np.concatenate(all_projs)
+        max_proj_smooth = smooth_max(all_projs, beta)
+        
+        # Apothem = S * sqrt(3) / 2
+        # max_proj <= Apothem
+        # S >= 2 * max_proj / sqrt(3)
+        S = 2 * max_proj_smooth / np.sqrt(3)
+        return S
+
+    def containment_penalty(positions, angles, S):
+        """
+        Penalty for inner hexagons not being contained in outer hexagon of side S.
+        Returns 0 if all contained, else positive penalty.
+        """
+        outer_normals = base_normals  # (6, 2)
+        apothem = S * np.sqrt(3) / 2
+        penalty = 0.0
+        for i in range(11):
+            verts = hex_vertices(positions[i, 0], positions[i, 1], 1.0, angles[i])
+            projs = verts @ outer_normals.T  # (6, 6)
+            violations = np.maximum(0, projs - apothem)
+            penalty += np.sum(violations ** 2)
+        return penalty
+
+    def objective_smooth(x, beta=100.0):
         if time.time() > deadline:
             return 1e10
         
         positions = x[:22].reshape(11, 2)
         angles = x[22:33]
         
-        # Calculate min side
-        S = get_min_side(positions, angles)
+        # Calculate min side using smooth surrogate
+        S = get_min_side_smooth(positions, angles, beta)
         
-        # Check overlaps
+        # Check overlaps and compute penalty
         penalty = 0.0
         for i in range(11):
+            v1 = hex_vertices(positions[i, 0], positions[i, 1], 1.0, angles[i])
+            n1 = get_normals(angles[i])
             for j in range(i+1, 11):
-                v1 = hex_vertices(positions[i][0], positions[i][1], 1.0, angles[i])
-                v2 = hex_vertices(positions[j][0], positions[j][1], 1.0, angles[j])
-                if not is_separated(v1, v2):
-                    # Estimate overlap penalty
-                    # Use distance between centers as a proxy for how bad the overlap is
+                v2 = hex_vertices(positions[j, 0], positions[j, 1], 1.0, angles[j])
+                n2 = get_normals(angles[j])
+                if not is_separated(v1, v2, n1, n2):
+                    # Use a smooth-ish penalty based on distance
                     d = np.linalg.norm(positions[i] - positions[j])
-                    # If d < 2, they are likely overlapping
+                    # If they are overlapping, d is likely < 2.0 for same orientation
+                    # We want to push them apart.
                     penalty += max(0, 2.0 - d) ** 2
-                    
-        return S + 100 * penalty
+        
+        # Containment penalty
+        pen = penalty + 0.1 * containment_penalty(positions, angles, S)
+        
+        return S + 100 * pen
+
+    def objective_exact(x):
+        """Exact objective for final polishing."""
+        if time.time() > deadline:
+            return 1e10
+        
+        positions = x[:22].reshape(11, 2)
+        angles = x[22:33]
+        
+        # Calculate min side exactly
+        S = get_min_side(positions, angles)
+        
+        # Check overlaps and compute penalty
+        penalty = 0.0
+        for i in range(11):
+            v1 = hex_vertices(positions[i, 0], positions[i, 1], 1.0, angles[i])
+            n1 = get_normals(angles[i])
+            for j in range(i+1, 11):
+                v2 = hex_vertices(positions[j, 0], positions[j, 1], 1.0, angles[j])
+                n2 = get_normals(angles[j])
+                if not is_separated(v1, v2, n1, n2):
+                    d = np.linalg.norm(positions[i] - positions[j])
+                    penalty += max(0, 2.0 - d) ** 2
+        
+        pen = penalty + 0.1 * containment_penalty(positions, angles, S)
+        
+        return S + 100 * pen
 
     # Initial guess
-    # 7 hexes in flower
+    # 7 hexes in flower pattern
     # 4 hexes in corners
     sqrt3 = np.sqrt(3)
     init_pos = np.array([
@@ -130,18 +189,71 @@ def hexagon_packing_11():
     
     x0 = np.concatenate([init_pos.flatten(), init_angles])
     
-    best_x = x0
-    best_val = objective(x0)
+    best_x = x0.copy()
+    best_val = objective_exact(x0)
     
-    # Run optimization
-    try:
-        result = minimize(objective, x0, method='Nelder-Mead', 
-                          options={'maxiter': 10000, 'xatol': 1e-4, 'fatol': 1e-4})
-        if result.success or result.fun < best_val:
-            best_x = result.x
-            best_val = result.fun
-    except Exception:
-        pass
+    rng = np.random.default_rng(42)
+
+    # Phase 1: Smooth optimization with low beta (wide basin search)
+    for restart in range(5):
+        if time.time() > deadline:
+            break
+        
+        if restart == 0:
+            x_start = x0.copy()
+        else:
+            # Perturb best-so-far
+            noise_scale = 0.5 / (restart + 1)
+            x_start = best_x + rng.normal(0, noise_scale, size=best_x.shape)
+        
+        try:
+            result = minimize(lambda x: objective_smooth(x, beta=50.0), x_start, method='Nelder-Mead', 
+                              options={'maxiter': 15000, 'xatol': 1e-6, 'fatol': 1e-8})
+            if result.fun < best_val:
+                best_x = result.x.copy()
+                best_val = objective_exact(best_x)
+        except Exception:
+            pass
+    
+    # Phase 2: Refine with higher beta (sharper max approximation)
+    for restart in range(5):
+        if time.time() > deadline:
+            break
+        
+        if restart == 0:
+            x_start = best_x.copy()
+        else:
+            noise_scale = 0.2
+            x_start = best_x + rng.normal(0, noise_scale, size=best_x.shape)
+        
+        try:
+            result = minimize(lambda x: objective_smooth(x, beta=200.0), x_start, method='Nelder-Mead', 
+                              options={'maxiter': 15000, 'xatol': 1e-7, 'fatol': 1e-9})
+            if result.fun < best_val:
+                best_x = result.x.copy()
+                best_val = objective_exact(best_x)
+        except Exception:
+            pass
+
+    # Phase 3: Final high-precision polish with exact objective
+    for restart in range(5):
+        if time.time() > deadline:
+            break
+        
+        if restart == 0:
+            x_start = best_x.copy()
+        else:
+            noise_scale = 0.1
+            x_start = best_x + rng.normal(0, noise_scale, size=best_x.shape)
+        
+        try:
+            result = minimize(objective_exact, x_start, method='Nelder-Mead', 
+                              options={'maxiter': 20000, 'xatol': 1e-8, 'fatol': 1e-10})
+            if result.fun < best_val:
+                best_x = result.x.copy()
+                best_val = objective_exact(best_x)
+        except Exception:
+            pass
 
     # Extract best result
     positions = best_x[:22].reshape(11, 2)
@@ -149,29 +261,17 @@ def hexagon_packing_11():
     
     # Final validation
     S = get_min_side(positions, angles)
+    S = max(S, np.sqrt(11))
     
-    # Check validity
-    valid = True
-    if S < np.sqrt(11) - 1e-6:
-        # If S is too small, it might be invalid due to area constraint?
-        # The problem says "Valid only if ... side >= sqrt(11)"
-        # So if our S < sqrt(11), we must set S = sqrt(11) and check if it fits?
-        # No, S is the side length of the OUTER hexagon.
-        # If the inner hexes fit in a smaller hex, they also fit in a larger one.
-        # But we want to MINIMIZE S.
-        # If the minimal S is < sqrt(11), we can return sqrt(11) as the side length,
-        # and the packing is still valid (inner hexes are inside).
-        # But the score is 1/S. So we want the smallest valid S.
-        # If the geometric S is 3.0, but constraint says S >= 3.31, then S=3.31 is the best we can do?
-        # Yes.
-        S = max(S, np.sqrt(11))
-        
     # Check overlaps again with final positions
+    valid = True
     for i in range(11):
+        v1 = hex_vertices(positions[i, 0], positions[i, 1], 1.0, angles[i])
+        n1 = get_normals(angles[i])
         for j in range(i+1, 11):
-            v1 = hex_vertices(positions[i][0], positions[i][1], 1.0, angles[i])
-            v2 = hex_vertices(positions[j][0], positions[j][1], 1.0, angles[j])
-            if not is_separated(v1, v2):
+            v2 = hex_vertices(positions[j, 0], positions[j, 1], 1.0, angles[j])
+            n2 = get_normals(angles[j])
+            if not is_separated(v1, v2, n1, n2):
                 valid = False
                 break
         if not valid:

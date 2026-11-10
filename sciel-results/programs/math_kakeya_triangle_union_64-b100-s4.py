@@ -1,261 +1,372 @@
+# EVOLVE-BLOCK-START
 import numpy as np
 import time
 
+# Precompute constants for speed
+_N = 64
+_M_FINE = 20000
+_M_COARSE = 2000
 
-def _compute_area(positions, n=64, n_heights=20000):
-    """Compute the union area using quadrature."""
-    a = (np.arange(n) + 1) / n
-    y = (np.arange(n_heights) + 0.5) / n_heights
-    w = (1 - y) / n
-    
-    L = positions[:, np.newaxis] + a[:, np.newaxis] * y[np.newaxis, :]
-    L_sorted = np.sort(L, axis=0)
-    
-    diffs = np.diff(L_sorted, axis=0)
-    overlaps = np.minimum(diffs, w[np.newaxis, :])
-    
-    union_lengths = w + np.sum(overlaps, axis=0)
-    area = np.mean(union_lengths)
-    
+_A = (np.arange(1, _N + 1, dtype=np.float64)) / _N
+_Y_FINE = (np.arange(_M_FINE, dtype=np.float64) + 0.5) / _M_FINE
+_W_FINE = (1.0 - _Y_FINE) / _N
+_Y_COARSE = (np.arange(_M_COARSE, dtype=np.float64) + 0.5) / _M_COARSE
+_W_COARSE = (1.0 - _Y_COARSE) / _N
+
+
+def _compute_area_fine(x, n=64, M=20000):
+    """Compute the union area of the n triangles using the full 20000-height quadrature."""
+    a = _A[:n]
+    y = _Y_FINE[:M]
+    w = _W_FINE[:M]
+    L = x[:, None] + a[:, None] * y[None, :]
+    Ls = np.sort(L, axis=0)
+    gaps = Ls[1:, :] - Ls[:-1, :]
+    gaps = np.minimum(gaps, w[None, :])
+    union_len = w + gaps.sum(axis=0)
+    area = union_len.mean()
     return area
 
 
-def _compute_area_fast(positions, n=64, n_heights=20000):
-    """Faster area computation using precomputed constants."""
-    a = (np.arange(n) + 1) / n
-    y = (np.arange(n_heights) + 0.5) / n_heights
-    w = (1 - y) / n
-    
-    L = positions[:, np.newaxis] + a[:, np.newaxis] * y[np.newaxis, :]
-    L_sorted = np.sort(L, axis=0)
-    
-    diffs = np.diff(L_sorted, axis=0)
-    overlaps = np.minimum(diffs, w[np.newaxis, :])
-    
-    union_lengths = w + np.sum(overlaps, axis=0)
-    area = np.mean(union_lengths)
-    
+def _compute_area_coarse(x, n=64, M=2000):
+    """Compute the union area using a coarse 2000-height grid (for speed during search)."""
+    a = _A[:n]
+    y = _Y_COARSE[:M]
+    w = _W_COARSE[:M]
+    L = x[:, None] + a[:, None] * y[None, :]
+    Ls = np.sort(L, axis=0)
+    gaps = Ls[1:, :] - Ls[:-1, :]
+    gaps = np.minimum(gaps, w[None, :])
+    union_len = w + gaps.sum(axis=0)
+    area = union_len.mean()
     return area
 
 
-def _subgradient(positions, n=64, n_heights=20000):
+def _compute_subgradient(x, n=64, M=2000):
     """
-    Compute subgradient of the union area with respect to positions.
-    The area is piecewise linear in each x_i, so we can compute
-    which triangles are in the 'active' set (affecting union boundary).
+    Compute a subgradient of the coarse-grid union area w.r.t. x.
+    
+    The union length at height m is:
+        U_m = w_m + sum_{j=0}^{n-2} min(L_{(j+1),m} - L_{(j),m}, w_m)
+    where L_{(j),m} is the j-th smallest of {x_i + a_i * y_m}.
+    
+    dU_m/dx_i = 1 if i is the largest index in the sorted order at height m
+               -1 if i is the smallest index in the sorted order at height m
+               0 otherwise, for each gap that is NOT capped by w_m.
+    
+    More precisely, for each consecutive pair in sorted order:
+      If gap < w_m: the pair contributes (d/dx of (L_{j+1} - L_j)) = e_{j+1} - e_j
+      If gap >= w_m: the pair contributes 0 (capped)
+    Plus the base w_m which doesn't depend on x.
+    
+    So subgradient component for x_i = sum over all heights m of:
+      +1 for each gap where i is the upper element and gap < w_m
+      -1 for each gap where i is the lower element and gap < w_m
+    Then divide by M to get the mean.
     """
-    a = (np.arange(n) + 1) / n
-    y = (np.arange(n_heights) + 0.5) / n_heights
-    w = (1 - y) / n
+    a = _A[:n]
+    y = _Y_COARSE[:M]
+    w = _W_COARSE[:M]
     
-    L = positions[:, np.newaxis] + a[:, np.newaxis] * y[np.newaxis, :]
+    L = x[:, None] + a[:, None] * y[None, :]  # shape (n, M)
     
-    # Sort and track original indices
-    sort_idx = np.argsort(L, axis=0)  # (n, n_heights)
-    L_sorted = np.take_along_axis(L, sort_idx, axis=0)
+    # Get sorted indices
+    idx = np.argsort(L, axis=0)  # shape (n, M), idx[j, m] = index of j-th smallest at height m
     
-    diffs = np.diff(L_sorted, axis=0)  # (n-1, n_heights)
+    # Get sorted values
+    Ls = np.take_along_axis(L, idx, axis=0)  # shape (n, M)
     
-    # For the union length: w + sum_j min(L_{j+1} - L_j, w)
-    # The derivative w.r.t. x_i depends on which sorted positions i occupies
-    # and whether the gap to neighbor is < w (overlapping) or > w (separated)
+    # Compute gaps
+    gaps = Ls[1:, :] - Ls[:-1, :]  # shape (n-1, M)
     
-    # For each height, compute contribution of each triangle to the union boundary
-    # A triangle's right edge contributes if it's the rightmost in its "cluster"
-    # A triangle's left edge contributes if it's the leftmost in its "cluster"
+    # Mask: which gaps are NOT capped (i.e., gap < w_m)
+    not_capped = gaps < w[None, :]  # shape (n-1, M)
     
-    # Simpler approach: use the fact that the union of intervals has length
-    # = sum of lengths - sum of overlaps. But with min formulation, let's
-    # compute the subgradient numerically via finite differences for reliability,
-    # but use a smarter scheme.
+    # For each uncapped gap at position j (between sorted positions j and j+1),
+    # the subgradient contribution is: +1 to x_{idx[j+1,m]}, -1 to x_{idx[j,m]}
     
-    # Actually, let's use the analytical structure:
-    # Union length at height y = w + sum_{j=0}^{n-2} min(d_j, w) where d_j = L_{(j+1)} - L_{(j)}
-    # d_j is linear in positions. min(d_j, w) has subgradient:
-    #   1 w.r.t. L_{(j+1)}, -1 w.r.t. L_{(j)} if d_j < w
-    #   0 if d_j > w
-    #   [0,1] and [-1,0] if d_j == w
+    # Build subgradient array
+    grad = np.zeros((n, M), dtype=np.float64)
     
-    # L_i = x_i + a_i * y, so dL_i/dx_i = 1
+    # For the lower element of each uncapped gap: -1
+    lower_idx = idx[:-1, :]  # shape (n-1, M)
+    # For the upper element of each uncapped gap: +1
+    upper_idx = idx[1:, :]   # shape (n-1, M)
     
-    # For each height, we need to know for each sorted position j,
-    # which original triangle it is, and whether the gap to its neighbors is < w
+    # Use scatter-add via bincount or direct indexing
+    # Flatten for efficiency
+    lower_flat = lower_idx.ravel()
+    upper_flat = upper_idx.ravel()
+    mask_flat = not_capped.ravel()
     
-    # Build subgradient array (n, n_heights)
-    sg = np.zeros((n, n_heights))
+    # Only count where not capped
+    lower_valid = lower_flat[mask_flat]
+    upper_valid = upper_flat[mask_flat]
+    m_idx = np.repeat(np.arange(M), n - 1)[mask_flat]  # which height each gap belongs to
     
-    for m in range(n_heights):
-        # Get sorted order at this height
-        order = sort_idx[:, m]  # (n,)
+    # Accumulate
+    grad_flat = np.zeros(n * M, dtype=np.float64)
+    np.add.at(grad_flat, lower_valid * M + m_idx, -1.0)
+    np.add.at(grad_flat, upper_valid * M + m_idx, 1.0)
+    
+    grad = grad_flat.reshape(n, M) / M  # Divide by M for mean
+    
+    # Sum over heights to get gradient w.r.t. each x_i
+    subgrad = grad.sum(axis=1)
+    
+    return subgrad
+
+
+def _keich_init(n=64):
+    """Classical Keich construction for n a power of 2."""
+    k = int(np.log2(n))
+    j = np.arange(1, k + 1, dtype=np.float64)
+    positions = np.zeros(n, dtype=np.float64)
+    for i in range(n):
+        eps = np.array(list(bin(i)[2:]), dtype=np.float64)
+        eps = np.pad(eps, (k - len(eps), 0), "constant")
+        positions[i] = np.sum((1.0 - j) * eps * (2.0 ** -j) / k)
+    return positions
+
+
+def _subgradient_method(x, n=64, max_iters=500, deadline=None):
+    """
+    Subgradient method for minimizing the coarse-grid union area.
+    Uses diminishing step sizes and momentum.
+    """
+    best_x = x.copy()
+    best_area = _compute_area_coarse(x, n)
+    current_area = best_area
+    
+    # Momentum
+    v = np.zeros(n, dtype=np.float64)
+    mu = 0.9  # momentum coefficient
+    
+    # Step size schedule
+    step0 = 0.05
+    decay = 0.995
+    
+    for it in range(max_iters):
+        if deadline is not None and time.time() > deadline:
+            break
         
-        # For each consecutive pair in sorted order, check if gap < w
-        for j in range(n - 1):
-            d_j = diffs[j, m]
-            if d_j < w[m]:  # overlapping: contributes to union
-                # The gap contributes: +1 to the right triangle, -1 to the left
-                left_tri = order[j]
-                right_tri = order[j + 1]
-                sg[right_tri, m] += 1.0
-                sg[left_tri, m] -= 1.0
-            # if d_j >= w, no contribution (separated intervals)
+        # Compute subgradient
+        g = _compute_subgradient(x, n)
+        
+        # Update with momentum
+        v = mu * v - step0 * (g / (np.linalg.norm(g) + 1e-12))
+        x = x + v
+        
+        # Evaluate
+        area = _compute_area_coarse(x, n)
+        
+        if area < best_area:
+            best_area = area
+            best_x = x.copy()
+        
+        # Decay step size
+        step0 *= decay
+        
+        if step0 < 1e-10:
+            break
     
-    # The base term w doesn't depend on positions
-    # Area = mean over heights of union_lengths
-    # d(area)/d(x_i) = mean over heights of sg[i, m]
+    return best_x, best_area
+
+
+def _smooth_min_subgradient(x, n=64, max_iters=300, deadline=None):
+    """
+    Smoothed subgradient method using log-sum-exp approximation for the min in gaps.
+    This provides a smoother objective that can be optimized more effectively.
+    """
+    best_x = x.copy()
+    best_area = _compute_area_coarse(x, n)
     
-    gradient = np.mean(sg, axis=1)
+    # Temperature for soft-min
+    tau = 0.01
+    tau_decay = 0.99
     
-    return gradient
+    step0 = 0.03
+    step_decay = 0.998
+    v = np.zeros(n, dtype=np.float64)
+    mu = 0.85
+    
+    a = _A[:n]
+    y = _Y_COARSE
+    w = _W_COARSE
+    M = len(y)
+    
+    for it in range(max_iters):
+        if deadline is not None and time.time() > deadline:
+            break
+        
+        L = x[:, None] + a[:, None] * y[None, :]
+        Ls = np.sort(L, axis=0)
+        gaps = Ls[1:, :] - Ls[:-1, :]
+        
+        # Soft-min: min(gap, w) ≈ -tau * logsumexp(-gap/tau, -w/tau)
+        # But we need the gradient of the union area, which involves the soft-min.
+        # The gradient of -tau * log(exp(-gap/tau) + exp(-w/tau)) w.r.t. gap
+        # = exp(-gap/tau) / (exp(-gap/tau) + exp(-w/tau))
+        
+        # Compute soft-min weight for each gap
+        # weight = exp(-gap/tau) / (exp(-gap/tau) + exp(-w/tau))
+        # This is 1 when gap << w, 0 when gap >> w
+        
+        gap_exp = np.exp(-gaps / tau)
+        w_exp = np.exp(-w[None, :] / tau)
+        weights = gap_exp / (gap_exp + w_exp)  # shape (n-1, M)
+        
+        # Now compute subgradient using these weights
+        idx = np.argsort(L, axis=0)
+        lower_idx = idx[:-1, :].ravel()
+        upper_idx = idx[1:, :].ravel()
+        m_idx = np.repeat(np.arange(M), n - 1)
+        w_flat = weights.ravel()
+        
+        grad_flat = np.zeros(n * M, dtype=np.float64)
+        np.add.at(grad_flat, lower_idx * M + m_idx, -w_flat)
+        np.add.at(grad_flat, upper_idx * M + m_idx, w_flat)
+        
+        grad = grad_flat.reshape(n, M).sum(axis=1) / M
+        
+        # Update
+        norm_g = np.linalg.norm(grad)
+        v = mu * v - step0 * (grad / (norm_g + 1e-12))
+        x = x + v
+        
+        area = _compute_area_coarse(x, n)
+        if area < best_area:
+            best_area = area
+            best_x = x.copy()
+        
+        # Decay
+        step0 *= step_decay
+        tau *= tau_decay
+        
+        if step0 < 1e-10:
+            break
+    
+    return best_x, best_area
+
+
+def _coordinate_descent(x, n=64, max_iters=200, tol=1e-12, deadline=None):
+    """
+    Coordinate descent on the coarse-grid area.
+    """
+    best_x = x.copy()
+    best_area = _compute_area_coarse(x, n)
+
+    for it in range(max_iters):
+        if deadline is not None and time.time() > deadline:
+            break
+        improved = False
+        for i in range(n):
+            if deadline is not None and time.time() > deadline:
+                return best_x, best_area
+            base = best_x[i]
+            steps = np.concatenate([
+                np.linspace(-0.05, 0.05, 21),
+                np.linspace(-0.2, -0.05, 10),
+                np.linspace(0.05, 0.2, 10),
+                np.linspace(-0.5, -0.2, 5),
+                np.linspace(0.2, 0.5, 5),
+            ])
+            best_local = base
+            best_local_area = best_area
+            for s in steps:
+                trial = best_x.copy()
+                trial[i] = base + s
+                ar = _compute_area_coarse(trial, n)
+                if ar < best_local_area - 1e-15:
+                    best_local_area = ar
+                    best_local = base + s
+            if abs(best_local - base) > 1e-14:
+                best_x[i] = best_local
+                best_area = best_local_area
+                improved = True
+        if not improved:
+            break
+    return best_x, best_area
+
+
+def _local_search(x, n=64, max_iters=300, deadline=None):
+    """
+    Randomized local search with adaptive step sizes.
+    """
+    best_x = x.copy()
+    best_area = _compute_area_coarse(x, n)
+    step_size = 0.01
+
+    for it in range(max_iters):
+        if deadline is not None and time.time() > deadline:
+            break
+        i = np.random.randint(n)
+        candidates = best_x[i] + step_size * np.random.randn(8)
+        best_cand = best_x[i]
+        best_cand_area = best_area
+        for c in candidates:
+            trial = best_x.copy()
+            trial[i] = c
+            ar = _compute_area_coarse(trial, n)
+            if ar < best_cand_area - 1e-15:
+                best_cand_area = ar
+                best_cand = c
+        if abs(best_cand - best_x[i]) > 1e-14:
+            best_x[i] = best_cand
+            best_area = best_cand_area
+            if it % 50 == 49:
+                step_size *= 0.8
+        else:
+            step_size *= 0.95
+            if step_size < 1e-8:
+                break
+    return best_x, best_area
 
 
 def kakeya_needle_2d_positions64() -> np.ndarray:
     """
-    Direct construction for Kakeya needle triangle positions.
-    
-    Uses the structural insight that triangles with larger a_i tilt more,
-    so we offset their base positions to maximize overlap at all heights.
+    Two-dimensional Kakeya-needle area-minimization problem.
+    Returns 64 finite floats x_0..x_63.
     """
     n = 64
     start_time = time.time()
-    deadline = start_time + 590  # Safety margin before 600s limit
-    
-    a = (np.arange(n) + 1) / n
-    
-    # Try multiple initializations:
-    # 1. Aligned: x_i = -a_i + 0.5 (near-optimal overlap by construction)
-    # 2. Scaled: x_i = -a_i * c for various c
-    # 3. Random perturbations of aligned
-    
-    candidates = []
-    
-    # Aligned construction
-    candidates.append(-a + 0.5)
-    
-    # Various c values
-    for c_try in [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
-        candidates.append(-a * c_try + 0.5 * c_try)
-    
-    # Random perturbations of aligned
-    for seed in [42, 123, 456, 789]:
-        np.random.seed(seed)
-        pert = np.random.normal(0, 0.05, n)
-        candidates.append(-a + 0.5 + pert)
-    
-    # Evaluate all candidates
-    best_positions = None
-    best_area = np.inf
-    
-    for pos_try in candidates:
-        if time.time() > deadline:
-            break
-        area_try = _compute_area(pos_try, n, 20000)
-        if area_try < best_area:
-            best_area = area_try
-            best_positions = pos_try.copy()
-    
-    # Local search phase 1: coarse
+    deadline = start_time + 620  # Safety margin
+
+    # Initialize with Keich construction
+    x = _keich_init(n)
+    best_x = x.copy()
+    best_area = _compute_area_coarse(x, n)
+
+    # Phase 1: Subgradient method (exploits convexity)
+    if time.time() < deadline - 120:
+        x, area = _subgradient_method(x, n, max_iters=400, deadline=deadline - 120)
+        if area < best_area:
+            best_x, best_area = x, area
+
+    # Phase 2: Smoothed subgradient with decreasing temperature
     if time.time() < deadline - 60:
-        current = best_positions.copy()
-        current_area = best_area
-        step_size = 0.03
-        
-        np.random.seed(42)
-        for it in range(8000):
-            if time.time() > deadline - 60:
-                break
-            
-            idx = np.random.randint(n)
-            delta = np.random.uniform(-step_size, step_size)
-            trial = current.copy()
-            trial[idx] += delta
-            
-            trial_area = _compute_area(trial, n, 20000)
-            
-            if trial_area < current_area:
-                current = trial
-                current_area = trial_area
-                if current_area < best_area:
-                    best_area = current_area
-                    best_positions = current.copy()
-            
-            step_size = max(0.005, step_size * 0.9997)
-    
-    # Local search phase 2: fine
+        x, area = _smooth_min_subgradient(best_x, n, max_iters=300, deadline=deadline - 60)
+        if area < best_area:
+            best_x, best_area = x, area
+
+    # Phase 3: Coordinate descent polish
     if time.time() < deadline - 30:
-        current = best_positions.copy()
-        current_area = best_area
-        step_size = 0.01
-        
-        np.random.seed(123)
-        for it in range(6000):
-            if time.time() > deadline - 30:
-                break
-            
-            idx = np.random.randint(n)
-            delta = np.random.uniform(-step_size, step_size)
-            trial = current.copy()
-            trial[idx] += delta
-            
-            trial_area = _compute_area(trial, n, 20000)
-            
-            if trial_area < current_area:
-                current = trial
-                current_area = trial_area
-                if current_area < best_area:
-                    best_area = current_area
-                    best_positions = current.copy()
-            
-            step_size = max(0.001, step_size * 0.9995)
-    
-    # Subgradient polish phase
+        x, area = _coordinate_descent(best_x, n, max_iters=100, deadline=deadline - 30)
+        if area < best_area:
+            best_x, best_area = x, area
+
+    # Phase 4: Final local search
     if time.time() < deadline - 10:
-        current = best_positions.copy()
-        current_area = best_area
-        lr = 0.01
-        
-        for it in range(3000):
-            if time.time() > deadline - 10:
-                break
-            
-            grad = _subgradient(current, n, 20000)
-            current = current - lr * grad
-            current_area = _compute_area(current, n, 20000)
-            
-            if current_area < best_area:
-                best_area = current_area
-                best_positions = current.copy()
-            
-            lr *= 0.999
-    
-    # Final micro-refinement
-    if time.time() < deadline - 3:
-        current = best_positions.copy()
-        current_area = best_area
-        step_size = 0.002
-        
-        np.random.seed(999)
-        for it in range(2000):
-            if time.time() > deadline - 3:
-                break
-            
-            idx = np.random.randint(n)
-            delta = np.random.uniform(-step_size, step_size)
-            trial = current.copy()
-            trial[idx] += delta
-            
-            trial_area = _compute_area(trial, n, 20000)
-            
-            if trial_area < current_area:
-                current = trial
-                current_area = trial_area
-                if current_area < best_area:
-                    best_area = current_area
-                    best_positions = current.copy()
-            
-            step_size = max(0.0005, step_size * 0.999)
-    
-    # Ensure finite
-    if not np.all(np.isfinite(best_positions)):
-        return np.zeros(n, dtype=np.float64)
-    
-    return best_positions.astype(np.float64)
+        x, area = _local_search(best_x, n, max_iters=200, deadline=deadline - 10)
+        if area < best_area:
+            best_x, best_area = x, area
+
+    # Verify with fine grid
+    fine_area = _compute_area_fine(best_x, n)
+    if not np.isfinite(fine_area) or fine_area <= 0:
+        return _keich_init(n)
+
+    return best_x.astype(np.float64)
+
+
+# EVOLVE-BLOCK-END

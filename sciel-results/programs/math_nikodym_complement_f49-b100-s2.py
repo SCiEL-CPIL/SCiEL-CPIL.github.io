@@ -1,12 +1,13 @@
 # EVOLVE-BLOCK-START
 import numpy as np
 import time
+import random
 
 def nikodym_set() -> np.ndarray:
     """
     Construct a Nikodym set in F_49^2.
-    Uses a greedy set cover approach to minimize the removed set R from the Hermitian unital,
-    thereby maximizing the complement S.
+    Uses a greedy set cover approach with deletion heuristic and local search
+    to minimize the removed set R from the Hermitian unital, thereby maximizing the complement S.
     """
     start_time = time.time()
     deadline = start_time + 500.0  # Safety margin
@@ -58,9 +59,6 @@ def nikodym_set() -> np.ndarray:
     # The tangent at u is the unique line meeting U only at u.
     
     # We need to compute the tangent line for each u in U.
-    # A line is defined by a point and a direction, or two points.
-    # In F_q^2, a line is a set of q points.
-    # For a given u in U, find the tangent line T_u.
     # T_u is the set of points x such that the line ux meets U only at u.
     
     # Efficient way:
@@ -242,6 +240,24 @@ def nikodym_set() -> np.ndarray:
         
         if time.time() > deadline:
             break
+
+    # Deletion heuristic: remove redundant sets from R
+    R_set = set(R)
+    changed = True
+    while changed:
+        changed = False
+        for u_idx in list(R):
+            # Check if T_u \ {u} is covered by union of T_v \ {v} for v in R \ {u}
+            s_u = sets_for_u[u_idx]
+            covered_by_others = set()
+            for v_idx in R:
+                if v_idx == u_idx:
+                    continue
+                covered_by_others |= sets_for_u[v_idx]
+            if s_u.issubset(covered_by_others):
+                R.remove(u_idx)
+                changed = True
+                break  # Restart loop since R changed
 
     # Construct S = U \ R
     R_set = set(R)

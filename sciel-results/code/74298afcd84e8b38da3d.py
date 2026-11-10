@@ -1,0 +1,221 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import time
+import random
+import numpy as np
+
+def construct():
+    deadline = time.time() + 115  # safety margin before 150s kill
+    n = 40
+    
+    # Build adjacency as bitmasks for fast operations
+    adj_mask = [0] * n
+    
+    def add_edge(u, v):
+        adj_mask[u] |= (1 << v)
+        adj_mask[v] |= (1 << u)
+    
+    def remove_edge(u, v):
+        adj_mask[u] &= ~(1 << v)
+        adj_mask[v] &= ~(1 << u)
+    
+    def degree(u):
+        return bin(adj_mask[u]).count('1')
+    
+    def total_edges():
+        return sum(degree(u) for u in range(n)) // 2
+    
+    def has_c6_fast(u, v):
+        """Check if adding edge (u,v) creates a C6 using bitmasks."""
+        nu = adj_mask[u] & ~(1 << v)
+        nv = adj_mask[v] & ~(1 << u)
+        
+        a = nu
+        while a:
+            la = a & (-a)
+            a ^= la
+            ai = la.bit_length() - 1
+            
+            nb = adj_mask[ai] & ~(1 << u) & ~(1 << v) & ~(1 << ai)
+            b = nb
+            while b:
+                lb = b & (-b)
+                b ^= lb
+                bi = lb.bit_length() - 1
+                
+                nc = adj_mask[bi] & ~(1 << u) & ~(1 << v) & ~(1 << ai) & ~(1 << bi)
+                c = nc
+                while c:
+                    lc = c & (-c)
+                    c ^= lc
+                    ci = lc.bit_length() - 1
+                    
+                    nd = adj_mask[ci] & nv & ~(1 << u) & ~(1 << ai) & ~(1 << bi) & ~(1 << ci)
+                    if nd:
+                        return True
+        
+        return False
+    
+    def build_adj_matrix():
+        """Build numpy adjacency matrix from bitmasks."""
+        A = np.zeros((n, n), dtype=np.float64)
+        for u in range(n):
+            mask = adj_mask[u]
+            while mask:
+                lb = mask & (-mask)
+                mask ^= lb
+                v = lb.bit_length() - 1
+                A[u, v] = 1.0
+        return A
+    
+    def spectral_gap(A):
+        """Compute λ1 - λ2 of adjacency matrix A."""
+        # Use power iteration for efficiency
+        eigvals = np.linalg.eigvalsh(A)
+        eigvals = np.sort(eigvals)[::-1]  # descending
+        if len(eigvals) < 2:
+            return 0.0
+        return eigvals[0] - eigvals[1]
+    
+    def spectral_local_search(initial_mask, time_limit):
+        """Local search using spectral gap heuristic to guide edge insertion."""
+        adj_mask[:] = list(initial_mask)
+        
+        best_adj_mask = list(adj_mask)
+        best_count = total_edges()
+        
+        # Precompute all non-edge pairs
+        all_non_edges = [(i, j) for i in range(n) for j in range(i + 1, n) 
+                         if not ((1 << j) & adj_mask[i])]
+        
+        while time.time() < time_limit:
+            if not all_non_edges:
+                break
+            
+            # Compute current adjacency matrix and spectral gap
+            A = build_adj_matrix()
+            current_gap = spectral_gap(A)
+            
+            # Score each candidate edge by potential spectral gap improvement
+            candidates = []
+            for (u, v) in all_non_edges:
+                if time.time() > time_limit:
+                    break
+                if (1 << v) & adj_mask[u]:
+                    continue
+                # Check if adding this edge creates C6
+                if has_c6_fast(u, v):
+                    continue
+                # Estimate spectral gap improvement
+                # Temporarily add edge and compute new gap
+                adj_mask[u] |= (1 << v)
+                adj_mask[v] |= (1 << u)
+                A_new = build_adj_matrix()
+                new_gap = spectral_gap(A_new)
+                # Undo
+                adj_mask[u] &= ~(1 << v)
+                adj_mask[v] &= ~(1 << u)
+                
+                # Score: prefer edges that increase spectral gap
+                score = new_gap - current_gap
+                candidates.append((score, u, v))
+            
+            if not candidates:
+                # No valid edges to add; perturb
+                if time.time() > time_limit - 1:
+                    break
+                
+                current_edges = []
+                for u in range(n):
+                    mask = adj_mask[u]
+                    while mask:
+                        lb = mask & (-mask)
+                        mask ^= lb
+                        v = lb.bit_length() - 1
+                        if u < v:
+                            current_edges.append((u, v))
+                
+                if not current_edges:
+                    break
+                
+                k = min(2, len(current_edges))
+                edges_to_remove = random.sample(current_edges, k)
+                for (u, v) in edges_to_remove:
+                    remove_edge(u, v)
+                
+                # Rebuild candidate list
+                all_non_edges = [(i, j) for i in range(n) for j in range(i + 1, n) 
+                                 if not ((1 << j) & adj_mask[i])]
+                continue
+            
+            # Add the best candidate
+            candidates.sort(reverse=True)
+            best_score, best_u, best_v = candidates[0]
+            add_edge(best_u, best_v)
+            
+            # Update non-edge list
+            all_non_edges = [(u, v) for (u, v) in all_non_edges 
+                           if not ((1 << v) & adj_mask[u])]
+            
+            current_count = total_edges()
+            if current_count > best_count:
+                best_count = current_count
+                best_adj_mask = list(adj_mask)
+        
+        return best_adj_mask, best_count
+
+    # Initial state: 8 disjoint K5s
+    init_adj = [0] * n
+    for k in range(8):
+        for a in range(5):
+            for b in range(a + 1, 5):
+                init_adj[5 * k + a] |= (1 << (5 * k + b))
+                init_adj[5 * k + b] |= (1 << (5 * k + a))
+    
+    best_overall_mask = list(init_adj)
+    best_overall_count = total_edges()
+    
+    # Run multiple local searches with different random seeds/orderings
+    num_restarts = 3
+    time_per_restart = (deadline - time.time()) / num_restarts - 2
+    
+    for r in range(num_restarts):
+        if time.time() > deadline - 5:
+            break
+        
+        if r == 0:
+            start_mask = list(init_adj)
+        else:
+            start_mask = list(best_overall_mask)
+            current_edges = []
+            for u in range(n):
+                mask = start_mask[u]
+                while mask:
+                    lb = mask & (-mask)
+                    mask ^= lb
+                    v = lb.bit_length() - 1
+                    if u < v:
+                        current_edges.append((u, v))
+            
+            if current_edges:
+                edges_to_remove = random.sample(current_edges, min(3, len(current_edges)))
+                for (u, v) in edges_to_remove:
+                    start_mask[u] &= ~(1 << v)
+                    start_mask[v] &= ~(1 << u)
+        
+        t_end = time.time() + time_per_restart
+        mask, count = spectral_local_search(start_mask, t_end)
+        
+        if count > best_overall_count:
+            best_overall_count = count
+            best_overall_mask = mask
+
+    # Build final edge list from the best state
+    edges = []
+    for u in range(n):
+        for v in range(u + 1, n):
+            if (1 << v) & best_overall_mask[u]:
+                edges.append([u, v])
+    
+    return edges
+# EVOLVE-BLOCK-END

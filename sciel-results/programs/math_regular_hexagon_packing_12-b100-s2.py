@@ -14,13 +14,6 @@ def _hex_vertices(cx, cy, d, angle_deg):
 def _hex_edge_normals(angle_deg):
     """Compute the 6 outward unit edge normals for a regular hexagon."""
     a = np.radians(angle_deg)
-    # Edge normals are at angles 30 + 60*k + a (for k=0..5)
-    # Wait, let me think about this more carefully.
-    # For a hexagon with vertex at angle a, the edges are between consecutive vertices.
-    # The outward normal of the edge from vertex k to vertex k+1 is perpendicular to the edge.
-    # The edge from vertex at angle (a + 60k) to vertex at angle (a + 60(k+1)) 
-    # has direction that is tangent to the hexagon.
-    # The outward normal points in the direction of the midpoint of the arc, which is at angle a + 60k + 30.
     normals_angles = a + np.radians(30) + np.radians(60) * np.arange(6)
     return np.column_stack([np.cos(normals_angles), np.sin(normals_angles)])
 
@@ -29,7 +22,6 @@ def _check_separation(hex1, hex2, tol=1e-6):
     v1 = _hex_vertices(hex1[0], hex1[1], 1.0, hex1[2])
     v2 = _hex_vertices(hex2[0], hex2[1], 1.0, hex2[2])
     
-    # Get edge normals for both hexagons
     n1 = _hex_edge_normals(hex1[2])
     n2 = _hex_edge_normals(hex2[2])
     
@@ -65,31 +57,24 @@ def _validate(inner_data, outer_data, s):
     
     outer_verts = _hex_vertices(outer_data[0], outer_data[1], s, outer_data[2])
     
-    # Check outer vertices distinct
     for i in range(6):
         for j in range(i+1, 6):
             if np.linalg.norm(outer_verts[i] - outer_verts[j]) < 1e-8:
                 return False
     
-    # Check inner hexagons
-    inner_verts_list = []
     for i in range(12):
         verts = _hex_vertices(inner_data[i,0], inner_data[i,1], 1.0, inner_data[i,2])
-        inner_verts_list.append(verts)
         
-        # Check unit edges
         for j in range(6):
             p1 = verts[j]
             p2 = verts[(j+1) % 6]
             if abs(np.linalg.norm(p2 - p1) - 1.0) > 1e-8:
                 return False
         
-        # Check inside outer
         for v in verts:
             if not _vertex_inside_outer(v, outer_verts):
                 return False
     
-    # Check separation
     for i in range(12):
         for j in range(i+1, 12):
             if not _check_separation(inner_data[i], inner_data[j]):
@@ -98,11 +83,7 @@ def _validate(inner_data, outer_data, s):
     return True
 
 def _min_enclosing_hex_side(centers, inner_angles=None):
-    """
-    Find the minimum side length s of a regular hexagon (centered at origin, angle 0)
-    that contains all inner hexagons.
-    """
-    # Outer hexagon (angle 0) has outward normals at 30, 90, 150, 210, 270, 330 degrees
+    """Find minimum side length s of a regular hexagon (centered at origin, angle 0) containing all inner hexagons."""
     outer_normals = _hex_edge_normals(0.0)
     
     if inner_angles is None:
@@ -111,27 +92,18 @@ def _min_enclosing_hex_side(centers, inner_angles=None):
     max_required_s = 0.0
     for i, center in enumerate(centers):
         inner_angle = inner_angles[i]
-        # Compute support function of inner hexagon in each outer normal direction
         inner_verts = _hex_vertices(0, 0, 1.0, inner_angle)
         for n in outer_normals:
             support = np.max(inner_verts @ n)
-            # The farthest point in direction n from origin is:
-            #   dot(center, n) + support
-            # This must be <= s * sqrt(3) / 2
             required_s = (center @ n + support) / (np.sqrt(3) / 2)
             if required_s > max_required_s:
                 max_required_s = required_s
     
     return max_required_s
 
-def hexagon_packing_12():
-    start_time = time.time()
-    deadline = start_time + 580  # safety margin before 630s kill
-    
+def _honeycomb_positions():
+    """Generate initial honeycomb positions for 12 hexagons."""
     sqrt3 = np.sqrt(3)
-    
-    # Initial placement in a honeycomb pattern
-    # 4 columns, 3 rows
     col_spacing = 1.5
     row_spacing = sqrt3
     
@@ -145,7 +117,6 @@ def hexagon_packing_12():
                 y = (row + 0.5) * row_spacing
             positions.append([x, y, 0.0])
     
-    # Center the arrangement
     xs = [p[0] for p in positions]
     ys = [p[1] for p in positions]
     cx = (min(xs) + max(xs)) / 2
@@ -155,65 +126,60 @@ def hexagon_packing_12():
         p[0] -= cx
         p[1] -= cy
     
-    inner_data = np.array(positions)
+    return np.array(positions)
+
+def hexagon_packing_12():
+    start_time = time.time()
+    deadline = start_time + 580
+    
+    sqrt3 = np.sqrt(3)
+    
+    # Initial honeycomb placement
+    inner_data = _honeycomb_positions()
     centers = inner_data[:, :2]
     inner_angles = np.zeros(12)
     
-    # Compute minimum enclosing hexagon side
     s = _min_enclosing_hex_side(centers, inner_angles)
-    # Add small margin
     s *= 1.001
-    
     outer_data = np.array([0.0, 0.0, 0.0])
     
-    # Validate initial solution
     if not _validate(inner_data, outer_data, s):
-        # Fallback: use larger s
         s = 6.0
         outer_data = np.array([0.0, 0.0, 0.0])
     
     best_value = 1.0 / s
     best_result = (inner_data.copy(), outer_data.copy(), s)
     
-    # Optimize to minimize s
+    # Objective function for optimization
     def objective(params):
-        # params: [x1,y1, x2,y2, ..., x12,y12, s]
         inner_xy = params[:24].reshape(12, 2)
         s_val = params[24]
         
         if s_val < np.sqrt(12):
             return 1e6
         
-        # Build inner data with all angles 0
         inner = np.zeros((12, 3))
         inner[:, 0] = inner_xy[:, 0]
         inner[:, 1] = inner_xy[:, 1]
-        inner[:, 2] = 0.0  # all angle 0
+        inner[:, 2] = 0.0
         
-        outer = np.array([0.0, 0.0, 0.0])
-        
-        # Check validity and compute penalty
         outer_verts = _hex_vertices(0, 0, s_val, 0)
         outer_normals = _hex_edge_normals(0.0)
         
         penalty = 0.0
         
-        # Check each inner hexagon is inside outer
         for i in range(12):
             verts = _hex_vertices(inner[i,0], inner[i,1], 1.0, 0.0)
             
-            # Use support function approach for containment check
             for n in outer_normals:
                 max_proj = np.max(verts @ n)
                 apothem = s_val * sqrt3 / 2
                 if max_proj > apothem + 1e-9:
                     penalty += (max_proj - apothem) ** 2
             
-            # Check separation from other hexagons
             for j in range(i+1, 12):
                 verts2 = _hex_vertices(inner[j,0], inner[j,1], 1.0, 0.0)
                 
-                # SAT check using edge normals
                 n1 = _hex_edge_normals(0.0)
                 n2 = _hex_edge_normals(0.0)
                 
@@ -230,63 +196,99 @@ def hexagon_packing_12():
                             separated = True
                             break
                         
-                        # Track minimum gap for penalty
                         gap = min(min2 - max1, min1 - max2)
                         if gap < min_gap:
                             min_gap = gap
+                    if separated:
+                        break
                 
                 if not separated and min_gap < 0:
                     penalty += min_gap ** 2
         
         return s_val + 1000 * penalty
     
-    # Initial params
-    init_params = np.zeros(25)
-    init_params[:24] = inner_data[:, :2].flatten()
-    init_params[24] = s
+    # Phase 1: Affine transform optimization (lower-dimensional manifold)
+    base_positions = _honeycomb_positions()[:, :2]
     
-    # Optimize
-    n_restarts = 20
-    for restart in range(n_restarts):
-        if time.time() > deadline - 20:
+    def affine_objective(params):
+        angle = params[0]
+        sx = params[1]
+        sy = params[2]
+        s_val = params[3]
+        
+        if s_val < np.sqrt(12):
+            return 1e6
+        if sx <= 0 or sy <= 0:
+            return 1e6
+        
+        cos_a = np.cos(angle)
+        sin_a = np.sin(angle)
+        
+        transformed = np.zeros_like(base_positions)
+        for i in range(12):
+            x, y = base_positions[i]
+            xs = x * sx
+            ys = y * sy
+            transformed[i, 0] = xs * cos_a - ys * sin_a
+            transformed[i, 1] = xs * sin_a + ys * cos_a
+        
+        full_params = np.zeros(25)
+        full_params[:24] = transformed.flatten()
+        full_params[24] = s_val
+        
+        return objective(full_params)
+    
+    # Optimize affine parameters
+    init_affine = np.array([0.0, 1.0, 1.0, s])
+    
+    for restart in range(10):
+        if time.time() > deadline - 60:
             break
         
         if restart == 0:
-            params0 = init_params.copy()
+            params0 = init_affine.copy()
         else:
-            # Perturb initial guess
-            perturbation = 0.3 * np.random.randn(24)
-            params0 = init_params.copy()
-            params0[:24] += perturbation
-            params0[24] = s + 0.3 * np.random.randn()
+            params0 = init_affine.copy()
+            params0[0] += 0.2 * np.random.randn()
+            params0[1] += 0.1 * np.random.randn()
+            params0[2] += 0.1 * np.random.randn()
+            params0[3] += 0.2 * np.random.randn()
         
         try:
             result = minimize(
-                objective,
+                affine_objective,
                 params0,
                 method='Nelder-Mead',
                 options={
-                    'maxiter': 3000,
-                    'xatol': 1e-7,
-                    'fatol': 1e-7,
+                    'maxiter': 2000,
+                    'xatol': 1e-8,
+                    'fatol': 1e-8,
                     'adaptive': True
                 }
             )
             
             if result.fun < 100:
-                final_params = result.x
-                inner_xy_final = final_params[:24].reshape(12, 2)
-                s_final = final_params[24]
+                angle, sx, sy, s_val = result.x
                 
-                if s_final > np.sqrt(12):
+                cos_a = np.cos(angle)
+                sin_a = np.sin(angle)
+                
+                transformed = np.zeros((12, 2))
+                for i in range(12):
+                    x, y = base_positions[i]
+                    xs = x * sx
+                    ys = y * sy
+                    transformed[i, 0] = xs * cos_a - ys * sin_a
+                    transformed[i, 1] = xs * sin_a + ys * cos_a
+                
+                if s_val > np.sqrt(12):
                     inner_final = np.zeros((12, 3))
-                    inner_final[:, 0] = inner_xy_final[:, 0]
-                    inner_final[:, 1] = inner_xy_final[:, 1]
+                    inner_final[:, 0] = transformed[:, 0]
+                    inner_final[:, 1] = transformed[:, 1]
                     inner_final[:, 2] = 0.0
                     outer_final = np.array([0.0, 0.0, 0.0])
                     
-                    # Recompute s to be exact
-                    s_exact = _min_enclosing_hex_side(inner_xy_final, inner_angles)
+                    s_exact = _min_enclosing_hex_side(transformed, inner_angles)
                     s_final = s_exact * 1.0001
                     
                     if _validate(inner_final, outer_final, s_final):
@@ -294,13 +296,70 @@ def hexagon_packing_12():
                         if value > best_value:
                             best_value = value
                             best_result = (inner_final, outer_final, s_final)
-        except Exception as e:
+        except Exception:
             pass
     
-    # Final high-precision polish pass
-    if time.time() < deadline - 30:
+    # Phase 2: Full 24-DOF Nelder-Mead polish
+    if time.time() < deadline - 40:
         current_inner = best_result[0].copy()
-        current_outer = best_result[1].copy()
+        current_s = best_result[2]
+        
+        init_params = np.zeros(25)
+        init_params[:24] = current_inner[:, :2].flatten()
+        init_params[24] = current_s
+        
+        n_restarts = 15
+        for restart in range(n_restarts):
+            if time.time() > deadline - 30:
+                break
+            
+            if restart == 0:
+                params0 = init_params.copy()
+            else:
+                perturbation = 0.3 * np.random.randn(24)
+                params0 = init_params.copy()
+                params0[:24] += perturbation
+                params0[24] = current_s + 0.3 * np.random.randn()
+            
+            try:
+                result = minimize(
+                    objective,
+                    params0,
+                    method='Nelder-Mead',
+                    options={
+                        'maxiter': 3000,
+                        'xatol': 1e-7,
+                        'fatol': 1e-7,
+                        'adaptive': True
+                    }
+                )
+                
+                if result.fun < 100:
+                    final_params = result.x
+                    inner_xy_final = final_params[:24].reshape(12, 2)
+                    s_final = final_params[24]
+                    
+                    if s_final > np.sqrt(12):
+                        inner_final = np.zeros((12, 3))
+                        inner_final[:, 0] = inner_xy_final[:, 0]
+                        inner_final[:, 1] = inner_xy_final[:, 1]
+                        inner_final[:, 2] = 0.0
+                        outer_final = np.array([0.0, 0.0, 0.0])
+                        
+                        s_exact = _min_enclosing_hex_side(inner_xy_final, inner_angles)
+                        s_final = s_exact * 1.0001
+                        
+                        if _validate(inner_final, outer_final, s_final):
+                            value = 1.0 / s_final
+                            if value > best_value:
+                                best_value = value
+                                best_result = (inner_final, outer_final, s_final)
+            except Exception:
+                pass
+    
+    # Phase 3: High-precision polish
+    if time.time() < deadline - 20:
+        current_inner = best_result[0].copy()
         current_s = best_result[2]
         
         polish_params = np.zeros(25)
@@ -332,7 +391,6 @@ def hexagon_packing_12():
                     inner_final[:, 2] = 0.0
                     outer_final = np.array([0.0, 0.0, 0.0])
                     
-                    # Recompute s to be exact
                     s_exact = _min_enclosing_hex_side(inner_xy_final, inner_angles)
                     s_final = s_exact * 1.0001
                     
@@ -341,7 +399,107 @@ def hexagon_packing_12():
                         if value > best_value:
                             best_value = value
                             best_result = (inner_final, outer_final, s_final)
-        except Exception as e:
+        except Exception:
             pass
+    
+    # Phase 4: Smooth surrogate with log-sum-exp for containment
+    if time.time() < deadline - 15:
+        def smooth_objective(params):
+            inner_xy = params[:24].reshape(12, 2)
+            s_val = params[24]
+            
+            if s_val < np.sqrt(12):
+                return 1e6
+            
+            outer_normals = _hex_edge_normals(0.0)
+            apothem = s_val * sqrt3 / 2
+            beta = 50.0  # Temperature for soft-max
+            
+            # Smooth containment violation using log-sum-exp
+            log_sum = np.zeros(12)
+            for i in range(12):
+                verts = _hex_vertices(inner_xy[i,0], inner_xy[i,1], 1.0, 0.0)
+                violations = []
+                for n in outer_normals:
+                    max_proj = np.max(verts @ n)
+                    v = max_proj - apothem
+                    violations.append(v)
+                violations = np.array(violations)
+                # log-sum-exp for max
+                m = np.max(violations)
+                if m > 0:
+                    log_sum[i] = m + np.log(np.sum(np.exp(violations - m)))
+                else:
+                    log_sum[i] = 0.0
+            
+            # Smooth separation using log-sum-exp on overlap
+            log_sum_sep = np.zeros(66)
+            idx = 0
+            n_normals = _hex_edge_normals(0.0)
+            for i in range(12):
+                verts1 = _hex_vertices(inner_xy[i,0], inner_xy[i,1], 1.0, 0.0)
+                for j in range(i+1, 12):
+                    verts2 = _hex_vertices(inner_xy[j,0], inner_xy[j,1], 1.0, 0.0)
+                    overlaps = []
+                    for normal in n_normals:
+                        proj1 = verts1 @ normal
+                        proj2 = verts2 @ normal
+                        min1, max1 = proj1.min(), proj1.max()
+                        min2, max2 = proj2.min(), proj2.max()
+                        # Overlap if projections intersect
+                        overlap = min(max1, max2) - max(min1, min2)
+                        overlaps.append(overlap)
+                    overlaps = np.array(overlaps)
+                    m = np.max(overlaps)
+                    if m > 0:
+                        log_sum_sep[idx] = m + np.log(np.sum(np.exp(overlaps - m)))
+                    else:
+                        log_sum_sep[idx] = 0.0
+                    idx += 1
+            
+            penalty = np.sum(log_sum) + np.sum(log_sum_sep)
+            return s_val + 100 * penalty
+        
+        current_inner = best_result[0].copy()
+        current_s = best_result[2]
+        init_params = np.zeros(25)
+        init_params[:24] = current_inner[:, :2].flatten()
+        init_params[24] = current_s
+        
+        for attempt in range(5):
+            if time.time() > deadline - 10:
+                break
+            
+            try:
+                result = minimize(
+                    smooth_objective,
+                    init_params,
+                    method='BFGS',
+                    options={'maxiter': 200, 'gtol': 1e-8}
+                )
+                
+                if result.fun < 100:
+                    final_params = result.x
+                    inner_xy_final = final_params[:24].reshape(12, 2)
+                    s_final = final_params[24]
+                    
+                    if s_final > np.sqrt(12):
+                        inner_final = np.zeros((12, 3))
+                        inner_final[:, 0] = inner_xy_final[:, 0]
+                        inner_final[:, 1] = inner_xy_final[:, 1]
+                        inner_final[:, 2] = 0.0
+                        outer_final = np.array([0.0, 0.0, 0.0])
+                        
+                        s_exact = _min_enclosing_hex_side(inner_xy_final, inner_angles)
+                        s_final = s_exact * 1.0001
+                        
+                        if _validate(inner_final, outer_final, s_final):
+                            value = 1.0 / s_final
+                            if value > best_value:
+                                best_value = value
+                                best_result = (inner_final, outer_final, s_final)
+                                init_params = final_params.copy()
+            except Exception:
+                pass
     
     return best_result

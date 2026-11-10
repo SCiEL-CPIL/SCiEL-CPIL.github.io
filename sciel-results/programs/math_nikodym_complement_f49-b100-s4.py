@@ -1,129 +1,63 @@
 # EVOLVE-BLOCK-START
 import numpy as np
 import time
+import heapq
 
 _P = 7
 _Q = 49
 _Q2 = 2401
 _DEADLINE = time.time() + 600.0
-_MARGIN = 15.0
+_MARGIN = 30.0
 
 
 def _build_tables():
     """Build field arithmetic, line membership, and the baseline Nikodym set."""
     p = _P
-    # alpha^2 = 3 (3 is a quadratic non-residue mod 7)
-    k = 3
+    k = 3  # alpha^2 = 3 (3 is a quadratic non-residue mod 7)
 
-    # Field addition: (a,b)+(c,d) = ((a+c)%p, (b+d)%p)
-    add = np.zeros((p * p, p * p, 2), dtype=np.int64)
-    for a in range(p):
-        for b in range(p):
-            i = a * p + b
-            for c in range(p):
-                for d in range(p):
-                    j = c * p + d
-                    add[i, j] = [(a + c) % p, (b + d) % p]
-
-    # Field multiplication: (a+b*alpha)(c+d*alpha) = (ac + bd*k, ad + bc)
-    mul = np.zeros((p * p, p * p, 2), dtype=np.int64)
-    for a in range(p):
-        for b in range(p):
-            i = a * p + b
-            for c in range(p):
-                for d in range(p):
-                    j = c * p + d
-                    mul[i, j] = [(a * c + b * d * k) % p, (a * d + b * c) % p]
-
-    # Inverse table (0 has no inverse; leave as 0)
-    inv = np.zeros(p * p, dtype=np.int64)
-    for i in range(1, p * p):
-        for j in range(1, p * p):
-            if mul[i, j, 0] == 1 and mul[i, j, 1] == 0:
-                inv[i] = j
-                break
-
-    # Build line membership: for each direction d (0..q, 0=vertical), each offset,
-    # the q points on that line.
-    # Vertical line through (x, y0): points (x, y0 + t) for t in F_q
-    # Slanted line through (x0, y0) with slope m: points (x0 + t, y0 + m*t)
-    # Represent each line by (direction_index, offset) where:
-    #   direction 0: vertical, offset = x
-    #   direction m+1: slanted slope m, offset = y - m*x (the y-intercept at x=0)
-    # total lines = 1 + q = 50 directions, each with q lines => 50*49 = 2450 lines
-    # Each line has q=49 points.
-
-    # line_points: list of arrays of shape (q,) with point indices in F_q^2
-    # point index in F_q^2: ((xa*p+xb)*q + ya*p+yb)
     def pt_idx(xa, xb, ya, yb):
         return ((xa * p + xb) * p * p + ya * p + yb)
 
-    line_points = []  # list of np.array of point indices
-    for xa in range(p):
-        for xb in range(p):
-            x = xa * p + xb
-            # vertical line
-            pts = []
-            for t in range(p * p):
-                ta, tb = t // p, t % p
-                ya, yb = (0 + ta) % p, (0 + tb) % p
-                pts.append(pt_idx(xa, xb, ya, yb))
-            line_points.append(np.array(pts, dtype=np.int64))
-    # slanted lines
-    for m in range(p * p):
-        ma, mb = m // p, m % p
-        for x0a in range(p):
-            for x0b in range(p):
-                for y0a in range(p):
-                    for y0b in range(p):
-                        x0 = x0a * p + x0b
-                        y0 = y0a * p + y0b
-                        # offset = y0 - m*x0 ... but we index by intercept at x=0
-                        # Actually a slanted line is determined by slope m and one point.
-                        # Two points on same slanted line iff y - m*x is constant (in F_q).
-                        # offset = y0 - m*x0
-                        off_a = (y0a - (ma * x0a + mb * x0b * k)) % p
-                        off_b = (y0b - (ma * x0b + mb * x0a)) % p
-                        # We need unique lines; (m, offset) pairs. offset = (off_a, off_b).
-                        # But iterating x0,y0 gives duplicates. Instead iterate offset directly.
-                        pass
-    # Redo slanted lines by (m, offset) directly
+    # Build line_points: list of arrays of point indices
+    # Line types:
+    #   0..48: vertical lines (fixed x, all y)
+    #   49..2448: slanted lines (slope m, offset (oa,ob))
     line_points = []
+
+    # Vertical lines: for each x in F_49, the line { (x, y) : y in F_49 }
     for xa in range(p):
         for xb in range(p):
-            x = xa * p + xb
             pts = []
             for t in range(p * p):
                 ta, tb = t // p, t % p
-                ya, yb = (ta) % p, (tb) % p
+                ya, yb = ta, tb
                 pts.append(pt_idx(xa, xb, ya, yb))
             line_points.append(np.array(pts, dtype=np.int64))
+
+    # Slanted lines: for each slope m in F_49 and offset (oa,ob) in F_49^2
+    # Line: { (t, m*t + offset) : t in F_49 }
     for m in range(p * p):
         ma, mb = m // p, m % p
         for oa in range(p):
             for ob in range(p):
-                # offset (oa, ob) = y - m*x at x=0 means the line: y = m*x + (oa,ob)
                 pts = []
                 for t in range(p * p):
                     ta, tb = t // p, t % p
-                    # x = t, y = m*t + offset
+                    # m*t = (ma+mb*alpha)*(ta+tb*alpha) = (ma*ta + mb*tb*3, ma*tb + mb*ta)
                     ya = (ma * ta + mb * tb * k + oa) % p
                     yb = (ma * tb + mb * ta + ob) % p
-                    xa, xb = ta, tb
-                    pts.append(pt_idx(xa, xb, ya, yb))
+                    pts.append(pt_idx(ta, tb, ya, yb))
                 line_points.append(np.array(pts, dtype=np.int64))
 
     n_lines = len(line_points)  # 49 + 49*49 = 2450
 
-    # For each point, list of lines containing it (should be exactly 50)
+    # For each point, list of lines containing it
     point_lines = [[] for _ in range(_Q2)]
     for li, pts in enumerate(line_points):
         for pi in pts:
             point_lines[pi].append(li)
 
-    # Baseline: S = { (x,y) in U : y not in Y }
-    # U: 2*xa + ya^2 - yb^2*k == 0 (mod p)
-    # Y: ya is a square mod p (i.e., ya in {0,1,2,4})
+    # Baseline: S = { (x,y) : 2*xa + ya^2 - yb^2*3 == 0 (mod 7) AND ya NOT a square mod 7 }
     squares = set()
     for u in range(p):
         squares.add((u * u) % p)
@@ -137,143 +71,18 @@ def _build_tables():
                         if ya not in squares:
                             S[pt_idx(xa, xb, ya, yb)] = True
 
-    return p, k, add, mul, inv, line_points, point_lines, S
+    return p, k, line_points, point_lines, S
 
 
 def nikodym_set() -> np.ndarray:
-    p, k, add, mul, inv, line_points, point_lines, S = _build_tables()
+    p, k, line_points, point_lines, S = _build_tables()
     q = _Q
     q2 = _Q2
+    n_lines = len(line_points)
 
-    # S is the complement (excluded set). N = all points not in S.
-    # For each point x, find a covering line (direction, line) such that all other
-    # points on that line are in N (i.e., not in S).
-    # A point x is "covered" by line L if x in L and (L \ {x}) subset of N.
-    # Equivalently, L contains x and no other point of S.
-    # So x is covered iff there exists a line L containing x such that
-    #   S_count_on_L == 1 (only x itself) OR x not in S and S_count_on_L == 0.
-
-    # Precompute for each line: which points of S are on it.
-    # line_S: list of sets of point indices in S on that line
-    line_S = []
-    for pts in line_points:
-        s_on_line = [pi for pi in pts if S[pi]]
-        line_S.append(s_on_line)
-
-    # For each point, the set of lines that cover it (currently)
-    # covered[x] = set of line indices that cover x
-    # A line L covers x iff x in L and all other points of L are in N.
-    # i.e., S points on L are subset of {x} if x in S, or empty if x not in S.
-
-    def covers(line_idx, x):
-        s_on = line_S[line_idx]
-        if S[x]:
-            return len(s_on) == 1 and s_on[0] == x
-        else:
-            return len(s_on) == 0
-
-    # For each point, which lines cover it
-    covered_by = [set() for _ in range(q2)]
-    for li in range(len(line_points)):
-        pts = line_points[li]
-        s_on = line_S[li]
-        # Determine which points on this line are covered by it
-        if len(s_on) == 0:
-            # all points on line are in N, so line covers all its points
-            for pi in pts:
-                covered_by[pi].add(li)
-        elif len(s_on) == 1:
-            x = s_on[0]
-            # line covers x (the only S point on it)
-            covered_by[x].add(li)
-        # else: line has >=2 S points, covers no one
-
-    # Check baseline validity: every point must have >=1 covering line
-    # (We trust the baseline is valid, but verify quickly.)
-    # For efficiency, we'll track for each point the number of covering lines.
-    cover_count = np.array([len(c) for c in covered_by], dtype=np.int64)
-
-    # Now greedily add points to S (complement) to maximize |S|.
-    # A point z can be added to S iff for every point x, if x currently has
-    # cover_count[x] == 1 (only one covering line), then that line must not
-    # be "broken" by adding z. Adding z to S breaks a line L iff z in L and
-    # L currently has 0 S points (so after adding z, L has 1 S point = z, and
-    # L now covers only z, not other points on L).
-    # More precisely: adding z to S changes line_S for every line containing z.
-    # For a line L containing z: before, S_count(L) = c. After, c+1.
-    # Points on L that were covered by L: if c==0, all points on L were covered by L.
-    #   After adding z, only z is covered by L. So all other points on L lose L
-    #   as a covering line. They remain valid only if they have another covering line.
-    #   So adding z is valid iff for every line L containing z with S_count(L)==0,
-    #   every point x on L, x != z, has cover_count[x] >= 2.
-    #   (If S_count(L)>=1, adding z makes it >=2, so L covered no one before
-    #    and covers no one after; no change to coverage of other points, and z
-    #    itself: if z was in N, it had some covering line; after adding z to S,
-    #    z needs a covering line with exactly z as the only S point. That's a
-    #    different condition. Let's handle z's own coverage too.)
-
-    # This is getting complex. Let me use a simpler but correct incremental check.
-    # Given the small size (2401 points, 2450 lines), I'll do the following:
-    # Maintain S as a boolean array. For each candidate z not in S, check validity
-    # of S ∪ {z} by verifying the Nikodym property. To speed up, only re-check
-    # points affected: points on lines containing z, plus z itself.
-
-    # Precompute for each point z, the list of lines containing z.
-    # (point_lines already has this.)
-
-    # For a fast validity check of S ∪ {z}:
-    # A point x is valid iff exists line L containing x with S_count(L ∪ {z}) == 
-    #   (1 if x in S∪{z} else 0) and the S-point on L (if any) is x.
-    # S_count(L ∪ {z}) = S_count(L) + (1 if z in L else 0).
-
-    # Let me just do a full re-verification but optimized, and use a deadline.
-
-    def is_valid(S_arr):
-        """Check Nikodym property. Returns True if valid."""
-        # For each line, compute S count
-        for li in range(len(line_points)):
-            pts = line_points[li]
-            s_count = 0
-            s_point = -1
-            for pi in pts:
-                if S_arr[pi]:
-                    s_count += 1
-                    s_point = pi
-                    if s_count > 1:
-                        break
-            # Determine coverage for points on this line
-            if s_count == 0:
-                # all points covered by this line
-                for pi in pts:
-                    if not covered_mark[pi]:
-                        covered_mark[pi] = True
-            elif s_count == 1:
-                if not covered_mark[s_point]:
-                    covered_mark[s_point] = True
-            # else: no one covered by this line
-        # Check all points covered
-        for pi in range(q2):
-            if not covered_mark[pi]:
-                return False
-        return True
-
-    covered_mark = np.zeros(q2, dtype=bool)
-
-    # Verify baseline
-    covered_mark[:] = False
-    assert is_valid(S), "Baseline is not a valid Nikodym set!"
-
-    # Greedy: try to add each point to S, in some order, if valid.
-    # Order: try points not currently in S. Use a heuristic: points that are
-    # "easy" to add (fewer lines with S_count==0 containing them).
-    
-    # Precompute for each point z not in S, the number of lines containing z
-    # with S_count == 0 (these are the lines that would be "broken").
-    # A line L has S_count==0 iff no point of S is on L.
-    
-    # Compute S_count for each line
-    line_S_count = np.zeros(len(line_points), dtype=np.int64)
-    for li in range(len(line_points)):
+    # Precompute line_S_count and cover_count
+    line_S_count = np.zeros(n_lines, dtype=np.int64)
+    for li in range(n_lines):
         pts = line_points[li]
         cnt = 0
         for pi in pts:
@@ -281,50 +90,212 @@ def nikodym_set() -> np.ndarray:
                 cnt += 1
         line_S_count[li] = cnt
 
-    # For each point z, count lines containing z with line_S_count == 0
-    # (only consider z not in S)
-    candidates = []
+    # cover_count[x] = number of lines L containing x such that:
+    #   if x in S: S_count(L) == 1 and x is the S-point on L
+    #   if x not in S: S_count(L) == 0
+    cover_count = np.zeros(q2, dtype=np.int64)
+    for li in range(n_lines):
+        pts = line_points[li]
+        s_count = 0
+        s_point = -1
+        for pi in pts:
+            if S[pi]:
+                s_count += 1
+                s_point = pi
+                if s_count > 1:
+                    break
+        if s_count == 0:
+            for pi in pts:
+                cover_count[pi] += 1
+        elif s_count == 1:
+            cover_count[s_point] += 1
+
+    # Verify baseline validity
+    if np.any(cover_count == 0):
+        # Should not happen with correct baseline; fallback to all points
+        result = np.zeros((q2, 2, 2), dtype=np.int64)
+        for z in range(q2):
+            x = z // (p * p)
+            y = z % (p * p)
+            xa, xb = x // p, x % p
+            ya, yb = y // p, y % p
+            result[z] = [[xa, xb], [ya, yb]]
+        return result
+
+    # Track zero-line count per point: number of lines through z with S_count == 0
+    zero_line_count = np.zeros(q2, dtype=np.int64)
     for z in range(q2):
-        if S[z]:
-            continue
-        # count lines with S_count==0 that contain z
-        zero_lines = 0
         for li in point_lines[z]:
             if line_S_count[li] == 0:
-                zero_lines += 1
-        candidates.append((zero_lines, z))
-    candidates.sort()
+                zero_line_count[z] += 1
 
-    # Greedy add
-    for zero_lines, z in candidates:
-        if time.time() > _DEADLINE - _MARGIN:
-            break
-        # Try adding z to S
-        S[z] = True
-        # Update line_S_count for lines containing z
+    def calc_damage(z):
+        """Calculate the weighted damage to other points if z is added to S."""
+        if S[z]:
+            return float('inf')
+        if zero_line_count[z] == 0:
+            return float('inf')
+        
+        damage = 0.0
+        for li in point_lines[z]:
+            old_count = line_S_count[li]
+            if old_count == 0:
+                # All other points on L lose a 0-line
+                for pi in line_points[li]:
+                    if pi != z:
+                        # Weight by inverse cover count of pi
+                        # If pi is in S, it needs 1-line, not 0-line.
+                        # Wait, if pi in S, it is covered by 1-lines.
+                        # Adding z to S makes L have count 1.
+                        # Does L become a valid cover for pi?
+                        # No, L now has z in S. If pi != z, L has 2 points in S? No, just z.
+                        # So L is a 1-line.
+                        # If pi in S, L is a valid cover for pi ONLY IF pi is the unique S point.
+                        # But z is the unique S point. So L is NOT a valid cover for pi (if pi in S).
+                        # So pi loses a 0-line (irrelevant for S points) and gains nothing?
+                        # Actually, if pi in S, it was covered by 1-lines. L was 0-line, so not a cover.
+                        # Now L is 1-line (with z). Still not a cover for pi.
+                        # So no change for pi in S.
+                        
+                        # If pi not in S:
+                        # It was covered by 0-lines. L was a 0-line.
+                        # Now L is a 1-line. So pi loses this 0-line.
+                        if not S[pi]:
+                            cc = cover_count[pi]
+                            if cc > 0:
+                                damage += 1.0 / cc
+                            else:
+                                damage += 100.0 # Should not happen if valid
+            elif old_count == 1:
+                # The existing S point on L loses this 1-line?
+                # L had 1 S point (say u).
+                # Now L has 2 S points (u and z).
+                # So L is no longer a 1-line.
+                # u loses this cover.
+                for pi in line_points[li]:
+                    if S[pi] and pi != z:
+                        cc = cover_count[pi]
+                        if cc > 0:
+                            damage += 1.0 / cc
+                        else:
+                            damage += 100.0
+                        break
+            # old_count >= 2: no change in coverage type (was invalid, still invalid)
+        
+        return damage
+
+    # Priority queue based on Damage
+    # We want to add points with MINIMUM damage.
+    
+    def build_pq():
+        pq = []
+        for z in range(q2):
+            if S[z] or zero_line_count[z] == 0:
+                continue
+            d = calc_damage(z)
+            if d < float('inf'):
+                heapq.heappush(pq, (d, z))
+        return pq
+
+    def try_add(z):
+        """Try adding z to S. Returns True if valid (and keeps the change)."""
+        if zero_line_count[z] == 0:
+            return False
+
+        # Check that no other point loses its last covering line
         affected_lines = point_lines[z]
         for li in affected_lines:
+            old_count = line_S_count[li]
+            if old_count == 0:
+                # L used to cover all its non-S points; now covers none (for non-S)
+                # and covers z (if z was the only S point? No, z is added, so count becomes 1).
+                # Wait, if old_count == 0, L is a 0-line.
+                # After adding z, L is a 1-line (z is the S point).
+                # Non-S points on L lose this 0-line.
+                for pi in line_points[li]:
+                    if pi != z and not S[pi]:
+                        if cover_count[pi] <= 1:
+                            return False
+            elif old_count == 1:
+                # L used to cover one S-point (u); now covers no one (count 2)
+                for pi in line_points[li]:
+                    if S[pi] and pi != z:
+                        if cover_count[pi] <= 1:
+                            return False
+                        break
+            # old_count >= 2: no change in coverage
+
+        # All checks passed: commit the addition
+        S[z] = True
+        for li in affected_lines:
+            old_count = line_S_count[li]
             line_S_count[li] += 1
-        # Check validity
-        covered_mark[:] = False
-        valid = is_valid(S)
-        if valid:
-            # Keep z in S
-            continue
-        else:
-            # Revert
-            S[z] = False
-            for li in affected_lines:
-                line_S_count[li] -= 1
+            if old_count == 0:
+                for pi in line_points[li]:
+                    if pi != z and not S[pi]:
+                        cover_count[pi] -= 1
+                        zero_line_count[pi] -= 1
+            elif old_count == 1:
+                for pi in line_points[li]:
+                    if S[pi] and pi != z:
+                        cover_count[pi] -= 1
+                        break
+
+        # Recompute z's cover_count
+        new_z_cover = 0
+        for li in affected_lines:
+            if line_S_count[li] == 1:
+                for pi in line_points[li]:
+                    if S[pi]:
+                        if pi == z:
+                            new_z_cover += 1
+                        break
+        cover_count[z] = new_z_cover
+        return True
+
+    # Main Loop: Min-Damage Greedy
+    while time.time() < _DEADLINE - _MARGIN:
+        pq = build_pq()
+        if not pq:
+            break
+        
+        added_any = False
+        while pq:
+            if time.time() > _DEADLINE - _MARGIN:
+                break
+            d, z = heapq.heappop(pq)
+            if S[z] or zero_line_count[z] == 0:
+                continue
+            # Re-check damage? Optional, but safer.
+            # If calc_damage is expensive, we might skip re-check.
+            # But state changes.
+            # Let's just try_add.
+            if try_add(z):
+                added_any = True
+                # Invalidate PQ?
+                # Damage of other points changed.
+                # We break out and rebuild PQ.
+                break
+        
+        if not added_any:
+            # Try a random restart or different strategy?
+            # For now, if greedy fails, try a few random valid adds?
+            # If no valid adds exist, we are done.
+            break
 
     # Build output: N = all points not in S
     pts_list = []
     for z in range(q2):
         if not S[z]:
-            xa, xb = z // (p * p), z % (p * p)
-            # z = ((xa*p+xb)*p*p + ya*p+yb) ... wait, my pt_idx was ((xa*p+xb)*q + ya*p+yb)
-            # Let me recompute. pt_idx(xa,xb,ya,yb) = ((xa*p+xb)*p*p + ya*p+yb)
-            # So z = (x * p*p + y) where x = xa*p+xb, y = ya*p+yb
+            x = z // (p * p)
+            y = z % (p * p)
+            xa, xb = x // p, x % p
+            ya, yb = y // p, y % p
+            pts_list.append([[xa, xb], [ya, yb]])
+
+    if not pts_list:
+        # Fallback: return all points
+        for z in range(q2):
             x = z // (p * p)
             y = z % (p * p)
             xa, xb = x // p, x % p

@@ -1,0 +1,536 @@
+import numpy as np
+import time
+from scipy.spatial.distance import pdist
+from scipy.optimize import minimize
+
+def min_max_dist_dim3_14() -> np.ndarray:
+    n = 14
+    d = 3
+    start_time = time.time()
+    deadline = start_time + 595  # safety margin before 630s kill
+
+    def true_score(points):
+        dists_sq = pdist(points, metric='sqeuclidean')
+        if len(dists_sq) == 0:
+            return 0.0
+        d_min_sq = np.min(dists_sq)
+        d_max_sq = np.max(dists_sq)
+        if d_max_sq < 1e-15:
+            return 0.0
+        return d_min_sq / d_max_sq
+
+    def normalize_rms(points):
+        rms = np.sqrt(np.mean(np.sum(points**2, axis=1)))
+        if rms < 1e-6:
+            return points
+        return points / rms
+
+    def normalize_maxdist(points):
+        """Scale so that max pairwise distance is 1."""
+        dists_sq = pdist(points, metric='sqeuclidean')
+        d_max_sq = np.max(dists_sq)
+        if d_max_sq < 1e-15:
+            return points
+        return points / np.sqrt(d_max_sq)
+
+    def soft_max_dist_sq(dists_sq, k=50.0):
+        """Smooth approximation of max(dists_sq) using log-sum-exp."""
+        m = np.max(dists_sq)
+        if m < 1e-15:
+            return 0.0
+        shifted = dists_sq / k - m / k
+        return k * (m / k + np.log(np.sum(np.exp(shifted))))
+
+    def soft_min_dist_sq(dists_sq, k=50.0):
+        """Smooth approximation of min(dists_sq) using -log-sum-exp(-d_i^2/k)."""
+        m = np.min(dists_sq)
+        if m < 1e-15:
+            return 0.0
+        shifted = -dists_sq / k + m / k
+        return k * (-m / k - np.log(np.sum(np.exp(shifted))))
+
+    def smooth_ratio_obj(x_flat, k=20.0):
+        """Minimize -soft_min/soft_max to maximize the ratio."""
+        pts = x_flat.reshape(n, d)
+        pts = normalize_rms(pts)
+        dists_sq = pdist(pts, metric='sqeuclidean')
+        d_max_sq = soft_max_dist_sq(dists_sq, k)
+        d_min_sq = soft_min_dist_sq(dists_sq, k)
+        if d_max_sq < 1e-10:
+            return 0.0
+        return -d_min_sq / d_max_sq
+
+    def repulsion_obj(x_flat):
+        """Minimize sum of 1/d^2 to spread points (Fekete-like)."""
+        pts = x_flat.reshape(n, d)
+        pts = normalize_rms(pts)
+        dists_sq = pdist(pts, metric='sqeuclidean')
+        dists_sq = np.maximum(dists_sq, 1e-10)
+        return np.sum(1.0 / dists_sq)
+
+    def fokete_obj(x_flat):
+        """Fekete: maximize product of pairwise distances."""
+        pts = x_flat.reshape(n, d)
+        pts = normalize_rms(pts)
+        dists_sq = pdist(pts, metric='sqeuclidean')
+        dists_sq = np.maximum(dists_sq, 1e-10)
+        return -np.sum(np.log(dists_sq))
+
+    def barrier_obj(x_flat, mu=0.1):
+        """
+        Barrier-augmented: maximize d_min^2 with constraint d_max^2 <= 1.
+        """
+        pts = x_flat.reshape(n, d)
+        pts = normalize_rms(pts)
+        dists_sq = pdist(pts, metric='sqeuclidean')
+        d_min_sq = np.min(dists_sq)
+        d_max_sq = np.max(dists_sq)
+        if d_max_sq < 1e-15:
+            return 1e10
+        if d_max_sq < 1.0 - 1e-4:
+            barrier = -mu * np.log(1.0 - d_max_sq)
+        else:
+            barrier = mu * (d_max_sq - 1.0)**2 + 100.0 * (d_max_sq - 1.0)
+        return -d_min_sq + barrier
+
+    def min_dist_max_constraint_obj(x_flat):
+        """
+        Maximize the minimum pairwise squared distance, with the constraint
+        that max pairwise squared distance = 1 (via scaling).
+        """
+        pts = x_flat.reshape(n, d)
+        pts = normalize_rms(pts)
+        dists_sq = pdist(pts, metric='sqeuclidean')
+        d_max_sq = np.max(dists_sq)
+        if d_max_sq < 1e-15:
+            return 1e10
+        scale = 1.0 / d_max_sq
+        scaled_dists_sq = dists_sq * scale
+        return -np.min(scaled_dists_sq)
+
+    def epigraph_obj(x_flat):
+        """
+        Objective for epigraph formulation:
+        Maximize t such that all pairwise d^2 >= t and all pairwise d^2 <= 1.
+        """
+        pts = x_flat[:n*d].reshape(n, d)
+        t = x_flat[n*d]
+        
+        pts = normalize_rms(pts)
+        dists_sq = pdist(pts, metric='sqeuclidean')
+        
+        viol_min = np.maximum(0, t - dists_sq)
+        penalty_min = np.sum(viol_min**2)
+        
+        viol_max = np.maximum(0, dists_sq - 1.0)
+        penalty_max = np.sum(viol_max**2)
+        
+        return -t + 100.0 * (penalty_min + penalty_max)
+
+    def nm_obj(x_flat):
+        pts = x_flat.reshape(n, d)
+        pts = normalize_rms(pts)
+        return -true_score(pts)
+
+    def smooth_epigraph_obj(x_flat, k=30.0):
+        """
+        Smooth epigraph: maximize t subject to soft constraints that
+        all pairwise d^2 >= t and all pairwise d^2 <= 1.
+        Uses log-sum-exp smoothing for both min and max constraints.
+        """
+        pts = x_flat.reshape(n, d)
+        pts = normalize_rms(pts)
+        dists_sq = pdist(pts, metric='sqeuclidean')
+        
+        # Soft min: approximate min(dists_sq) smoothly
+        m_min = np.min(dists_sq)
+        if m_min < 1e-15:
+            return 1e10
+        shifted_min = -dists_sq / k + m_min / k
+        soft_min = k * (-m_min / k - np.log(np.sum(np.exp(shifted_min))))
+        
+        # Soft max: approximate max(dists_sq) smoothly  
+        m_max = np.max(dists_sq)
+        if m_max < 1e-15:
+            return 1e10
+        shifted_max = dists_sq / k - m_max / k
+        soft_max = k * (m_max / k + np.log(np.sum(np.exp(shifted_max))))
+        
+        # We want: maximize soft_min / soft_max
+        # Equivalent to: minimize -soft_min / soft_max
+        # But for epigraph with t: maximize t such that soft_min >= t and soft_max <= 1
+        # Penalty formulation: -t + penalty if soft_min < t + penalty if soft_max > 1
+        t = soft_min  # set t to the soft min value
+        viol_max = np.maximum(0.0, soft_max - 1.0)
+        penalty = 10.0 * viol_max**2 + 0.1 * viol_max
+        
+        return -t + penalty
+
+    def tight_smooth_obj(x_flat, k=50.0):
+        """
+        Very tight smooth ratio: -soft_min/soft_max with large k for accuracy.
+        """
+        pts = x_flat.reshape(n, d)
+        pts = normalize_rms(pts)
+        dists_sq = pdist(pts, metric='sqeuclidean')
+        
+        m_min = np.min(dists_sq)
+        if m_min < 1e-15:
+            return 1e10
+        shifted_min = -dists_sq / k + m_min / k
+        soft_min = k * (-m_min / k - np.log(np.sum(np.exp(shifted_min))))
+        
+        m_max = np.max(dists_sq)
+        if m_max < 1e-15:
+            return 1e10
+        shifted_max = dists_sq / k - m_max / k
+        soft_max = k * (m_max / k + np.log(np.sum(np.exp(shifted_max))))
+        
+        if soft_max < 1e-10:
+            return 0.0
+        return -soft_min / soft_max
+
+    # Build diverse initial candidates
+    candidates = []
+
+    # 1. Cuboctahedron vertices (12) + 2 poles (±z)
+    cuboct = np.array([
+        [1, 1, 0], [1, -1, 0], [-1, 1, 0], [-1, -1, 0],
+        [1, 0, 1], [1, 0, -1], [-1, 0, 1], [-1, 0, -1],
+        [0, 1, 1], [0, 1, -1], [0, -1, 1], [0, -1, -1]
+    ], dtype=float)
+    cuboct = cuboct / np.sqrt(2.0)
+    poles = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]])
+    candidates.append(np.vstack([cuboct, poles]))
+
+    # 2. Icosahedron (12) + 2 poles
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    ico = np.array([
+        [0.0, 1.0, phi], [0.0, -1.0, phi], [0.0, 1.0, -phi], [0.0, -1.0, -phi],
+        [1.0, phi, 0.0], [-1.0, phi, 0.0], [1.0, -phi, 0.0], [-1.0, -phi, 0.0],
+        [phi, 0.0, 1.0], [-phi, 0.0, 1.0], [phi, 0.0, -1.0], [-phi, 0.0, -1.0]
+    ], dtype=float)
+    ico = ico / np.linalg.norm(ico, axis=1, keepdims=True)
+    candidates.append(np.vstack([ico, poles]))
+
+    # 3. Dodecagon in xy-plane + 2 poles
+    angles = np.linspace(0, 2 * np.pi, 12, endpoint=False)
+    dodec = np.column_stack([np.cos(angles), np.sin(angles), np.zeros(12)])
+    candidates.append(np.vstack([dodec, poles]))
+
+    # 4. Two hexagons at different z levels + 2 poles
+    for z_off in [0.3, 0.5, 0.7]:
+        ang1 = np.linspace(0, 2 * np.pi, 6, endpoint=False)
+        ang2 = ang1 + np.pi / 6
+        hex1 = np.column_stack([np.cos(ang1), np.sin(ang1), np.ones(6) * z_off])
+        hex2 = np.column_stack([np.cos(ang2), np.sin(ang2), np.ones(6) * (-z_off)])
+        all_pts = np.vstack([hex1, hex2, poles])
+        candidates.append(normalize_rms(all_pts))
+
+    # 5. Cube (8) + octahedron (6)
+    cube = np.array([
+        [-1, -1, -1], [-1, -1, 1], [-1, 1, -1], [-1, 1, 1],
+        [1, -1, -1], [1, -1, 1], [1, 1, -1], [1, 1, 1]
+    ], dtype=float)
+    cube = cube / np.sqrt(3.0)
+    octa = np.array([
+        [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]
+    ], dtype=float)
+    candidates.append(normalize_rms(np.vstack([cube, octa])))
+
+    # 6. Antipodal pairs
+    for seed in range(8):
+        rng = np.random.RandomState(seed)
+        pts_upper = rng.randn(7, 3)
+        pts_upper[:, 2] = np.abs(pts_upper[:, 2]) + 0.3
+        pts_upper = pts_upper / np.linalg.norm(pts_upper, axis=1, keepdims=True)
+        pts_lower = -pts_upper
+        all_pts = np.vstack([pts_upper, pts_lower])
+        candidates.append(normalize_rms(all_pts))
+
+    # 7. Tilted dodecagon + poles
+    for tilt in [0.1, 0.2, 0.3, 0.4, 0.5, 0.7]:
+        dodec_t = np.column_stack([np.cos(angles), np.sin(angles), np.zeros(12)])
+        c, s = np.cos(tilt), np.sin(tilt)
+        R = np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+        dodec_t = dodec_t @ R.T
+        all_pts = np.vstack([dodec_t, poles])
+        candidates.append(normalize_rms(all_pts))
+
+    # 8. Cuboctahedron with tilted poles
+    for pole_angle in [0.1, 0.2, 0.3, 0.5]:
+        p1 = np.array([np.sin(pole_angle), 0.0, np.cos(pole_angle)])
+        p2 = -p1
+        all_pts = np.vstack([cuboct, p1.reshape(1,3), p2.reshape(1,3)])
+        candidates.append(normalize_rms(all_pts))
+
+    # 9. Icosahedron with moved poles
+    for z_pole in [0.6, 0.8, 1.0, 1.3, 1.5]:
+        p1 = np.array([0.0, 0.0, z_pole])
+        p2 = np.array([0.0, 0.0, -z_pole])
+        all_pts = np.vstack([ico, p1.reshape(1,3), p2.reshape(1,3)])
+        candidates.append(normalize_rms(all_pts))
+
+    # 10. Random starts
+    for seed in range(10):
+        rng = np.random.RandomState(100 + seed)
+        pts = rng.randn(n, 3)
+        candidates.append(normalize_rms(pts))
+
+    # 11. Fibonacci sphere with perturbation
+    for seed in range(5):
+        rng = np.random.RandomState(200 + seed)
+        golden = (1 + np.sqrt(5)) / 2
+        pts = np.zeros((n, 3))
+        for i in range(n):
+            z = 1 - 2 * i / (n - 1)
+            r = np.sqrt(1 - z**2)
+            theta = 2 * np.pi * i / golden
+            pts[i] = [r * np.cos(theta), r * np.sin(theta), z]
+        pts += rng.randn(n, 3) * 0.1
+        candidates.append(normalize_rms(pts))
+
+    # Score all candidates
+    best_score = 0.0
+    best_points = None
+    for cand in candidates:
+        cand = normalize_rms(cand)
+        s = true_score(cand)
+        if s > best_score:
+            best_score = s
+            best_points = cand.copy()
+
+    # Optimize each candidate
+    num_candidates = min(len(candidates), 25)
+    for i in range(num_candidates):
+        if time.time() > deadline - 30:
+            break
+
+        cand = normalize_rms(candidates[i])
+        try:
+            # Phase 1: Repulsion (Fekete-like) to spread points
+            res1 = minimize(
+                repulsion_obj,
+                cand.flatten(),
+                method='L-BFGS-B',
+                options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-10}
+            )
+            pts1 = normalize_rms(res1.x.reshape(n, d))
+
+            # Phase 1b: Fekete objective
+            res1b = minimize(
+                fokete_obj,
+                cand.flatten(),
+                method='L-BFGS-B',
+                options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-10}
+            )
+            pts1b = normalize_rms(res1b.x.reshape(n, d))
+            if true_score(pts1b) > true_score(pts1):
+                pts1 = pts1b
+
+            # Phase 2: Smooth ratio optimization
+            best_phase2_pts = pts1
+            best_phase2_score = true_score(pts1)
+            for k in [5.0, 10.0, 20.0, 50.0]:
+                if time.time() > deadline - 35:
+                    break
+                try:
+                    res2 = minimize(
+                        lambda x, k=k: smooth_ratio_obj(x, k),
+                        pts1.flatten(),
+                        method='L-BFGS-B',
+                        options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-10}
+                    )
+                    pts2 = normalize_rms(res2.x.reshape(n, d))
+                    s2 = true_score(pts2)
+                    if s2 > best_phase2_score:
+                        best_phase2_score = s2
+                        best_phase2_pts = pts2
+                except Exception:
+                    continue
+
+            # Phase 2b: min_dist_max_constraint
+            try:
+                res2b = minimize(
+                    min_dist_max_constraint_obj,
+                    best_phase2_pts.flatten(),
+                    method='L-BFGS-B',
+                    options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-10}
+                )
+                pts2b = normalize_rms(res2b.x.reshape(n, d))
+                s2b = true_score(pts2b)
+                if s2b > best_phase2_score:
+                    best_phase2_score = s2b
+                    best_phase2_pts = pts2b
+            except Exception:
+                pass
+
+            # Phase 3: Barrier optimization
+            pts3_init = normalize_maxdist(best_phase2_pts)
+            best_barrier_pts = best_phase2_pts
+            best_barrier_score = best_phase2_score
+            for mu in [0.01, 0.05, 0.1, 0.3, 1.0]:
+                if time.time() > deadline - 40:
+                    break
+                try:
+                    res_b = minimize(
+                        lambda x, mu=mu: barrier_obj(x, mu),
+                        pts3_init.flatten(),
+                        method='L-BFGS-B',
+                        options={'maxiter': 300, 'ftol': 1e-12, 'gtol': 1e-10}
+                    )
+                    pts_b = normalize_rms(res_b.x.reshape(n, d))
+                    s_b = true_score(pts_b)
+                    if s_b > best_barrier_score:
+                        best_barrier_score = s_b
+                        best_barrier_pts = pts_b
+                except Exception:
+                    continue
+
+            # Phase 4: Nelder-Mead on true objective
+            res_nm = minimize(
+                nm_obj,
+                best_barrier_pts.flatten(),
+                method='Nelder-Mead',
+                options={'maxiter': 3000, 'xatol': 1e-12, 'fatol': 1e-14,
+                         'adaptive': True}
+            )
+            pts_nm = normalize_rms(res_nm.x.reshape(n, d))
+            s_nm = true_score(pts_nm)
+            if s_nm > best_score:
+                best_score = s_nm
+                best_points = pts_nm.copy()
+
+        except Exception:
+            continue
+
+    # Additional local search from best solution
+    if best_points is not None and time.time() < deadline - 60:
+        for _ in range(8):
+            if time.time() > deadline - 30:
+                break
+            try:
+                for pert_size in [0.02, 0.05, 0.1, 0.2]:
+                    if time.time() > deadline - 35:
+                        break
+                    rng = np.random.RandomState(int(time.time()*1000) % 10000)
+                    perturbed = best_points + rng.randn(n, d) * pert_size
+                    perturbed = normalize_rms(perturbed)
+
+                    # Quick repulsion
+                    res_p = minimize(
+                        repulsion_obj,
+                        perturbed.flatten(),
+                        method='L-BFGS-B',
+                        options={'maxiter': 100, 'ftol': 1e-12, 'gtol': 1e-10}
+                    )
+                    pts_p = normalize_rms(res_p.x.reshape(n, d))
+
+                    # Barrier refinement
+                    pts_p_scaled = normalize_maxdist(pts_p)
+                    best_local_pts = pts_p
+                    best_local_score = true_score(pts_p)
+                    for mu in [0.05, 0.2, 0.5]:
+                        if time.time() > deadline - 40:
+                            break
+                        try:
+                            res_lb = minimize(
+                                lambda x, mu=mu: barrier_obj(x, mu),
+                                pts_p_scaled.flatten(),
+                                method='L-BFGS-B',
+                                options={'maxiter': 200, 'ftol': 1e-12, 'gtol': 1e-10}
+                            )
+                            pts_lb = normalize_rms(res_lb.x.reshape(n, d))
+                            s_lb = true_score(pts_lb)
+                            if s_lb > best_local_score:
+                                best_local_score = s_lb
+                                best_local_pts = pts_lb
+                        except Exception:
+                            continue
+
+                    # Nelder-Mead polish
+                    res_nm2 = minimize(
+                        nm_obj,
+                        best_local_pts.flatten(),
+                        method='Nelder-Mead',
+                        options={'maxiter': 2000, 'xatol': 1e-12, 'fatol': 1e-14,
+                                 'adaptive': True}
+                    )
+                    pts_final = normalize_rms(res_nm2.x.reshape(n, d))
+                    s_final = true_score(pts_final)
+                    if s_final > best_score:
+                        best_score = s_final
+                        best_points = pts_final.copy()
+            except Exception:
+                continue
+
+    # Final high-precision polish using smooth surrogate then Nelder-Mead
+    if best_points is not None and time.time() < deadline - 15:
+        # Phase A: Smooth epigraph optimization with multiple k values
+        best_smooth_pts = best_points.copy()
+        best_smooth_score = best_score
+        for k_val in [20.0, 40.0, 80.0, 150.0]:
+            if time.time() > deadline - 25:
+                break
+            try:
+                res_sm = minimize(
+                    lambda x, k=k_val: smooth_epigraph_obj(x, k),
+                    best_smooth_pts.flatten(),
+                    method='L-BFGS-B',
+                    options={'maxiter': 500, 'ftol': 1e-15, 'gtol': 1e-13}
+                )
+                pts_sm = normalize_rms(res_sm.x.reshape(n, d))
+                s_sm = true_score(pts_sm)
+                if s_sm > best_smooth_score:
+                    best_smooth_score = s_sm
+                    best_smooth_pts = pts_sm
+            except Exception:
+                continue
+        
+        # Phase B: Tight smooth ratio optimization
+        for k_val in [50.0, 100.0, 200.0]:
+            if time.time() > deadline - 20:
+                break
+            try:
+                res_tight = minimize(
+                    lambda x, k=k_val: tight_smooth_obj(x, k),
+                    best_smooth_pts.flatten(),
+                    method='L-BFGS-B',
+                    options={'maxiter': 500, 'ftol': 1e-15, 'gtol': 1e-13}
+                )
+                pts_tight = normalize_rms(res_tight.x.reshape(n, d))
+                s_tight = true_score(pts_tight)
+                if s_tight > best_smooth_score:
+                    best_smooth_score = s_tight
+                    best_smooth_pts = pts_tight
+            except Exception:
+                continue
+        
+        # Phase C: Final Nelder-Mead polish on true objective
+        try:
+            res_final = minimize(
+                nm_obj,
+                best_smooth_pts.flatten(),
+                method='Nelder-Mead',
+                options={'maxiter': 15000, 'xatol': 1e-15, 'fatol': 1e-17,
+                         'adaptive': True}
+            )
+            pts_final = normalize_rms(res_final.x.reshape(n, d))
+            s_final = true_score(pts_final)
+            if s_final > best_score:
+                best_score = s_final
+                best_points = pts_final.copy()
+        except Exception:
+            pass
+
+    # Safety checks
+    if best_points is None or not np.all(np.isfinite(best_points)):
+        best_points = np.vstack([cuboct, poles])
+        best_points = normalize_rms(best_points)
+
+    # Verify no NaN or inf
+    if not np.all(np.isfinite(best_points)):
+        best_points = np.vstack([cuboct, poles])
+        best_points = normalize_rms(best_points)
+
+    return best_points

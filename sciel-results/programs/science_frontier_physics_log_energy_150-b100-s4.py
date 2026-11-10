@@ -1,233 +1,240 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+import numpy as np
+import time
+import math
+
 N = 150
 
-# EVOLVE-BLOCK-START
-import numpy as np
-from math import log, fsum
-import time
-from scipy.optimize import minimize
+def _energy(points):
+    """Compute logarithmic energy using math.fsum for precision."""
+    n = points.shape[0]
+    diff = points[:, np.newaxis, :] - points[np.newaxis, :, :]
+    dist_sq = np.sum(diff * diff, axis=2)
+    np.fill_diagonal(dist_sq, 1.0)
+    dist = np.sqrt(dist_sq)
+    iu = np.triu_indices(n, k=1)
+    # Use math.fsum for high-precision summation as required by the task
+    terms = [-math.log(d) for d in dist[iu[0], iu[1]]]
+    return math.fsum(terms)
 
-DEADLINE = 120.0
-SAFETY_MARGIN = 0.90  # use 90% of time
-
-def _log_energy_precise(pts):
-    """Compute logarithmic energy sum_{i<j} log(1/|x_i - x_j|) using fsum."""
-    n = len(pts)
-    terms = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            d = np.linalg.norm(pts[i] - pts[j])
-            if d < 1e-15:
-                return 1e30
-            terms.append(-log(d))
-    return fsum(terms)
-
-def _fibonacci_spiral(n, offset=0.0):
-    """Golden-angle spiral points on unit sphere with optional phase offset."""
-    i = np.arange(n) + 0.5
-    z = 1.0 - 2.0 * i / n
-    phi = np.pi * (1.0 + np.sqrt(5.0)) * i + offset
-    r = np.sqrt(np.maximum(0, 1.0 - z * z))
-    return np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
-
-def _random_points(n, rng):
-    """Random points on unit sphere."""
-    v = rng.standard_normal((n, 3))
-    norms = np.linalg.norm(v, axis=1, keepdims=True)
-    return v / norms
-
-def _repulsion_refine_cartesian(pts, n_iters=200, lr=0.01, deadline=None):
-    """
-    Iterative repulsion in Cartesian space to spread points.
-    This acts as a pre-conditioner before spherical optimization.
-    """
-    pts = pts.copy().astype(np.float64)
-    n = len(pts)
-    for it in range(n_iters):
-        if deadline is not None and time.time() > deadline:
-            break
-        forces = np.zeros_like(pts)
-        # Vectorized force calculation for speed
-        # diff[i,j] = pts[i] - pts[j]
-        diff = pts[:, np.newaxis, :] - pts[np.newaxis, :, :]
-        d2 = np.sum(diff * diff, axis=2)
-        np.fill_diagonal(d2, 1.0) # Avoid div by zero
-        inv_d2 = 1.0 / d2
-        np.fill_diagonal(inv_d2, 0.0)
-        # F_i = sum_j (x_i - x_j) / d_ij^2
-        forces = np.sum(diff * inv_d2[:, :, np.newaxis], axis=1)
-        
-        pts += lr * forces
-        # Project back to unit sphere
-        norms = np.linalg.norm(pts, axis=1, keepdims=True)
-        pts = pts / norms
-    return pts
-
-def _cartesian_to_spherical(pts):
-    """Convert Cartesian points to (theta, phi) array of shape (N, 2)."""
-    x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
-    theta = np.arccos(np.clip(z, -1.0, 1.0))
-    phi = np.arctan2(y, x)
-    # Ensure phi is in [0, 2pi)
-    phi = np.where(phi < 0, phi + 2 * np.pi, phi)
-    return np.column_stack([theta, phi])
-
-def _spherical_energy_grad(params):
-    """
-    Calculate Energy and Gradient for spherical coordinates.
-    params: array of shape (2*N), alternating [theta_0, phi_0, theta_1, phi_1, ...]
-    Returns: (energy, gradient)
-    """
-    theta = params[0::2]
-    phi = params[1::2]
+def _grad_and_energy(points):
+    """Compute log energy and its gradient for points on unit sphere (vectorized)."""
+    n = points.shape[0]
+    diff = points[:, np.newaxis, :] - points[np.newaxis, :, :]
+    dist_sq = np.sum(diff * diff, axis=2)
+    np.fill_diagonal(dist_sq, 1.0)
+    dist = np.sqrt(dist_sq)
     
-    # Convert to Cartesian
-    sin_t = np.sin(theta)
-    cos_t = np.cos(theta)
-    cos_p = np.cos(phi)
-    sin_p = np.sin(phi)
+    iu = np.triu_indices(n, k=1)
+    # Energy calculation (using standard sum for speed in optimization loop, 
+    # final check uses _energy with fsum)
+    energy = -np.sum(np.log(dist[iu[0], iu[1]]))
     
-    X = np.column_stack([sin_t * cos_p, sin_t * sin_p, cos_t])
+    # Gradient: 
+    # E = - sum_{i<j} log(d_ij)
+    # dE/dx_i = - sum_{j != i} d/dx_i (-log(d_ij)) 
+    # Wait, E = - sum log(d). dE/dx_i = - sum_{j != i} (1/d_ij) * (x_i - x_j)/d_ij = - sum (x_i - x_j)/d_ij^2
+    # Let's re-verify.
+    # f(x) = -log(||x-y||). grad_x f = - (x-y)/||x-y||^2.
+    # Sum over j: grad_i = - sum_{j != i} (x_i - x_j)/dist_sq[i,j]
     
-    # Pairwise differences
-    diff = X[:, np.newaxis, :] - X[np.newaxis, :, :]
+    coeff = np.zeros_like(dist_sq)
+    mask = ~np.eye(n, dtype=bool)
+    coeff[mask] = -1.0 / dist_sq[mask]
     
-    # Squared distances
-    r2 = np.sum(diff * diff, axis=2)
-    np.fill_diagonal(r2, 1.0)
-    
-    # Inverse squared distances
-    inv_r2 = 1.0 / r2
-    np.fill_diagonal(inv_r2, 0.0)
-    
-    # Gradient of E w.r.t Cartesian X
-    # dE/dX_i = - sum_j (X_i - X_j) / r_ij^2
-    grad_cart = -np.sum(diff * inv_r2[:, :, np.newaxis], axis=1)
-    
-    # Energy
-    r = np.sqrt(r2)
-    np.fill_diagonal(r, 1.0)
-    log_r = np.log(r)
-    np.fill_diagonal(log_r, 0.0)
-    energy = -0.5 * np.sum(log_r)
-    
-    # Jacobian dX/dparams
-    dX_dtheta = np.column_stack([
-        cos_t * cos_p, 
-        cos_t * sin_p, 
-        -sin_t
-    ])
-    
-    dX_dphi = np.column_stack([
-        -sin_t * sin_p, 
-        sin_t * cos_p, 
-        np.zeros(N)
-    ])
-    
-    # Chain rule
-    grad_theta = np.sum(grad_cart * dX_dtheta, axis=1)
-    grad_phi = np.sum(grad_cart * dX_dphi, axis=1)
-    
-    # Pack gradient
-    grad = np.empty(2 * N)
-    grad[0::2] = grad_theta
-    grad[1::2] = grad_phi
+    # grad[i] = sum_j coeff[i,j] * (x_i - x_j)
+    # = x_i * sum_j coeff[i,j] - sum_j coeff[i,j] * x_j
+    row_sums = coeff.sum(axis=1)
+    grad = points * row_sums[:, np.newaxis] - coeff @ points
     
     return energy, grad
 
+def _project_to_sphere(points):
+    """Project points to unit sphere."""
+    norms = np.linalg.norm(points, axis=1, keepdims=True)
+    norms[norms < 1e-15] = 1.0
+    return points / norms
+
+def _fibonacci_spiral(n, seed=0):
+    """Generate Fibonacci spiral points on unit sphere with optional perturbation."""
+    if seed == 0:
+        i = np.arange(n) + 0.5
+    else:
+        rng = np.random.RandomState(seed)
+        i = np.arange(n) + 0.5 + rng.uniform(-0.1, 0.1, n)
+        i = np.clip(i, 0.5, n - 0.5)
+    
+    z = 1.0 - 2.0 * i / n
+    phi = np.pi * (1.0 + np.sqrt(5.0)) * i
+    r = np.sqrt(np.maximum(0, 1.0 - z * z))
+    return np.column_stack([r * np.cos(phi), r * np.sin(phi), z])
+
+def _random_points(n, seed=None):
+    """Generate random points on unit sphere."""
+    if seed is not None:
+        rng = np.random.RandomState(seed)
+    else:
+        rng = np.random
+    pts = rng.randn(n, 3)
+    norms = np.linalg.norm(pts, axis=1, keepdims=True)
+    norms[norms < 1e-15] = 1.0
+    return pts / norms
+
+def _riemannian_cg(points, max_iter=500, tol=1e-10, deadline=None):
+    """Riemannian conjugate gradient on the sphere with backtracking line search."""
+    n = points.shape[0]
+    X = points.copy()
+    e, g = _grad_and_energy(X)
+    
+    def _tangent(v, x):
+        dot = np.sum(v * x, axis=1, keepdims=True)
+        return v - dot * x
+    
+    g_t = _tangent(g, X)
+    
+    if np.linalg.norm(g_t) < tol:
+        return X, e
+    
+    d = -g_t
+    g_old_t = g_t
+    
+    for it in range(max_iter):
+        if deadline is not None and time.time() > deadline:
+            break
+        
+        # Backtracking line search
+        X, e, g, alpha = _backtracking_line_search(X, d, e, g, max_iter=25)
+        
+        g_t = _tangent(g, X)
+        if np.linalg.norm(g_t) < tol:
+            break
+        
+        # Update direction
+        beta = np.sum(g_t * g_t) / (np.sum(g_old_t * g_old_t) + 1e-30)
+        d = -g_t + beta * d
+        d = _tangent(d, X)
+        
+        g_old_t = g_t
+    
+    return X, e
+
+def _lbfgs_optimize(points, max_iter=500, ftol=1e-14, gtol=1e-12, deadline=None):
+    """Optimize using L-BFGS-B with projection and deadline check."""
+    from scipy.optimize import minimize
+    
+    call_count = [0]
+    
+    def objective_and_grad(x_flat):
+        call_count[0] += 1
+        if deadline is not None and time.time() > deadline:
+            raise TimeoutError()
+        pts = x_flat.reshape(-1, 3)
+        pts = _project_to_sphere(pts)
+        e, g = _grad_and_energy(pts)
+        dot = np.sum(g * pts, axis=1, keepdims=True)
+        g_tangent = g - dot * pts
+        return e, g_tangent.reshape(-1)
+    
+    try:
+        result = minimize(
+            objective_and_grad,
+            points.reshape(-1),
+            jac=True,
+            method='L-BFGS-B',
+            options={'maxiter': max_iter, 'ftol': ftol, 'gtol': gtol, 'maxls': 30}
+        )
+        if result.x is not None and np.all(np.isfinite(result.x)):
+            return _project_to_sphere(result.x.reshape(-1, 3))
+    except (Exception, TimeoutError):
+        pass
+    
+    return points
+
+def _backtracking_line_search(X, d, e, g, max_iter=20, c1=1e-4):
+    """Backtracking line search on the sphere."""
+    alpha = 1.0
+    for _ in range(max_iter):
+        X_new = X + alpha * d
+        X_new = _project_to_sphere(X_new)
+        e_new, g_new = _grad_and_energy(X_new)
+        # Check Armijo condition
+        if e_new <= e + c1 * alpha * np.sum(g * d):
+            return X_new, e_new, g_new, alpha
+        alpha *= 0.5
+    return X, e, g, alpha
+
 def construct():
     start_time = time.time()
-    deadline = start_time + DEADLINE * SAFETY_MARGIN
-    
-    rng = np.random.default_rng(42)
-    
+    deadline = start_time + 145.0  # 5s safety margin before 150s limit
+
     # Generate multiple initial configurations
     inits = []
-    # Fibonacci spiral variants
-    inits.append(_fibonacci_spiral(N))
-    inits.append(_fibonacci_spiral(N, offset=0.5))
-    inits.append(_fibonacci_spiral(N, offset=1.0))
-    # Random starts
-    for _ in range(3):
-        inits.append(_random_points(N, rng))
+    inits.append(_fibonacci_spiral(N, seed=0))
+    for s in range(5):
+        inits.append(_random_points(N, seed=42 + s))
     
-    best_pts = None
-    best_energy = 1e30
+    best_points = None
+    best_energy = np.inf
     
-    # For each initialization:
-    # 1. Pre-condition with Cartesian repulsion
-    # 2. Convert to spherical
-    # 3. Optimize with L-BFGS-B
-    for init in inits:
-        if time.time() > deadline:
+    # Phase 1: Quick L-BFGS on all initial configurations
+    for init_idx, init_pts in enumerate(inits):
+        if time.time() > deadline - 50.0:
             break
-            
-        # 1. Pre-condition
-        refined_cart = _repulsion_refine_cartesian(init, n_iters=100, lr=0.01, deadline=deadline)
         
-        # 2. Convert to spherical
-        theta_phi = _cartesian_to_spherical(refined_cart)
-        x0 = theta_phi.ravel()
-        
-        # 3. Optimize
         try:
-            res = minimize(
-                _spherical_energy_grad, 
-                x0, 
-                method='L-BFGS-B', 
-                jac=True,
-                options={
-                    'maxiter': 500,
-                    'ftol': 1e-12,
-                    'gtol': 1e-8,
-                    'maxfun': 1000
-                }
-            )
-            
-            # Convert result back to Cartesian
-            theta_opt = res.x[0::2]
-            phi_opt = res.x[1::2]
-            
-            sin_t = np.sin(theta_opt)
-            cos_t = np.cos(theta_opt)
-            cos_p = np.cos(phi_opt)
-            sin_p = np.sin(phi_opt)
-            
-            X_opt = np.column_stack([sin_t * cos_p, sin_t * sin_p, cos_t])
-            
-            # Normalize
-            norms = np.linalg.norm(X_opt, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            X_opt = X_opt / norms
-            
-            # Check for validity (no points too close)
-            min_dist = np.inf
-            # Quick check using vectorized distance
-            diff = X_opt[:, np.newaxis, :] - X_opt[np.newaxis, :, :]
-            dists = np.sqrt(np.sum(diff * diff, axis=2))
-            np.fill_diagonal(dists, np.inf)
-            min_dist = np.min(dists)
-            
-            if min_dist < 1e-9:
-                continue
-                
-            # Calculate precise energy
-            e = _log_energy_precise(X_opt)
-            
-            if e < best_energy:
-                best_energy = e
-                best_pts = X_opt.copy()
-                
+            cand = _lbfgs_optimize(init_pts, max_iter=150, ftol=1e-10, gtol=1e-8, deadline=deadline)
+            cand_energy = _energy(cand)
+            if cand_energy < best_energy:
+                best_energy = cand_energy
+                best_points = cand.copy()
         except Exception:
             pass
-            
-    if best_pts is None:
-        # Fallback to best pre-conditioned point or initial
-        best_pts = _repulsion_refine_cartesian(_fibonacci_spiral(N), n_iters=500, lr=0.01, deadline=deadline)
-        
-    # Final normalization
-    norms = np.linalg.norm(best_pts, axis=1, keepdims=True)
-    best_pts = best_pts / norms
     
-    return best_pts
-# EVOLVE-BLOCK-END
+    # Phase 2: Polish with Riemannian CG (more iterations with better line search)
+    if best_points is not None and time.time() < deadline - 30.0:
+        try:
+            cand, cand_energy = _riemannian_cg(best_points, max_iter=500, tol=1e-12, deadline=deadline)
+            cand_energy_precise = _energy(cand)
+            if cand_energy_precise < best_energy:
+                best_energy = cand_energy_precise
+                best_points = cand.copy()
+        except Exception:
+            pass
+    
+    # Phase 3: Final L-BFGS polish with tighter tolerances
+    if best_points is not None and time.time() < deadline - 15.0:
+        try:
+            cand = _lbfgs_optimize(best_points, max_iter=300, ftol=1e-15, gtol=1e-13, deadline=deadline)
+            cand_energy_precise = _energy(cand)
+            if cand_energy_precise < best_energy:
+                best_energy = cand_energy_precise
+                best_points = cand.copy()
+        except Exception:
+            pass
+    
+    # Phase 4: Final Riemannian CG polish with very tight tolerance
+    if best_points is not None and time.time() < deadline - 3.0:
+        try:
+            cand, _ = _riemannian_cg(best_points, max_iter=300, tol=1e-14, deadline=deadline)
+            cand_energy_precise = _energy(cand)
+            if cand_energy_precise < best_energy:
+                best_energy = cand_energy_precise
+                best_points = cand.copy()
+        except Exception:
+            pass
+    
+    # Final projection and validation
+    if best_points is None:
+        best_points = _fibonacci_spiral(N)
+    
+    best_points = _project_to_sphere(best_points)
+    
+    # Ensure no points are too close
+    for i in range(N):
+        for j in range(i+1, N):
+            d = np.linalg.norm(best_points[i] - best_points[j])
+            if d < 1e-9:
+                # Nudge apart
+                best_points[j] += 1e-8 * np.random.randn(3)
+                best_points = _project_to_sphere(best_points)
+    
+    return best_points

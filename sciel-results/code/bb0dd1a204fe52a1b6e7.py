@@ -1,0 +1,1 @@
+BET: {mechanism: "Vectorizing the per-q refinement loop and adding a second tighter polish pass should find more precise optima within the same time budget, improving the policy quality", q: 0.6, delta: [0.01, 0.05]}

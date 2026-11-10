@@ -1,0 +1,316 @@
+# EVOLVE-BLOCK-START
+import numpy as np
+import time
+from scipy.optimize import minimize
+from autoresearch_suite.chem_clusters import relax, sutton_chen_energy_gradient
+
+# Global deadline guard
+_START_TIME = time.time()
+_DEADLINE = _START_TIME + 295.0  # 295s safety margin before 330s kill
+
+def _remaining():
+    return _DEADLINE - time.time()
+
+def _get_spacing(kind):
+    """
+    Calculate approximate equilibrium bond length for the pair part of Sutton-Chen.
+    """
+    if kind == '12-6':
+        n, m, c = 12, 6, 144.41
+    elif kind == '9-6':
+        n, m, c = 9, 6, 39.432
+    elif kind == '10-8':
+        n, m, c = 10, 8, 34.408
+    else:
+        return 1.0
+    return (2 * n / (c * m)) ** (1.0 / (n - m / 2.0))
+
+def _fcc_positions(n, a=1.0):
+    """Generate n atoms in FCC lattice positions (truncated)."""
+    basis = np.array([[0, 0, 0], [0, 0.5, 0.5], [0.5, 0, 0.5], [0.5, 0.5, 0]]) * a
+    positions = []
+    max_idx = int(np.ceil(n ** (1/3)) + 4)
+    sites = []
+    for i in range(-max_idx, max_idx + 1):
+        for j in range(-max_idx, max_idx + 1):
+            for k in range(-max_idx, max_idx + 1):
+                for b in basis:
+                    pos = np.array([i, j, k]) * a + b
+                    dist = np.linalg.norm(pos)
+                    sites.append((dist, pos))
+    sites.sort(key=lambda x: x[0])
+    seen = set()
+    for d, pos in sites:
+        key = tuple(np.round(pos, 6))
+        if key not in seen:
+            seen.add(key)
+            positions.append(pos)
+            if len(positions) >= n:
+                break
+    return np.array(positions[:n])
+
+def _hcp_positions(n, a=1.0):
+    """Generate n atoms in HCP lattice positions (truncated)."""
+    c = a * np.sqrt(8/3)
+    positions = []
+    max_idx = int(np.ceil(n ** (1/3)) + 4)
+    sites = []
+    for layer in range(-max_idx, max_idx + 1):
+        z = layer * c / 2
+        for i in range(-max_idx, max_idx + 1):
+            for j in range(-max_idx, max_idx + 1):
+                pos = np.array([i * a, j * a * np.sqrt(3)/2, z])
+                sites.append((np.linalg.norm(pos), pos))
+        for i in range(-max_idx, max_idx + 1):
+            for j in range(-max_idx, max_idx + 1):
+                pos = np.array([(i + 0.5) * a, (j + 1/6) * a * np.sqrt(3), z + c/2])
+                sites.append((np.linalg.norm(pos), pos))
+    sites.sort(key=lambda x: x[0])
+    seen = set()
+    for d, pos in sites:
+        key = tuple(np.round(pos, 6))
+        if key not in seen:
+            seen.add(key)
+            positions.append(pos)
+            if len(positions) >= n:
+                break
+    return np.array(positions[:n])
+
+def _bcc_positions(n, a=1.0):
+    """Generate n atoms in BCC lattice positions (truncated)."""
+    basis = np.array([[0, 0, 0], [0.5, 0.5, 0.5]]) * a
+    positions = []
+    max_idx = int(np.ceil(n ** (1/3)) + 4)
+    sites = []
+    for i in range(-max_idx, max_idx + 1):
+        for j in range(-max_idx, max_idx + 1):
+            for k in range(-max_idx, max_idx + 1):
+                for b in basis:
+                    pos = np.array([i, j, k]) * a + b
+                    dist = np.linalg.norm(pos)
+                    sites.append((dist, pos))
+    sites.sort(key=lambda x: x[0])
+    seen = set()
+    for d, pos in sites:
+        key = tuple(np.round(pos, 6))
+        if key not in seen:
+            seen.add(key)
+            positions.append(pos)
+            if len(positions) >= n:
+                break
+    return np.array(positions[:n])
+
+def _icosahedral_positions(n, a=1.0):
+    """
+    Generate n atoms in an icosahedral cluster (Mackay icosahedron truncated).
+    """
+    phi = (1 + np.sqrt(5)) / 2
+    # 12 vertices of an icosahedron
+    verts = np.array([
+        [0, 1, phi], [0, -1, phi], [0, 1, -phi], [0, -1, -phi],
+        [1, phi, 0], [-1, phi, 0], [1, -phi, 0], [-1, -phi, 0],
+        [phi, 0, 1], [phi, 0, -1], [-phi, 0, 1], [-phi, 0, -1]
+    ]) * a / np.sqrt(1 + phi**2)
+    
+    positions = [np.zeros(3)]  # center
+    
+    # Add vertices
+    for v in verts:
+        positions.append(v)
+    
+    # If we need more, add face centers and edge midpoints
+    if n > 13:
+        # Face centers of the 20 faces
+        faces = [
+            [0, 1, 8], [0, 2, 9], [1, 3, 8], [2, 4, 9],
+            [1, 0, 5], [3, 2, 6], [0, 4, 5], [2, 6, 7],
+            [5, 8, 10], [6, 9, 11], [8, 1, 10], [9, 3, 11],
+            [10, 5, 7], [11, 6, 4], [8, 10, 0], [9, 11, 2],
+            [5, 7, 1], [6, 4, 3], [10, 8, 0], [11, 9, 2]
+        ]
+        for f in faces:
+            if len(positions) >= n:
+                break
+            fc = (verts[f[0]] + verts[f[1]] + verts[f[2]]) / 3.0
+            positions.append(fc)
+        
+        # Edge midpoints
+        if n > 33:
+            edges = []
+            for i in range(12):
+                for j in range(i+1, 12):
+                    d = np.linalg.norm(verts[i] - verts[j])
+                    if d < 2.1 * a / np.sqrt(1+phi**2):  # approximate edge length
+                        edges.append((i, j))
+            for e in edges:
+                if len(positions) >= n:
+                    break
+                em = (verts[e[0]] + verts[e[1]]) / 2.0
+                positions.append(em)
+    
+    # Fill remaining with random points on the surface
+    while len(positions) < n:
+        idx = np.random.randint(0, 12)
+        pos = verts[idx] + np.random.normal(0, 0.1 * a, 3)
+        positions.append(pos)
+    
+    return np.array(positions[:n])
+
+def _random_cluster(n, spacing, seed, min_dist=None):
+    """Random rejection-sampling cluster."""
+    if min_dist is None:
+        min_dist = spacing * 0.9
+    rng = np.random.default_rng(seed)
+    radius = spacing * n ** (1.0/3.0) * 0.9
+    points = []
+    max_attempts = 5000
+    while len(points) < n and max_attempts > 0:
+        max_attempts -= 1
+        p = rng.uniform(-radius, radius, 3)
+        if np.linalg.norm(p) > radius:
+            continue
+        if all(np.linalg.norm(p - q) >= min_dist for q in points):
+            points.append(p)
+    if len(points) < n:
+        while len(points) < n:
+            p = rng.uniform(-radius, radius, 3)
+            points.append(p)
+    return np.array(points)
+
+def _min_distance_check(pos):
+    """Check minimum distance between any two atoms."""
+    n = len(pos)
+    if n < 2:
+        return np.inf
+    dists = np.linalg.norm(pos[:, np.newaxis] - pos[np.newaxis, :], axis=-1)
+    np.fill_diagonal(dists, np.inf)
+    return np.min(dists)
+
+def construct(instance):
+    global _START_TIME, _DEADLINE
+    
+    n = instance["n"]
+    kind = instance["kind"]
+    potential = instance["potential"]
+    
+    # Use physically motivated spacing based on pair potential minimum
+    spacing = _get_spacing(kind)
+    
+    # Generate diverse starting points
+    candidates = []
+    
+    # 1. FCC
+    try:
+        fcc = _fcc_positions(n, spacing)
+        if len(fcc) == n:
+            candidates.append(("fcc", fcc))
+    except Exception:
+        pass
+    
+    # 2. HCP
+    try:
+        hcp = _hcp_positions(n, spacing)
+        if len(hcp) == n:
+            candidates.append(("hcp", hcp))
+    except Exception:
+        pass
+    
+    # 3. BCC
+    try:
+        bcc = _bcc_positions(n, spacing)
+        if len(bcc) == n:
+            candidates.append(("bcc", bcc))
+    except Exception:
+        pass
+    
+    # 4. Icosahedral
+    try:
+        ico = _icosahedral_positions(n, spacing)
+        if len(ico) == n:
+            candidates.append(("ico", ico))
+    except Exception:
+        pass
+    
+    # 5. Perturbed FCC (breaks symmetry, helps escape local minima)
+    try:
+        fcc = _fcc_positions(n, spacing)
+        rng = np.random.default_rng(1)
+        noise = rng.normal(0, spacing * 0.1, fcc.shape)
+        perturbed_fcc = fcc + noise
+        candidates.append(("pert_fcc", perturbed_fcc))
+    except Exception:
+        pass
+    
+    # 6. Perturbed HCP
+    try:
+        hcp = _hcp_positions(n, spacing)
+        rng = np.random.default_rng(2)
+        noise = rng.normal(0, spacing * 0.1, hcp.shape)
+        perturbed_hcp = hcp + noise
+        candidates.append(("pert_hcp", perturbed_hcp))
+    except Exception:
+        pass
+        
+    # 7-10. Random clusters with different seeds
+    for seed in [42, 123, 456, 789]:
+        try:
+            rand = _random_cluster(n, spacing, seed)
+            candidates.append((f"rand_{seed}", rand))
+        except Exception:
+            pass
+    
+    # Relax each candidate and keep the best
+    best_energy = np.inf
+    best_positions = None
+    
+    for name, pos in candidates:
+        if _remaining() < 15.0:  # Need at least 15s for one more relaxation + safety
+            break
+        try:
+            energy, relaxed_pos = relax(pos, potential, kind)
+            # Check validity
+            if np.all(np.isfinite(relaxed_pos)):
+                min_d = _min_distance_check(relaxed_pos)
+                if min_d >= 0.35:
+                    if energy < best_energy:
+                        best_energy = energy
+                        best_positions = relaxed_pos
+        except Exception:
+            pass
+    
+    # If we have a valid best position and time remains, try to improve it via perturbation
+    if best_positions is not None and _remaining() > 30.0:
+        # Perturb the best solution
+        rng = np.random.default_rng(999)
+        # Try a few perturbation levels
+        for kick_level in [0.1, 0.2, 0.5]:
+            if _remaining() < 15.0:
+                break
+            try:
+                noise = rng.normal(0, kick_level * spacing, best_positions.shape)
+                perturbed = best_positions + noise
+                energy, relaxed_pos = relax(perturbed, potential, kind)
+                if np.all(np.isfinite(relaxed_pos)):
+                    min_d = _min_distance_check(relaxed_pos)
+                    if min_d >= 0.35 and energy < best_energy:
+                        best_energy = energy
+                        best_positions = relaxed_pos
+            except Exception:
+                pass
+
+    # If no valid result, try one more random attempt
+    if best_positions is None:
+        if _remaining() > 5.0:
+            try:
+                pos = _random_cluster(n, spacing, 12345, min_dist=0.4)
+                energy, relaxed_pos = relax(pos, potential, kind)
+                if np.all(np.isfinite(relaxed_pos)):
+                    best_positions = relaxed_pos
+            except Exception:
+                # Last resort: simple grid
+                best_positions = np.zeros((n, 3))
+                for i in range(n):
+                    best_positions[i] = [i * 0.8, 0, 0]
+    
+    return best_positions
+# EVOLVE-BLOCK-END

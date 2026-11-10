@@ -1,0 +1,238 @@
+import time
+import random
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 115.0  # Safety margin
+    
+    n = 16
+    all_edges = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    m = len(all_edges)  # 120
+
+    # Precompute: for each edge (u,v), the set of vertices that are "relevant"
+    # i.e., vertices w != u, v. Used to mask out u,v,a,b,c,d quickly.
+    # Actually we just need fast bit operations.
+
+    def creates_q3(u, v, adj):
+        """Check if adding edge (u,v) to graph with adjacency 'adj' creates a Q3."""
+        mask_u = adj[u] & ~(1 << v)
+        mask_v = adj[v] & ~(1 << u)
+
+        if not mask_u or not mask_v:
+            return False
+
+        # Iterate a in N(u) \ {v}
+        mask_a = mask_u
+        while mask_a:
+            lsb_a = mask_a & -mask_a
+            a = lsb_a.bit_length() - 1
+            mask_a ^= lsb_a
+
+            # Iterate b in N(u) \ {v, a}
+            mask_b = mask_u & ~lsb_a
+            while mask_b:
+                lsb_b = mask_b & -mask_b
+                b = lsb_b.bit_length() - 1
+                mask_b ^= lsb_b
+
+                # c in N(v) \ {u} ∩ N(a)
+                mask_c = mask_v & adj[a]
+                if not mask_c:
+                    continue
+
+                # d in N(v) \ {u} ∩ N(b)
+                mask_d = mask_v & adj[b]
+                if not mask_d:
+                    continue
+
+                # Exclude a and b from c and d candidates
+                mask_c &= ~(lsb_a | lsb_b)
+                mask_d &= ~(lsb_a | lsb_b)
+
+                if not mask_c or not mask_d:
+                    continue
+
+                # Iterate c in mask_c
+                mask_c_iter = mask_c
+                while mask_c_iter:
+                    lsb_c = mask_c_iter & -mask_c_iter
+                    c = lsb_c.bit_length() - 1
+                    mask_c_iter ^= lsb_c
+
+                    # d in mask_d, d != c
+                    mask_d_iter = mask_d & ~lsb_c
+                    if not mask_d_iter:
+                        continue
+
+                    while mask_d_iter:
+                        lsb_d = mask_d_iter & -mask_d_iter
+                        d = lsb_d.bit_length() - 1
+                        mask_d_iter ^= lsb_d
+
+                        # e in N(a) ∩ N(b) \ {u,v,a,b,c,d}
+                        forbidden = (1 << u) | (1 << v) | lsb_a | lsb_b | lsb_c | lsb_d
+                        mask_e = (adj[a] & adj[b]) & ~forbidden
+                        if not mask_e:
+                            continue
+
+                        # f in N(c) ∩ N(d) \ {u,v,a,b,c,d}
+                        mask_f = (adj[c] & adj[d]) & ~forbidden
+                        if not mask_f:
+                            continue
+
+                        # Check if ∃ e in mask_e, f in mask_f s.t. e != f and (e,f) edge
+                        # Iterate over the smaller set
+                        if mask_e.bit_count() <= mask_f.bit_count():
+                            mask_e_iter = mask_e
+                            while mask_e_iter:
+                                lsb_e = mask_e_iter & -mask_e_iter
+                                e = lsb_e.bit_length() - 1
+                                mask_e_iter ^= lsb_e
+                                # f in mask_f \ {e} and (e,f) is an edge
+                                if mask_f & adj[e] & ~lsb_e:
+                                    return True
+                        else:
+                            mask_f_iter = mask_f
+                            while mask_f_iter:
+                                lsb_f = mask_f_iter & -mask_f_iter
+                                f = lsb_f.bit_length() - 1
+                                mask_f_iter ^= lsb_f
+                                if mask_e & adj[f] & ~lsb_f:
+                                    return True
+        return False
+
+    def edge_count(adj):
+        return sum(adj[i].bit_count() for i in range(n)) // 2
+
+    def greedy_construct():
+        adj = [0] * n
+        shuffled_edges = all_edges[:]
+        random.shuffle(shuffled_edges)
+        for u, v in shuffled_edges:
+            if not creates_q3(u, v, adj):
+                adj[u] |= (1 << v)
+                adj[v] |= (1 << u)
+        return adj
+
+    def local_search_add(adj):
+        """Try to add any missing edge that doesn't create Q3. Repeat until no improvement."""
+        improved = True
+        while improved:
+            improved = False
+            missing = [(i, j) for i in range(n) for j in range(i + 1, n)
+                       if not (adj[i] >> j) & 1]
+            random.shuffle(missing)
+            for u, v in missing:
+                if not creates_q3(u, v, adj):
+                    adj[u] |= (1 << v)
+                    adj[v] |= (1 << u)
+                    improved = True
+        return adj
+
+    def kick_and_refill(adj, kick_size):
+        """Remove kick_size random edges, then refill via local search."""
+        current_adj = adj[:]
+        # Get current edges
+        edges = [(i, j) for i in range(n) for j in range(i + 1, n) if (current_adj[i] >> j) & 1]
+        for _ in range(kick_size):
+            if not edges:
+                break
+            idx = random.randint(0, len(edges) - 1)
+            u, v = edges[idx]
+            current_adj[u] &= ~(1 << v)
+            current_adj[v] &= ~(1 << u)
+            edges.pop(idx)
+        current_adj = local_search_add(current_adj)
+        return current_adj
+
+    def tabu_kick(adj, kick_size, tabu_size=3):
+        """Remove kick_size edges, avoid re-adding tabu_size recently removed edges."""
+        current_adj = adj[:]
+        edges = [(i, j) for i in range(n) for j in range(i + 1, n) if (current_adj[i] >> j) & 1]
+        removed = []
+        for _ in range(kick_size):
+            if not edges:
+                break
+            idx = random.randint(0, len(edges) - 1)
+            u, v = edges[idx]
+            current_adj[u] &= ~(1 << v)
+            current_adj[v] &= ~(1 << u)
+            edges.pop(idx)
+            removed.append((u, v))
+
+        # Refill: try to add edges, but skip those in 'removed' for the first pass
+        # then allow them
+        improved = True
+        while improved:
+            improved = False
+            missing = [(i, j) for i in range(n) for j in range(i + 1, n)
+                       if not (current_adj[i] >> j) & 1]
+            random.shuffle(missing)
+            for u, v in missing:
+                if (u, v) in removed or (v, u) in removed:
+                    continue  # tabu
+                if not creates_q3(u, v, current_adj):
+                    current_adj[u] |= (1 << v)
+                    current_adj[v] |= (1 << u)
+                    improved = True
+        # Second pass: allow tabu edges
+        improved = True
+        while improved:
+            improved = False
+            missing = [(i, j) for i in range(n) for j in range(i + 1, n)
+                       if not (current_adj[i] >> j) & 1]
+            random.shuffle(missing)
+            for u, v in missing:
+                if not creates_q3(u, v, current_adj):
+                    current_adj[u] |= (1 << v)
+                    current_adj[v] |= (1 << u)
+                    improved = True
+        return current_adj
+
+    best_adj = [0] * n
+    best_count = 0
+
+    while time.time() < deadline - 5:
+        # Generate a new random greedy solution
+        adj = greedy_construct()
+        adj = local_search_add(adj)
+        count = edge_count(adj)
+
+        if count > best_count:
+            best_count = count
+            best_adj = adj[:]
+
+        # Try several kicks from this local optimum
+        if time.time() < deadline - 3:
+            for kick_size in [2, 3, 5, 7]:
+                if time.time() > deadline - 3:
+                    break
+                new_adj = kick_and_refill(adj, kick_size)
+                new_count = edge_count(new_adj)
+                if new_count > best_count:
+                    best_count = new_count
+                    best_adj = new_adj[:]
+                    adj = new_adj  # continue kicking from improved solution
+
+            # Try tabu kick
+            if time.time() < deadline - 3:
+                for kick_size in [3, 5]:
+                    if time.time() > deadline - 3:
+                        break
+                    new_adj = tabu_kick(adj, kick_size)
+                    new_count = edge_count(new_adj)
+                    if new_count > best_count:
+                        best_count = new_count
+                        best_adj = new_adj[:]
+
+    # Final polish: try to add any missing edge to best_adj
+    best_adj = local_search_add(best_adj)
+    best_count = edge_count(best_adj)
+
+    # Return edge list
+    result = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if (best_adj[i] >> j) & 1:
+                result.append([i, j])
+    return result

@@ -1,0 +1,164 @@
+import time
+from math import gcd
+from itertools import combinations, product
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 45  # Safety margin for 90s limit
+
+    best_A = [1, 7, 13]
+    best_B = [4, 10, 16]
+    best_count = 5
+    
+    # Fallback values known to be valid (5 distinct primes)
+    # 5, 11, 17, 23, 29 are primes
+    
+    def is_pairwise_coprime(values):
+        vals = list(set(values))
+        for i in range(len(vals)):
+            for j in range(i+1, len(vals)):
+                if gcd(vals[i], vals[j]) != 1:
+                    return False
+        return True
+
+    # Precompute primes up to 256
+    def sieve(n):
+        is_prime = [True] * (n + 1)
+        is_prime[0] = is_prime[1] = False
+        for i in range(2, int(n**0.5) + 1):
+            if is_prime[i]:
+                for j in range(i*i, n + 1, i):
+                    is_prime[j] = False
+        return is_prime
+
+    is_prime = sieve(256)
+    primes = [i for i in range(2, 257) if is_prime[i]]
+
+    # Strategy 1: Search for 9 distinct primes
+    # We want A+B to contain 9 distinct primes.
+    # This implies all 9 sums are distinct and prime.
+    
+    # Iterate over small A and B
+    # To speed up, we can iterate over A and then find valid B's.
+    # For a fixed A, a value b is "valid" if a1+b, a2+b, a3+b are all prime.
+    # Then we need to pick 3 distinct valid b's such that the 9 sums are distinct.
+    
+    max_val = 128
+    
+    for a1 in range(1, 50):
+        if time.time() > deadline:
+            return [best_A, best_B]
+        for a2 in range(a1+1, 50):
+            if time.time() > deadline:
+                return [best_A, best_B]
+            for a3 in range(a2+1, 50):
+                if time.time() > deadline:
+                    return [best_A, best_B]
+                
+                A = (a1, a2, a3)
+                
+                # Find all b in [1, 128] such that a1+b, a2+b, a3+b are prime
+                valid_bs = []
+                for b in range(1, max_val + 1):
+                    if is_prime[a1+b] and is_prime[a2+b] and is_prime[a3+b]:
+                        valid_bs.append(b)
+                
+                if len(valid_bs) < 3:
+                    continue
+                
+                # We need to choose 3 distinct b's from valid_bs
+                # such that the 9 sums are distinct.
+                # To maximize chance, we can just check the first few combinations
+                # or use a heuristic.
+                # Since we just need ONE solution with 9 distinct sums,
+                # and valid_bs might be large, let's try a few random or sequential picks.
+                
+                # Sequential check of combinations is O(N^3).
+                # If len(valid_bs) is small, it's fine.
+                # If large, we can sample.
+                
+                # Let's try the first 20 valid_bs and check combinations
+                # Actually, if we pick b1, b2, b3, the sums are:
+                # a1+b1, a2+b1, a3+b1
+                # a1+b2, a2+b2, a3+b2
+                # a1+b3, a2+b3, a3+b3
+                # Distinctness requires:
+                # 1. b1, b2, b3 distinct (ensured by combination)
+                # 2. a1+b1 != a2+b2, etc.
+                # Since a1,a2,a3 are distinct, a1+b1 == a2+b2 implies b2-b1 = a1-a2.
+                # If we pick b's that are far apart, collisions are less likely.
+                
+                # Let's try to find a combination where b's are "spread out"
+                # or just iterate through combinations of the first 10 valid_bs
+                if len(valid_bs) > 10:
+                    # Sample some
+                    import random
+                    random.seed(42)
+                    candidates = random.sample(valid_bs, 10)
+                else:
+                    candidates = valid_bs
+                
+                for b1, b2, b3 in combinations(candidates, 3):
+                    B = (b1, b2, b3)
+                    sums = set()
+                    for ai in A:
+                        for bi in B:
+                            sums.add(ai + bi)
+                    
+                    if len(sums) == 9:
+                        if is_pairwise_coprime(sums):
+                            best_A = list(A)
+                            best_B = list(B)
+                            best_count = 9
+                            return [best_A, best_B]
+
+    # If 9 not found, fall back to the AP search from the original code
+    # which is known to find 5, and maybe 6,7,8.
+    # But since 9 is the max, and we want to beat 1.8 (which is 9/5),
+    # we MUST find 9.
+    # If the above search fails, we try the AP search.
+    
+    max_a = 50
+    max_d = 20
+    max_b = 50
+    max_e = 20
+    
+    for a in range(1, max_a + 1):
+        if time.time() > deadline:
+            return [best_A, best_B]
+        for d in range(1, max_d + 1):
+            if a + 2*d > 128:
+                continue
+            A = (a, a+d, a+2*d)
+            
+            for b in range(1, max_b + 1):
+                if time.time() > deadline:
+                    return [best_A, best_B]
+                for e in range(1, max_e + 1):
+                    if b + 2*e > 128:
+                        continue
+                    B = (b, b+e, b+2*e)
+                    
+                    sums = set()
+                    for ai in A:
+                        for bi in B:
+                            sums.add(ai + bi)
+                    
+                    if len(sums) <= best_count:
+                        continue
+                    
+                    if is_pairwise_coprime(sums):
+                        best_count = len(sums)
+                        best_A = list(A)
+                        best_B = list(B)
+                        
+                        if best_count == 9:
+                            return [best_A, best_B]
+
+    return [best_A, best_B]
+
+if __name__ == "__main__":
+    A, B = construct()
+    print(f"Found A={A}, B={B}")
+    sums = set(a+b for a in A for b in B)
+    print(f"Distinct sums: {len(sums)}, Values: {sorted(sums)}")

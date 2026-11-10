@@ -1,284 +1,256 @@
+# EVOLVE-BLOCK-START
 import numpy as np
 import time
+import scipy.optimize as opt
 
 def moving_sofa_2d() -> np.ndarray:
-    # Grid definition
-    xs = np.arange(-3, 1.5, 0.01)
-    ys = np.arange(-1.5, 1.5, 0.01)
-    x_grid, y_grid = np.meshgrid(xs, ys)
-    x_flat = x_grid.ravel()
-    y_flat = y_grid.ravel()
-    n_points = len(x_flat)
+    """
+    Moves a sofa through an L-shaped corridor.
+    Uses a deterministic parametric optimization strategy.
+    The path is defined by x(theta) and y(theta) as smooth functions of angle theta.
+    We optimize the coefficients of these functions to maximize the area of the sofa.
+    """
+    # 1. Setup Grid
+    # Sofa points: x in [-3, 1.5), y in [-1.5, 1.5), step 0.01
+    x_grid = np.arange(-3, 1.5, 0.01)
+    y_grid = np.arange(-1.5, 1.5, 0.01)
+    X, Y = np.meshgrid(x_grid, y_grid)
+    P = np.column_stack((X.ravel(), Y.ravel()))
+    N_points = P.shape[0]
+    
+    # Start and End states
+    start_state = [0.0, 0.0, 0.0]
+    end_state = [-2.0, 0.0, 90.0]
+    
+    def densify_path(path_list):
+        """
+        Densifies a list of [x, y, a] such that angle steps are <= 1 degree.
+        """
+        if not path_list:
+            return [start_state, end_state]
+            
+        full_path = [start_state] + list(path_list) + [end_state]
+        
+        densified = [full_path[0]]
+        for i in range(len(full_path) - 1):
+            p1 = full_path[i]
+            p2 = full_path[i + 1]
+            
+            a1 = p1[2]
+            a2 = p2[2]
+            
+            da = a2 - a1
+            steps = max(1, int(np.ceil(abs(da))))
+            
+            if steps == 1:
+                densified.append(p2)
+            else:
+                dx = (p2[0] - p1[0]) / steps
+                dy = (p2[1] - p1[1]) / steps
+                da_step = da / steps
+                
+                for j in range(1, steps):
+                    nx = p1[0] + j * dx
+                    ny = p1[1] + j * dy
+                    na = a1 + j * da_step
+                    densified.append([nx, ny, na])
+                densified.append(p2)
+                
+        return densified
 
-    start_time = time.time()
-    time_limit = 575.0  # Safety margin before 630s kill
-
-    def _make_densified(path):
-        """Build the full densified path: start + path + end, with linear interpolation."""
-        full = [(0.0, 0.0, 0.0)]
-        for p in path:
-            full.append((float(p[0]), float(p[1]), float(p[2])))
-        full.append((-2.0, 0.0, 90.0))
-        dens = [full[0]]
-        for i in range(len(full) - 1):
-            p1 = full[i]
-            p2 = full[i + 1]
-            da = abs(p2[2] - p1[2])
-            m = max(1, int(np.ceil(da)))
-            for k in range(m):
-                t = (k + 1) / m
-                dens.append((
-                    p1[0] + (p2[0] - p1[0]) * t,
-                    p1[1] + (p2[1] - p1[1]) * t,
-                    p1[2] + (p2[2] - p1[2]) * t,
-                ))
-        dens.append(full[-1])
-        return dens
-
-    def _placement_mask(cx, cy, ca_deg):
-        """Boolean mask of grid points inside corridor placement (cx, cy, ca_deg)."""
-        ca = np.deg2rad(ca_deg)
-        cos_a = np.cos(ca)
-        sin_a = np.sin(ca)
-        dx = x_flat - cx
-        dy = y_flat - cy
-        u = dx * cos_a + dy * sin_a
-        v = -dx * sin_a + dy * cos_a
-        in_arm1 = (u >= 0) & (u <= 1) & (v >= -3) & (v <= 1)
-        in_arm2 = (u >= -3) & (u <= 1) & (v >= 0) & (v <= 1)
-        return in_arm1 | in_arm2
-
-    def _segment_indices(dens, seg_start_idx):
-        """Return (start, end) slice indices in dens for the segment starting at seg_start_idx."""
-        # dens[0] = start, dens[1..] = interpolated + end
-        # Segment from full_path[i] to full_path[i+1] corresponds to:
-        # We need to figure out which dens indices belong to this segment.
-        # Actually, it's easier to just recompute all masks for a given path.
-        pass
-
-    def evaluate_path(path):
-        """Full evaluation: returns (area_score, densified_list, per_placement_masks)."""
-        dens = _make_densified(path)
-        mask = np.ones(n_points, dtype=bool)
-        masks = []
-        for (cx, cy, ca_deg) in dens:
-            m = _placement_mask(cx, cy, ca_deg)
-            mask &= m
-            masks.append(m)
+    def evaluate_path_fast(path_array):
+        """
+        Evaluates the area of the sofa for a given path array of shape (n, 3).
+        Returns: float area
+        """
+        if path_array.size == 0:
+            path_list = []
+        else:
+            path_list = path_array.tolist()
+            
+        dense_path = densify_path(path_list)
+        
+        mask = np.ones(N_points, dtype=bool)
+        
+        wx = P[:, 0]
+        wy = P[:, 1]
+        
+        for p in dense_path:
+            x, y, a_deg = p
+            a_rad = np.deg2rad(a_deg)
+            
+            cos_a = np.cos(a_rad)
+            sin_a = np.sin(a_rad)
+            
+            dx = wx - x
+            dy = wy - y
+            
+            u = dx * cos_a + dy * sin_a
+            v = -dx * sin_a + dy * cos_a
+            
+            in_r1 = (u >= 0) & (u <= 1) & (v >= -3) & (v <= 1)
+            in_r2 = (u >= -3) & (u <= 1) & (v >= 0) & (v <= 1)
+            
+            in_corridor = in_r1 | in_r2
+            
+            mask &= in_corridor
+            
             if not np.any(mask):
-                return 0.0, dens, masks
-        return float(np.sum(mask)) * 0.0001, dens, masks
+                return 0.0
+                
+        return float(np.sum(mask)) * 0.0001
 
-    def evaluate_path_fast(path, prev_dens=None, prev_masks=None, changed_idx=None):
+    # 2. Parametric Path Definition
+    # We define the path in terms of angle theta from 0 to 90 degrees.
+    # We use a Fourier-like series for x and y to allow smooth, flexible curves.
+    # x(theta) = c0 + c1*cos(t) + c2*sin(t) + c3*cos(2t) + c4*sin(2t)
+    # y(theta) = d0 + d1*cos(t) + d2*sin(t) + d3*cos(2t) + d4*sin(2t)
+    # where t = theta in radians.
+    
+    # Number of waypoints to sample from the parametric curve for evaluation
+    N_WAYPOINTS = 20
+    
+    def get_path_from_coeffs(coeffs):
         """
-        Fast evaluation: if only one control point changed, recompute only affected segments.
-        Returns (area_score, dens, masks).
+        coeffs: array of shape (10,) -> [c0..c4, d0..d4]
+        Returns: np.ndarray of shape (N_WAYPOINTS, 3)
         """
-        n_ctrl = len(path)
-        dens = _make_densified(path)
+        c = coeffs[:5]
+        d = coeffs[5:]
         
-        if prev_dens is None or changed_idx is None:
-            return evaluate_path(path)
+        # Sample angles uniformly from 0 to 90
+        # We exclude 0 and 90 because the evaluator adds the start and end states.
+        # However, the evaluator inserts the returned rows between start and end.
+        # If we return rows with angles 0 or 90, it might cause duplicate or zero-step intervals.
+        # It's safer to return angles strictly between 0 and 90.
+        angles_deg = np.linspace(1, 89, N_WAYPOINTS)
+        t = np.deg2rad(angles_deg)
         
-        # Determine which dens indices are affected by changing path[changed_idx]
-        # The densified path has segments between consecutive full_path points.
-        # full_path = [start, p0, p1, ..., p_{n-1}, end]
-        # Changing p_i affects segment (start->p0) if i==0, segment (p_i->p_{i+1}) always,
-        # and segment (p_{i-1}->p_i) if i>0.
-        # 
-        # We need to map segment indices to dens index ranges.
-        # Let's precompute the segment-to-dens-index mapping from the old dens.
-        # Actually, the dens structure depends on the path (angle differences), so
-        # changing an angle can change the number of interpolation steps.
-        # For safety, if angles change significantly, do full recompute.
+        # Compute x, y
+        cos_t = np.cos(t)
+        sin_t = np.sin(t)
+        cos_2t = np.cos(2 * t)
+        sin_2t = np.sin(2 * t)
         
-        # Check if the angle at changed_idx changed (affecting m for adjacent segments)
-        old_p = prev_dens  # We stored the old densified list
-        # This is getting complex. Let's just do full recompute but with early exit.
-        # The incremental speedup is nice-to-have; the main gain is from the polish phase.
-        return evaluate_path(path)
+        xs = c[0] + c[1]*cos_t + c[2]*sin_t + c[3]*cos_2t + c[4]*sin_2t
+        ys = d[0] + d[1]*cos_t + d[2]*sin_t + d[3]*cos_2t + d[4]*sin_2t
+        
+        # Construct path array
+        path = np.column_stack((xs, ys, angles_deg))
+        return path
 
-    # Initial path: hand-tuned starting point
-    initial_path = [
-        (-0.1, 0.1, 15.0),
-        (-0.2, 0.2, 20.0),
-        (-0.3, 0.3, 34.0),
-        (-0.3, 0.3, 40.0),
-        (-0.4, 0.3, 50.0),
-        (-0.5, 0.2, 55.0),
-        (-0.6, 0.2, 75.0),
-        (-0.7, 0.3, 86.0),
-    ]
+    def objective(coeffs):
+        """
+        Objective function for minimization (scipy minimizes, so we negate area).
+        """
+        path = get_path_from_coeffs(coeffs)
+        area = evaluate_path_fast(path)
+        return -area
 
-    best_score, best_dens, best_masks = evaluate_path(initial_path)
-    best_path = initial_path[:]
-    current_path = initial_path[:]
-
-    # Phase 1: Random local search with adaptive step sizes
-    np.random.seed(42)
-    epsilon_xy = 0.15
-    epsilon_a = 3.0
-    no_improve = 0
-    max_no_improve = 30
-    phase1_time_limit = 400.0  # Spend ~400s on random search
-
-    while time.time() - start_time < min(time_limit, phase1_time_limit):
-        idx = np.random.randint(len(current_path))
-        p = current_path[idx]
-
-        new_x = p[0] + np.random.normal(0, epsilon_xy)
-        new_y = p[1] + np.random.normal(0, epsilon_xy)
-        new_a = p[2] + np.random.normal(0, epsilon_a)
-        new_a = np.clip(new_a, 0.0, 90.0)
-
-        new_p = (new_x, new_y, new_a)
-        test_path = current_path[:]
-        test_path[idx] = new_p
-
-        score, dens, masks = evaluate_path(test_path)
-
+    # 3. Optimization
+    start_time = time.time()
+    deadline = start_time + 590.0
+    
+    # Initial guess based on known good paths (approximate)
+    # The inner corner moves roughly from (0,0) to (-2,0) while rotating.
+    # A simple linear interpolation in x,y with fixed angles is a bad start.
+    # Let's use the seed path from the previous program as a guide for initial coefficients.
+    # Seed path:
+    # [-0.1, 0.1, 15.0],
+    # [-0.2, 0.2, 20.0],
+    # [-0.3, 0.3, 34.0],
+    # [-0.3, 0.3, 40.0],
+    # [-0.4, 0.3, 50.0],
+    # [-0.5, 0.2, 55.0],
+    # [-0.6, 0.2, 75.0],
+    # [-0.7, 0.3, 86.0]
+    
+    # Fit these points to our parametric form to get a good initial guess?
+    # Or just use a heuristic initial guess.
+    # Let's try a few random initializations and pick the best one after a quick eval.
+    
+    best_coeffs = None
+    best_score = -1.0
+    
+    # Try a few random starts
+    n_starts = 5
+    for i in range(n_starts):
+        if time.time() > deadline:
+            break
+            
+        if i == 0:
+            # Heuristic start
+            # x goes from ~0 to ~-2. y stays small.
+            # c0 (bias) ~ -1
+            # c1 (cos) ~ -1 (cos goes 1 to 0)
+            # c2 (sin) ~ 0
+            # c3 (cos2t) ~ 0
+            # c4 (sin2t) ~ 0
+            # y: d0 ~ 0.1, d1 ~ 0, d2 ~ 0, d3 ~ 0, d4 ~ 0
+            coeffs = np.array([-1.0, -1.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0])
+        else:
+            # Random start in reasonable bounds
+            coeffs = np.random.uniform([-2, -2, -1, -1, -1, 0.5, -1, -1, -1, -1], 
+                                       [0, 0, 1, 1, 1, 0.5, 1, 1, 1, 1])
+            
+        # Quick evaluation
+        score = -objective(coeffs)
         if score > best_score:
             best_score = score
-            best_path = test_path
-            current_path = test_path
-            best_dens = dens
-            best_masks = masks
-            no_improve = 0
-        else:
-            no_improve += 1
-            if no_improve >= max_no_improve:
-                epsilon_xy *= 0.85
-                epsilon_a *= 0.85
-                no_improve = 0
-                if epsilon_xy < 0.01 and epsilon_a < 0.5:
-                    current_path = best_path[:]
-                    epsilon_xy = 0.3
-                    epsilon_a = 5.0
+            best_coeffs = coeffs.copy()
+            
+    # If we found a good start, run a more intensive optimization
+    if best_coeffs is not None:
+        # Use Powell or Nelder-Mead
+        # Powell is often better for non-differentiable or noisy functions, but here the function is discrete (grid points).
+        # However, the parametric mapping is smooth. The evaluation is piecewise constant w.r.t coeffs.
+        # So we are optimizing a step function. Gradient-based methods won't work well.
+        # Derivative-free methods like Nelder-Mead or Powell are appropriate.
+        
+        # We can also increase the number of waypoints for final evaluation to ensure smoothness,
+        # but for optimization, 20 waypoints might be enough to capture the shape.
+        
+        try:
+            res = opt.minimize(objective, best_coeffs, method='Powell', 
+                               options={'maxiter': 100, 'xatol': 1e-3, 'fatol': 1e-5})
+            
+            if time.time() < deadline:
+                final_score = -res.fun
+                if final_score > best_score:
+                    best_score = final_score
+                    best_coeffs = res.x
+        except Exception as e:
+            pass
+            
+    # 4. Final Path Construction
+    if best_coeffs is not None:
+        final_path = get_path_from_coeffs(best_coeffs)
+    else:
+        # Fallback to a simple valid path
+        final_path = np.array([
+            [-0.1, 0.1, 15.0],
+            [-0.2, 0.2, 20.0],
+            [-0.3, 0.3, 34.0],
+            [-0.3, 0.3, 40.0],
+            [-0.4, 0.3, 50.0],
+            [-0.5, 0.2, 55.0],
+            [-0.6, 0.2, 75.0],
+            [-0.7, 0.3, 86.0],
+        ], dtype=np.float64)
+        
+    # Ensure the path is valid (finite, correct shape)
+    if not np.all(np.isfinite(final_path)):
+        final_path = np.array([
+            [-0.1, 0.1, 15.0],
+            [-0.2, 0.2, 20.0],
+            [-0.3, 0.3, 34.0],
+            [-0.3, 0.3, 40.0],
+            [-0.4, 0.3, 50.0],
+            [-0.5, 0.2, 55.0],
+            [-0.6, 0.2, 75.0],
+            [-0.7, 0.3, 86.0],
+        ], dtype=np.float64)
+        
+    return final_path
 
-    # Phase 2: Coordinate-descent polish
-    # For each control point, try small deterministic perturbations in x, y, a
-    polish_xy = 0.05
-    polish_a = 1.0
-    polish_iters = 5
-    polish_deadline = time_limit - 10.0  # Leave 10s buffer
-
-    for it in range(polish_iters):
-        if time.time() > polish_deadline:
-            break
-        improved = False
-        for idx in range(len(best_path)):
-            if time.time() > polish_deadline:
-                break
-            p = best_path[idx]
-            best_local = best_score
-            best_local_p = p
-            # Try perturbations in x
-            for dx in (-polish_xy, -polish_xy*0.5, polish_xy*0.5, polish_xy):
-                test_p = (p[0]+dx, p[1], p[2])
-                test_path = best_path[:]
-                test_path[idx] = test_p
-                s, d, m = evaluate_path(test_path)
-                if s > best_local:
-                    best_local = s
-                    best_local_p = test_p
-            # Try perturbations in y
-            for dy in (-polish_xy, -polish_xy*0.5, polish_xy*0.5, polish_xy):
-                test_p = (p[0], p[1]+dy, p[2])
-                test_path = best_path[:]
-                test_path[idx] = test_p
-                s, d, m = evaluate_path(test_path)
-                if s > best_local:
-                    best_local = s
-                    best_local_p = test_p
-            # Try perturbations in a
-            for da in (-polish_a, -polish_a*0.5, polish_a*0.5, polish_a):
-                new_a = np.clip(p[2]+da, 0.0, 90.0)
-                test_p = (p[0], p[1], new_a)
-                test_path = best_path[:]
-                test_path[idx] = test_p
-                s, d, m = evaluate_path(test_path)
-                if s > best_local:
-                    best_local = s
-                    best_local_p = test_p
-            if best_local > best_score:
-                best_path[idx] = best_local_p
-                best_score = best_local
-                improved = True
-        if not improved:
-            # Shrink polish steps
-            polish_xy *= 0.6
-            polish_a *= 0.6
-            if polish_xy < 0.005 and polish_a < 0.1:
-                break
-
-    # Phase 3: Smooth boundary-nudging (epigraph-inspired)
-    # For the best path, find the most constraining placement (the one that removes
-    # the most points from the intersection). Nudge nearby control points away from
-    # that placement's constraint.
-    if time.time() < polish_deadline - 5:
-        # Recompute best
-        best_score, best_dens, best_masks = evaluate_path(best_path)
-        
-        # Find the placement that contributes most to the constraint
-        # (i.e., the one with the fewest points inside, among those that are active)
-        current_mask = np.ones(n_points, dtype=bool)
-        for m in best_masks:
-            current_mask &= m
-        
-        # For each placement, count how many points it excludes that are still in the intersection
-        # Actually, the most constraining placement is the one whose mask has the smallest
-        # overlap with the final intersection. Let's find the placement that, if removed,
-        # would add the most points back.
-        
-        # Simpler: for each control point, try a small outward nudge based on the
-        # gradient of the constraint. Since we don't have gradients, use random nudge
-        # biased away from the most-constraining placement.
-        
-        # Find the most constraining placement index
-        # A placement is "constraining" if it excludes points that would otherwise be in.
-        # Approximate: the placement with the smallest number of points inside,
-        # weighted by how many of those points are in the final intersection.
-        
-        final_mask = np.ones(n_points, dtype=bool)
-        for m in best_masks:
-            final_mask &= m
-        
-        # For each placement, compute how many final-intersection points it excludes
-        # (i.e., points in final_mask that are NOT in this placement's mask)
-        # But final_mask is the intersection, so every placement contains all final_mask points.
-        # Instead, find the placement that is "tightest": the one where the fewest
-        # non-intersection points are excluded (i.e., it's closest to the boundary).
-        
-        # Alternative: for each placement, compute the minimum distance from
-        # final-intersection points to the corridor boundary in that placement's frame.
-        # The placement with the smallest such minimum distance is the most constraining.
-        
-        # This is expensive. Let's just do a few random nudges of the control points
-        # that are closest to the most-constraining placement.
-        
-        # Identify the most-constraining placement by checking which placement, when
-        # slightly relaxed (shifted), would allow more points.
-        # Approximation: the placement whose center is closest to any final-intersection point.
-        
-        # For simplicity, just do a final random polish with very small steps
-        np.random.seed(123)
-        small_xy = 0.03
-        small_a = 0.5
-        for _ in range(50):
-            if time.time() > polish_deadline:
-                break
-            idx = np.random.randint(len(best_path))
-            p = best_path[idx]
-            new_x = p[0] + np.random.normal(0, small_xy)
-            new_y = p[1] + np.random.normal(0, small_xy)
-            new_a = np.clip(p[2] + np.random.normal(0, small_a), 0.0, 90.0)
-            test_path = best_path[:]
-            test_path[idx] = (new_x, new_y, new_a)
-            s, d, m = evaluate_path(test_path)
-            if s > best_score:
-                best_score = s
-                best_path = test_path
-                best_dens = d
-                best_masks = m
-
-    return np.array(best_path)
+# EVOLVE-BLOCK-END

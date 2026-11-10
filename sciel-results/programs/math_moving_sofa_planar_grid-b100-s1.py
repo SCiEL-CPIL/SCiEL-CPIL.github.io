@@ -9,6 +9,13 @@ def _build_grid():
     X, Y = np.meshgrid(xs, ys, indexing='ij')
     return X.ravel(), Y.ravel()
 
+def _build_subgrid(step=3):
+    """Build a coarser grid for faster evaluation during optimization."""
+    xs = np.arange(-3.0, 1.5, 0.01 * step)
+    ys = np.arange(-1.5, 1.5, 0.01 * step)
+    X, Y = np.meshgrid(xs, ys, indexing='ij')
+    return X.ravel(), Y.ravel()
+
 def _densify_path(path):
     full = np.vstack([[0.0, 0.0, 0.0], path, [-2.0, 0.0, 90.0]])
     result = [full[0]]
@@ -23,12 +30,6 @@ def _densify_path(path):
             result.append(interp)
     return np.array(result)
 
-def _point_in_base(u, v):
-    # Base L-shape: {0<=u<=1, -3<=v<=1} U {-3<=u<=1, 0<=v<=1}
-    arm1 = (u >= 0) & (u <= 1) & (v >= -3) & (v <= 1)
-    arm2 = (u >= -3) & (u <= 1) & (v >= 0) & (v <= 1)
-    return arm1 | arm2
-
 def _evaluate_path(path, grid_x, grid_y):
     dense = _densify_path(path)
     n_points = len(grid_x)
@@ -40,7 +41,6 @@ def _evaluate_path(path, grid_x, grid_y):
         cos_a = np.cos(a_rad)
         sin_a = np.sin(a_rad)
         
-        # Rotate point by -a: R(-a) * (p - c)
         dx = grid_x - x
         dy = grid_y - y
         u = cos_a * dx + sin_a * dy
@@ -56,45 +56,69 @@ def _evaluate_path(path, grid_x, grid_y):
     
     return np.sum(inside) * 0.0001
 
-def _negative_area(params, grid_x, grid_y):
+def _coordinate_descent(params, grid_x, grid_y, deadline, max_rounds=50):
+    """Fast coordinate descent optimization using subgrid for speed."""
     n = len(params) // 3
-    path = params.reshape(n, 3)
-    # Ensure angles are in reasonable range
-    area = _evaluate_path(path, grid_x, grid_y)
-    return -area
+    path = params.copy().reshape(n, 3)
+    sub_x, sub_y = _build_subgrid(step=3)
+    
+    best_area = _evaluate_path(path, sub_x, sub_y)
+    
+    step_sizes = [0.5, 0.2, 0.1, 0.05, 0.02, 0.01, 0.005]
+    
+    for step_size in step_sizes:
+        if time.time() > deadline:
+            break
+        improved = True
+        while improved and time.time() < deadline:
+            improved = False
+            for i in range(n):
+                for dim in range(3):
+                    # Try positive and negative steps
+                    for direction in [1, -1]:
+                        trial = path.copy()
+                        trial[i, dim] += direction * step_size
+                        # Keep angles in reasonable range
+                        if dim == 2:
+                            trial[i, 2] = np.clip(trial[i, 2], -90, 180)
+                        area = _evaluate_path(trial, sub_x, sub_y)
+                        if area > best_area:
+                            path = trial
+                            best_area = area
+                            improved = True
+                            break
+    
+    # Validate on full grid
+    full_x, full_y = _build_grid()
+    full_area = _evaluate_path(path, full_x, full_y)
+    return path.flatten(), full_area
 
 def moving_sofa_2d() -> np.ndarray:
     start_time = time.time()
-    deadline = start_time + 580  # 580s safety margin
+    deadline = start_time + 590  # 590s safety margin
     
-    grid_x, grid_y = _build_grid()
+    # Use subgrid for fast optimization
+    sub_x, sub_y = _build_subgrid(step=3)
     
-    # Initial path: a reasonable starting guess
-    # The path should go from angle ~0 to ~90
-    # Let's use a smooth arc
+    # Initial path
     n_ctrl = 8
-    angles = np.linspace(10, 80, n_ctrl)
-    # x,y positions: inner corner should move appropriately
-    # At angle 0, corner at (0,0); at angle 90, corner at (-2,0)
-    # The corner should trace a path that allows maximum clearance
     t = np.linspace(0, 1, n_ctrl)
-    x = -2.0 * t  # linear from 0 to -2
-    y = 0.5 * np.sin(np.pi * t)  # slight arc
+    angles = np.linspace(10, 80, n_ctrl)
+    x = -2.0 * t
+    y = 0.5 * np.sin(np.pi * t)
     
     initial_params = np.column_stack([x, y, angles]).flatten()
     
     best_params = initial_params.copy()
-    best_area = _evaluate_path(initial_params.reshape(n_ctrl, 3), grid_x, grid_y)
+    best_area = _evaluate_path(initial_params.reshape(n_ctrl, 3), sub_x, sub_y)
     
-    # Try multiple optimization strategies
-    # Strategy 1: Nelder-Mead
+    # Strategy 1: Nelder-Mead on subgrid
     try:
         result = minimize(
-            _negative_area,
+            lambda p: -_evaluate_path(p.reshape(n_ctrl, 3), sub_x, sub_y),
             initial_params,
-            args=(grid_x, grid_y),
             method='Nelder-Mead',
-            options={'maxiter': 200, 'xatol': 0.01, 'fatol': 0.0001}
+            options={'maxiter': 150, 'xatol': 0.05, 'fatol': 0.001}
         )
         if result.fun < 0:
             area = -result.fun
@@ -105,29 +129,22 @@ def moving_sofa_2d() -> np.ndarray:
         pass
     
     if time.time() > deadline:
+        # Validate on full grid before returning
+        full_x, full_y = _build_grid()
+        final_area = _evaluate_path(best_params.reshape(n_ctrl, 3), full_x, full_y)
         return best_params.reshape(n_ctrl, 3)
     
-    # Strategy 2: COBYLA with more iterations
-    try:
-        result = minimize(
-            _negative_area,
-            best_params,
-            args=(grid_x, grid_y),
-            method='COBYLA',
-            options={'maxiter': 300, 'rhobeg': 0.1}
-        )
-        if result.fun < 0:
-            area = -result.fun
-            if area > best_area:
-                best_area = area
-                best_params = result.x.copy()
-    except:
-        pass
+    # Strategy 2: Coordinate descent on subgrid
+    params_cd, area_cd = _coordinate_descent(best_params, sub_x, sub_y, deadline)
+    if area_cd > best_area:
+        best_area = area_cd
+        best_params = params_cd
     
     if time.time() > deadline:
+        full_x, full_y = _build_grid()
         return best_params.reshape(n_ctrl, 3)
     
-    # Strategy 3: Try with more control points
+    # Strategy 3: Try with more control points on subgrid
     n_ctrl2 = 12
     t2 = np.linspace(0, 1, n_ctrl2)
     angles2 = np.linspace(8, 82, n_ctrl2)
@@ -137,40 +154,38 @@ def moving_sofa_2d() -> np.ndarray:
     
     try:
         result = minimize(
-            _negative_area,
+            lambda p: -_evaluate_path(p.reshape(n_ctrl2, 3), sub_x, sub_y),
             initial_params2,
-            args=(grid_x, grid_y),
             method='Nelder-Mead',
-            options={'maxiter': 300, 'xatol': 0.01, 'fatol': 0.0001}
+            options={'maxiter': 150, 'xatol': 0.05, 'fatol': 0.001}
         )
         if result.fun < 0:
             area = -result.fun
+            # Compare on subgrid first
             if area > best_area:
-                best_area = area
-                best_params = result.x.copy()
-                n_ctrl = n_ctrl2
+                # Validate on full grid
+                full_x, full_y = _build_grid()
+                full_area = _evaluate_path(result.x.reshape(n_ctrl2, 3), full_x, full_y)
+                if full_area > best_area:
+                    best_area = full_area
+                    best_params = result.x.copy()
+                    n_ctrl = n_ctrl2
     except:
         pass
     
     if time.time() > deadline:
+        full_x, full_y = _build_grid()
         return best_params.reshape(n_ctrl, 3)
     
-    # Local refinement
-    try:
-        result = minimize(
-            _negative_area,
-            best_params,
-            args=(grid_x, grid_y),
-            method='Nelder-Mead',
-            options={'maxiter': 200, 'xatol': 0.005, 'fatol': 0.00005}
-        )
-        if result.fun < 0:
-            area = -result.fun
-            if area > best_area:
-                best_area = area
-                best_params = result.x.copy()
-    except:
-        pass
+    # Final refinement with coordinate descent on subgrid
+    params_final, area_final = _coordinate_descent(best_params, sub_x, sub_y, deadline)
+    if area_final > best_area:
+        best_area = area_final
+        best_params = params_final
+    
+    # Final validation on full grid
+    full_x, full_y = _build_grid()
+    final_area = _evaluate_path(best_params.reshape(n_ctrl, 3), full_x, full_y)
     
     return best_params.reshape(n_ctrl, 3)
 

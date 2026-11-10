@@ -1,0 +1,177 @@
+import time
+import math
+
+def construct():
+    start_time = time.time()
+    deadline = start_time + 110.0  # 110s deadline to be safe
+    
+    # We will search for k up to N_MAX
+    # k * sigma(k) = M.
+    # We want to maximize the number of k for a single M.
+    # Let's try N_MAX = 2_000_000.
+    N_MAX = 2_000_000
+    
+    # 1. Sieve for smallest prime factors (SPF)
+    spf = list(range(N_MAX + 1))
+    for i in range(2, int(math.isqrt(N_MAX)) + 1):
+        if spf[i] == i:  # i is prime
+            for j in range(i*i, N_MAX + 1, i):
+                if spf[j] == j:
+                    spf[j] = i
+    
+    # 2. Compute sigma(k) for all k
+    sigma = [0] * (N_MAX + 1)
+    sigma[1] = 1
+    # We can compute sigma using the multiplicative property and SPF.
+    # sigma(n) = sigma(p^a * m) = sigma(p^a) * sigma(m) if gcd(p,m)=1
+    # Let n = p * m where p is the smallest prime factor.
+    # This is tricky to do in a single forward pass without storing extra info.
+    # Alternative: Use the formula sigma(n) = sum_{d|n} d.
+    # We can use a sieve-like approach to compute sigma directly?
+    # sigma is not easily computed by a simple additive sieve like sum of divisors.
+    # However, we can use the recurrence:
+    # If n = p^k * m, gcd(p,m)=1, sigma(n) = sigma(p^k) * sigma(m).
+    # Let's store for each n:
+    #   p = spf[n]
+    #   m = n // p
+    #   If m % p != 0:
+    #       sigma[n] = sigma[m] * (1 + p)
+    #   Else:
+    #       # n has p^2 as factor
+    #       # We need to know the power of p in n.
+    #       # This requires tracking the power or using a different structure.
+    
+    # Let's use a slightly more complex but robust method:
+    # For each prime p, iterate through multiples of p and add contributions?
+    # No, sigma is multiplicative.
+    
+    # Let's stick to the SPF method with auxiliary arrays:
+    # p_power[n] = highest power of spf[n] dividing n
+    # rest[n] = n // p_power[n]
+    
+    p_power = [1] * (N_MAX + 1)
+    rest = [1] * (N_MAX + 1)
+    sigma = [0] * (N_MAX + 1)
+    sigma[1] = 1
+    
+    for i in range(2, N_MAX + 1):
+        p = spf[i]
+        if i % p == 0:
+            # i = p * (i/p)
+            # Let's trace back to the highest power
+            # Actually, we can compute iteratively if we process in order.
+            # If spf[i] == p, let j = i // p.
+            # If spf[j] == p, then p divides j.
+            # This implies i = p * j.
+            
+            # Better approach:
+            # For each i, find p = spf[i].
+            # Let m = i // p.
+            # If m % p == 0:
+            #    p_power[i] = p * p_power[m]
+            #    rest[i] = rest[m]
+            # Else:
+            #    p_power[i] = p
+            #    rest[i] = m
+            # sigma[i] = sigma[rest[i]] * (1 + p + ... + p_power[i])
+            
+            m = i // p
+            if m % p == 0:
+                p_power[i] = p * p_power[m]
+                rest[i] = rest[m]
+            else:
+                p_power[i] = p
+                rest[i] = m
+            
+            # Calculate sum of geometric series 1 + p + ... + p_power[i]
+            # sum = (p_power[i] * p - 1) // (p - 1) if p > 1
+            # Or simply (p^(a+1) - 1)/(p-1) where p_power = p^a.
+            # p_power[i] is p^a. Sum = (p * p_power[i] - 1) // (p - 1)
+            
+            # Optimization: Precompute sums? Or just calculate.
+            # p_power[i] can be large? No, i <= 2e6.
+            
+            if p == 2:
+                # 1 + 2 + ... + 2^a = 2^(a+1) - 1
+                # p_power[i] = 2^a. Sum = 2 * p_power[i] - 1
+                geom_sum = 2 * p_power[i] - 1
+            else:
+                geom_sum = (p * p_power[i] - 1) // (p - 1)
+            
+            sigma[i] = sigma[rest[i]] * geom_sum
+        else:
+            # This case shouldn't happen if spf is correct and i>=2
+            # spf[i] always divides i.
+            pass
+
+    # 3. Count collisions
+    counts = {}
+    # We also want to keep track of the k's for the best M to return them.
+    # Storing all k's for all M is memory heavy.
+    # Strategy: First pass to find M_max with max count.
+    # Second pass to collect k's for M_max.
+    
+    for k in range(1, N_MAX + 1):
+        M = k * sigma[k]
+        if M > 10**18:
+            continue
+        if M in counts:
+            counts[M] += 1
+        else:
+            counts[M] = 1
+        
+        if time.time() > deadline - 5.0:
+            break
+
+    if not counts:
+        return {'M': 333312, 'k': [336, 372, 434]}
+
+    # Find M with max count
+    best_M = max(counts, key=counts.get)
+    best_count = counts[best_M]
+    
+    # Collect k's for best_M
+    # We need k such that k * sigma(k) == best_M and k <= isqrt(best_M)
+    k_list = []
+    limit = math.isqrt(best_M)
+    
+    # We only calculated sigma up to N_MAX.
+    # If any solution k > N_MAX, we missed it.
+    # But usually, if M is generated by small k's, the k's are small.
+    # Also, if k is large, k > sqrt(M) is not allowed.
+    # So we only care about k <= sqrt(M).
+    # If sqrt(M) > N_MAX, we might miss solutions.
+    # M ~ k^2 log k. If k=2e6, M ~ 4e12 * 10 ~ 4e13. sqrt(M) ~ 6e6.
+    # So if N_MAX = 2e6, we might miss k in (2e6, 6e6].
+    # To be safe, we should ensure N_MAX >= sqrt(M_max_found).
+    # However, M_max_found depends on the search.
+    # Let's check the best_M found.
+    
+    if limit > N_MAX:
+        # We need to extend the search or accept that we might have missed some.
+        # Given the time constraint, extending is risky.
+        # But 2e6 is a good start. Let's see if we can do better.
+        # Actually, if we find a collision among k < 2e6, the M is likely < (2e6 * sigma(2e6))^2? No.
+        # M = k sigma(k).
+        # If k=1000, M ~ 1000 * 2000 = 2e6. sqrt(M) ~ 1400.
+        # If k=2e6, M ~ 2e6 * 1e7 = 2e13. sqrt(M) ~ 4.5e6.
+        # So for large M, we need sigma up to 4.5e6.
+        # Let's increase N_MAX to 5_000_000 if time permits.
+        # But for now, let's just use what we have.
+        # If we miss solutions, the count is lower, but valid.
+        pass
+
+    for k in range(1, min(N_MAX, limit) + 1):
+        if k * sigma[k] == best_M:
+            k_list.append(k)
+    
+    # Sort and distinct
+    k_list = list(set(k_list))
+    k_list.sort()
+    
+    # Final check
+    if not k_list:
+         # Fallback
+         return {'M': 333312, 'k': [336, 372, 434]}
+         
+    return {'M': best_M, 'k': k_list}

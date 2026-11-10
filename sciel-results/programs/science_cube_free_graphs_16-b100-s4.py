@@ -3,108 +3,273 @@ import random
 
 def construct():
     start_time = time.time()
-    deadline = start_time + 115  # 115s to be safe
+    deadline = start_time + 115.0  # Safety margin
     
+    n = 16
+    all_edges = [(i, j) for i in range(n) for j in range(i+1, n)]
+    edge_index = {(u, v): i for i, (u, v) in enumerate(all_edges)}
+    m = len(all_edges) # 120
+    
+    # Precompute Q3 conflicts for each edge
+    # conflict_mask[i] is a bitmask of edges j such that adding edge j to a graph 
+    # containing edge i creates a Q3.
+    # This is not quite right. Conflict depends on the context (other edges present).
+    # However, we can precompute which sets of 8 vertices form a Q3.
+    # A Q3 is a specific subgraph. If the graph contains all edges of a Q3, it's invalid.
+    # So we are looking for a set of edges that does NOT contain the edge set of any Q3.
+    # This is the Independent Set problem in a hypergraph, or equivalently,
+    # we can view it as finding a set of edges with no "forbidden" subset.
+    
+    # Let's stick to the greedy + local search but optimize the check.
+    # The current `creates_q3` is O(k^4) or worse.
+    # We can precompute for each pair of edges (u,v) and (a,b) if they can be part of a Q3?
+    # Actually, the most expensive part is the search for e and f.
+    
+    # Let's try a different approach:
+    # 1. Generate a random initial graph (greedy).
+    # 2. Use simulated annealing or tabu search to improve it.
+    # Moves: Add edge, Remove edge, Swap edge.
+    # Objective: Maximize number of edges subject to no Q3.
+    
+    # To speed up `creates_q3`, we can precompute common neighbors?
+    # No, common neighbors change.
+    
+    # Optimization of creates_q3:
+    # Instead of iterating all a, b, c, d, we can iterate over potential Q3s.
+    # How many Q3s are there in K16?
+    # A Q3 is determined by 8 vertices. C(16,8) = 12870.
+    # For each set of 8 vertices, how many ways to form a Q3?
+    # The Q3 is the cube graph. It has 12 edges.
+    # So for each set of 8 vertices, there are multiple ways to label them as a cube.
+    # The number of isomorphic copies of Q3 in K8 is 120 (automorphisms of Q3? No, embeddings).
+    # Actually, it's easier to just check if a specific set of 12 edges exists.
+    
+    # Let's precompute all Q3 edge sets.
+    # There are 12870 sets of 8 vertices.
+    # For each set, we can check if it contains a Q3.
+    # But we need to know WHICH edges form the Q3 to mark them as conflicting.
+    
+    # Alternative:
+    # Precompute for every triple of edges if they form a "corner" of a Q3?
+    
+    # Let's optimize the current `creates_q3` first.
+    # The inner loops are the bottleneck.
+    
+    def creates_q3(u, v, adj):
+        mask_u = adj[u] & ~(1 << v)
+        mask_v = adj[v] & ~(1 << u)
+        
+        # Get list of neighbors
+        # If degree is low, this is fast.
+        
+        # Iterate a in mask_u
+        mask_a = mask_u
+        while mask_a:
+            lsb_a = mask_a & -mask_a
+            a = lsb_a.bit_length() - 1
+            mask_a ^= lsb_a
+            
+            # Iterate b in mask_u excluding a
+            mask_b = mask_u & ~lsb_a
+            while mask_b:
+                lsb_b = mask_b & -mask_b
+                b = lsb_b.bit_length() - 1
+                mask_b ^= lsb_b
+                
+                # c in N(v) \ {u} AND N(a)
+                mask_c = mask_v & adj[a]
+                # d in N(v) \ {u} AND N(b)
+                mask_d = mask_v & adj[b]
+                
+                # We need (a,c) and (b,d) to be edges.
+                # And (a,e), (b,e) and (c,f), (d,f) and (e,f).
+                
+                # Optimization:
+                # If mask_c is empty or mask_d is empty, skip.
+                if not mask_c or not mask_d:
+                    continue
+                
+                # Iterate c in mask_c
+                mask_c_iter = mask_c
+                while mask_c_iter:
+                    lsb_c = mask_c_iter & -mask_c_iter
+                    c = lsb_c.bit_length() - 1
+                    mask_c_iter ^= lsb_c
+                    
+                    if c == a or c == b:
+                        continue
+                        
+                    # d in mask_d, d != c
+                    mask_d_iter = mask_d & ~lsb_c
+                    while mask_d_iter:
+                        lsb_d = mask_d_iter & -mask_d_iter
+                        d = lsb_d.bit_length() - 1
+                        mask_d_iter ^= lsb_d
+                        
+                        if d == a or d == b or d == c:
+                            continue
+                        
+                        # Check e, f
+                        # e in N(a) \cap N(b) \ {u,v,a,b,c,d}
+                        # f in N(c) \cap N(d) \ {u,v,a,b,c,d}
+                        # e != f, (e,f) edge.
+                        
+                        # Precompute intersection?
+                        # adj[a] & adj[b] is fast.
+                        mask_e = (adj[a] & adj[b]) & ~((1 << u) | (1 << v) | (1 << a) | (1 << b) | (1 << c) | (1 << d))
+                        if mask_e == 0:
+                            continue
+                            
+                        mask_f = (adj[c] & adj[d]) & ~((1 << u) | (1 << v) | (1 << a) | (1 << b) | (1 << c) | (1 << d))
+                        if mask_f == 0:
+                            continue
+                        
+                        # Check if there is e in mask_e and f in mask_f such that e!=f and (e,f) edge.
+                        # This is equivalent to:
+                        # Does mask_e intersect with (union of N(f) for f in mask_f)?
+                        # Or simpler: iterate e, check if mask_f & adj[e] & ~lsb_e is non-empty.
+                        
+                        # Optimization:
+                        # If mask_e has only 1 bit, check that one.
+                        # If mask_f has only 1 bit, check that one.
+                        
+                        # General case:
+                        # We want to know if there exists e in mask_e, f in mask_f s.t. e!=f and adj[e] has bit f.
+                        
+                        # Let's try to iterate the smaller set.
+                        if mask_e.bit_count() < mask_f.bit_count():
+                            mask_e_iter = mask_e
+                            while mask_e_iter:
+                                lsb_e = mask_e_iter & -mask_e_iter
+                                e = lsb_e.bit_length() - 1
+                                mask_e_iter ^= lsb_e
+                                if mask_f & adj[e] & ~lsb_e:
+                                    return True
+                        else:
+                            mask_f_iter = mask_f
+                            while mask_f_iter:
+                                lsb_f = mask_f_iter & -mask_f_iter
+                                f = lsb_f.bit_length() - 1
+                                mask_f_iter ^= lsb_f
+                                if mask_e & adj[f] & ~lsb_f:
+                                    return True
+        return False
+
     best_edges = []
     best_count = 0
     
-    # Pre-compute all possible edges
-    all_edges = [(i, j) for i in range(16) for j in range(i+1, 16)]
-    
-    # Shuffle and try
-    # We will run multiple random restarts
-    while time.time() < deadline:
-        random.shuffle(all_edges)
-        adj = [0] * 16  # Bitmasks
-        current_edges = []
+    # Greedy construction
+    def greedy_construct():
+        adj = [0] * n
+        edges = []
+        shuffled_edges = all_edges[:]
+        random.shuffle(shuffled_edges)
         
-        for u, v in all_edges:
-            # Check if adding (u, v) creates a Q3
+        for u, v in shuffled_edges:
             if not creates_q3(u, v, adj):
-                # Add edge
                 adj[u] |= (1 << v)
                 adj[v] |= (1 << u)
-                current_edges.append([u, v])
-                
-        if len(current_edges) > best_count:
-            best_count = len(current_edges)
-            best_edges = current_edges.copy()
-            
-    return best_edges
+                edges.append((u, v))
+        return adj, edges
 
-def creates_q3(u, v, adj):
-    # Check if there exists a Q3 containing (u, v) in the graph defined by adj + (u, v)
-    # We assume (u, v) is present.
-    # We need to find 6 other vertices forming the rest of the cube.
-    
-    # Slots:
-    # 0: u (000)
-    # 1: v (001)
-    # 2: s1 (010)
-    # 3: s2 (011)
-    # 4: s3 (100)
-    # 5: s4 (101)
-    # 6: s5 (110)
-    # 7: s6 (111)
-    
-    # Edges to check (excluding u-v):
-    # (u, s1), (u, s3)
-    # (v, s2), (v, s4)
-    # (s1, s2), (s1, s5)
-    # (s3, s4), (s3, s5)
-    # (s2, s6), (s4, s6)
-    # (s5, s6)
-    
-    # Candidates for s1, s3: neighbors of u (excluding v)
-    # Candidates for s2, s4: neighbors of v (excluding u)
-    
-    # Get neighbors
-    n_u = [x for x in range(16) if x != v and (adj[u] >> x) & 1]
-    n_v = [x for x in range(16) if x != u and (adj[v] >> x) & 1]
-    
-    # We need s1, s3 from n_u, distinct.
-    # We need s2, s4 from n_v, distinct.
-    # s5, s6 from remaining vertices.
-    
-    # To speed up, we can iterate s1, s3 from n_u
-    # and s2, s4 from n_v
-    # Then check if there exist s5, s6.
-    
-    for s1 in n_u:
-        for s3 in n_u:
-            if s1 == s3: continue
+    # Local Search
+    def local_search(adj, edges):
+        improved = True
+        while improved:
+            improved = False
+            # Try to add edges
+            missing_edges = [e for e in all_edges if not ((adj[e[0]] >> e[1]) & 1)]
+            random.shuffle(missing_edges)
             
-            # Check edges (u, s1) and (u, s3) are already satisfied by selection
-            # Now check (s1, s2) and (s3, s4) later?
-            # Let's pick s2, s4 from n_v
+            for u, v in missing_edges:
+                if not creates_q3(u, v, adj):
+                    adj[u] |= (1 << v)
+                    adj[v] |= (1 << u)
+                    edges.append((u, v))
+                    improved = True
+            # Try to swap edges?
+            # Remove an edge, try to add 2?
+            # For now, just adding is safe.
+        return adj, edges
+
+    # Simulated Annealing / Tabu
+    def tabu_search(adj, edges):
+        current_adj = adj[:]
+        current_edges = edges[:]
+        current_score = len(current_edges)
+        best_adj = current_adj[:]
+        best_edges = current_edges[:]
+        best_score = current_score
+        
+        tabu_list = []
+        tabu_tenure = 10
+        
+        for step in range(500):
+            if time.time() > deadline:
+                break
             
-            for s2 in n_v:
-                for s4 in n_v:
-                    if s2 == s4: continue
-                    if s2 == s1 or s2 == s3: continue
-                    if s4 == s1 or s4 == s3: continue
-                    
-                    # Check edges (s1, s2) and (s3, s4)
-                    if not ((adj[s1] >> s2) & 1): continue
-                    if not ((adj[s3] >> s4) & 1): continue
-                    
-                    # Now we need s5, s6
-                    # s5 must be connected to s1, s3, s6
-                    # s6 must be connected to s2, s4, s5
-                    
-                    # Candidates for s5: neighbors of s1 and s3, not in {u, v, s1, s2, s3, s4}
-                    # Candidates for s6: neighbors of s2 and s4, not in {u, v, s1, s2, s3, s4}
-                    
-                    used = {u, v, s1, s2, s3, s4}
-                    cand_s5 = [x for x in range(16) if x not in used and (adj[s1] >> x) & 1 and (adj[s3] >> x) & 1]
-                    cand_s6 = [x for x in range(16) if x not in used and (adj[s2] >> x) & 1 and (adj[s4] >> x) & 1]
-                    
-                    for s5 in cand_s5:
-                        for s6 in cand_s6:
-                            if s5 == s6: continue
-                            # Check (s1, s5), (s3, s5) already checked for s5 in cand_s5
-                            # Check (s2, s6), (s4, s6) already checked for s6 in cand_s6
-                            # Check (s5, s6)
-                            if (adj[s5] >> s6) & 1:
-                                return True
-    return False
+            # Generate move: Remove a random edge from current_edges
+            if not current_edges:
+                break
+            idx = random.randint(0, len(current_edges) - 1)
+            u_rem, v_rem = current_edges[idx]
+            
+            # Check tabu
+            if (u_rem, v_rem) in tabu_list:
+                continue
+                
+            # Remove
+            current_adj[u_rem] &= ~(1 << v_rem)
+            current_adj[v_rem] &= ~(1 << u_rem)
+            current_edges.pop(idx)
+            
+            # Try to add as many edges as possible
+            missing = [e for e in all_edges if not ((current_adj[e[0]] >> e[1]) & 1)]
+            random.shuffle(missing)
+            
+            added = []
+            for u, v in missing:
+                if not creates_q3(u, v, current_adj):
+                    current_adj[u] |= (1 << v)
+                    current_adj[v] |= (1 << u)
+                    current_edges.append((u, v))
+                    added.append((u, v))
+            
+            new_score = len(current_edges)
+            
+            # Accept if better or random (annealing)
+            # Simple hill climbing for now
+            if new_score >= current_score:
+                current_score = new_score
+                if new_score > best_score:
+                    best_score = new_score
+                    best_adj = current_adj[:]
+                    best_edges = current_edges[:]
+            else:
+                # Revert
+                # This is messy. Let's just restart if we get stuck?
+                # Or simple random restarts.
+                pass
+            
+            # Update tabu
+            tabu_list.append((u_rem, v_rem))
+            if len(tabu_list) > tabu_tenure:
+                tabu_list.pop(0)
+                
+        return best_adj, best_edges
+
+    while time.time() < deadline:
+        adj, edges = greedy_construct()
+        adj, edges = local_search(adj, edges)
+        if len(edges) > best_count:
+            best_count = len(edges)
+            best_edges = edges[:]
+            
+        # Run a short tabu search
+        if time.time() < deadline - 5:
+            _, edges_tabu = tabu_search(adj, edges)
+            if len(edges_tabu) > best_count:
+                best_count = len(edges_tabu)
+                best_edges = edges_tabu[:]
+
+    return [[u, v] for u, v in best_edges]

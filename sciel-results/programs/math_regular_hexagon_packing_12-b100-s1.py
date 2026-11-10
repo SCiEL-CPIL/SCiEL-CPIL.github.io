@@ -1,9 +1,9 @@
 # EVOLVE-BLOCK-START
 import numpy as np
 import time
+import random
 
 def _hex_vertices(cx, cy, side, angle_deg):
-    """Compute 6 vertices of a regular hexagon centered at (cx,cy) with given side and angle."""
     a = np.radians(angle_deg)
     angles = a + np.arange(6) * np.pi / 3.0
     return np.column_stack([
@@ -11,40 +11,46 @@ def _hex_vertices(cx, cy, side, angle_deg):
         cy + side * np.sin(angles)
     ])
 
+def _compute_all_vertices(centers, angles_deg, side=1.0):
+    n = len(centers)
+    verts = np.empty((n * 6, 2))
+    for i in range(n):
+        verts[i*6:(i+1)*6] = _hex_vertices(centers[i,0], centers[i,1], side, angles_deg[i])
+    return verts
+
 def _min_outer_side(vertices_all):
-    """
-    Given array of all inner hexagon vertices (shape (72,2)), compute minimum outer hex side s
-    (centered at origin, angle 0) that contains all vertices.
-    """
     k = np.arange(6)
-    angles = (k + 0.5) * np.pi / 3  # 30, 90, 150, 210, 270, 330 degrees
-    m = np.column_stack([np.cos(angles), np.sin(angles)])  # shape (6,2)
-    
-    dots = vertices_all @ m.T  # shape (N, 6)
-    max_dot = np.max(dots, axis=1)  # shape (N,)
+    angles = (k + 0.5) * np.pi / 3
+    m = np.column_stack([np.cos(angles), np.sin(angles)])
+    dots = vertices_all @ m.T
+    max_dot = np.max(dots, axis=1)
     global_max = np.max(max_dot)
-    
     if global_max < 0:
         global_max = 0.0
-    
     s_min = (2.0 / np.sqrt(3.0)) * global_max
     return s_min
 
+def _min_outer_side_smooth(vertices_all, beta=50.0):
+    k = np.arange(6)
+    angles = (k + 0.5) * np.pi / 3
+    m = np.column_stack([np.cos(angles), np.sin(angles)])
+    dots = vertices_all @ m.T
+    max_per_vertex = np.max(dots, axis=1)
+    max_val = np.max(max_per_vertex)
+    if max_val < 0:
+        max_val = 0.0
+    shifted = max_per_vertex - max_val
+    log_sum_exp = max_val + np.log(np.sum(np.exp(beta * shifted)) / len(max_per_vertex)) / beta
+    s_min = (2.0 / np.sqrt(3.0)) * log_sum_exp
+    return s_min
+
 def _check_nonoverlap(centers, angles_deg, side=1.0, tol=1e-6):
-    """
-    Check if all pairs of hexagons are non-overlapping using SAT.
-    Returns True if no overlap, False otherwise.
-    centers: (12,2), angles_deg: (12,)
-    """
     n = len(centers)
     vertices_list = []
+    normals_list = []
     for i in range(n):
         verts = _hex_vertices(centers[i,0], centers[i,1], side, angles_deg[i])
         vertices_list.append(verts)
-    
-    # Precompute edge normals for each hexagon
-    normals_list = []
-    for verts in vertices_list:
         normals = []
         for e in range(6):
             p1 = verts[e]
@@ -60,7 +66,6 @@ def _check_nonoverlap(centers, angles_deg, side=1.0, tol=1e-6):
         for j in range(i+1, n):
             v1 = vertices_list[i]
             v2 = vertices_list[j]
-            # SAT: check all 12 edge normals (6 from each hexagon)
             overlap = True
             for hex_idx in range(2):
                 verts = [v1, v2][hex_idx]
@@ -79,26 +84,14 @@ def _check_nonoverlap(centers, angles_deg, side=1.0, tol=1e-6):
                 return False
     return True
 
-def _compute_all_vertices(centers, angles_deg, side=1.0):
-    """Compute all 72 vertices of 12 hexagons."""
-    verts = []
-    for i in range(len(centers)):
-        verts.append(_hex_vertices(centers[i,0], centers[i,1], side, angles_deg[i]))
-    return np.vstack(verts)
-
 def _initial_honeycomb():
-    """
-    Create initial honeycomb-like arrangement of 12 hexagons.
-    """
     d = np.sqrt(3.0)
     positions = []
     angles = []
     
-    # Center
     positions.append([0.0, 0.0])
     angles.append(0.0)
     
-    # Inner ring: 6 hexagons
     for k in range(6):
         angle = k * np.pi / 3
         x = d * np.cos(angle)
@@ -106,7 +99,6 @@ def _initial_honeycomb():
         positions.append([x, y])
         angles.append(0.0)
     
-    # Outer ring: 5 more hexagons
     d2 = 2.0 * d
     for k in range(5):
         angle = (k * 72 + 30) * np.pi / 180
@@ -119,28 +111,36 @@ def _initial_honeycomb():
     angles = np.array(angles)
     return positions, angles
 
-def _objective(params, side=1.0):
-    """
-    Objective: minimize outer hex side s, with penalty for overlaps.
-    params: (36,) = [x1,y1,theta1, x2,y2,theta2, ..., x12,y12,theta12]
-    """
+def _objective_smooth(params, beta=50.0):
     params_2d = params.reshape(12, 3)
     centers = params_2d[:, :2]
     angles_deg = params_2d[:, 2]
     
-    all_verts = _compute_all_vertices(centers, angles_deg, side)
+    all_verts = _compute_all_vertices(centers, angles_deg)
+    s = _min_outer_side_smooth(all_verts, beta)
+    
+    if not _check_nonoverlap(centers, angles_deg):
+        return s + 50.0
+    
+    return s
+
+def _objective_exact(params):
+    params_2d = params.reshape(12, 3)
+    centers = params_2d[:, :2]
+    angles_deg = params_2d[:, 2]
+    
+    all_verts = _compute_all_vertices(centers, angles_deg)
     s = _min_outer_side(all_verts)
     
-    if not _check_nonoverlap(centers, angles_deg, side):
+    if not _check_nonoverlap(centers, angles_deg):
         return s + 50.0
     
     return s
 
 def hexagon_packing_12():
     start_time = time.time()
-    deadline = start_time + 580.0
+    deadline = start_time + 590.0  # 10s safety margin
     
-    # Start with honeycomb arrangement
     centers, angles_deg = _initial_honeycomb()
     params = np.column_stack([centers, angles_deg]).flatten()
     
@@ -158,26 +158,44 @@ def hexagon_packing_12():
         best_s = _min_outer_side(all_verts)
         best_params = params.copy()
     
-    # Simulated annealing with adaptive step size
     np.random.seed(42)
+    random.seed(42)
+    
+    # Phase 1: Directed Simulated Annealing (single-hexagon moves)
     T = 0.5
-    cooling = 0.9995
+    cooling = 0.99985
     step_size = 0.3
+    angle_step = 5.0
     accept_count = 0
     total_count = 0
     
     current_params = best_params.copy()
     current_s = best_s
     
-    max_iters = 500000
+    max_iters = 400000
     for it in range(max_iters):
-        if time.time() > deadline:
+        if time.time() > deadline - 250.0:
             break
         
-        new_params = current_params + np.random.randn(36) * step_size
+        # Pick random hexagon to move (directed move)
+        i = random.randint(0, 11)
         
-        centers_new = new_params.reshape(12, 3)[:, :2]
-        angles_new = new_params.reshape(12, 3)[:, 2]
+        old_cx = current_params[i*3]
+        old_cy = current_params[i*3+1]
+        old_ang = current_params[i*3+2]
+        
+        # Generate new position for this hexagon
+        new_cx = old_cx + np.random.randn() * step_size
+        new_cy = old_cy + np.random.randn() * step_size
+        new_ang = old_ang + np.random.randn() * angle_step
+        
+        # Apply move
+        current_params[i*3] = new_cx
+        current_params[i*3+1] = new_cy
+        current_params[i*3+2] = new_ang
+        
+        centers_new = current_params.reshape(12, 3)[:, :2]
+        angles_new = current_params.reshape(12, 3)[:, 2]
         
         all_verts_new = _compute_all_vertices(centers_new, angles_new)
         s_new = _min_outer_side(all_verts_new)
@@ -188,32 +206,78 @@ def hexagon_packing_12():
         delta = s_new - current_s
         total_count += 1
         
-        if delta < 0 or np.random.random() < np.exp(-delta / T):
-            current_params = new_params
+        if delta < 0 or np.random.random() < np.exp(-delta / max(T, 1e-10)):
             current_s = s_new
             accept_count += 1
             if s_new < best_s:
                 best_s = s_new
-                best_params = new_params.copy()
+                best_params = current_params.copy()
+        else:
+            # Revert
+            current_params[i*3] = old_cx
+            current_params[i*3+1] = old_cy
+            current_params[i*3+2] = old_ang
         
         T *= cooling
         
-        # Adaptive step size: adjust based on acceptance rate
         if it % 500 == 0 and it > 0:
-            acc_rate = accept_count / total_count
-            if acc_rate < 0.2:
-                step_size *= 0.8
-            elif acc_rate > 0.8:
-                step_size *= 1.2
-            step_size = np.clip(step_size, 0.01, 1.0)
+            acc_rate = accept_count / max(total_count, 1)
+            if acc_rate < 0.15:
+                step_size *= 0.85
+                angle_step *= 0.85
+            elif acc_rate > 0.75:
+                step_size *= 1.15
+                angle_step *= 1.15
+            step_size = np.clip(step_size, 0.01, 1.5)
+            angle_step = np.clip(angle_step, 0.5, 15.0)
             accept_count = 0
             total_count = 0
     
-    # Final refinement with smaller steps
-    for _ in range(20000):
-        if time.time() > deadline:
+    # Phase 2: Gradient-based optimization with smooth surrogate
+    from scipy.optimize import minimize
+    
+    n_starts = 10
+    for si in range(n_starts):
+        if time.time() > deadline - 100.0:
             break
-        trial = best_params + np.random.randn(36) * 0.03
+        
+        if si == 0:
+            x0 = best_params.copy()
+        elif si == 1:
+            x0 = best_params + np.random.randn(36) * 0.05
+        elif si == 2:
+            x0 = best_params + np.random.randn(36) * 0.1
+        elif si == 3:
+            x0 = best_params + np.random.randn(36) * 0.15
+        elif si == 4:
+            x0 = best_params + np.random.randn(36) * 0.2
+        else:
+            x0 = best_params + np.random.randn(36) * (0.08 + 0.04 * si)
+        
+        try:
+            result = minimize(
+                _objective_smooth,
+                x0,
+                method='L-BFGS-B',
+                options={'maxiter': 1000, 'maxls': 100, 'ftol': 1e-13, 'gtol': 1e-11},
+                tol=1e-13
+            )
+            
+            c = result.x.reshape(12, 3)[:, :2]
+            a = result.x.reshape(12, 3)[:, 2]
+            if _check_nonoverlap(c, a):
+                s_exact = _min_outer_side(_compute_all_vertices(c, a))
+                if s_exact < best_s:
+                    best_s = s_exact
+                    best_params = result.x.copy()
+        except Exception:
+            pass
+    
+    # Phase 3: Fine polish with small random steps
+    for _ in range(40000):
+        if time.time() > deadline - 30.0:
+            break
+        trial = best_params + np.random.randn(36) * 0.015
         c = trial.reshape(12,3)[:, :2]
         a = trial.reshape(12,3)[:, 2]
         if not _check_nonoverlap(c, a):
@@ -223,11 +287,25 @@ def hexagon_packing_12():
             best_s = s_trial
             best_params = trial
     
-    # Very fine polish
-    for _ in range(5000):
-        if time.time() > deadline:
+    # Phase 4: Ultra-fine polish
+    for _ in range(25000):
+        if time.time() > deadline - 10.0:
             break
-        trial = best_params + np.random.randn(36) * 0.01
+        trial = best_params + np.random.randn(36) * 0.004
+        c = trial.reshape(12,3)[:, :2]
+        a = trial.reshape(12,3)[:, 2]
+        if not _check_nonoverlap(c, a):
+            continue
+        s_trial = _min_outer_side(_compute_all_vertices(c, a))
+        if s_trial < best_s:
+            best_s = s_trial
+            best_params = trial
+    
+    # Phase 5: Very fine polish
+    for _ in range(15000):
+        if time.time() > deadline - 3.0:
+            break
+        trial = best_params + np.random.randn(36) * 0.001
         c = trial.reshape(12,3)[:, :2]
         a = trial.reshape(12,3)[:, 2]
         if not _check_nonoverlap(c, a):

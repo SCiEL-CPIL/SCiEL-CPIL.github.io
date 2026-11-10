@@ -1,219 +1,225 @@
 # EVOLVE-BLOCK-START
 import numpy as np
-import time
 from scipy.optimize import minimize
-
-def _hex_vertices(cx, cy, d, angle_deg):
-    """Return 6 vertices of a regular hexagon centered at (cx,cy) with side d and angle in degrees."""
-    a = np.radians(angle_deg)
-    angles = a + np.radians(60 * np.arange(6))
-    return np.column_stack([cx + d * np.cos(angles), cy + d * np.sin(angles)])
-
-def _get_all_inner_vertices(positions):
-    """Return (72, 2) array of all vertices of 12 unit hexagons at given positions (angle 0)."""
-    n = len(positions)
-    all_verts = np.empty((n * 6, 2))
-    for i in range(n):
-        cx, cy = positions[i]
-        verts = _hex_vertices(cx, cy, 1.0, 0)
-        all_verts[i*6:(i+1)*6] = verts
-    return all_verts
-
-def _check_separation_fast(positions):
-    """
-    Check if all pairs of unit hexagons at given positions are separated.
-    Returns True if separated, False otherwise.
-    Uses Separating Axis Theorem.
-    """
-    n = len(positions)
-    verts_list = []
-    for i in range(n):
-        verts_list.append(_hex_vertices(positions[i, 0], positions[i, 1], 1.0, 0))
-    
-    for i in range(n):
-        vi = verts_list[i]
-        for j in range(i+1, n):
-            vj = verts_list[j]
-            found_sep = False
-            for k in range(6):
-                p1 = vi[k]
-                p2 = vi[(k+1) % 6]
-                edge = p2 - p1
-                normal = np.array([-edge[1], edge[0]])
-                proj_i = vi @ normal
-                proj_j = vj @ normal
-                if proj_i.max() < proj_j.min() - 1e-6 or proj_j.max() < proj_i.min() - 1e-6:
-                    found_sep = True
-                    break
-            if found_sep:
-                continue
-            for k in range(6):
-                p1 = vj[k]
-                p2 = vj[(k+1) % 6]
-                edge = p2 - p1
-                normal = np.array([-edge[1], edge[0]])
-                proj_i = vi @ normal
-                proj_j = vj @ normal
-                if proj_i.max() < proj_j.min() - 1e-6 or proj_j.max() < proj_i.min() - 1e-6:
-                    found_sep = True
-                    break
-            if not found_sep:
-                return False
-    return True
-
-def _min_containing_hex_side(positions, ocx, ocy, angle_deg):
-    """
-    Compute minimum side length s of a regular hexagon centered at (ocx, ocy)
-    with given angle that contains all vertices of unit hexagons at positions.
-    """
-    all_verts = _get_all_inner_vertices(positions)
-    a_rad = np.radians(angle_deg)
-    normal_angles = a_rad + np.radians(30 + 60 * np.arange(6))
-    normals = np.column_stack([np.cos(normal_angles), np.sin(normal_angles)])
-    
-    # Shift vertices relative to outer center
-    shifted = all_verts - np.array([ocx, ocy])
-    dots = shifted @ normals.T
-    max_dot = np.max(dots)
-    
-    s = (2.0 / np.sqrt(3.0)) * max_dot
-    return s
-
-def _objective(params):
-    """
-    Objective function for optimization.
-    params: (27,) array. First 24 are (x1, y1, ..., x12, y12), next 2 are outer center (ox, oy), last is angle_deg.
-    Returns s (outer hexagon side length) or penalty.
-    """
-    positions = params[:24].reshape(12, 2)
-    ocx, ocy = params[24], params[25]
-    angle_deg = params[26]
-    
-    if not _check_separation_fast(positions):
-        return 1000.0
-    
-    s = _min_containing_hex_side(positions, ocx, ocy, angle_deg)
-    return s
-
-def _hex_lattice_positions(spacing_scale=1.0):
-    """Generate a hexagonal lattice arrangement of 12 unit hexagons."""
-    s = spacing_scale
-    h = 2.5 * s
-    v = 2.165 * s
-    
-    positions = np.array([
-        [0.0, 0.0],
-        [-h, 0.0],
-        [h, 0.0],
-        [-h/2, v],
-        [h/2, v],
-        [-h/2, -v],
-        [h/2, -v],
-        [-3*h/2, v],
-        [3*h/2, v],
-        [-3*h/2, -v],
-        [3*h/2, -v],
-        [0.0, -2*v],
-    ])
-    return positions
-
-def _circular_positions(radius=2.0):
-    """Generate positions on a circle."""
-    angles = np.linspace(0, 2*np.pi, 12, endpoint=False)
-    positions = np.column_stack([radius * np.cos(angles), radius * np.sin(angles)])
-    return positions
+import itertools
 
 def hexagon_packing_12():
     """
-    Constructs a packing of 12 disjoint unit regular hexagons inside a larger regular hexagon.
+    Constructs a packing of 12 disjoint unit regular hexagons inside a larger regular hexagon, minimizing the side length.
+    Returns
+        inner_hex_data: np.ndarray of shape (12,3)
+        outer_hex_data: np.ndarray of shape (3,)
+        outer_hex_side_length: float
     """
-    start_time = time.time()
-    deadline = start_time + 580
     
-    np.random.seed(42)
-    
-    best_s = float('inf')
+    def get_hex_vertices(cx, cy, side, angle_deg):
+        """
+        Returns vertices of a regular hexagon.
+        angle_deg is the angle of the first vertex (i=0) relative to x-axis.
+        """
+        angle_rad = np.deg2rad(angle_deg)
+        vertices = []
+        for i in range(6):
+            theta = angle_rad + i * np.pi / 3
+            x = cx + side * np.cos(theta)
+            y = cy + side * np.sin(theta)
+            vertices.append([x, y])
+        return np.array(vertices)
+
+    def get_normals(vertices):
+        """
+        Returns unit outward normals for the edges of a convex polygon given in CCW order.
+        """
+        n = len(vertices)
+        normals = np.zeros((n, 2))
+        for i in range(n):
+            p1 = vertices[i]
+            p2 = vertices[(i + 1) % n]
+            edge = p2 - p1
+            # Outward normal for CCW polygon: rotate edge by -90 deg
+            # (x, y) -> (y, -x)
+            normal = np.array([edge[1], -edge[0]])
+            norm = np.linalg.norm(normal)
+            if norm > 1e-10:
+                normals[i] = normal / norm
+        return normals
+
+    def project_vertices(vertices, normal):
+        """
+        Projects vertices onto a normal vector, returns (min, max) dot products.
+        """
+        dots = vertices @ normal
+        return np.min(dots), np.max(dots)
+
+    def check_separation(hex1_verts, hex1_normals, hex2_verts, hex2_normals):
+        """
+        Returns True if hexagons are separated (disjoint), False if they overlap.
+        Uses Separating Axis Theorem.
+        """
+        # Check normals of hex1
+        for n in hex1_normals:
+            min1, max1 = project_vertices(hex1_verts, n)
+            min2, max2 = project_vertices(hex2_verts, n)
+            if max1 < min2 - 1e-9 or max2 < min1 - 1e-9:
+                return True # Separated
+        
+        # Check normals of hex2
+        for n in hex2_normals:
+            min1, max1 = project_vertices(hex1_verts, n)
+            min2, max2 = project_vertices(hex2_verts, n)
+            if max1 < min2 - 1e-9 or max2 < min1 - 1e-9:
+                return True # Separated
+        
+        return False # Overlapping
+
+    def objective(params):
+        """
+        params: array of 36 values (12 * (x, y, angle_deg))
+        Returns: Minimal side length S of outer hexagon (centered at 0,0, angle 0) 
+                 required to contain all inner hexagons, plus penalty if they overlap.
+        """
+        n_hex = 12
+        hexes = []
+        for i in range(n_hex):
+            x = params[3*i]
+            y = params[3*i+1]
+            angle = params[3*i+2]
+            verts = get_hex_vertices(x, y, 1.0, angle)
+            normals = get_normals(verts)
+            hexes.append((verts, normals))
+        
+        # Check separation
+        overlap_penalty = 0.0
+        for i in range(n_hex):
+            for j in range(i+1, n_hex):
+                if not check_separation(hexes[i][0], hexes[i][1], hexes[j][0], hexes[j][1]):
+                    # Calculate overlap depth roughly for penalty? 
+                    # Just a large constant penalty is often enough for Nelder-Mead to push them apart
+                    overlap_penalty += 10.0
+        
+        if overlap_penalty > 0:
+            return overlap_penalty + 100.0 # Ensure it's worse than any valid S
+
+        # Calculate required S for outer hexagon (centered at 0,0, angle 0)
+        # Outer hexagon normals (for angle 0, vertex at (S,0)):
+        # Vertices at 0, 60, 120, 180, 240, 300 degrees.
+        # Edges are between these.
+        # Normal to edge between 0 and 60: 
+        # Edge vector: (cos60-1, sin60-0) = (-0.5, 0.866). 
+        # Outward normal: (0.866, 0.5) -> angle 30 deg.
+        # Normals are at 30, 90, 150, 210, 270, 330 degrees.
+        outer_normals = []
+        for k in range(6):
+            theta = np.deg2rad(30 + 60*k)
+            outer_normals.append(np.array([np.cos(theta), np.sin(theta)]))
+        
+        max_dist = 0.0
+        for i in range(n_hex):
+            verts, _ = hexes[i]
+            for n in outer_normals:
+                # Distance from origin to the plane defined by normal n and passing through vertex v
+                # We need S such that all vertices v satisfy v . n <= S * sqrt(3) / 2
+                # So S >= 2/sqrt(3) * v . n
+                # Note: v . n can be negative, but we take max over all vertices and normals.
+                # Since normals point out, and hex is centered at 0, we need max(v . n) for all v, n.
+                dots = verts @ n
+                max_dot = np.max(dots)
+                if max_dot > 0:
+                    required_s = (2.0 / np.sqrt(3.0)) * max_dot
+                    if required_s > max_dist:
+                        max_dist = required_s
+        
+        return max_dist
+
+    def generate_lattice_seeds():
+        seeds = []
+        # Hexagonal lattice vectors
+        # Side 1 hexagon, apothem sqrt(3)/2.
+        # Center distance for touching: sqrt(3).
+        # Orientation: Vertex at 0 deg.
+        # Neighbors are at angles 30, 90, 150, 210, 270, 330.
+        
+        # Lattice basis vectors
+        v1 = np.array([1.5, np.sqrt(3)/2])
+        v2 = np.array([0, np.sqrt(3)])
+        
+        # Generate all lattice points i*v1 + j*v2 for i,j in [-2, 2]
+        lattice_pts = []
+        for i in range(-2, 3):
+            for j in range(-2, 3):
+                if i == 0 and j == 0:
+                    continue
+                p = i * v1 + j * v2
+                d = np.linalg.norm(p)
+                lattice_pts.append((d, i, j, p))
+        
+        # Sort by distance from origin
+        lattice_pts.sort(key=lambda x: x[0])
+        
+        # Take the 11 closest points + origin
+        closest_11 = lattice_pts[:11]
+        seed_pts = [[0, 0, 0]] + [[p[3][0], p[3][1], 0] for p in closest_11]
+        seeds.append(np.array(seed_pts).flatten())
+        
+        # Also try a slightly different selection to break symmetry if needed,
+        # but the 11 closest is the most compact.
+        # Let's also add the original fixed seed as a backup.
+        seed_inner_orig = np.array(
+            [
+                [0, 0, 0],
+                [-2.5, 0, 0],
+                [2.5, 0, 0],
+                [-1.25, 2.17, 0],
+                [1.25, 2.17, 0],
+                [-1.25, -2.17, 0],
+                [1.25, -2.17, 0],
+                [-3.75, 2.17, 0],
+                [3.75, 2.17, 0],
+                [-3.75, -2.17, 0],
+                [3.75, -2.17, 0],
+                [0, -4, 0]
+            ]
+        )
+        seeds.append(seed_inner_orig.flatten())
+        
+        return seeds
+
     best_params = None
+    best_score = float('inf')
     
-    inits = []
+    starts = generate_lattice_seeds()
     
-    base_lattice = _hex_lattice_positions(1.0)
-    inits.append(base_lattice)
-    
-    for scale in [0.9, 1.1]:
-        inits.append(_hex_lattice_positions(scale))
+    # Add random perturbations of the lattice seed
+    base_seed = starts[0]
+    for _ in range(10):
+        noise = np.random.normal(0, 0.2, 36)
+        starts.append(base_seed + noise)
         
-    for r in [1.5, 2.0, 2.5]:
-        inits.append(_circular_positions(r))
-        
+    # Add random starts
     for _ in range(5):
-        inits.append(np.random.randn(12, 2) * 3.0)
-        
-    for _ in range(5):
-        inits.append(base_lattice + np.random.randn(12, 2) * 0.5)
+        rand_params = np.random.uniform(-3, 3, 36)
+        starts.append(rand_params)
 
-    for i, init_pos in enumerate(inits):
-        if time.time() > deadline - 30:
-            break
-            
-        for init_angle in [0, 30, 10, -10]:
-            if time.time() > deadline - 30:
-                break
-                
-            # Initial outer center near centroid of positions
-            centroid = init_pos.mean(axis=0)
-            
-            init_params = np.zeros(27)
-            init_params[:24] = init_pos.flatten()
-            init_params[24] = centroid[0]
-            init_params[25] = centroid[1]
-            init_params[26] = init_angle
-            
-            try:
-                res = minimize(
-                    _objective, 
-                    init_params, 
-                    method='Nelder-Mead', 
-                    options={'maxiter': 3000, 'xatol': 1e-9, 'fatol': 1e-9}
-                )
-            except Exception:
-                continue
-                
-            if res.fun < best_s and res.fun < 100:
-                best_s = res.fun
-                best_params = res.x.copy()
-                
-    # Fallback
-    if best_params is None or best_s > 100:
-        best_pos = _hex_lattice_positions(1.0)
-        best_angle = 0
-        centroid = best_pos.mean(axis=0)
-        all_verts = _get_all_inner_vertices(best_pos)
-        a_rad = np.radians(best_angle)
-        normal_angles = a_rad + np.radians(30 + 60 * np.arange(6))
-        normals = np.column_stack([np.cos(normal_angles), np.sin(normal_angles)])
-        shifted = all_verts - centroid
-        dots = shifted @ normals.T
-        max_dot = np.max(dots)
-        best_s = (2.0 / np.sqrt(3.0)) * max_dot
-        best_params = np.zeros(27)
-        best_params[:24] = best_pos.flatten()
-        best_params[24] = centroid[0]
-        best_params[25] = centroid[1]
-        best_params[26] = best_angle
+    for start in starts:
+        try:
+            res = minimize(objective, start, method='Nelder-Mead', 
+                           options={'maxiter': 2000, 'xatol': 1e-7, 'fatol': 1e-7})
+            if res.fun < best_score:
+                best_score = res.fun
+                best_params = res.x
+        except Exception:
+            pass
 
-    final_positions = best_params[:24].reshape(12, 2)
-    ocx, ocy = best_params[24], best_params[25]
-    final_angle = best_params[26]
-    
-    # Shift everything so outer hexagon is at origin
-    inner_hex_data = np.zeros((12, 3))
-    inner_hex_data[:, 0] = final_positions[:, 0] - ocx
-    inner_hex_data[:, 1] = final_positions[:, 1] - ocy
-    inner_hex_data[:, 2] = 0.0
-    
-    outer_hex_data = np.array([0.0, 0.0, final_angle])
-    
-    return inner_hex_data, outer_hex_data, best_s
+    if best_params is None:
+        # Fallback
+        best_params = starts[0]
+        best_score = objective(best_params)
+
+    # Extract final result
+    inner_hex_data = best_params.reshape(12, 3)
+    outer_hex_data = np.array([0, 0, 0])
+    outer_hex_side_length = best_score
+
+    return inner_hex_data, outer_hex_data, outer_hex_side_length
 
 # EVOLVE-BLOCK-END

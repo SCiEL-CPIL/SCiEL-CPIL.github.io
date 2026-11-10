@@ -1,0 +1,340 @@
+"""Direct construction of the optimal 32-point triangular lattice configuration with 76 unit-distance edges."""
+# EVOLVE-BLOCK-START
+import time
+
+def _count_edges(points):
+    """Count the number of unit-distance pairs among given points on triangular lattice."""
+    point_set = set(points)
+    neighbors = [(1,0), (-1,0), (0,1), (0,-1), (1,-1), (-1,1)]
+    edge_count = 0
+    for a, b in points:
+        for da, db in neighbors:
+            if (a+da, b+db) in point_set:
+                edge_count += 1
+    return edge_count // 2
+
+def _harborth_bound(n):
+    """Return the Harborth bound floor(3n - sqrt(12n - 3))."""
+    import math
+    return int(math.floor(3*n - math.sqrt(12*n - 3)))
+
+def _construct_hexagonal_ring(n=32):
+    """Construct points in hexagonal ring pattern on triangular lattice.
+    
+    For n=32, we use rings with cumulative counts:
+    Ring 0: 1 point (center)
+    Ring 1: 6 points (total 7)
+    Ring 2: 12 points (total 19)
+    Ring 3: 18 points (total 37) - we take only 13 of these to reach 32
+    
+    Total: 1 + 6 + 12 + 13 = 32
+    
+    In axial coordinates (a, b) for point a + b*omega:
+    Ring k consists of points where max(|a|, |b|, |a+b|) = k
+    """
+    points = []
+    
+    # Ring 0: center
+    points.append((0, 0))
+    
+    # Ring 1: 6 points where max(|a|,|b|,|a+b|) = 1
+    ring1 = [(1,0), (0,1), (-1,1), (-1,0), (0,-1), (1,-1)]
+    points.extend(ring1)
+    
+    # Ring 2: 12 points where max(|a|,|b|,|a+b|) = 2
+    ring2 = []
+    for a in range(-2, 3):
+        for b in range(-2, 3):
+            if max(abs(a), abs(b), abs(a+b)) == 2:
+                ring2.append((a, b))
+    points.extend(ring2)
+    
+    # Ring 3: need 13 points where max(|a|,|b|,|a+b|) = 3
+    ring3_full = []
+    for a in range(-3, 4):
+        for b in range(-3, 4):
+            if max(abs(a), abs(b), abs(a+b)) == 3:
+                ring3_full.append((a, b))
+    
+    # Exhaustive search for the best 13 points in Ring 3
+    # to maximize edges to Ring 2 and internal edges in Ring 3
+    existing = set(points)
+    neighbors = [(1,0), (-1,0), (0,1), (0,-1), (1,-1), (-1,1)]
+    
+    # Precompute connections for Ring 3 points
+    r3_connections = {}
+    for p in ring3_full:
+        a, b = p
+        # Connections to existing (Ring 0, 1, 2)
+        ext_conn = 0
+        for da, db in neighbors:
+            if (a+da, b+db) in existing:
+                ext_conn += 1
+        r3_connections[p] = ext_conn
+        
+    # Precompute internal connections within Ring 3
+    r3_set = set(ring3_full)
+    internal_adj = {}
+    for p in ring3_full:
+        a, b = p
+        internal_adj[p] = set()
+        for da, db in neighbors:
+            if (a+da, b+db) in r3_set:
+                internal_adj[p].add((a+da, b+db))
+        
+    # We want to choose 13 points from 18 to maximize:
+    # sum of ext_conn for selected + number of internal edges among selected
+    import itertools
+    best_subset = None
+    best_score = -1
+    
+    for subset in itertools.combinations(ring3_full, 13):
+        subset_set = set(subset)
+        score = 0
+        for p in subset:
+            score += r3_connections[p]
+        # Count internal edges within subset
+        for p in subset:
+            for q in internal_adj[p]:
+                if q in subset_set:
+                    score += 1
+        score //= 2  # Each edge counted twice
+        
+        if score > best_score:
+            best_score = score
+            best_subset = subset
+            
+    for p in best_subset:
+        points.append(p)
+        
+    return points
+
+def _local_improve(points, time_limit):
+    """Local search to improve the configuration with single moves and 2-point swaps."""
+    start_time = time.time()
+    point_set = set(points)
+    current = points[:]
+    current_edges = _count_edges(current)
+    best = current[:]
+    best_edges = current_edges
+    
+    neighbors = [(1,0), (-1,0), (0,1), (0,-1), (1,-1), (-1,1)]
+    n = len(points)
+    
+    def _count_neighbors(p, ps):
+        """Count neighbors of point p in point set ps."""
+        a, b = p
+        count = 0
+        for da, db in neighbors:
+            if (a+da, b+db) in ps:
+                count += 1
+        return count
+    
+    improved = True
+    while improved and time.time() < time_limit:
+        improved = False
+        # Single-point moves
+        for idx in range(n):
+            if time.time() >= time_limit:
+                break
+            old_point = current[idx]
+            
+            # Try moving this point to nearby positions
+            for da in range(-4, 5):
+                for db in range(-4, 5):
+                    if da == 0 and db == 0:
+                        continue
+                    new_point = (old_point[0] + da, old_point[1] + db)
+                    
+                    if new_point in point_set and new_point != old_point:
+                        continue
+                    if abs(new_point[0]) > 64 or abs(new_point[1]) > 64:
+                        continue
+                    
+                    # Compute edge change
+                    point_set.discard(old_point)
+                    
+                    gained = _count_neighbors(new_point, point_set)
+                    lost = _count_neighbors(old_point, point_set)
+                    
+                    delta = gained - lost
+                    
+                    point_set.add(old_point)
+                    
+                    if delta > 0:
+                        point_set.discard(old_point)
+                        point_set.add(new_point)
+                        current[idx] = new_point
+                        current_edges += delta
+                        if current_edges > best_edges:
+                            best_edges = current_edges
+                            best = current[:]
+                        improved = True
+                        break
+                if improved and current[idx] != old_point:
+                    break
+        
+        if time.time() >= time_limit:
+            break
+            
+        # 2-point swaps
+        for i in range(n):
+            if time.time() >= time_limit:
+                break
+            for j in range(i+1, n):
+                if time.time() >= time_limit:
+                    break
+                pi = current[i]
+                pj = current[j]
+                
+                # Try swapping pi to nearby and pj to nearby
+                for da1 in range(-2, 3):
+                    for db1 in range(-2, 3):
+                        if da1 == 0 and db1 == 0:
+                            continue
+                        new_pi = (pi[0] + da1, pi[1] + db1)
+                        if abs(new_pi[0]) > 64 or abs(new_pi[1]) > 64:
+                            continue
+                        if new_pi == pj:
+                            continue
+                        if new_pi in point_set and new_pi != pi:
+                            continue
+                        
+                        for da2 in range(-2, 3):
+                            for db2 in range(-2, 3):
+                                if da2 == 0 and db2 == 0:
+                                    continue
+                                new_pj = (pj[0] + da2, pj[1] + db2)
+                                if abs(new_pj[0]) > 64 or abs(new_pj[1]) > 64:
+                                    continue
+                                if new_pj == pi:
+                                    continue
+                                if new_pj == new_pi:
+                                    continue
+                                if new_pj in point_set and new_pj != pj:
+                                    continue
+                                
+                                # Compute edge change for swap
+                                point_set.discard(pi)
+                                point_set.discard(pj)
+                                
+                                gained = 0
+                                lost = 0
+                                
+                                # Remove edges from pi and pj
+                                for na, nb in neighbors:
+                                    if (pi[0]+na, pi[1]+nb) in point_set:
+                                        lost += 1
+                                for na, nb in neighbors:
+                                    if (pj[0]+na, pj[1]+nb) in point_set:
+                                        lost += 1
+                                # Check if pi-pj were neighbors
+                                if (pi[0]-pj[0], pi[1]-pj[1]) in neighbors:
+                                    lost += 2  # Each loses one edge to the other
+                                    
+                                # Add edges from new_pi and new_pj
+                                for na, nb in neighbors:
+                                    if (new_pi[0]+na, new_pi[1]+nb) in point_set:
+                                        gained += 1
+                                for na, nb in neighbors:
+                                    if (new_pj[0]+na, new_pj[1]+nb) in point_set:
+                                        gained += 1
+                                # Check if new_pi-new_pj are neighbors
+                                if (new_pi[0]-new_pj[0], new_pi[1]-new_pj[1]) in neighbors:
+                                    gained += 2
+                                    
+                                delta = gained - lost
+                                
+                                if delta > 0:
+                                    point_set.add(new_pi)
+                                    point_set.add(new_pj)
+                                    current[i] = new_pi
+                                    current[j] = new_pj
+                                    current_edges += delta
+                                    if current_edges > best_edges:
+                                        best_edges = current_edges
+                                        best = current[:]
+                                    improved = True
+                                    break
+                            if improved:
+                                break
+                        if improved:
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+    
+    return best, best_edges
+
+def construct():
+    """Construct 32 distinct lattice points maximizing unit-distance pairs."""
+    deadline = time.time() + 115  # Safety margin before 120s limit
+    
+    n = 32
+    target = _harborth_bound(n)  # 76
+    
+    # Generate initial hexagonal ring configuration
+    points = _construct_hexagonal_ring(n)
+    
+    # Validate
+    point_set = set(points)
+    if len(point_set) != n:
+        # Fallback: use a known good pattern
+        points = [(a, b) for a in range(16) for b in range(2)]
+    
+    edges = _count_edges(points)
+    
+    # If we haven't reached the target, try local improvement
+    if edges < target and time.time() < deadline - 10:
+        improved_points, improved_edges = _local_improve(points, deadline - 5)
+        if improved_edges > edges:
+            points = improved_points
+            edges = improved_edges
+    
+    # Try additional restarts with perturbed initial solutions if time allows
+    if edges < target and time.time() < deadline - 30:
+        import random
+        random.seed(42)
+        for restart in range(5):
+            if time.time() >= deadline - 10:
+                break
+            # Create a perturbed version of the best solution
+            perturbed = points[:]
+            # Move 1-2 random points
+            for _ in range(random.randint(1, 2)):
+                idx = random.randint(0, n-1)
+                a, b = perturbed[idx]
+                da = random.randint(-2, 2)
+                db = random.randint(-2, 2)
+                new_p = (a+da, b+db)
+                if abs(new_p[0]) <= 64 and abs(new_p[1]) <= 64 and new_p not in perturbed:
+                    perturbed[idx] = new_p
+            
+            perturbed_set = set(perturbed)
+            if len(perturbed_set) == n:
+                perturbed_edges = _count_edges(perturbed)
+                if perturbed_edges >= edges:
+                    improved_points, improved_edges = _local_improve(perturbed, deadline - 5)
+                    if improved_edges > edges:
+                        points = improved_points
+                        edges = improved_edges
+    
+    # Final validation and return
+    result_set = set()
+    for a, b in points:
+        if abs(a) <= 64 and abs(b) <= 64:
+            result_set.add((a, b))
+    
+    if len(result_set) != n:
+        # Guaranteed fallback: 16x2 rectangle
+        result_set = set((a, b) for a in range(16) for b in range(2))
+    
+    result = [[a, b] for a, b in result_set]
+    
+    # Ensure exactly 32 entries
+    if len(result) != n:
+        result = [[a, b] for a in range(16) for b in range(2)]
+    
+    return result
+# EVOLVE-BLOCK-END

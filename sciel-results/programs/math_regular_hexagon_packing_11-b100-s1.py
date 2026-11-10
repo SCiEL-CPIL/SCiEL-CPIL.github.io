@@ -1,8 +1,9 @@
 # EVOLVE-BLOCK-START
 import numpy as np
 import time
-from scipy.optimize import minimize, fsolve
+from scipy.optimize import minimize
 
+# ---------- geometry helpers (match the task contract exactly) ----------
 def _hex_vertices(cx, cy, s, angle_deg):
     angles = np.radians(angle_deg) + np.radians(60) * np.arange(6)
     return np.column_stack([
@@ -12,63 +13,56 @@ def _hex_vertices(cx, cy, s, angle_deg):
 
 def _all_vertices(positions, angles, side=1.0):
     n = len(positions)
-    verts = np.zeros((n, 6, 2))
     base_angles = np.radians(angles)[:, None] + np.radians(60) * np.arange(6)[None, :]
+    verts = np.zeros((n, 6, 2))
     verts[:, :, 0] = positions[:, 0:1] + side * np.cos(base_angles)
     verts[:, :, 1] = positions[:, 1:2] + side * np.sin(base_angles)
     return verts
 
-def _check_separation_fast(positions, angles, tol=1e-6):
+def _separated(positions, angles, tol=1e-6):
     n = len(positions)
     all_verts = _all_vertices(positions, angles)
-    hex_normals = np.zeros((n, 6, 2))
     base = np.radians(angles)[:, None] + np.radians(30) + np.radians(60) * np.arange(6)[None, :]
-    hex_normals[:, :, 0] = np.cos(base)
-    hex_normals[:, :, 1] = np.sin(base)
-
+    hex_normals = np.stack([np.cos(base), np.sin(base)], axis=2)
     for i in range(n):
+        vi = all_verts[i]
+        ni = hex_normals[i]
         for j in range(i + 1, n):
-            vi = all_verts[i]
             vj = all_verts[j]
-            normals = np.vstack([hex_normals[i], hex_normals[j]])
+            nj = hex_normals[j]
+            normals = np.vstack([ni, nj])
             proj_i = vi @ normals.T
             proj_j = vj @ normals.T
-            max_i = np.max(proj_i, axis=0)
-            min_i = np.min(proj_i, axis=0)
-            max_j = np.max(proj_j, axis=0)
-            min_j = np.min(proj_j, axis=0)
-            if np.any(max_i < min_j - tol) or np.any(max_j < min_i - tol):
+            if np.any(np.max(proj_i, axis=0) < np.min(proj_j, axis=0) - tol) \
+               or np.any(np.max(proj_j, axis=0) < np.min(proj_i, axis=0) - tol):
                 continue
             return False
     return True
 
-# Smooth (soft-max) version of the enclosing-side objective.
-def _soft_max(x, beta=50.0):
+def _enclosing_side(positions, angles, outer_angle=0.0):
+    all_verts = _all_vertices(positions, angles).reshape(-1, 2)
+    normals = np.array([[np.cos(np.radians(outer_angle + 30 + 60 * i)),
+                         np.sin(np.radians(outer_angle + 30 + 60 * i))] for i in range(6)])
+    projs = all_verts @ normals.T
+    return np.max(projs) / (np.sqrt(3) / 2)
+
+def _soft_max(x, beta=80.0):
     m = np.max(x)
     return m + np.log(np.mean(np.exp(x - m))) / beta
 
-def _min_enclosing_side_smooth(positions, angles, beta=50.0):
+def _enclosing_side_soft(positions, angles, outer_angle=0.0, beta=80.0):
     all_verts = _all_vertices(positions, angles).reshape(-1, 2)
-    normals = np.array([[np.cos(np.radians(30 + 60 * i)), np.sin(np.radians(30 + 60 * i))] for i in range(6)])
-    apothem_factor = np.sqrt(3) / 2
+    normals = np.array([[np.cos(np.radians(outer_angle + 30 + 60 * i)),
+                         np.sin(np.radians(outer_angle + 30 + 60 * i))] for i in range(6)])
     projs = all_verts @ normals.T
-    max_proj = _soft_max(projs, beta)
-    return max_proj / apothem_factor
+    return _soft_max(projs, beta) / (np.sqrt(3) / 2)
 
-def _min_enclosing_side(positions, angles):
+def _contained(positions, angles, side, outer_angle=0.0, tol=-1e-6):
     all_verts = _all_vertices(positions, angles).reshape(-1, 2)
-    normals = np.array([[np.cos(np.radians(30 + 60 * i)), np.sin(np.radians(30 + 60 * i))] for i in range(6)])
-    apothem_factor = np.sqrt(3) / 2
-    projs = all_verts @ normals.T
-    max_proj = np.max(projs)
-    return max_proj / apothem_factor
-
-def _check_containment_fast(positions, angles, side, tol=-1e-6):
-    all_verts = _all_vertices(positions, angles).reshape(-1, 2)
-    outer_verts = _hex_vertices(0.0, 0.0, side, 0.0)
+    outer = _hex_vertices(0.0, 0.0, side, outer_angle)
     for i in range(6):
-        p1 = outer_verts[i]
-        p2 = outer_verts[(i + 1) % 6]
+        p1 = outer[i]
+        p2 = outer[(i + 1) % 6]
         e = p2 - p1
         v = all_verts - p1
         cross = e[0] * v[:, 1] - e[1] * v[:, 0]
@@ -76,244 +70,225 @@ def _check_containment_fast(positions, angles, side, tol=-1e-6):
             return False
     return True
 
-def _build_symmetric_positions(ring_r, valley_r, angle_offset=0.0, ring_angle=0.0, valley_angle=0.0):
+# ---------- candidate generators ----------
+def _sym_candidate(ring_r, valley_r, angle_offset=0.0):
     positions = np.zeros((11, 2))
     angles = np.zeros(11)
     positions[0] = [0.0, 0.0]
-    angles[0] = angle_offset
     for k in range(6):
         a = np.radians(30 + 60 * k + angle_offset)
         positions[k + 1] = [ring_r * np.cos(a), ring_r * np.sin(a)]
-        angles[k + 1] = ring_angle
-    valley_angles_deg = [30, 90, 150, 210]
-    for k, va in enumerate(valley_angles_deg):
-        a = np.radians(va + angle_offset)
+    for k in range(4):
+        a = np.radians(0 + 60 * k + angle_offset)
         positions[7 + k] = [valley_r * np.cos(a), valley_r * np.sin(a)]
-        angles[7 + k] = valley_angle
     return positions, angles
 
-def _solve_topology(topology_type):
-    if topology_type == "symmetric_6_4":
-        def equations(vars):
-            ring_pos = []
-            for k in range(6):
-                a = np.radians(30 + 60 * k)
-                ring_pos.append(np.array([2 * np.cos(a), 2 * np.sin(a)]))
-            eqs = []
-            eqs.append(np.sum((vars[0:2] - ring_pos[0])**2) - 4)
-            eqs.append(np.sum((vars[0:2] - ring_pos[5])**2) - 4)
-            eqs.append(np.sum((vars[2:4] - ring_pos[1])**2) - 4)
-            eqs.append(np.sum((vars[2:4] - ring_pos[0])**2) - 4)
-            eqs.append(np.sum((vars[4:6] - ring_pos[2])**2) - 4)
-            eqs.append(np.sum((vars[4:6] - ring_pos[1])**2) - 4)
-            eqs.append(np.sum((vars[6:8] - ring_pos[3])**2) - 4)
-            eqs.append(np.sum((vars[6:8] - ring_pos[2])**2) - 4)
-            return eqs
+def _random_candidate(rng):
+    positions = np.zeros((11, 2))
+    angles = np.zeros(11)
+    positions[0] = [0.0, 0.0]
+    angles[0] = rng.uniform(0, 60)
+    for k in range(6):
+        a = np.radians(30 + 60 * k + rng.uniform(-4, 4))
+        r = rng.uniform(1.8, 2.6)
+        positions[k + 1] = [r * np.cos(a), r * np.sin(a)]
+        angles[k + 1] = rng.uniform(0, 60)
+    for k in range(4):
+        a = np.radians(0 + 60 * k + rng.uniform(-8, 8))
+        r = rng.uniform(2.8, 4.4)
+        positions[7 + k] = [r * np.cos(a), r * np.sin(a)]
+        angles[7 + k] = rng.uniform(0, 60)
+    return positions, angles
 
-        guess = []
-        for k in range(4):
-            a = np.radians(0 + 60 * k)
-            guess.extend([3.5 * np.cos(a), 3.5 * np.sin(a)])
+# ---------- local refinement ----------
+def _refine(positions, angles, deadline, rng, outer_angle=0.0):
+    best_pos = positions.copy()
+    best_ang = angles.copy()
+    best_side = _enclosing_side(positions, angles, outer_angle)
+    t0 = time.time()
 
+    def _run(obj, x0, maxiter):
+        nonlocal best_pos, best_ang, best_side
         try:
-            sol, info, ier, msg = fsolve(equations, guess, full_output=True)
-            if ier != 1:
-                return None
-            positions = np.zeros((11, 2))
-            angles = np.zeros(11)
-            positions[0] = [0, 0]
-            for k in range(6):
-                a = np.radians(30 + 60 * k)
-                positions[k+1] = [2 * np.cos(a), 2 * np.sin(a)]
-            for k in range(4):
-                positions[7+k] = sol[2*k:2*k+2]
-            if not _check_separation_fast(positions, angles):
-                return None
-            return positions, angles
+            res = minimize(
+                obj, x0, method='Nelder-Mead',
+                options={'maxiter': maxiter, 'xatol': 1e-12, 'fatol': 1e-13,
+                         'adaptive': True, 'maxfev': maxiter * 40}
+            )
+            pos = res.x[:22].reshape(11, 2)
+            ang = res.x[22:] % 360
+            if _separated(pos, ang):
+                s = _enclosing_side(pos, ang, outer_angle)
+                if s < best_side:
+                    best_side = s
+                    best_pos = pos.copy()
+                    best_ang = ang.copy()
         except Exception:
-            return None
-    return None
+            pass
 
-def _refine_positions(positions, angles, deadline):
-    """Refine positions using a smooth (soft-max) surrogate for the enclosing side,
-    keeping the separation constraint as a hard gate. Then a high-precision polish pass
-    with the exact (nonsmooth) objective and tight tolerances."""
-    best_positions = positions.copy()
-    best_angles = angles.copy()
-    best_side = _min_enclosing_side(positions, angles)
+    # smooth-surface pass
+    def obj_smooth(x):
+        pos = x[:22].reshape(11, 2)
+        ang = x[22:]
+        if not _separated(pos, ang):
+            return 1e6 + 0.001 * np.sum((pos) ** 2)
+        return _enclosing_side_soft(pos, ang, outer_angle, beta=80.0)
 
-    # Smooth surrogate objective: minimize soft-max enclosing side, penalize overlap.
-    def obj_smooth(pos_flat):
-        pos = pos_flat.reshape(11, 2)
-        if not _check_separation_fast(pos, best_angles):
-            return 1e10
-        return _min_enclosing_side_smooth(pos, best_angles, beta=50.0)
+    x0 = np.concatenate([positions.flatten(), angles])
+    _run(obj_smooth, x0, 2000)
 
+    # exact (nonsmooth) polish pass
+    if time.time() < deadline - 30:
+        def obj_exact(x):
+            pos = x[:22].reshape(11, 2)
+            ang = x[22:]
+            if not _separated(pos, ang):
+                return 1e6 + 0.001 * np.sum((pos) ** 2)
+            return _enclosing_side(pos, ang, outer_angle)
+
+        x1 = np.concatenate([best_pos.flatten(), best_ang])
+        _run(obj_exact, x1, 3000)
+
+    return best_pos, best_ang, best_side
+
+# ---------- joint rotation + outer angle optimization ----------
+def _best_rotation_joint(positions, angles):
+    """Optimize cluster rotation theta and outer hex angle phi jointly."""
+    best_side = _enclosing_side(positions, angles, 0.0)
+    best_theta = 0.0
+    best_phi = 0.0
+
+    def _eval(theta, phi):
+        c = np.cos(np.radians(theta))
+        s = np.sin(np.radians(theta))
+        rot = np.array([[c, -s], [s, c]])
+        p_rot = positions @ rot.T
+        a_rot = (angles + theta) % 360
+        return _enclosing_side(p_rot, a_rot, phi)
+
+    # Coarse grid
+    for theta in np.linspace(0, 60, 31):
+        for phi in np.linspace(0, 60, 31):
+            s = _eval(theta, phi)
+            if s < best_side:
+                best_side = s
+                best_theta = theta
+                best_phi = phi
+
+    # Fine grid around best
+    for theta in np.linspace(max(0, best_theta - 5), min(60, best_theta + 5), 41):
+        for phi in np.linspace(max(0, best_phi - 5), min(60, best_phi + 5), 41):
+            s = _eval(theta, phi)
+            if s < best_side:
+                best_side = s
+                best_theta = theta
+                best_phi = phi
+
+    # Nelder-Mead polish
     try:
         res = minimize(
-            obj_smooth,
-            best_positions.flatten(),
+            lambda v: _eval(v[0], v[1]),
+            [best_theta, best_phi],
             method='Nelder-Mead',
-            options={'maxiter': 2000, 'xatol': 1e-10, 'fatol': 1e-12}
+            options={'maxiter': 2000, 'xatol': 1e-10, 'fatol': 1e-12,
+                     'adaptive': True, 'maxfev': 60000}
         )
-        if res.fun < best_side and res.fun < 1e9:
-            trial_pos = res.x.reshape(11, 2)
-            if _check_separation_fast(trial_pos, best_angles):
-                side = _min_enclosing_side(trial_pos, best_angles)
-                if side < best_side:
-                    best_side = side
-                    best_positions = trial_pos
+        if res.fun < best_side:
+            best_side = res.fun
+            best_theta = res.x[0] % 60
+            best_phi = res.x[1] % 60
     except Exception:
         pass
 
-    # High-precision polish pass with the exact nonsmooth objective.
-    if time.time() < deadline - 30:
-        def obj_exact(pos_flat):
-            pos = pos_flat.reshape(11, 2)
-            if not _check_separation_fast(pos, best_angles):
-                return 1e10
-            return _min_enclosing_side(pos, best_angles)
-        try:
-            res2 = minimize(
-                obj_exact,
-                best_positions.flatten(),
-                method='Nelder-Mead',
-                options={'maxiter': 3000, 'xatol': 1e-12, 'fatol': 1e-14}
-            )
-            if res2.fun < best_side and res2.fun < 1e9:
-                trial_pos = res2.x.reshape(11, 2)
-                if _check_separation_fast(trial_pos, best_angles):
-                    side = _min_enclosing_side(trial_pos, best_angles)
-                    if side < best_side:
-                        best_side = side
-                        best_positions = trial_pos
-        except Exception:
-            pass
+    c = np.cos(np.radians(best_theta))
+    s = np.sin(np.radians(best_theta))
+    rot = np.array([[c, -s], [s, c]])
+    p_rot = positions @ rot.T
+    a_rot = (angles + best_theta) % 360
+    return p_rot, a_rot, best_phi, best_side
 
-    return best_positions, best_angles, best_side
-
+# ---------- main entry point ----------
 def hexagon_packing_11():
-    start_time = time.time()
-    deadline = start_time + 620.0
+    start = time.time()
+    deadline = start + 580.0  # safety margin
+    rng = np.random.default_rng(42)
 
-    best_positions = None
-    best_angles = None
+    best_pos = None
+    best_ang = None
     best_side = float('inf')
+    best_phi = 0.0
 
-    # Phase 1: Solve specific topologies (graph-embedding with exact tangency).
-    topologies = ["symmetric_6_4"]
-    for topo in topologies:
-        if time.time() > deadline - 120:
+    def consider(pos, ang):
+        nonlocal best_pos, best_ang, best_side
+        if not _separated(pos, ang):
+            return False
+        s = _enclosing_side(pos, ang, 0.0)
+        if s < best_side:
+            best_side = s
+            best_pos = pos.copy()
+            best_ang = ang.copy()
+            return True
+        return False
+
+    # --- Phase A: coarse deterministic grid ---
+    for ring_r in np.linspace(1.75, 2.6, 15):
+        if time.time() > deadline - 180:
             break
-        res = _solve_topology(topo)
-        if res is not None:
-            positions, angles = res
-            side = _min_enclosing_side(positions, angles)
-            if side < best_side:
-                best_side = side
-                best_positions = positions.copy()
-                best_angles = angles.copy()
-
-    # Phase 2: Dense symmetric grid search to seed a good starting point.
-    if time.time() < deadline - 180:
-        ring_r_range = np.linspace(1.732, 2.6, 35)
-        valley_r_range = np.linspace(2.5, 4.6, 30)
-        angle_offset_range = np.linspace(0, 30, 13)
-        for ar in ring_r_range:
+        for valley_r in np.linspace(2.9, 4.5, 15):
             if time.time() > deadline - 180:
                 break
-            for vr in valley_r_range:
-                if time.time() > deadline - 180:
-                    break
-                for ao in angle_offset_range:
-                    if time.time() > deadline - 180:
-                        break
-                    positions, angles = _build_symmetric_positions(ar, vr, ao, 0.0, 0.0)
-                    if not _check_separation_fast(positions, angles):
-                        continue
-                    side = _min_enclosing_side(positions, angles)
-                    if side < best_side:
-                        best_side = side
-                        best_positions = positions.copy()
-                        best_angles = angles.copy()
+            for ao in (0.0, 10.0, 20.0, 30.0):
+                pos, ang = _sym_candidate(ring_r, valley_r, ao)
+                consider(pos, ang)
 
-    # Fallback if nothing valid found.
-    if best_positions is None:
-        positions = np.zeros((11, 2))
-        angles = np.zeros(11)
-        positions[0] = [0.0, 0.0]
-        for k in range(6):
-            a = np.radians(30 + 60 * k)
-            positions[k + 1] = [2 * np.cos(a), 2 * np.sin(a)]
-        for k in range(4):
-            a = np.radians(0 + 60 * k)
-            positions[7 + k] = [3.5 * np.cos(a), 3.5 * np.sin(a)]
-        best_positions = positions
-        best_angles = angles
-        best_side = _min_enclosing_side(best_positions, best_angles)
+    # --- Phase B: randomized multi-start + local refinement ---
+    n_starts = 0
+    while time.time() < deadline - 200:
+        if n_starts % 3 == 0:
+            pos, ang = _sym_candidate(rng.uniform(1.8, 2.6), rng.uniform(2.9, 4.4), rng.uniform(0, 30))
+        else:
+            pos, ang = _random_candidate(rng)
+        n_starts += 1
+        consider(pos, ang)
+        pos2, ang2, s2 = _refine(pos, ang, deadline, rng, outer_angle=0.0)
+        if s2 < best_side:
+            best_side = s2
+            best_pos = pos2.copy()
+            best_ang = ang2.copy()
 
-    # Phase 3: Smooth-surface local refinement + high-precision polish.
-    if time.time() < deadline - 60:
-        best_positions, best_angles, best_side = _refine_positions(
-            best_positions, best_angles, deadline
-        )
+    # --- fallback ---
+    if best_pos is None:
+        pos, ang = _sym_candidate(2.0, 3.5, 0.0)
+        best_pos, best_ang, best_side = pos, ang, _enclosing_side(pos, ang, 0.0)
 
-    # Phase 4: Best global rotation (hexagon symmetry: 60 deg period).
-    if time.time() < deadline - 30:
-        def obj_rot(theta):
-            c = np.cos(np.radians(theta))
-            s = np.sin(np.radians(theta))
-            rot_mat = np.array([[c, -s], [s, c]])
-            pos_rot = best_positions @ rot_mat.T
-            angles_rot = (best_angles + theta) % 360
-            return _min_enclosing_side(pos_rot, angles_rot)
+    # --- Phase C: polish the best, then joint rotation + outer angle ---
+    if time.time() < deadline - 80:
+        pos2, ang2, s2 = _refine(best_pos, best_ang, deadline, rng, outer_angle=0.0)
+        if s2 < best_side:
+            best_pos, best_ang, best_side = pos2, ang2, s2
 
-        best_rot = 0.0
-        best_rot_side = best_side
-        for t in np.linspace(0, 60, 121):
-            s_t = obj_rot(t)
-            if s_t < best_rot_side:
-                best_rot_side = s_t
-                best_rot = t
-        try:
-            res_rot = minimize(obj_rot, [best_rot], method='Nelder-Mead',
-                               options={'maxiter': 1000, 'xatol': 1e-10})
-            if res_rot.fun < best_rot_side:
-                best_rot = res_rot.x[0]
-                best_rot_side = res_rot.fun
-        except Exception:
-            pass
-        if best_rot_side < best_side:
-            best_side = best_rot_side
-            c = np.cos(np.radians(best_rot))
-            s = np.sin(np.radians(best_rot))
-            rot_mat = np.array([[c, -s], [s, c]])
-            best_positions = best_positions @ rot_mat.T
-            best_angles = (best_angles + best_rot) % 360
+    if time.time() < deadline - 40:
+        pos_r, ang_r, phi_r, s_r = _best_rotation_joint(best_pos, best_ang)
+        if s_r < best_side:
+            best_pos, best_ang, best_side, best_phi = pos_r, ang_r, phi_r, s_r
+        # one more polish after rotation
+        if time.time() < deadline - 25:
+            pos2, ang2, s2 = _refine(best_pos, best_ang, deadline, rng, outer_angle=best_phi)
+            if s2 < best_side:
+                best_pos, best_ang, best_side = pos2, ang2, s2
 
-    # Final verification and containment.
-    final_side = _min_enclosing_side(best_positions, best_angles)
-    if not _check_separation_fast(best_positions, best_angles):
-        positions = np.zeros((11, 2))
-        angles = np.zeros(11)
-        positions[0] = [0.0, 0.0]
-        for k in range(6):
-            a = np.radians(30 + 60 * k)
-            positions[k + 1] = [2 * np.cos(a), 2 * np.sin(a)]
-        for k in range(4):
-            a = np.radians(0 + 60 * k)
-            positions[7 + k] = [3.5 * np.cos(a), 3.5 * np.sin(a)]
-        best_positions = positions
-        best_angles = angles
-        final_side = _min_enclosing_side(best_positions, best_angles)
+    # --- Final verification ---
+    final_side = _enclosing_side(best_pos, best_ang, best_phi)
+    if not _separated(best_pos, best_ang):
+        pos, ang = _sym_candidate(2.0, 3.5, 0.0)
+        best_pos, best_ang, best_phi = pos, ang, 0.0
+        final_side = _enclosing_side(pos, ang, 0.0)
 
-    if not _check_containment_fast(best_positions, best_angles, final_side):
+    if not _contained(best_pos, best_ang, final_side, best_phi):
         final_side *= 1.001
 
-    inner = np.column_stack([best_positions, best_angles])
-    outer_hex_data = np.array([0.0, 0.0, 0.0])
-    side_length = float(final_side)
-
-    return inner, outer_hex_data, side_length
+    inner = np.column_stack([best_pos, best_ang])
+    outer = np.array([0.0, 0.0, best_phi])
+    return inner, outer, float(final_side)
 
 # EVOLVE-BLOCK-END

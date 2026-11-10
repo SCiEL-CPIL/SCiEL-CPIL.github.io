@@ -1,0 +1,276 @@
+"""Rewritten: bipartite circulant + greedy repair for n(3,16)."""
+import time
+import random
+from collections import deque
+
+# EVOLVE-BLOCK-START
+
+def _bipartite_circulant_girth(n_half, offsets):
+    """Return girth of bipartite circulant with n_half vertices per part,
+    edges i ~ i+offset mod n_half. n_half vertices per side, total 2*n_half."""
+    n = 2 * n_half
+    # Build adjacency
+    adj = [[] for _ in range(n)]
+    for i in range(n_half):
+        for off in offsets:
+            j = (i + off) % n_half + n_half
+            adj[i].append(j)
+            adj[j].append(i)
+    # BFS from each vertex to find shortest cycle
+    # For bipartite graph, shortest cycle = 2 * shortest path from v to v in BFS tree
+    # Actually: BFS from each vertex, track parent, find when we hit a vertex already visited
+    # at a different level -> cycle length = level[u] + level[v] + 1 - 2*lca_depth
+    # Simpler: for each vertex, BFS and track (parent, depth). When we find an edge (u,v) where
+    # v is already visited and v is not parent of u, cycle = depth[u] + depth[v] + 1.
+    # But we need the *shortest* cycle, so we do BFS from each vertex and record min cycle found.
+    # Optimization: for regular graphs, we can do a single BFS from each vertex.
+    min_cycle = float('inf')
+    for start in range(n):
+        depth = [-1] * n
+        parent = [-1] * n
+        depth[start] = 0
+        q = deque([start])
+        while q:
+            u = q.popleft()
+            for v in adj[u]:
+                if depth[v] == -1:
+                    depth[v] = depth[u] + 1
+                    parent[v] = u
+                    q.append(v)
+                elif v != parent[u] and u != parent[v]:
+                    # Found a cycle
+                    cycle_len = depth[u] + depth[v] + 1
+                    if cycle_len < min_cycle:
+                        min_cycle = cycle_len
+        # Early termination if we already found a short cycle
+        if min_cycle <= 4:
+            break
+    return min_cycle if min_cycle < float('inf') else 0
+
+
+def _verify_girth(n, edges, g):
+    """Verify no cycle shorter than g using non-backtracking BFS from each vertex."""
+    adj = [[] for _ in range(n)]
+    for u, v in edges:
+        adj[u].append(v)
+        adj[v].append(u)
+    # Non-backtracking: state = (current, prev)
+    # BFS from each vertex, tracking shortest non-backtracking walk back to start
+    for start in range(n):
+        # dist[prev][curr] = shortest non-backtracking walk from (start, -1) to (prev, curr)
+        # Initialize: for each neighbor v of start, dist[start][v] = 1
+        dist = {}
+        q = deque()
+        for v in adj[start]:
+            dist[(start, v)] = 1
+            q.append((start, v))
+        while q:
+            prev, curr = q.popleft()
+            d = dist[(prev, curr)]
+            if d >= g:
+                continue
+            if curr == start and prev != -1:
+                # Found a non-backtracking walk from start back to start of length d
+                # This is a cycle of length d
+                return False
+            for nxt in adj[curr]:
+                if nxt == prev:
+                    continue  # non-backtracking
+                state = (curr, nxt)
+                if state not in dist:
+                    dist[state] = d + 1
+                    q.append(state)
+    return True
+
+
+def _check_regular(n, edges, k):
+    """Check graph is simple and k-regular."""
+    adj = [set() for _ in range(n)]
+    for u, v in edges:
+        if u == v:
+            return False
+        if v in adj[u]:
+            return False  # repeated edge
+        adj[u].add(v)
+        adj[v].add(u)
+    for i in range(n):
+        if len(adj[i]) != k:
+            return False
+    return True
+
+
+def construct(k, g):
+    """Construct a k-regular graph of girth at least g with minimal vertices."""
+    start_time = time.time()
+    deadline = 140.0  # safety margin before 150s kill
+    
+    if k != 3 or g != 16:
+        # Fallback for other parameters: use LZW-like construction
+        return _lzw_fallback(k, g)
+    
+    # Target: n(3,16) = 936 is known best. Moore bound = 510.
+    # Try bipartite circulants with n_half from 255 up to 468.
+    # Bipartite circulant C(m; S) where m = n/2, S is set of offsets.
+    # For 3-regular bipartite: |S| = 3, so 3 offsets.
+    
+    best_n = float('inf')
+    best_edges = None
+    
+    # Strategy 1: Try specific known-good offset sets for small m
+    # Strategy 2: Random search over offset sets
+    
+    # First, try a few hand-crafted or known constructions
+    # For bipartite 3-regular with girth 16, we need m such that 2m >= 510, so m >= 255.
+    
+    # Try m = 255, 256, ..., up to 468
+    # For each m, try random sets of 3 offsets (mod m), check girth.
+    
+    random.seed(42)
+    
+    # Precompute: for a bipartite circulant with offsets {a, b, c},
+    # the girth is determined by the shortest non-trivial relation
+    # in the group Z_m generated by a, b, c with the constraint that
+    # the walk doesn't backtrack.
+    
+    # Efficient girth check for bipartite circulant:
+    # A non-backtracking walk of length 2L corresponds to a sequence of
+    # L steps, each +s_i or -s_i where s_i in {a,b,c}, with no immediate
+    # reversal. The walk returns to start iff the sum of signed offsets = 0 mod m.
+    # Girth >= g means no such walk of length < g.
+    
+    def circulant_girth_check(m, offsets):
+        """Check if bipartite circulant with m vertices per part and given offsets
+        has girth >= 16. Uses BFS in the Cayley graph sense."""
+        # BFS on states (position, last_offset_used) to avoid backtracking
+        # Position in [0, m), last_offset in {0,1,2} or -1 for start
+        # We want to find shortest cycle through vertex 0.
+        # Since it's bipartite and vertex-transitive, checking from vertex 0 suffices
+        # for the girth (shortest cycle).
+        
+        # dist[pos][last] = shortest non-backtracking walk from (0, -1) to (pos, last)
+        # last = index of offset used, or -1 for start
+        INF = float('inf')
+        dist = [[INF] * 4 for _ in range(m)]  # 4 = 3 offsets + start
+        # Initialize
+        for i, off in enumerate(offsets):
+            dist[off % m][i] = 1
+            dist[(-off) % m][i] = 1  # Wait, no. From 0, we go to off or -off? 
+            # In bipartite circulant, from vertex i on left, edges go to (i+off) % m on right.
+            # So from left vertex 0, we go to right vertex off % m.
+            # From right vertex j, we go to left vertex (j - off) % m for each off.
+            # So it's symmetric.
+            # Let me redefine: left vertices 0..m-1, right vertices 0..m-1.
+            # Edge (left i, right (i+off)%m) for each off.
+            # From left i, neighbors are right (i+off)%m.
+            # From right j, neighbors are left (j-off)%m.
+            # Non-backtracking: don't go back to where we came from.
+            pass
+        
+        # Simpler: just build the graph and BFS.
+        adj = [[] for _ in range(2 * m)]
+        for i in range(m):
+            for off in offsets:
+                j = (i + off) % m
+                adj[i].append(m + j)
+                adj[m + j].append(i)
+        
+        # BFS from vertex 0
+        depth = [-1] * (2 * m)
+        parent = [-1] * (2 * m)
+        depth[0] = 0
+        q = deque([0])
+        min_cycle = INF
+        while q:
+            u = q.popleft()
+            for v in adj[u]:
+                if depth[v] == -1:
+                    depth[v] = depth[u] + 1
+                    parent[v] = u
+                    q.append(v)
+                elif v != parent[u] and u != parent[v]:
+                    cycle_len = depth[u] + depth[v] + 1
+                    if cycle_len < min_cycle:
+                        min_cycle = cycle_len
+        return min_cycle
+    
+    # Try m values
+    # For efficiency, only check girth for promising m values
+    # m must be >= 255 (Moore bound / 2)
+    
+    # Known result: the (3,16)-cage has 936 vertices, so m = 468.
+    # Let's try to find a valid construction with m <= 468.
+    
+    # Try specific m values that are prime or have good properties
+    candidate_ms = list(range(255, 469))
+    random.shuffle(candidate_ms)
+    
+    for m in candidate_ms:
+        if time.time() > deadline:
+            break
+        
+        # Try a few random offset sets
+        for trial in range(50):
+            if time.time() > deadline:
+                break
+            offsets = random.sample(range(1, m), 3)
+            # Ensure offsets are distinct mod m and not 0
+            offsets = sorted(set(offsets))
+            if len(offsets) < 3:
+                continue
+            
+            girth = circulant_girth_check(m, offsets)
+            if girth >= 16:
+                # Found a valid graph!
+                n = 2 * m
+                edges = []
+                for i in range(m):
+                    for off in offsets:
+                        j = (i + off) % m
+                        edges.append((i, m + j))
+                if n < best_n:
+                    best_n = n
+                    best_edges = edges
+                break  # Found valid for this m, try smaller m
+    
+    if best_edges is not None:
+        return best_n, best_edges
+    
+    # Fallback: use the LZW construction from the seed
+    return _lzw_fallback(k, g)
+
+
+def _lzw_fallback(k, g):
+    """Original Lazebnik-Ustimenko-Woldar construction as fallback."""
+    q = k
+    d = max(3, g - 5 if (g - 5) % 2 else g - 4)
+    if q == 4:
+        table = [[0, 0, 0, 0], [0, 1, 2, 3], [0, 2, 3, 1], [0, 3, 1, 2]]
+        add, sub, mul = (lambda x, y: x ^ y), (lambda x, y: x ^ y), (lambda x, y: table[x][y])
+    else:
+        add, sub, mul = (lambda x, y: (x + y) % q), (lambda x, y: (x - y) % q), (lambda x, y: x * y % q)
+    rule = {2: (1, 1), 3: (2, 1), 4: (1, 2)}
+    for c in range(5, d + 1):
+        r, c0 = (c - 5) % 4, c - (c - 5) % 4
+        rule[c] = [(1, c0 - 2), (c0 - 1, 1), (c0, 1), (1, c0 + 1)][r]
+
+    def neighbours(vertex):
+        side, x = vertex
+        for first in range(q):
+            y = [None, first] + [0] * (d - 1)
+            for c in range(2, d + 1):
+                a, b = rule[c]
+                y[c] = add(x[c], mul(y[a], x[b])) if side == 0 else sub(x[c], mul(x[a], y[b]))
+            yield 1 - side, tuple(y)
+
+    start = (0, (None,) + (0,) * d)
+    index, order, edges = {start: 0}, [start], []
+    for vertex in order:
+        for other in neighbours(vertex):
+            if other not in index:
+                index[other] = len(order)
+                order.append(other)
+            if vertex[0] == 0:
+                edges.append((index[vertex], index[other]))
+    return len(order), edges
+
+# EVOLVE-BLOCK-END

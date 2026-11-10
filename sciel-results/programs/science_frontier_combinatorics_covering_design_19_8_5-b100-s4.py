@@ -1,220 +1,138 @@
-"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
-# EVOLVE-BLOCK-START
 import itertools
-import time
 import random
 
+
 def construct(v, k, t):
-    start_time = time.time()
-    deadline = start_time + 115.0  # Safety margin before 120s limit
-    
-    # Precompute all t-subsets
+    # Precompute all t-subsets and their indices
     all_t_subsets = list(itertools.combinations(range(v), t))
-    n_t = len(all_t_subsets)
-    t_sub_to_idx = {sub: i for i, sub in enumerate(all_t_subsets)}
+    t_subset_to_idx = {s: i for i, s in enumerate(all_t_subsets)}
+    num_t = len(all_t_subsets)
     
-    # Precompute all k-blocks and their coverage masks
-    all_blocks = list(itertools.combinations(range(v), k))
-    n_blocks = len(all_blocks)
+    # Precompute all k-subsets
+    all_k_subsets = list(itertools.combinations(range(v), k))
+    num_k = len(all_k_subsets)
     
-    # For each block, compute bitmask of t-subsets it covers
-    # Using Python integers as bitmasks (n_t ~ 11628 bits, fits in Python int)
-    block_masks = [0] * n_blocks
-    for bi, b in enumerate(all_blocks):
-        mask = 0
-        for sub in itertools.combinations(b, t):
-            idx = t_sub_to_idx[sub]
-            mask |= (1 << idx)
-        block_masks[bi] = mask
-    
-    # Full mask of all t-subsets uncovered
-    full_mask = (1 << n_t) - 1
-    
-    def greedy_cover(noise_seed=None, alpha=0.0):
-        """
-        Greedy set cover with optional random noise.
-        alpha: noise magnitude (0 = pure greedy, >0 = stochastic)
-        """
-        if noise_seed is not None:
-            rng = random.Random(noise_seed)
-        else:
-            rng = random.Random()
-            
-        uncovered = full_mask
-        blocks = []
+    # For each k-subset, compute the list of t-subset indices it covers
+    k_to_t_indices = []
+    for k_sub in all_k_subsets:
+        t_indices = []
+        for t_sub in itertools.combinations(k_sub, t):
+            t_indices.append(t_subset_to_idx[t_sub])
+        k_to_t_indices.append(t_indices)
         
-        while uncovered:
-            best_block = None
-            best_gain = -1
+    # Reverse mapping: for each t-subset index, which k-subsets cover it
+    t_to_k_indices = [[] for _ in range(num_t)]
+    for ki, t_indices in enumerate(k_to_t_indices):
+        for ti in t_indices:
+            t_to_k_indices[ti].append(ki)
             
-            # Find block with maximum coverage of uncovered t-subsets
-            # Optimization: skip blocks with 0 gain
-            for bi in range(n_blocks):
-                gain = (uncovered & block_masks[bi]).bit_count()
-                if gain > 0:
-                    # Add noise for diversification
-                    if alpha > 0:
-                        gain += rng.random() * alpha
-                    if gain > best_gain:
-                        best_gain = gain
-                        best_block = bi
-                        
-            if best_block is None:
+    max_cov = len(k_to_t_indices[0]) if num_k > 0 else 0
+
+    def run_greedy(order):
+        coverage = [max_cov] * num_k
+        uncovered = [True] * num_t
+        selected = [False] * num_k
+        uncovered_count = num_t
+        cover_count = [0] * num_t
+        
+        # Initialize buckets
+        buckets = [[] for _ in range(max_cov + 1)]
+        for ki in order:
+            buckets[max_cov].append(ki)
+            
+        current_max = max_cov
+        selected_indices = []
+        
+        while uncovered_count > 0:
+            # Find the highest non-empty bucket
+            while current_max >= 0 and not buckets[current_max]:
+                current_max -= 1
+            
+            if current_max < 0:
                 break
                 
-            blocks.append(best_block)
-            uncovered &= ~block_masks[best_block]
+            ki = buckets[current_max].pop()
             
-            if time.time() > deadline:
-                return None  # Timeout
+            if selected[ki]:
+                continue
                 
-        return blocks
-    
-    def prune_blocks(blocks):
-        """
-        Remove redundant blocks iteratively.
-        A block is redundant if all t-subsets it covers are covered by other blocks.
-        """
-        if not blocks:
-            return blocks
-        
-        # Work with indices for efficiency
-        current = list(blocks)
-        
-        # Iterate until no more changes
+            if coverage[ki] != current_max:
+                # Stale entry, move to correct bucket
+                buckets[coverage[ki]].append(ki)
+                continue
+                
+            if coverage[ki] == 0:
+                continue
+            
+            # Select this k-subset
+            selected[ki] = True
+            selected_indices.append(ki)
+            
+            # Update coverage for neighbors and cover_count
+            for ti in k_to_t_indices[ki]:
+                cover_count[ti] += 1
+                if uncovered[ti]:
+                    uncovered[ti] = False
+                    uncovered_count -= 1
+                    for other_ki in t_to_k_indices[ti]:
+                        if not selected[other_ki]:
+                            coverage[other_ki] -= 1
+                            
+        return selected_indices, cover_count
+
+    def reduce_cover(selected_indices, cover_count):
+        # selected_indices is a list of ki
+        # cover_count is the count for this specific set
+        # We modify selected_indices and cover_count to remove redundant blocks
         changed = True
-        while changed and time.time() < deadline:
+        while changed:
             changed = False
-            n = len(current)
-            
-            if n == 0:
-                break
-            
-            # Count how many blocks cover each t-subset
-            count_cover = [0] * n_t
-            
-            for bi in current:
-                mask = block_masks[bi]
-                m = mask
-                while m:
-                    lsb = m & -m
-                    idx = lsb.bit_length() - 1
-                    count_cover[idx] += 1
-                    m ^= lsb
-            
-            # Identify essential blocks (those with at least one uniquely covered t-subset)
-            essential = [False] * n
-            for i, bi in enumerate(current):
-                mask = block_masks[bi]
-                m = mask
-                while m:
-                    lsb = m & -m
-                    idx = lsb.bit_length() - 1
-                    if count_cover[idx] == 1:
-                        essential[i] = True
+            to_remove = []
+            for idx, ki in enumerate(selected_indices):
+                # Check if ki is redundant
+                # Redundant if for all ti in ki, cover_count[ti] > 1
+                redundant = True
+                for ti in k_to_t_indices[ki]:
+                    if cover_count[ti] == 1:
+                        redundant = False
                         break
-                    m ^= lsb
+                if redundant:
+                    to_remove.append(idx)
             
-            # Remove non-essential blocks
-            new_current = [current[i] for i in range(n) if essential[i]]
-            
-            if len(new_current) < len(current):
-                changed = True
-                current = new_current
-        
-        return current
-    
-    # Run multiple greedy covers with different noise levels and seeds
+            if not to_remove:
+                break
+                
+            changed = True
+            # Remove them in reverse order to keep indices valid
+            for idx in reversed(to_remove):
+                ki = selected_indices[idx]
+                for ti in k_to_t_indices[ki]:
+                    cover_count[ti] -= 1
+                selected_indices.pop(idx)
+                
+        return selected_indices
+
+    # Run multiple times with different orders
     best_blocks = None
-    best_count = float('inf')
+    best_len = float('inf')
     
-    # First, run pure greedy
-    pure_result = greedy_cover(noise_seed=0, alpha=0.0)
-    if pure_result is not None:
-        pruned = prune_blocks(pure_result)
-        if len(pruned) < best_count:
-            best_count = len(pruned)
-            best_blocks = pruned
-    
-    # Then, run stochastic greedy with various alpha values and seeds
-    alphas = [0.1, 0.5, 1.0, 2.0]
-    seeds = range(1, 20)
-    
-    for alpha in alphas:
-        for seed in seeds:
-            if time.time() > deadline:
-                break
-            
-            result = greedy_cover(noise_seed=seed, alpha=alpha)
-            if result is not None:
-                pruned = prune_blocks(result)
-                if len(pruned) < best_count:
-                    best_count = len(pruned)
-                    best_blocks = pruned
-    
-    # If we still have time, try more aggressive pruning with local search
-    if best_blocks is not None and time.time() < deadline - 5.0:
-        # Try to improve by swapping blocks
-        # For each block, try replacing it with a different block that maintains coverage
-        # This is expensive, so only do a few iterations
-        current = list(best_blocks)
-        improved = True
-        while improved and time.time() < deadline - 2.0:
-            improved = False
-            for i in range(len(current)):
-                if time.time() > deadline - 2.0:
-                    break
-                # Compute coverage of current block i
-                mask_i = block_masks[current[i]]
-                
-                # Check if any other block can replace it while maintaining coverage
-                # i.e., all t-subsets in mask_i are covered by other blocks
-                # This is equivalent to: for each t-subset in mask_i, count_cover >= 2
-                # But we need to check after removing block i
-                
-                # Simpler: temporarily remove block i and check if all its t-subsets are still covered
-                # This is O(n_t) per check, which is ~11628 ops. With ~300 blocks, that's ~3.5M ops.
-                # Might be too slow if done naively.
-                
-                # Alternative: use the same essential check
-                # Count coverage without block i
-                count_without_i = [0] * n_t
-                for j, bi in enumerate(current):
-                    if j == i:
-                        continue
-                    mask = block_masks[bi]
-                    m = mask
-                    while m:
-                        lsb = m & -m
-                        idx = lsb.bit_length() - 1
-                        count_without_i[idx] += 1
-                        m ^= lsb
-                
-                # Check if all t-subsets in mask_i are covered by other blocks
-                m = mask_i
-                can_remove = True
-                while m:
-                    lsb = m & -m
-                    idx = lsb.bit_length() - 1
-                    if count_without_i[idx] == 0:
-                        can_remove = False
-                        break
-                    m ^= lsb
-                
-                if can_remove:
-                    current.pop(i)
-                    improved = True
-                    break  # Restart the loop since indices changed
+    # Deterministic run
+    order = list(range(num_k))
+    indices, counts = run_greedy(order)
+    reduced_indices = reduce_cover(indices, counts)
+    if len(reduced_indices) < best_len:
+        best_len = len(reduced_indices)
+        best_blocks = [list(all_k_subsets[i]) for i in reduced_indices]
         
-        if len(current) < best_count:
-            best_count = len(current)
-            best_blocks = current
-    
-    # Return the best blocks found
-    if best_blocks is None:
-        # Fallback: return pure greedy result
-        return pure_result if pure_result is not None else []
-    
-    # Convert block indices back to actual blocks
-    return [list(all_blocks[bi]) for bi in best_blocks]
-# EVOLVE-BLOCK-END
+    # Randomized runs
+    num_restarts = 50 # Increase restarts as reduction is fast
+    for _ in range(num_restarts):
+        random_order = list(range(num_k))
+        random.shuffle(random_order)
+        indices, counts = run_greedy(random_order)
+        reduced_indices = reduce_cover(indices, counts)
+        if len(reduced_indices) < best_len:
+            best_len = len(reduced_indices)
+            best_blocks = [list(all_k_subsets[i]) for i in reduced_indices]
+            
+    return best_blocks

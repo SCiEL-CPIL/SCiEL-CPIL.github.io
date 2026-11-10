@@ -1,0 +1,9 @@
+import time
+import random
+
+def construct():
+    N = 256
+    # ... precomputation ...
+    # ... greedy init ...
+    # ... SA loop ...
+    return sorted(selected)

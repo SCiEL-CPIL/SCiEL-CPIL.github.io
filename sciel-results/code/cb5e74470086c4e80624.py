@@ -1,0 +1,43 @@
+"""Initial program for the suite task; SCiEL evolves the EVOLVE-BLOCK."""
+# EVOLVE-BLOCK-START
+import time
+
+def _find_max_overlap_fast(s1, s2, max_ov_len):
+    """Find the maximum overlap where suffix of s1 matches prefix of s2."""
+    max_ov = min(len(s1), len(s2), max_ov_len)
+    for o in range(max_ov, 0, -1):
+        if s1[-o:] == s2[:o]:
+            return o
+    return 0
+
+def construct(n):
+    start_time = time.time()
+    deadline = start_time + 110
+
+    if n == 1:
+        return "1"
+
+    word = "1"
+    
+    for m in range(2, n + 1):
+        if time.time() > deadline:
+            break
+
+        # Extract all (m-1)-permutations from word in order of appearance
+        perms, seen = [], set()
+        for i in range(len(word) - (m - 1) + 1):
+            window = word[i:i + m - 1]
+            if len(set(window)) == m - 1:
+                if window not in seen:
+                    seen.add(window)
+                    perms.append(window)
+
+        new = ""
+        for p in perms:
+            block = p + str(m) + p
+            ov = _find_max_overlap_fast(new, block, len(new))
+            new += block[ov:]
+        word = new
+
+    return word
+# EVOLVE-BLOCK-END

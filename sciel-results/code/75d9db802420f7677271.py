@@ -1,0 +1,347 @@
+import time
+import random
+import numpy as np
+from collections import deque
+
+def _build_luw(d, q):
+    """
+    Build the Lazebnik-Ustimenko-Woldar graph CD(d, q).
+    n = 2 * q^d, degree = q, girth >= 2d+4 (for d>=3).
+    """
+    q_int = int(q)
+    
+    rule = {}
+    if d >= 2: rule[2] = (1, 1)
+    if d >= 3: rule[3] = (2, 1)
+    if d >= 4: rule[4] = (1, 2)
+    if d >= 5: rule[5] = (1, 3)
+    if d >= 6: rule[6] = (2, 3)
+    if d >= 7: rule[7] = (1, 4)
+    
+    for c in range(8, d + 1):
+        if c % 2 == 0:
+            rule[c] = (c - 1, 1)
+        else:
+            rule[c] = (c - 1, c - 2)
+            
+    n = 2 * (q_int ** d)
+    adj = [[] for _ in range(n)]
+    edges = []
+    
+    def idx_to_tuple(idx):
+        side = 0 if idx < q_int ** d else 1
+        rem = idx % (q_int ** d)
+        x = [0] * d
+        for i in range(d - 1, -1, -1):
+            x[i] = rem % q_int
+            rem //= q_int
+        return side, tuple(x)
+    
+    for x_val in range(q_int ** d):
+        x = idx_to_tuple(x_val)[1]
+        for y0 in range(q_int):
+            y = [0] * d
+            y[0] = y0
+            for c in range(2, d + 1):
+                a, b = rule[c]
+                y[c-1] = (x[c-1] + y[a-1] * x[b-1]) % q_int
+            
+            y_idx = 1 * (q_int ** d) + sum(y[i] * (q_int ** (d - 1 - i)) for i in range(d))
+            x_idx = x_val
+            
+            if x_idx < y_idx:
+                adj[x_idx].append(y_idx)
+                adj[y_idx].append(x_idx)
+                edges.append((x_idx, y_idx))
+            else:
+                adj[x_idx].append(y_idx)
+                adj[y_idx].append(x_idx)
+                edges.append((y_idx, x_idx))
+                
+    return n, edges, adj
+
+def _girth_check(adj, n, g):
+    """
+    Check if the graph has girth at least g.
+    """
+    h = (g - 1) // 2
+    for s in range(n):
+        depth = [-1] * n
+        parent = [-1] * n
+        depth[s] = 0
+        queue = deque([s])
+        
+        while queue:
+            u = queue.popleft()
+            if depth[u] >= h:
+                continue
+            for v in adj[u]:
+                if depth[v] == -1:
+                    depth[v] = depth[u] + 1
+                    parent[v] = u
+                    queue.append(v)
+                else:
+                    if v != parent[u]:
+                        cycle_len = depth[u] + depth[v] + 1
+                        if cycle_len < g:
+                            return False
+    return True
+
+def _construct_luw(k, g):
+    deadline = time.time() + 110.0
+    best_n = float('inf')
+    best_edges = None
+    
+    q = int(k)
+    
+    for d in [3, 4, 5, 6]:
+        if time.time() > deadline - 10:
+            break
+            
+        try:
+            n, edges, _ = _build_luw(d, q)
+        except Exception:
+            continue
+            
+        # Quick regularity check
+        # In LUW, each vertex has exactly q neighbors by construction.
+        # We trust the construction for regularity but verify girth.
+        
+        # Rebuild adj for girth check
+        adj = [[] for _ in range(n)]
+        for u, v in edges:
+            adj[u].append(v)
+            adj[v].append(u)
+            
+        if _girth_check(adj, n, g):
+            if n < best_n:
+                best_n = n
+                best_edges = edges
+            break
+
+    if best_edges is None:
+        raise ValueError("No valid LUW graph found")
+        
+    return best_n, best_edges
+
+def _mul_psl2(m1, m2, q):
+    a1, b1, c1, d1 = m1
+    a2, b2, c2, d2 = m2
+    a = (a1*a2 + b1*c2) % q
+    b = (a1*b2 + b1*d2) % q
+    c = (c1*a2 + d1*c2) % q
+    d = (c1*b2 + d1*d2) % q
+    return (a, b, c, d)
+
+def _generate_psl2(q):
+    elements = []
+    idx_map = {}
+    
+    for a in range(q):
+        for b in range(q):
+            for c in range(q):
+                if a == 0:
+                    if b == 0:
+                        continue
+                    if (b * c) % q != (q - 1) % q:
+                        continue
+                    d = 0
+                else:
+                    d = (1 + b * c) % q
+                    a_inv = pow(a, q - 2, q)
+                    d = (d * a_inv) % q
+                
+                if (a * d - b * c) % q != 1:
+                    continue
+                
+                m = (a, b, c, d)
+                # Normalize
+                # First non-zero element should be in 1..(q-1)/2
+                flipped = False
+                for val in [a, b, c, d]:
+                    if val != 0:
+                        if val > (q - 1) // 2:
+                            m = ((q - a) % q, (q - b) % q, (q - c) % q, (q - d) % q)
+                            flipped = True
+                        break
+                
+                if m not in idx_map:
+                    idx_map[m] = len(elements)
+                    elements.append(m)
+    
+    return elements, idx_map
+
+def _check_girth_psl2(group, idx_map, candidates, g, q):
+    """
+    Check girth of the Cayley graph generated by candidates in PSL(2, q).
+    """
+    n = len(group)
+    # We can do BFS from the identity element (index 0)
+    # But we need to check from all vertices? No, for vertex-transitive graphs,
+    # checking from one vertex is sufficient to find the shortest cycle through that vertex.
+    # However, the girth is the shortest cycle in the whole graph.
+    # Since the graph is vertex-transitive, the girth is the same for all vertices.
+    # So checking from the identity is sufficient.
+    
+    identity = (1, 0, 0, 1)
+    start_idx = idx_map[identity]
+    
+    depth = [-1] * n
+    parent = [-1] * n
+    depth[start_idx] = 0
+    queue = deque([start_idx])
+    
+    max_depth = g // 2
+    
+    while queue:
+        u = queue.popleft()
+        if depth[u] >= max_depth:
+            continue
+        
+        g_elem = group[u]
+        for s in candidates:
+            neighbor = _mul_psl2(g_elem, s, q)
+            # Normalize neighbor
+            a, b, c, d = neighbor
+            # Check if -M
+            # If first non-zero is > (q-1)/2, flip
+            flipped = False
+            for val in [a, b, c, d]:
+                if val != 0:
+                    if val > (q - 1) // 2:
+                        neighbor = ((q - a) % q, (q - b) % q, (q - c) % q, (q - d) % q)
+                        flipped = True
+                    break
+            
+            v = idx_map.get(neighbor)
+            if v is None:
+                # Should not happen if group is complete
+                continue
+                
+            if depth[v] == -1:
+                depth[v] = depth[u] + 1
+                parent[v] = u
+                queue.append(v)
+            else:
+                if v != parent[u]:
+                    cycle_len = depth[u] + depth[v] + 1
+                    if cycle_len < g:
+                        return False
+                        
+    return True
+
+def construct(k, g):
+    deadline = time.time() + 115.0
+    
+    if k == 5 and g == 9:
+        # Try PSL(2, q) first
+        best_n = float('inf')
+        best_edges = None
+        
+        # q=13 -> n=1092
+        # q=17 -> n=1360
+        # q=19 -> n=1710
+        
+        for q in [13, 17]:
+            if time.time() > deadline - 20:
+                break
+                
+            try:
+                group, idx_map = _generate_psl2(q)
+            except Exception:
+                continue
+                
+            n = len(group)
+            if n >= best_n:
+                continue
+                
+            # Find involutions
+            involutions = []
+            for m in group:
+                # m^2 = I
+                m2 = _mul_psl2(m, m, q)
+                # Normalize m2
+                a, b, c, d = m2
+                for val in [a, b, c, d]:
+                    if val != 0:
+                        if val > (q - 1) // 2:
+                            m2 = ((q - a) % q, (q - b) % q, (q - c) % q, (q - d) % q)
+                        break
+                if m2 == (1, 0, 0, 1) and m != (1, 0, 0, 1):
+                    involutions.append(m)
+                    
+            if not involutions:
+                continue
+                
+            # Random search for generators
+            found = False
+            attempts = 0
+            max_attempts = 2000
+            
+            while attempts < max_attempts and time.time() < deadline - 10:
+                attempts += 1
+                
+                s1 = random.choice(group)
+                s2 = random.choice(group)
+                s3 = random.choice(involutions)
+                
+                # Check orders
+                # s1, s2 should not be involutions or identity
+                # s1 != s1^-1
+                s1_inv = (s1[3], s1[1], s1[2], s1[0]) # Inverse of (a,b,c,d) is (d,b,c,a) for det=1? No.
+                # Inverse of (a b; c d) is (d -b; -c a)
+                s1_inv = (s1[3], (q - s1[1]) % q, (q - s1[2]) % q, s1[0])
+                s2_inv = (s2[3], (q - s2[1]) % q, (q - s2[2]) % q, s2[0])
+                
+                # Normalize inverses
+                for m in [s1_inv, s2_inv]:
+                    a, b, c, d = m
+                    for val in [a, b, c, d]:
+                        if val != 0:
+                            if val > (q - 1) // 2:
+                                s1_inv = ((q - a) % q, (q - b) % q, (q - c) % q, (q - d) % q)
+                            break
+                    for val in [a, b, c, d]:
+                        if val != 0:
+                            if val > (q - 1) // 2:
+                                s2_inv = ((q - a) % q, (q - b) % q, (q - c) % q, (q - d) % q)
+                            break
+                
+                candidates = [s1, s1_inv, s2, s2_inv, s3]
+                
+                if len(set(candidates)) != 5:
+                    continue
+                    
+                # Check girth
+                if _check_girth_psl2(group, idx_map, candidates, g, q):
+                    # Construct edges
+                    edges = []
+                    for i, g_elem in enumerate(group):
+                        for s in candidates:
+                            neighbor = _mul_psl2(g_elem, s, q)
+                            # Normalize neighbor
+                            a, b, c, d = neighbor
+                            for val in [a, b, c, d]:
+                                if val != 0:
+                                    if val > (q - 1) // 2:
+                                        neighbor = ((q - a) % q, (q - b) % q, (q - c) % q, (q - d) % q)
+                                    break
+                            
+                            j = idx_map[neighbor]
+                            if i < j:
+                                edges.append((i, j))
+                    
+                    if len(edges) == n * k // 2:
+                        best_n = n
+                        best_edges = edges
+                        found = True
+                        break
+                        
+            if found:
+                return best_n, best_edges
+                
+        # Fallback to LUW
+        return _construct_luw(k, g)
+        
+    else:
+        return _construct_luw(k, g)
